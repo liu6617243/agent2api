@@ -748,7 +748,7 @@ const OFFICEACE: ProviderConfig = {
 const MINIMAX: ProviderConfig = {
   provider: 'minimax',
   // 品牌名各语言相同，不进词典（与 "Cline Free" 同一处置）
-  label: 'MiniMax',
+  label: 'Minimax 中国',
   desktop: false,
   manualTitle: t('粘贴 refreshToken'),
   // 整段是一个 t() 键：扫描器只认字符串字面量（拼接串提不到键），所以不拆行
