@@ -366,8 +366,10 @@ impl AccountStore {
         record
             .fields_mut()
             .insert("creditExpiresAt".to_string(), Value::from(normalized));
-        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record))
-            .map_err(|error| error.message)?;
+        // with_conn 已把 rusqlite 错误映射成 AccountStoreError，直接 `?` 即可
+        // （凭据 setter 那个 `.map_err(|error| error.message)` 是给它自己的
+        // `Result<_, String>` 签名用的，这里签名是 AccountStoreError，不能照抄）。
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record))?;
         Ok(true)
     }
 
