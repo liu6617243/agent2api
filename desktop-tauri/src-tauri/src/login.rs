@@ -1202,6 +1202,11 @@ pub async fn start(
         // OfficeAce 只有一家（自助 OAuth 一条链，没有地区/版本概念），品牌名里
         // 不需要地区
         "officeace" => "OfficeAce 果办",
+        // Minimax 只有一家（agent.minimax.cn 全站统一，没有地区/版本之分），
+        // 品牌名里不需要地区 —— 与注册表的 `label: "Minimax 中国"` 同口径。
+        // 少了这一条会落到默认分支，标题变成「登录 WorkBuddy 国内版账号」
+        // 而窗口里开的是 MiniMax 的授权页（正是上面那段注释警告的情形）。
+        "minimax" => "Minimax 中国",
         _ => "WorkBuddy",
     };
     // 窗口标题：Cline 两家的池、ZCode 两家的地区、CodeArts / Trae / OfficeAce
@@ -1210,7 +1215,7 @@ pub async fn start(
     let title = if matches!(
         provider,
         "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae" | "qoder"
-        | "qoder-intl" | "antigravity" | "officeace"
+        | "qoder-intl" | "antigravity" | "officeace" | "minimax"
     ) {
         format!("登录 {provider_label} 账号")
     } else {
