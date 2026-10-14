@@ -123,16 +123,6 @@
       },
     },
     {
-      key: 'minimax-cn', name: 'Minimax 中国', icon: 'minimax-cn.png',
-      protocol: P.anthropic, baseUrl: 'https://api.minimaxi.com/anthropic',
-      hint: wbI18n.t('国内站（minimaxi.com）；OpenAI 兼容地址为 https://api.minimaxi.com/v1'),
-      quirks: {
-        urlSuffix: '?beta=true',
-        headers: { ...ANTHROPIC_BETA_HEADERS },
-        anthropicToolType: 'custom',
-      },
-    },
-    {
       key: 'siliconflow', name: 'SiliconFlow', icon: 'siliconflow.png',
       protocol: P.openai, baseUrl: 'https://api.siliconflow.com/v1',
       hint: wbI18n.t('国内站为 https://api.siliconflow.cn/v1'),
