@@ -741,15 +741,33 @@ const OFFICEACE: ProviderConfig = {
  * `userId` 可选（上游不返回稳定身份，仅用于展示与身份识别）；
  * `name` 可选（身份键：同名再粘 = 更新，不同账号要起不同名字）。
  *
- * ── 没有网页登录 / 桌面导入 ─────────────────────────────────────
- * 授权在 MiniMax Code 客户端侧完成（设备码），网关只做「粘贴令牌 + 续期」，
- * 因此 `desktop: false` 且不提供 `webLogin`（方法分段只剩手填一项）。
+ * ── 两条添加路径 ───────────────────────────────────────────────
+ * ① `webLogin`：网关自己走设备码授权（RFC 8628 + PKCE S256），用户点授权页
+ *    确认即可拿到 refreshToken —— 不必去客户端登录态里翻那串容易失效的令牌。
+ * ② 手填：没有浏览器时的兜底，粘贴 refreshToken（+可选 accessToken）。
+ * 两条路最终都落`add_minimax_account`，是同一份账号记录。
+ *
+ * 没有桌面导入：`desktop: false` —— 本机没有可读的「客户端登录态文件」
+ * 契约（令牌只存在于客户端内存/授权服务端，网关拿不到那个文件）。
  */
 const MINIMAX: ProviderConfig = {
   provider: 'minimax',
   // 品牌名各语言相同，不进词典（与 "Cline Free" 同一处置）
   label: 'Minimax 中国',
   desktop: false,
+  // 网页登录（后端 providers::minimax::login）：标准设备码授权
+  // （RFC 8628 + PKCE S256）。没有回调、没有自定义协议、不起本地端口——
+  // 就是「打开授权页 → 用户确认 → 网关轮询拿到 refreshToken」，因此
+  // 内嵌窗口与系统浏览器两种方式都可行。
+  webLogin: {
+    noteHtml: t('打开授权页登录 <b>MiniMax</b>（agent.minimax.cn），确认后账号自动加入列表。'),
+    button: t('打开 Minimax 网页登录'),
+    busyText: t('等待 Minimax 登录完成…'),
+    modes: [
+      { value: 'embedded', label: t('内嵌窗口（推荐）'), hint: t('内嵌窗口打开；完成后自动加入列表，关窗即取消等待') },
+      { value: 'external', label: t('系统浏览器'), hint: t('系统浏览器打开（复用已登录的 MiniMax 账号）；完成后自动加入列表') },
+    ],
+  },
   manualTitle: t('粘贴 refreshToken'),
   // 整段是一个 t() 键：扫描器只认字符串字面量（拼接串提不到键），所以不拆行
   manualNoteHtml: t('粘贴 MiniMax Code 的 <code>refreshToken</code>（从客户端登录态导出；直接粘贴含 <code>refresh_token=</code> 的整行也行）。<br>refresh_token 是<b>一次性轮换</b>的：网关每次续期都会换发一枚新的并当场作废旧值，新值由网关自动回写，不需要手工再粘。access token 约 1 小时到期，由网关自动续期；令牌丢了只能回 MiniMax Code 客户端重新走设备码授权，请妥善保存。'),

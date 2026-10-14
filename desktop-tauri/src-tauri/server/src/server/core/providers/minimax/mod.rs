@@ -30,12 +30,15 @@
 //!
 //! ── 凭证形态 ──────────────────────────────────────────────────
 //! `refreshToken` 是主凭证（丢了只能回 MiniMax Code 客户端重新走设备码授权），
-//! `accessToken` 只是约 3600 秒的短期缓存。授权在客户端侧完成，网关只做
-//! **粘贴令牌 + 续期**（没有网页登录链路；将来接设备码登录再开 `supports_web_login`）。
+//! `accessToken` 只是约 3600 秒的短期缓存。**两条添加路径**共用同一套凭证语义：
+//!   - 网页登录（`login.rs`）：标准设备码流程（RFC 8628 + PKCE S256），
+//!     用户点授权页确认即可，网关轮询换令牌 —— 不必去客户端里翻令牌串；
+//!   - 粘贴令牌：没有浏览器时的兜底（原方案，见下）。
+//! 两条路最终都走 `add_minimax_account` 落同一份账号记录。
 //!
 //! ── 交付边界 ──────────────────────────────────────────────────
 //! ```text
-//!   ✅ 账号：粘贴 refreshToken 添加（account_store::minimax_accounts）
+//!   ✅ 账号：网页登录（设备码授权）或粘贴 refreshToken
 //!   ✅ token 刷新：临期懒刷 + 401 强刷（单飞 + 比较再写 + 新 rt 必回写）
 //!   ✅ 模型目录：静态 4 项（上游无公开列模型接口；supports_model_refresh=false）
 //!   ✅ 聊天转发：build_chat_request → Anthropic Messages（Bearer + anthropic-version）
@@ -48,6 +51,7 @@
 //! ```text
 //!   endpoints.rs    两个基址 / 各端点路径 / OAuth 公开参数 / anthropic-version
 //!   credentials.rs  凭证快照 + 临期判定（refreshToken 主、一次性轮换语义）
+//!   login.rs        设备码授权登录（RFC 8628 + PKCE S256 + 轮换取令牌）
 //!   oauth.rs        token 端点 form 刷新 + 单飞 + 比较再写（新 rt 必回写）
 //!   models.rs       静态目录（4 项原样透传，is_known 判大小写不敏感）
 //!   client.rs       agent 网关 Bearer 请求薄封装 + base_resp 业务码口径
@@ -65,6 +69,7 @@ pub mod checkin;
 pub mod client;
 pub mod credentials;
 pub mod endpoints;
+pub mod login;
 pub mod models;
 pub mod oauth;
 
