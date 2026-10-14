@@ -317,7 +317,7 @@ async fn poll_tokens(start: &DeviceAuthStart) -> Result<DeviceTokens, GatewayErr
                         .and_then(|text| text.trim().parse::<i64>().ok())
                 })
                 .filter(|value| *value > 0)
-                .unwrap_or(super::oauth_default_expires_in_seconds());
+                .unwrap_or(super::oauth::oauth_default_expires_in_seconds());
             return Ok(DeviceTokens {
                 access_token: access,
                 refresh_token: refresh,
