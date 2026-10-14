@@ -240,11 +240,16 @@ pub async fn poll_and_register(
     start: &DeviceAuthStart,
 ) -> Result<String, GatewayError> {
     let tokens = poll_tokens(start).await?;
+    // 把上游给的 expires_in（秒）换算成绝对毫秒交给账号层（口径 = now + expires_in，
+    // 与 `add_minimax_account` 内部对 expiresAt 的处理一致）。不给它的话账号层
+    // 会退回「1 小时」的保守缺省值 —— 与实测同值，但那是猜的；这里用上游的真值。
+    let expires_at = logging::now_ms() + tokens.expires_in.saturating_mul(1000);
     let account = store
         .add_minimax_account(
             &json!({
                 "refreshToken": tokens.refresh_token,
                 "accessToken": tokens.access_token,
+                "expiresAt": expires_at,
             }),
             None,
             "web",
