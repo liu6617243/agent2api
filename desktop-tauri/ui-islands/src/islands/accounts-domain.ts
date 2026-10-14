@@ -208,6 +208,18 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   //   由网关基址 + app key 派生），不是任何凭据本身：面板上显示 `modelAppKey`
   //   会把网关 key 露在界面上（`identifierOf` 读的是字段**值**，不只是标签）。
   officeace: { usage: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
+  // MiniMax（MiniMax Code）。各位各有出处：
+  // `usage: true` —— 积分余额读 `GET /minimax-cloud/api/v1/credit/details`
+  //   （Σ remaining_amount，见后端 providers::minimax::balance + 适配器
+  //   `query_usage`，`supports_usage` 已开）。
+  // `edition: false` —— 单一入口（粘贴 refreshToken），没有国际版/地区概念。
+  // `identifier: 'id'` —— 账号标识渲染**账号 id**（`minimax-<hash>`，由备注名 /
+  //   令牌摘要派生）：上游不返回稳定身份（OAuth 响应只有令牌本身），`userId`
+  //   只是用户粘贴时可选带来的串、常常为空，不能当标识列。
+  // `expiry: 'expiresAt'` —— accessToken 约 3600 秒到期（临期由网关懒刷，
+  //   一次性轮换的新 rt 自动回写）；只有 refreshToken 的账号这一列也只是
+  //   「该刷了」的提示。
+  minimax: { usage: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
 }
 
 /**

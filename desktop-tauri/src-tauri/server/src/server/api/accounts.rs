@@ -802,6 +802,26 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             // 面板传来的名字是用户自己打的 ⇒ 标 custom（此后续期/重登不改它）
             store.add_officeace_account(&payload, import_name, true)
         }
+        // MiniMax（MiniMax Code）：**粘贴 refreshToken** 直接落账号。
+        //
+        // **添加时绝不打上游校验**（与 Antigravity 的 `verify_paste` 相反）：
+        // MiniMax 的 refresh_token 是**一次性**的——拿它打一次 token 端点就
+        // 会换回一枚新 rt，而校验路径没有「把新 rt 写进尚不存在的记录」的
+        // 收尾，用户粘的那枚当场作废、新那枚又被丢掉，等于添一次废一次。
+        // 有效性交给转发/余额/签到链路的懒刷新验证（临期自动刷、刷失败 401
+        // 文案指向重新授权），与 OfficeAce 的「不调上游、由刷新链路验」同口径。
+        //
+        // `importDesktop` 不提供：登录态在 MiniMax Code 客户端自己的加密
+        // 存储里，没有可读文件形态（与 Accio / ZCode / Loomy 同一处境）。
+        Some(crate::server::core::providers::ProviderKind::Minimax) => {
+            if import_desktop {
+                return management_error(
+                    400,
+                    "MiniMax 不支持导入桌面端登录态，请粘贴 refreshToken 添加账号",
+                );
+            }
+            store.add_minimax_account(&payload, import_name, "manual")
+        }
         // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
         // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的
         // `edition` 反推：那是账号的属性，而落哪一家是身份问题）。
@@ -1158,6 +1178,15 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     // （`refresh_account` 的文档里把这条列为「加带 refreshToken 的家时必须一起加」）。
     if state.store().antigravity_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::Antigravity).await;
+    }
+    // MiniMax：**有**可刷新的 refreshToken（自家 OAuth token 端点），走适配器
+    // 的强制刷新（`grant_type=refresh_token` 打 `account.minimax.cn/oauth2/token`，
+    // 新 access_token 与新 refresh_token 一起「比较-再写」回写——一次性轮换，
+    // 漏回写新 rt 账号续期链就报废，见 `providers::minimax::oauth`）。
+    // 这条分派不能省：漏了就落到下面的 workbuddy 兜底链路（与 Antigravity /
+    // CodeArts / Trae 同一条理由）。
+    if state.store().minimax_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::Minimax).await;
     }
     // WorkBuddy 系（国内版 / 国际版）的兜底：两条链路都按**账号自己的**
     // endpoint / prefixPath / platform / edition 续期

@@ -48,6 +48,7 @@
   "保活+领取": "Keep-alive + claim",
   "保活中…": "Keeping alive…",
   "保活模型链": "Keep-alive model chain",
+  "先查签到状态再领取积分 · 幂等 · 按自然日重置": "Checks status first, then claims the points · idempotent · resets on the calendar day",
   "全选": "Select all",
   "全部 {n} 家": "All {n} providers",
   "全部完成": "All done",

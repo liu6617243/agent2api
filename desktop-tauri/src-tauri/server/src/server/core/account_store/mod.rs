@@ -96,6 +96,8 @@
 //!                开头的 API Key 添加、公开形态（只给尾号）
 //!   antigravity_accounts.rs Antigravity 账号（单一 provider）：粘贴 Google
 //!                refresh token 添加、刷新回写（比较-再写）、公开形态（只给尾号）
+//!   minimax_accounts.rs  MiniMax 账号（单一 provider）：粘贴 refreshToken 添加
+//!                （一次性轮换，刷新回写比较-再写且新 rt 必覆盖）、公开形态（只给尾号）
 
 pub mod accio_accounts;
 pub mod antigravity_accounts;
@@ -109,6 +111,7 @@ pub mod commandcode_accounts;
 pub mod custom_accounts;
 pub mod kuku_accounts;
 pub mod loomy_accounts;
+pub mod minimax_accounts;
 pub mod monkeycode_accounts;
 pub mod officeace_accounts;
 pub mod priority;
@@ -225,6 +228,14 @@ pub(crate) const ANTIGRAVITY_PROVIDER_ID: &str = crate::server::core::providers:
 /// [`LOOMY_PROVIDER_ID`] 的口径）。账号形态见 `officeace_accounts.rs`。
 pub(crate) const OFFICEACE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::OfficeAce,
+);
+
+/// MiniMax（MiniMax Code）provider id（账号存储内部多处要用；**从注册表推导**，
+/// 同 [`LOOMY_PROVIDER_ID`] 的口径）。账号形态见 `minimax_accounts.rs`
+/// （单一 provider、没有地区之分；粘贴 refreshToken 添加，
+/// `update_minimax_credentials_if_current` 回写一次性轮换的新 rt）。
+pub(crate) const MINIMAX_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::Minimax,
 );
 
 /// Cline **免费池** provider id（账号存储内部多处要用；**从注册表推导**，同

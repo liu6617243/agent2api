@@ -186,6 +186,10 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::officeace::models::remote_refreshed(),
             super::officeace::models::last_refreshed_at(),
         ),
+        // MiniMax：静态清单（上游没有公开的列模型接口，4 项原样透传，见
+        // `minimax::models` 的模块头）：永远不是远程来源，也没有刷新时刻 ——
+        // 与 ZCode 同一处置，界面「来源」列如实显示成内置清单。
+        ProviderKind::Minimax => (false, 0),
     }
 }
 

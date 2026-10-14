@@ -48,6 +48,7 @@
   "保活+领取": "Manter ativo + Resgatar",
   "保活中…": "Mantendo ativo…",
   "保活模型链": "Cadeia de modelos para manter ativo",
+  "先查签到状态再领取积分 · 幂等 · 按自然日重置": "Consulta o status antes de resgatar os pontos · idempotente · reinicia no dia natural",
   "全选": "Selecionar tudo",
   "全部 {n} 家": "Todos os {n} provedores",
   "全部完成": "Tudo concluído",

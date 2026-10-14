@@ -347,6 +347,17 @@ pub async fn checkin_for(
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
+        "minimax" => {
+            // MiniMax：`POST /minimax-cloud/api/v1/signin/claim`（先看
+            // signin/status 面板再领，claim_result 1=本次领取 / 2=今日已领过；
+            // 接口幂等，见 `minimax::checkin` 的模块头）。令牌临期时由实现
+            // 内部走单飞刷新链（一次性轮换的新 rt 一起回写）。
+            let claim =
+                crate::server::core::providers::minimax::checkin::claim_daily_checkin(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
         "codearts" => {
             // CodeArts：当日 ops 福利（每日登录送积分那一组，`Rewards::DailyLogin`
             // ——一次性注册礼归新手福利，不在这里领，见 welfare 的模块头）。

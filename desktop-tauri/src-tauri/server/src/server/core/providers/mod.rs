@@ -130,6 +130,14 @@ pub mod content_block;
 pub mod custom;
 pub mod kuku;
 pub mod loomy;
+/// MiniMax（MiniMax Code / agent.minimax.cn）。适配实现在 `minimax/`：
+/// 账号管理（粘贴 refreshToken）+ OAuth 刷新（**refresh_token 一次性轮换**，
+/// 单飞 + 比较再写 + 新 rt 必回写）+ 静态模型目录 + **会话转发**（上游推理
+/// 端点说 Anthropic Messages，`build_chat_request` 构造 Anthropic 请求、
+/// 响应帧由 `upstream::translate::AnthropicToChatStream` 折回 chat SSE，
+/// 与 ZCode 活动套餐通道同一处置）+ 积分余额 + 每日签到全部已接通；
+/// `is_stateful` 保持 false，见 `minimax/mod.rs` 的模块头。
+pub mod minimax;
 /// MonkeyCode（长亭科技的开源 AI 开发平台）。适配实现在 `monkeycode/`：
 /// 账号管理（粘贴 session）+ 模型目录（`GET /api/v1/users/models`）+
 /// **会话转发**（上游是「建任务 → WebSocket 任务流」，ACP 事件翻译为 chat 帧，
@@ -458,6 +466,28 @@ pub enum ProviderKind {
     /// 不需要 CodeArts 那种会话闸门。凭据两层：网关 Basic（不过期，转发用）
     /// 与控制面临时 AK/SK（2 小时，额度/签到用）。
     OfficeAce,
+    /// MiniMax（MiniMax Code）。适配实现在 `minimax/`：账号管理（**粘贴
+    /// refreshToken**）、OAuth 刷新、静态模型目录、**会话转发**、积分余额、
+    /// 每日签到全部已接通，见 `minimax/mod.rs` 的模块头。
+    ///
+    /// ── 上游长什么样（实测定案；参考实现 minimax_shim.py + mm_checkin.py）──
+    /// 一条账号体系两个域：OAuth `account.minimax.cn/oauth2/token`（form，
+    /// `grant_type=refresh_token`，公开参数 client_id=mcode-public /
+    /// scope=agent.default / audience=agent-backend）；推理与管理都在
+    /// `agent.minimax.cn`，Bearer access_token。推理端点
+    /// `POST /mavis/api/v1/llm/v1/messages` 说 **Anthropic Messages**
+    /// （实测只认 `Authorization: Bearer`，不认 `x-api-key`）。
+    ///
+    /// ── 本家最关键的一条事实：refresh_token 一次性轮换 ──────────
+    /// 每刷一次下发新 refresh_token、旧值当场吊销（与 Google 的长寿命
+    /// refresh_token 相反）。刷新成功必须**同时**回写新 access_token 与新
+    /// refresh_token（`minimax::oauth`），漏掉任何一半，账号整条续期链报废。
+    ///
+    /// ── 转发路线（已落地）─────────────────────────────────────
+    /// **无状态**，只是响应协议是 Anthropic：复用既有的
+    /// [`adapter::UpstreamResponse::Anthropic`] 变体与翻译层（ZCode 活动套餐
+    /// 通道的先例），`is_stateful` 保持 false，不新增协议变体。
+    Minimax,
 }
 
 /// 一个提供商的静态元数据。
@@ -549,6 +579,10 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // glm-5.3 / deepseek-v4-flash-0731 / kimi-k2.6 …），注册表顺序决定目录
     // 合并时同名模型先归谁家 —— 放在末尾即「同名时优先已有各家」。
     ProviderMeta { id: "officeace", label: "OfficeAce 果办" },
+    // MiniMax（MiniMax Code）：单一入口（粘贴 refreshToken）、没有地区伴生。
+    // 排末尾（新家按约定追加在末尾，与 Kuku / Command Code / Antigravity /
+    // OfficeAce 同一处置）。
+    ProviderMeta { id: "minimax", label: "MiniMax" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -632,6 +666,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "commandcode" => Some(ProviderKind::CommandCode),
         "antigravity" => Some(ProviderKind::Antigravity),
         "officeace" => Some(ProviderKind::OfficeAce),
+        "minimax" => Some(ProviderKind::Minimax),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -673,6 +708,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::CommandCode => "commandcode",
         ProviderKind::Antigravity => "antigravity",
         ProviderKind::OfficeAce => "officeace",
+        ProviderKind::Minimax => "minimax",
     }
 }
 

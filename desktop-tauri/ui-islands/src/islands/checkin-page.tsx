@@ -57,6 +57,9 @@ const PROVIDER_DESC: Record<string, string> = {
   // 它执行的是 ops 活动交付（三个接口），一句话说明里点出这一点，用户才不会
   // 拿它跟别家「一次请求」的签到比快慢。
   codearts: t('每日福利 · 领取 → 确认 → 回读核实 · 按北京时间自然日重置'),
+  // MiniMax：先 GET signin/status 看今日是否已领，未领才 POST signin/claim
+  // （上游接口幂等，重复领不报错也不重复发，见后端 providers::minimax::checkin）
+  minimax: t('先查签到状态再领取积分 · 幂等 · 按自然日重置'),
 }
 
 /** 页内标签页的档位（值与 checkin-state 的 CheckinTab 一致） */

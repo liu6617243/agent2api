@@ -303,6 +303,11 @@ impl AccountStore {
             // 之类与它无关的空字段，而「刷新 Token」按钮靠的 hasRefreshToken
             // 只是**恰好**在兜底形状里也算得出来 —— 那不是设计，是巧合。
             self.to_officeace_public_account(record)
+        } else if record.provider() == super::MINIMAX_PROVIDER_ID {
+            // MiniMax（MiniMax Code）：单一入口（粘贴 refreshToken），公开形态
+            // 去掉令牌本体、只留 refreshToken 尾号与「有没有 refreshToken /
+            // accessToken」+ expiresAt（见 `minimax_accounts.rs`）
+            self.to_minimax_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)

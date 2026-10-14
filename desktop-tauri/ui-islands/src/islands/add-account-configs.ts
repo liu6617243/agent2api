@@ -722,6 +722,45 @@ const OFFICEACE: ProviderConfig = {
   ],
 }
 
+/**
+ * MiniMax（MiniMax Code / agent.minimax.cn）：**粘贴 refreshToken** 直接落账号。
+ *
+ * ── 与别家的关键差异（实测定案；见后端 `providers::minimax` 的模块头）──────
+ * refresh_token 是**一次性轮换**的：每打一次 token 端点就换发一枚新值、旧值
+ * 当场作废（与 Google 的长寿命 refresh_token 相反）。这条语义决定了两件事：
+ *   ① 添加时**绝不打上游校验**（与 Antigravity 的 `verify_paste` 相反）——
+ *      校验路径没有「把新 rt 写进尚不存在的记录」的收尾，打一次就会把用户
+ *      粘的那枚作废、新那枚又被丢掉，等于添一次废一次。有效性交给转发 /
+ *      余额 / 签到链路的懒刷新验证（与 OfficeAce 的「不调上游」同口径）。
+ *   ② 续期后网关**自动回写新 rt**（`oauth::refresh_and_save` →
+ *      `update_minimax_credentials_if_current`），用户不需要手工再粘。
+ *
+ * ── 字段 ───────────────────────────────────────────────────────
+ * `refreshToken` 必填（主凭证；丢了只能回客户端重新走设备码授权）；
+ * `accessToken` 可选（约 3600 秒的短期缓存，带上可立即转发、省一次刷新）；
+ * `userId` 可选（上游不返回稳定身份，仅用于展示与身份识别）；
+ * `name` 可选（身份键：同名再粘 = 更新，不同账号要起不同名字）。
+ *
+ * ── 没有网页登录 / 桌面导入 ─────────────────────────────────────
+ * 授权在 MiniMax Code 客户端侧完成（设备码），网关只做「粘贴令牌 + 续期」，
+ * 因此 `desktop: false` 且不提供 `webLogin`（方法分段只剩手填一项）。
+ */
+const MINIMAX: ProviderConfig = {
+  provider: 'minimax',
+  // 品牌名各语言相同，不进词典（与 "Cline Free" 同一处置）
+  label: 'MiniMax',
+  desktop: false,
+  manualTitle: t('粘贴 refreshToken'),
+  // 整段是一个 t() 键：扫描器只认字符串字面量（拼接串提不到键），所以不拆行
+  manualNoteHtml: t('粘贴 MiniMax Code 的 <code>refreshToken</code>（从客户端登录态导出；直接粘贴含 <code>refresh_token=</code> 的整行也行）。<br>refresh_token 是<b>一次性轮换</b>的：网关每次续期都会换发一枚新的并当场作废旧值，新值由网关自动回写，不需要手工再粘。access token 约 1 小时到期，由网关自动续期；令牌丢了只能回 MiniMax Code 客户端重新走设备码授权，请妥善保存。'),
+  fields: [
+    { key: 'refreshToken', label: 'refreshToken', rows: 2, placeholder: t('MiniMax Code 的 refreshToken（也可直接粘贴 refresh_token=… 整行）') },
+    { key: 'accessToken', label: 'accessToken', optional: true, rows: 2, placeholder: t('可选：当前 access token，带上可立即转发、省一次刷新') },
+    { key: 'userId', label: 'userId', optional: true, placeholder: t('可选：账号身份串，仅用于展示与身份识别') },
+    { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空则用「MiniMax + 令牌尾号」') },
+  ],
+}
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -763,6 +802,9 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // OfficeAce（华为云果办 / OfficeClaw）：浏览器登录（自助 OAuth）或粘贴网关
   //凭据，排在末尾（与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
   OFFICEACE,
+  // MiniMax（MiniMax Code）：粘贴 refreshToken，排在末尾（同上，新接入的家
+  // 加在表尾，与后端注册表 PROVIDERS 的追加顺序一致）
+  MINIMAX,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

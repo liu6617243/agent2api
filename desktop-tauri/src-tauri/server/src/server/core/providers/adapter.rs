@@ -1143,6 +1143,12 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // （Basic 网关凭据；账号管理走手工导入 / 自助 OAuth，见
         // `officeace/mod.rs` 的模块头）
         ProviderKind::OfficeAce => &super::officeace::adapter::OFFICEACE_ADAPTER,
+        // MiniMax（MiniMax Code）：账号 / OAuth 刷新（refresh_token 一次性
+        // 轮换，新 rt 必回写）/ 静态目录 / 转发 / 余额 / 签到全部已接通。
+        // 转发走既有的 `UpstreamResponse::Anthropic` 那条翻译层（推理端点
+        // 说 Anthropic Messages，与 ZCode 活动套餐通道同一处置；
+        // 见 `minimax/mod.rs` 与 `minimax/adapter.rs`）
+        ProviderKind::Minimax => &super::minimax::MINIMAX_ADAPTER,
     }
 }
 
@@ -1238,6 +1244,10 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // OfficeAce：远程目录（`GET {网关}/v1/models`）+ 有转发能力，
         // 进本列表才会被后台目录刷新调度
         ProviderKind::OfficeAce,
+        // MiniMax：适配器已接真身（账号 / token 刷新 / 转发 / 余额 / 签到）。
+        // 清单是静态表、`supports_model_refresh()` 为 false（ZCode 同一处境：
+        // 列入是为了「已接线」这个判定本身，刷新循环对它是空操作）。
+        ProviderKind::Minimax,
     ]
 }
 
