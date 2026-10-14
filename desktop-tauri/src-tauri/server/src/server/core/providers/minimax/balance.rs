@@ -132,20 +132,51 @@ pub async fn query_usage(store: &AccountStore, account_id: &str) -> Result<Value
             }
             wallets.push(wallet);
         }
-        // 最近会作废的那笔（选取规则与实测依据见 `nearest_expiring` 的文档）。
-        // 没有一批还带余额、或上游没给明细时不给到期相关的键，让界面回落到
-        // 「无到期批次」，而不是显示一个无意义的 0。
+        // 最近会作废的那批（选取规则见 `nearest_expiring` 的文档）。
+        // ① 回写账号记录的 `creditExpiresAt` —— 「有效期」列显示积分倒计时
+        //    就是从这儿来的（`set_minimax_credit_expiry` 的文档说明了为什么不
+        //    能写 expiresAt：那是刷新链的临期判据，被覆盖会让网关不再续期）。
+        //    值没变时 setter 内部跳过写库（sweep 每分钟一轮，不能白挨写）。
+        // ② `credits[]` 给余额格的「积分明细」弹层（`creditDetail` 能力位 +
+        //    `accounts-credit-detail.tsx` 的 `creditRowsOf` 契约：面额 / 已用 /
+        //    剩余 + 领取 → 到期）。**按到期升序**（最近作废在最前，与 Trae 的
+        //    排序口径一致；前端不再重排，见 creditRowsOf 的注释）。
         if let Some(batch) = nearest_expiring(items, now) {
+            let _ = store.set_minimax_credit_expiry(&resolved_id, batch.expire_at);
+            let mut credits: Vec<Value> = items
+                .iter()
+                .map(|item| {
+                    let mut pack = json!({
+                        "name": credit_type_label(item),
+                        "unit": "积分",
+                        "total": number_of(item, "granted_amount"),
+                        "used": number_of(item, "consumed_amount"),
+                        "remain": number_of(item, "remaining_amount"),
+                    });
+                    if let Some(granted) = millis_of(item, "granted_at_ms") {
+                        pack["grantAt"] = Value::from(granted);
+                    }
+                    if let Some(expire) = millis_of(item, "expire_at_ms") {
+                        pack["expireAt"] = Value::from(expire);
+                    }
+                    pack
+                })
+                .collect();
+            credits.sort_by_key(|pack| pack.get("expireAt").and_then(Value::as_i64).unwrap_or(i64::MAX));
             return Ok(json!({
                 "available": total,
                 "unit": "积分",
                 "wallets": wallets,
+                "credits": credits,
                 "nearestExpiryMs": batch.expire_at,
                 "nearestExpiryBalance": batch.remaining,
                 "expiringWithin24h": batch.expire_at - now <= 24 * 60 * 60 * 1000,
                 "raw": payload,
             }));
         }
+        // 没有会作废的批次：清掉记录里的旧值（传 0 → 界面回落「—」），
+        // 并照常返回读数（不给到期相关的键，弹层也不会有明细行）。
+        let _ = store.set_minimax_credit_expiry(&resolved_id, 0);
     }
     Ok(json!({
         "available": total,

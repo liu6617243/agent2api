@@ -86,6 +86,19 @@ type ProviderFeatures = {
    */
   creditDetail?: boolean
   /**
+   * 「有效期」列改读**积分批次到期**（`creditExpiresAt`），而不是令牌到期
+   * （只有 Minimax）。
+   *
+   * 为什么要有这个开关：两家的「有效期」语义本来就不同 —— WorkBuddy 的
+   * `expiresAt` 是订阅/套餐到期（用户关心），Minimax 的令牌约 1 小时一续、
+   * 列里长期停在「59 分钟后」，对用户没有信息量；它真正会丢的钱是**积分
+   * 批次**（每笔签到积分独立 30 天，见后端 `providers::minimax::balance` 的
+   * 模块头）。`creditExpiresAt` 由后端余额查询回写（`set_minimax_credit_expiry`），
+   * 查过一次余额才有值 —— 没有值时 ExpiryCell 回落到令牌到期，首屏不会
+   * 空成「—」。
+   */
+  creditExpiry?: boolean
+  /**
    * 这一家「并发上限」的默认值（>0 = 本家**没有**「不限」这一档）。
    * CodeArts 的 3 是上游硬顶（超过直接回 HTTP 400，且那是账号级冲突、不降级换号），
    * 所以那一家把 `0` 解释成「按默认 3」而不是「不做并发过滤」；后端同一口径写在两处
@@ -219,7 +232,12 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // `expiry: 'expiresAt'` —— accessToken 约 3600 秒到期（临期由网关懒刷，
   //   一次性轮换的新 rt 自动回写）；只有 refreshToken 的账号这一列也只是
   //   「该刷了」的提示。
-  minimax: { usage: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
+  // `creditExpiry: true` —— 列里**优先**显示积分批次到期（`creditExpiresAt`，
+  //   最近会作废的那批，后端余额查询回写；没查过余额时回落令牌）。积分是
+  //   批次制、会真作废，令牌却长期停在「约 1 小时」—— 用户要的是前者。
+  // `creditDetail: true` —— 余额格挂「积分明细」入口（逐笔批次：面额 / 已用 /
+  //   剩余 + 领取 → 到期），后端 `credits[]` 按到期升序给。
+  minimax: { usage: true, creditDetail: true, creditExpiry: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
 }
 
 /**
