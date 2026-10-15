@@ -661,9 +661,15 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // 见 `providers::officeace::oauth` 的模块头），所以这里没有 CodeArts 那种
         // loopback 回调要放行；但「不设限」仍是必须显式写出的选择（落进默认分支
         // 会拿到 WorkBuddy 的白名单 → 窗口白屏）。
+        // MiniMax 同样不设限：设备码授权页在 `agent.minimax.cn` / `platform.minimaxi.com`
+        // 一带，而登录动作由官方账号体系接管（手机号 / 微信扫码 / 邮箱 + 可能的
+        // 身份提供方跳转），主机不可穷举；**更要紧的是它不需要回本机** ——
+        // 结果是后端**轮询** `/oauth2/token` 拿到的（见
+        // `core::login::start_minimax_device_login`），窗口最后停在哪儿都行。
+        // 落进默认分支会拿到 WorkBuddy 的白名单 → 窗口白屏，正是上面警告的那类故障。
         "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
         | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
-        | "kuku" | "antigravity" | "officeace" => None,
+        | "kuku" | "antigravity" | "officeace" | "minimax" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
         // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
@@ -871,6 +877,12 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 与轮询 —— 与 ZCode / CodeArts 同一条路。它的授权码由网关**轮询云端**
         // 取回（云端回调页不往本机跳），所以窗口最后停在云端页上也不影响登录判定。
         "officeace" => Ok("officeace"),
+        // MiniMax：**设备授权登录**（RFC 8628）。与 Cline 同形 —— 授权地址由
+        // **后端**问上游换（先要一次 device_code），壳侧只负责开窗口与轮询，
+        // 用户确认后由后端后台任务轮询换令牌、落账号。因此两种打开方式
+        // （内嵌窗口 / 系统浏览器）都走得通：判定完全在后端轮询，不依赖本机
+        // 回调或自定义协议。
+        "minimax" => Ok("minimax"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
@@ -1184,6 +1196,10 @@ pub async fn start(
         // OfficeAce 只有一家（自助 OAuth 一条链，没有地区/版本概念），品牌名里
         // 不需要地区
         "officeace" => "OfficeAce 果办",
+        // MiniMax：本家是中国区名字「Minimax中国」（与添加账号卡片 / 弹窗标题
+        // 逐字一致，见 add-account-configs.ts 的 MINIMAX.label）。品牌名已含
+        // 地区语义，下面拼标题时跳过 edition 后缀。
+        "minimax" => "Minimax中国",
         _ => "WorkBuddy",
     };
     // 窗口标题：Cline 两家的池、ZCode 两家的地区、CodeArts / Trae / OfficeAce
@@ -1192,7 +1208,7 @@ pub async fn start(
     let title = if matches!(
         provider,
         "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae" | "qoder"
-        | "qoder-intl" | "antigravity" | "officeace"
+        | "qoder-intl" | "antigravity" | "officeace" | "minimax"
     ) {
         format!("登录 {provider_label} 账号")
     } else {

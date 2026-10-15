@@ -723,7 +723,8 @@ const OFFICEACE: ProviderConfig = {
 }
 
 /**
- * MiniMax（MiniMax Code / agent.minimax.cn）：**粘贴 refreshToken** 直接落账号。
+ * MiniMax（MiniMax Code / agent.minimax.cn）：**网页登录（设备码）** + **粘贴
+ * refreshToken** 两条入口。
  *
  * ── 与别家的关键差异（实测定案；见后端 `providers::minimax` 的模块头）──────
  * refresh_token 是**一次性轮换**的：每打一次 token 端点就换发一枚新值、旧值
@@ -735,21 +736,39 @@ const OFFICEACE: ProviderConfig = {
  *   ② 续期后网关**自动回写新 rt**（`oauth::refresh_and_save` →
  *      `update_minimax_credentials_if_current`），用户不需要手工再粘。
  *
+ * ── 网页登录为什么是「设备码」而不是「跳转回调」──────────────────
+ * 授权在 MiniMax 的官方账号体系侧完成（RFC 8628 设备码）：点按钮后网关先向
+ * 上游换一对 `user_code` + 授权页地址，把它交给窗口打开；用户在页面上确认后
+ * 由网关**后台轮询** `/oauth2/token` 换令牌并落账号。因此结果不依赖本机回调
+ * 或自定义协议 —— 内嵌窗口与系统浏览器两种方式都走得通（与 Cline 同款）。
+ *
  * ── 字段 ───────────────────────────────────────────────────────
  * `refreshToken` 必填（主凭证；丢了只能回客户端重新走设备码授权）；
  * `accessToken` 可选（约 3600 秒的短期缓存，带上可立即转发、省一次刷新）；
  * `userId` 可选（上游不返回稳定身份，仅用于展示与身份识别）；
  * `name` 可选（身份键：同名再粘 = 更新，不同账号要起不同名字）。
  *
- * ── 没有网页登录 / 桌面导入 ─────────────────────────────────────
- * 授权在 MiniMax Code 客户端侧完成（设备码），网关只做「粘贴令牌 + 续期」，
- * 因此 `desktop: false` 且不提供 `webLogin`（方法分段只剩手填一项）。
+ * ── 没有桌面端导入 ─────────────────────────────────────────────
+ * 登录态在 MiniMax Code 客户端自己的存储里（没有 auth.json 那种稳定可读的
+ * 形态），因此 `desktop: false`。
  */
 const MINIMAX: ProviderConfig = {
   provider: 'minimax',
-  // 品牌名各语言相同，不进词典（与 "Cline Free" 同一处置）
-  label: 'MiniMax',
+  // 展示名（卡片 + 登录弹窗标题）：本家的**中国区**名字。各语言相同，不进词典
+  // （与 "Cline Free" 同一处置）。
+  label: 'Minimax中国',
   desktop: false,
+  // 设备码网页登录（后端 `core::login::start_minimax_device_login`）。
+  // 两种打开方式都给：判定全在后端轮询，窗口在哪家浏览器无关。
+  webLogin: {
+    noteHtml: t('打开官方授权页完成设备码确认，账号自动加入列表。授权页会显示一枚授权码，确认后网关在后台自动完成登录。'),
+    button: t('打开 MiniMax 网页登录'),
+    busyText: t('等待 MiniMax 授权完成…'),
+    modes: [
+      { value: 'embedded', label: t('内嵌窗口（推荐）'), hint: t('内嵌窗口打开；完成后自动加入列表，关窗即取消等待') },
+      { value: 'external', label: t('系统浏览器'), hint: t('系统浏览器打开（复用已登录的 MiniMax 账号）；完成后自动加入列表') },
+    ],
+  },
   manualTitle: t('粘贴 refreshToken'),
   // 整段是一个 t() 键：扫描器只认字符串字面量（拼接串提不到键），所以不拆行
   manualNoteHtml: t('粘贴 MiniMax Code 的 <code>refreshToken</code>（从客户端登录态导出；直接粘贴含 <code>refresh_token=</code> 的整行也行）。<br>refresh_token 是<b>一次性轮换</b>的：网关每次续期都会换发一枚新的并当场作废旧值，新值由网关自动回写，不需要手工再粘。access token 约 1 小时到期，由网关自动续期；令牌丢了只能回 MiniMax Code 客户端重新走设备码授权，请妥善保存。'),

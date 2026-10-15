@@ -20,8 +20,13 @@
 //!   - **有余额**（`supports_usage = true`，`GET /credit/details`，见 `balance.rs`）；
 //!   - **有签到**（`POST /signin/claim`，幂等，见 `checkin.rs`）；
 //!   - **没有远程目录**（`supports_model_refresh = false`：静态 4 项，见 `models.rs`）；
-//!   - **没有网页登录**（授权在 MiniMax Code 客户端侧完成（设备码），网关只做
-//!     粘贴令牌 + 续期；将来若接设备码登录再开 `supports_web_login`）；
+//!   - **有网页登录，但走独立入口**（设备码授权，与 Cline 同形）：`supports_web_login`
+//!     **刻意保持默认 false**，因为那条通用链要求适配器给静态 `build_login_url`，
+//!     而本家的授权地址要**先从上游换一次 `user_code`**（`login::start`）——
+//!     放在 `/api/session/login/start` 里同步问上游更贴合（见 `api::session`
+//!     的 Minimax 分支与 `core::login::start_minimax_device_login`）。标记为 true
+//!     会让通用分支调 `build_login_url`→None，把一个能用的功能变成 400。
+//!     粘贴令牌那条手工入口仍然保留；
 //!   - **不改写模型名**（对外 id = 上游字面值，`sse_model_rewrite` 保持 false）。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────

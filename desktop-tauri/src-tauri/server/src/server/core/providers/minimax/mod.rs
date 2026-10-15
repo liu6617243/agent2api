@@ -30,16 +30,20 @@
 //!
 //! ── 凭证形态 ──────────────────────────────────────────────────
 //! `refreshToken` 是主凭证（丢了只能回 MiniMax Code 客户端重新走设备码授权），
-//! `accessToken` 只是约 3600 秒的短期缓存。授权在客户端侧完成，网关只做
-//! **粘贴令牌 + 续期**（没有网页登录链路；将来接设备码登录再开 `supports_web_login`）。
+//! `accessToken` 只是约 3600 秒的短期缓存。授权在官方客户端侧完成 —— 网关
+//! 提供两条入口：**粘贴令牌**（手工）与**设备码网页登录**（`login.rs`，
+//! 走 RFC 8628 设备授权：拿 user_code + 授权页地址给用户、后台轮询换令牌后
+//! 落账号，见 `core::login::start_minimax_device_login`）。
 //!
 //! ── 交付边界 ──────────────────────────────────────────────────
 //! ```text
 //!   ✅ 账号：粘贴 refreshToken 添加（account_store::minimax_accounts）
+//!   ✅ 网页登录：设备码授权（login.rs + core::login::start_minimax_device_login）
 //!   ✅ token 刷新：临期懒刷 + 401 强刷（单飞 + 比较再写 + 新 rt 必回写）
 //!   ✅ 模型目录：静态 4 项（上游无公开列模型接口；supports_model_refresh=false）
 //!   ✅ 聊天转发：build_chat_request → Anthropic Messages（Bearer + anthropic-version）
-//!   ✅ 积分余额：supports_usage=true（credit/details → {available, unit, wallets, raw}）
+//!   ✅ 积分余额：supports_usage=true（credit/details → {available, unit, wallets, credits, raw}）
+//!   ✅ 积分批次到期：写回 creditExpiresAt（「有效期」列 = 最先过期积分剩余时间）
 //!   ✅ 每日签到：billing/checkin 分派 + auto_checkin 台账（claim 幂等）
 //!   ✅ 注册接线：ProviderKind / 注册表 / adapter_for / 目录缓存 / 账号存储 / 添加分支
 //! ```
@@ -49,9 +53,10 @@
 //!   endpoints.rs    两个基址 / 各端点路径 / OAuth 公开参数 / anthropic-version
 //!   credentials.rs  凭证快照 + 临期判定（refreshToken 主、一次性轮换语义）
 //!   oauth.rs        token 端点 form 刷新 + 单飞 + 比较再写（新 rt 必回写）
+//!   login.rs        设备码授权（RFC 8628：start 拿 user_code + 轮询换令牌落账号）
 //!   models.rs       静态目录（4 项原样透传，is_known 判大小写不敏感）
 //!   client.rs       agent 网关 Bearer 请求薄封装 + base_resp 业务码口径
-//!   balance.rs      积分余额（Σ details[].remaining_amount，临期先刷）
+//!   balance.rs      积分余额 + 批次到期（Σ details[].remaining_amount，临期先刷）
 //!   checkin.rs      每日签到（status 面板 + claim 领取 → {success, msg}）
 //!   adapter.rs      ProviderAdapter 实现（账号 / 刷新 / 目录 / 转发 / 余额）
 //! ```
@@ -65,6 +70,7 @@ pub mod checkin;
 pub mod client;
 pub mod credentials;
 pub mod endpoints;
+pub mod login;
 pub mod models;
 pub mod oauth;
 

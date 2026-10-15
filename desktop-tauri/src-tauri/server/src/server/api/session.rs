@@ -347,6 +347,22 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
             "edition": task.edition, "provider": provider_id }));
     }
+    // MiniMax：**设备授权登录**（RFC 8628 device_code）。与 Cline 同形：同步
+    // 问上游要 user_code 与授权页地址（一次 POST），把地址交给界面打开；用户
+    // 在官方客户端侧确认后由后台任务轮询换令牌、落账号。
+    // 响应形状与 workbuddy / Cline 两条链一致（`{state, authUrl}`），前端不需要
+    // 新分支。为什么不做成 `supports_web_login` 那条通用回调链：本家的地址要
+    // **先从上游换一次 user_code**，不是适配器能静态拼出来的（见 minimax
+    // adapter 模块头与 `core::login::start_minimax_device_login`）。
+    if kind == crate::server::core::providers::ProviderKind::Minimax {
+        let handle = match state.login().start_minimax_device_login().await {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        let task = handle.snapshot();
+        return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
+            "edition": task.edition, "provider": "minimax" }));
+    }
     // CatPaw：上游把 token **推**到我们的 loopback 回调上（见 core::login::catpaw），
     // 所以这里除了发起还要把回调基址告诉它 —— 那必须是本网关自己的监听地址，
     // 而上游的 redirect 白名单只放行 127.0.0.1 / localhost（实测）。

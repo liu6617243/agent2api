@@ -299,7 +299,21 @@ export function LimitsCell({ account, open }: { account: AccountRecord; open: bo
  */
 export function ExpiryCell({ account }: { account: AccountRecord }) {
   const features = providerFeatures(providerOf(account))
-  const expiresAt = expiryMillis(features.edition ? account.expiresAt : account[features.expiry])
+  // 积分批次到期优先（`creditExpiry` 能力位：Minimax）。`creditExpiresAt` 由
+  // 后端余额查询回写（`set_minimax_credit_expiry`），查过一次余额才有值；
+  // 没有时回落令牌到期 —— 首次添加还没查过余额的账号显示令牌倒计时，
+  // 比一杠「没有过期时间」有用。落盘值恒为未来时刻或 0（后端只写
+  // `nearest_expiring` 选出的未过期批次，其余清 0），0 走回落分支，
+  // 不会误入下面的「已过期」。
+  //
+  // 对 Minimax 而言这一列的含义是**最先过期那批积分的剩余时间**（积分自动
+  // 领取后 30 天内有效、各笔独立到期），不是 24 小时倒计时 —— 详见
+  // accounts-domain.ts 的 creditExpiry 说明。
+  const expiresAt = expiryMillis(
+    features.creditExpiry && account.creditExpiresAt
+      ? account.creditExpiresAt
+      : features.edition ? account.expiresAt : account[features.expiry],
+  )
   if (!expiresAt) return <span className='muted' title={t('记录里没有过期时间')}>—</span>
   const left = expiresAt - Date.now()
   if (left <= 0) return <Badge variant='destructive' shape='tag' title={t('凭证已过期，转发时会先刷新')}>{t('已过期')}</Badge>
