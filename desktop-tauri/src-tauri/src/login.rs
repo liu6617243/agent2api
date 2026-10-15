@@ -664,18 +664,6 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
         | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
         | "kuku" | "antigravity" | "officeace" => None,
-        //
-        // Minimax 同样不设限：授权页在 `account.minimax.cn`，而登录会按用户选的
-        // 方式继续跳它自己的账号体系（手机号 / 邮箱 / 第三方身份），主机不可穷举
-        // —— 与 ZCode / CodeArts / OfficeAce 同一情形。**必须显式列出**：落进默认
-        // 分支会拿到 WorkBuddy 那张表（里面既没有 `minimax.cn`，情况与上面
-        // Trae 那条注释描述的完全一样），症状是登录窗口一片空白而日志毫无痕迹。
-        //
-        // 与 Trae / CodeArts 不同的是**不需要放行本机端口**：设备码授权没有任何
-        // 回调落到本机（用户在授权页手动确认，结果由网关轮询上游换回来，见
-        // `providers::minimax::login`），因此这里既没有 loopback 白名单问题，
-        // 也没有「回调被当成非法导航拦掉」那种静默故障。
-        "minimax" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
         // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
@@ -883,12 +871,6 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 与轮询 —— 与 ZCode / CodeArts 同一条路。它的授权码由网关**轮询云端**
         // 取回（云端回调页不往本机跳），所以窗口最后停在云端页上也不影响登录判定。
         "officeace" => Ok("officeace"),
-        // Minimax（MiniMax Code）：标准设备码授权（RFC 8628 + PKCE S256，
-        // 见 `providers::minimax::login`）。**没有任何回调落到本机** ——
-        // 用户在授权页手动确认，授权结果由网关轮询上游换回来，因此壳侧
-        // 只需要开窗口（内嵌或系统浏览器），既不需要回调白名单加本机端口，
-        // 也不需要拦截脚本。与 Qoder / Cline 的设备授权同一条路。
-        "minimax" => Ok("minimax"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
@@ -1202,11 +1184,6 @@ pub async fn start(
         // OfficeAce 只有一家（自助 OAuth 一条链，没有地区/版本概念），品牌名里
         // 不需要地区
         "officeace" => "OfficeAce 果办",
-        // Minimax 只有一家（agent.minimax.cn 全站统一，没有地区/版本之分），
-        // 品牌名里不需要地区 —— 与注册表的 `label: "Minimax 中国"` 同口径。
-        // 少了这一条会落到默认分支，标题变成「登录 WorkBuddy 国内版账号」
-        // 而窗口里开的是 MiniMax 的授权页（正是上面那段注释警告的情形）。
-        "minimax" => "Minimax 中国",
         _ => "WorkBuddy",
     };
     // 窗口标题：Cline 两家的池、ZCode 两家的地区、CodeArts / Trae / OfficeAce
@@ -1215,7 +1192,7 @@ pub async fn start(
     let title = if matches!(
         provider,
         "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae" | "qoder"
-        | "qoder-intl" | "antigravity" | "officeace" | "minimax"
+        | "qoder-intl" | "antigravity" | "officeace"
     ) {
         format!("登录 {provider_label} 账号")
     } else {

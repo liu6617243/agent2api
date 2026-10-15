@@ -107,6 +107,9 @@ pub const SCOPE_ANTIGRAVITY: &str = "antigravity";
 pub const SCOPE_OFFICEACE: &str = "officeace";
 
 /// 全部 scope（事实来源：`cached_scopes` 按它遍历；新增一家时加在这里）。
+///
+/// MiniMax 不在列：它的清单是**静态表**（`providers::minimax::models`），没有
+/// 远程目录可缓存 —— 与 ZCode 同一处置（ZCode 也不占缓存槽）。
 pub const ALL_SCOPES: &[&str] = &[
     SCOPE_WORKBUDDY,
     SCOPE_WORKBUDDY_INTL,
@@ -126,6 +129,7 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_MONKEYCODE_INTL,
     SCOPE_COMMANDCODE,
     SCOPE_ANTIGRAVITY,
+    SCOPE_OFFICEACE,
 ];
 
 /// 一份清单缓存

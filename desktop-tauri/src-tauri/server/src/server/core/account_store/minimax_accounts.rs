@@ -327,52 +327,6 @@ impl AccountStore {
         Ok(CredentialWrite::Written)
     }
 
-    /// 余额查询后回写「积分批次到期」（`balance::query_usage` 调用）。
-    ///
-    /// ── 这是什么 ────────────────────────────────────────────────
-    /// MiniMax 的积分是**批次制**（每笔签到积分独立 30 天，到期作废，见
-    /// `providers::minimax::balance` 的模块头）。账号列表的「有效期」列要显示
-    /// 的就是**最近会作废的那批**（`creditExpiresAt`）—— 而不是 access token
-    /// 的到期（那个约 1 小时且由网关自动续期，长期停在「59 分钟后」，对用户
-    /// 没有信息量）。
-    ///
-    /// ── 写哪、何时写 ────────────────────────────────────────────
-    /// 只写 `creditExpiresAt` 这一个字段，**不改令牌字段** —— `expiresAt` 是
-    /// 刷新链的临期判据（`credentials::from_record` 读它），被积分到期覆盖会让
-    /// 网关误以为令牌还能用 18 天、不再续期，账号整条报废。查询在 `expire_at_ms
-    /// <= now` 的批次上不产出到期值（上游已清零），此时传 0 表示「没有待过期
-    /// 批次」，界面回落显示「—」。
-    ///
-    /// ── 防抖 ────────────────────────────────────────────────────
-    /// 余额 sweep 默认每分钟跑一轮；值没变就跳过写库，否则一张账号卡每分钟
-    /// 白挨一次磁盘写。
-    pub fn set_minimax_credit_expiry(
-        &self,
-        id: &str,
-        expire_at_ms: i64,
-    ) -> Result<bool, AccountStoreError> {
-        let guard = self.guard();
-        let Some(mut record) = self.record_by_id(&guard, id) else {
-            return Ok(false);
-        };
-        // 只认本家（这个字段是它家的，别家记录不该被它写）
-        if record.provider() != MINIMAX_PROVIDER_ID {
-            return Ok(false);
-        }
-        let normalized = if expire_at_ms > 0 { expire_at_ms } else { 0 };
-        if record.get("creditExpiresAt").and_then(Value::as_i64) == Some(normalized) {
-            return Ok(false);
-        }
-        record
-            .fields_mut()
-            .insert("creditExpiresAt".to_string(), Value::from(normalized));
-        // with_conn 已把 rusqlite 错误映射成 AccountStoreError，直接 `?` 即可
-        // （凭据 setter 那个 `.map_err(|error| error.message)` 是给它自己的
-        // `Result<_, String>` 签名用的，这里签名是 AccountStoreError，不能照抄）。
-        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record))?;
-        Ok(true)
-    }
-
     /// MiniMax 账号的**公开形态**（进 HTTP 响应）。
     ///
     /// 与别家同一条硬约束：**绝不透出令牌本体** —— 只给 `tokenTail`
@@ -403,14 +357,6 @@ impl AccountStore {
         public.insert(
             "expiresAt".to_string(),
             Value::from(record.expires_at().unwrap_or(0.0) as i64),
-        );
-        // 积分批次到期（最近会作废的那批，`set_minimax_credit_expiry` 回写）。
-        // **必须在公开形态里显式给出** —— 这张表是白名单，漏了前端就永远读不到
-        // （AutoClaw 的 tokenExpiresAt 同款做法；与 expiresAt 的区别见该 setter 的文档：
-        //  expiresAt 是令牌临期判据，creditExpiresAt 只是展示用的积分倒计时）。
-        public.insert(
-            "creditExpiresAt".to_string(),
-            Value::from(record.get("creditExpiresAt").and_then(Value::as_i64).unwrap_or(0)),
         );
         public.insert("desktop".to_string(), Value::Bool(false));
         public.insert("priority".to_string(), Value::from(record.priority()));

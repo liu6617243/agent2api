@@ -41,13 +41,6 @@ pub const DEFAULT_API_BASE_URL: &str = "https://agent.minimax.cn";
 /// OAuth token 端点路径（相对账号基址）
 pub const TOKEN_PATH: &str = "/oauth2/token";
 
-/// 设备码授权·第一步端点（相对账号基址）
-pub const DEVICE_CODE_PATH: &str = "/oauth2/device/code";
-
-/// 浏览器授权页（verification_uri 缺失时的兜底；带 user_code 的
-/// `verification_uri_complete` 有它就用后者）
-pub const AUTHORIZE_PATH: &str = "/oauth-authorize";
-
 /// 推理路径（Anthropic Messages，相对 API 基址）
 pub const MESSAGES_PATH: &str = "/mavis/api/v1/llm/v1/messages";
 
@@ -99,16 +92,6 @@ pub fn api_base_url() -> String {
 /// OAuth token 端点完整地址
 pub fn token_url() -> String {
     format!("{}{TOKEN_PATH}", account_base_url())
-}
-
-/// 设备码授权·第一步端点完整地址
-pub fn device_code_url() -> String {
-    format!("{}{DEVICE_CODE_PATH}", account_base_url())
-}
-
-/// 浏览器授权页兜底地址（缺尾斜杠，与上游 `oauth-authorize?user_code=` 形态一致）
-pub fn authorize_url() -> String {
-    format!("{}{AUTHORIZE_PATH}", account_base_url())
 }
 
 /// 推理端点完整地址

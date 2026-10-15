@@ -347,20 +347,6 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
             "edition": task.edition, "provider": provider_id }));
     }
-    // MiniMax：设备码授权（RFC 8628 + PKCE S256，见 core::providers::minimax::login）。
-    // 与 Cline 那条同形态：同步换到 device_code 与授权页地址 → 登记任务 → 后台轮询，
-    // 因此响应形状同样是 `{state, authUrl}`，前端不需要新分支。
-    // 区别是本家换令牌必须带 PKCE verifier —— 它由 login::start 本地生成、
-    // 只活这一轮（不落盘、不打印），网关内部自己带着，调用方无感。
-    if kind == crate::server::core::providers::ProviderKind::Minimax {
-        let handle = match state.login().start_minimax_device_login().await {
-            Ok(handle) => handle,
-            Err(error) => return management_error(400, error),
-        };
-        let task = handle.snapshot();
-        return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
-            "edition": task.edition, "provider": "minimax" }));
-    }
     // CatPaw：上游把 token **推**到我们的 loopback 回调上（见 core::login::catpaw），
     // 所以这里除了发起还要把回调基址告诉它 —— 那必须是本网关自己的监听地址，
     // 而上游的 redirect 白名单只放行 127.0.0.1 / localhost（实测）。

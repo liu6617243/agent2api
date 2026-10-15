@@ -582,7 +582,7 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // MiniMax（MiniMax Code）：单一入口（粘贴 refreshToken）、没有地区伴生。
     // 排末尾（新家按约定追加在末尾，与 Kuku / Command Code / Antigravity /
     // OfficeAce 同一处置）。
-    ProviderMeta { id: "minimax", label: "Minimax 中国" },
+    ProviderMeta { id: "minimax", label: "MiniMax" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
