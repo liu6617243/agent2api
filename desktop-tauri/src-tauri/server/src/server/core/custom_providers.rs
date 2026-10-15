@@ -1114,6 +1114,26 @@ pub const LEGACY_OPENCODE_BASE_URL: &str = "https://opencode.ai/zen/v1";
 /// OpenCode Zen 免费档的**当前端点**（旧端点已废弃，见上）。
 pub const OPENCODE_BASE_URL: &str = "https://opencode.ai/inference/v1";
 
+/// OpenCode **Go**（订阅制）的端点。它与免费档的要求**不同**：免费档要「伪装成
+/// 官方客户端」（四会话头 + 工具对 + 匿名凭证），Go 只要客户端**带一个稳定的
+/// 会话头**——上游文档 `docs/go/#where-can-i-use-it` 的公开路由要求（「Send a
+/// stable session ID in `x-opencode-session` for each conversation」），缺了直接
+/// `400 MissingSessionID`（实测：这道检查在鉴权之前，且只看在场、不校验形状）。
+/// 两面的要求不同，转发侧按端点分派，见 `providers::custom::emulation`。
+pub const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
+
+/// 这条记录的 baseUrl 是否逐字命中 OpenCode Go 端点（忽略末尾斜杠与 ASCII 大小写）。
+///
+/// 与 [`migrate_base_url`] 同一口径的**精确匹配**：只有官方那个端点走 Go 面的
+/// 特殊处理，用户自建的中转/代理地址一概不碰（那类地址背后是什么取决于中转
+/// 自己，网关不该替它猜）。
+pub fn is_opencode_go_endpoint(base_url: &str) -> bool {
+    base_url
+        .trim()
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(OPENCODE_GO_BASE_URL)
+}
+
 /// 读侧迁移：把**逐字等于旧端点**的 baseUrl 改写成当前端点。
 ///
 /// 为什么在读侧做而不是写一条一次性迁移：旧端点是免费档的入口，2026-10 起打它

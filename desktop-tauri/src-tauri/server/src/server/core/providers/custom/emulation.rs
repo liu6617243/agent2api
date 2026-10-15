@@ -34,6 +34,17 @@
 //! `clientEmulation: "opencode"` 时才生效（预置卡「OpenCode Zen」会带上
 //! 它），手写的家与本网关的其它路径完全不受影响。
 //!
+//! ── 还有第二个面：OpenCode **Go**（`/zen/go/v1`）─────────────
+//! Go 是订阅制端点，要求与免费档**完全不同**：它只要客户端**带一个稳定的
+//! 会话头**（上游文档 `docs/go/#where-can-i-use-it` 的公开路由要求：「Send a
+//! stable session ID in `x-opencode-session` for each conversation」），
+//! 不要求任何伪装，也拒绝被塞桩工具的请求（社区实测 #44300/#44382）。
+//! 本模块对 Go 面只做一件事 —— [`apply_go_headers`]：补会话头与产品 UA，
+//! 凭证与请求体一概不碰。两个面的分派由 `providers::custom::forward` 按
+//! **端点**做（判据 `custom_providers::is_opencode_go_endpoint`），
+//! 且 Go 面**不受 `clientEmulation` 开关控制** —— 那条要求是端点自身的
+//! 协议要求，不是「伪装」，没有开关可关。
+//!
 //! ── 代价与边界（用它之前要知道的事）─────────────────────────
 //!   · 它会**改写用户的请求体**（补桩工具、强制 `stream: true`）——
 //!     与「自定义家透传」的默认语义相反，所以只在显式开启时做；
@@ -254,6 +265,34 @@ pub fn apply_headers(headers: &mut Vec<(String, String)>, api_key: &str, session
         ("X-Session-Id".to_string(), session.to_string()),
     ];
     merge(headers, pairs);
+}
+
+/// **Go 面**（`/zen/go/v1`）的会话头名。免费档的四个头在 Go 上一个都不需要，
+/// Go 只看这一个（上游文档点名的就是它）。
+pub const GO_SESSION_HEADER: &str = "x-opencode-session";
+
+/// Go 面的 User-Agent：Go 的文档要求客户端「自报家门」（`my-coding-agent/1.0`
+/// 这类），**明确不要通用 HTTP 库名** —— 网关默认的 `undici` 正好是它劝阻的
+/// 那种，所以这条路径必须换掉。版本取自 crate 版本，随发布自动更新。
+fn go_user_agent() -> String {
+    format!("agent2api/{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// **Go 面**（`/zen/go/v1`）的出站头：只补会话头与 UA。
+///
+/// 与免费档的伪装是两回事：Go 要的只是「每场对话一个稳定会话头」这条**公开的
+/// 路由要求**（缺了 400 MissingSessionID，实测这道检查在鉴权之前、且不校验
+/// 形状）。所以本函数：
+///   · **不动凭证** —— Go 用账号自己的 API Key，这里一个 Authorization 都不加；
+///   · **不动请求体** —— Go 面拒绝被塞桩工具（社区实测 #44300/#44382），
+///     `ensure_agent_shape` 那条路对 Go 一律不叫；
+///   · 会话 id 仍走 [`session_id`] 的派生（同一场对话同一个 id），
+///     Go 拿它做路由与提示词缓存亲和。
+pub fn apply_go_headers(headers: &mut Vec<(String, String)>, session: &str) {
+    merge(headers, [
+        ("User-Agent".to_string(), go_user_agent()),
+        (GO_SESSION_HEADER.to_string(), session.to_string()),
+    ]);
 }
 
 /// 把一对键值按名合并进头表（ASCII 不区分大小写；同名覆盖，其余追加）
