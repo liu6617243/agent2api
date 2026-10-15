@@ -174,10 +174,14 @@
     },
     {
       key: 'opencode-zen', name: 'OpenCode Zen', icon: 'opencode-zen.png',
-      protocol: P.openai, baseUrl: 'https://opencode.ai/zen/v1',
+      // 端点 2026-10 换过：旧的 /zen/v1 已废弃（打它一律 403 FreeTierError），
+      // 当前是 /inference/v1。存量记录里写着的旧值由后端读侧自动迁移
+      // （custom_providers::migrate_base_url），不必手改。
+      protocol: P.openai, baseUrl: 'https://opencode.ai/inference/v1',
       hint: wbI18n.t('免费模型不用填 Key（默认勾上「该上游无需鉴权」，网关自动用匿名凭证）；付费模型则填 Zen 的 API Key。免费档上游只认官方客户端形态，已默认开启「伪装 OpenCode 官方客户端」'),
-      // 免费档的三道校验（匿名凭证 / 会话头 / 请求体形态）由该开关统一补齐，
-      // 见后端 providers::custom::emulation 的模块头（含实测记录）
+      // 免费档的四道校验（匿名凭证 / 四个会话头 / 不带 request·project 头 /
+      // 请求体形态）由该开关统一补齐，见后端 providers::custom::emulation
+      // 的模块头（含 2026-10-14 对着官方客户端 v2.0.27 的实测记录）
       clientEmulation: 'opencode',
       account: { noAuth: true },
     },

@@ -170,6 +170,11 @@ pub(crate) async fn forward(
     }
     // 翻译协议在这里分出去（凭证与基址已就绪；chat 路径继续往下走）
     let quirks = ProviderQuirks::from_provider(&provider);
+    // 存量记录里可能还写着 OpenCode 免费档的**旧端点**（`/zen/v1`，2026-10 起
+    // 打它一律 403）—— 提供商记录与账号覆盖项两层都可能是旧值，所以在**解析出
+    // 最终地址之后**再过一次读侧迁移（提供商层已在 `custom_providers::item_of`
+    // 过了一遍，账号覆盖项只在这里能碰到）。
+    let base_url = custom_providers::migrate_base_url(&base_url, quirks.emulate_opencode);
     if let Some(kind) = kind {
         return forward_translated(
             kind,
