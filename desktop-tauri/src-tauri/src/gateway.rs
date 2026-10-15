@@ -197,6 +197,13 @@ fn read_api_key() -> Option<String> {
 fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(Duration::from_millis(REQUEST_TIMEOUT_MS))
+        // 管理 API 永远只打本机回环，必须**显式关**系统代理探测：reqwest 默认
+        // 会读系统设置/环境变量里的代理（Windows 上连 127.0.0.1 也不例外，
+        // 除非代理排除列表写了 localhost —— 多数客户端如 Clash 默认并不写）。
+        // 不关的话，用户一开系统代理，壳 → 网关的每个请求都会被丢给
+        // 127.0.0.1:7897 去「代理访问本机」，连不上直接失败 → 账号列表刷不出来。
+        // （转发链路的 egress::build_client 对直连出口就是这么处理同一问题的。）
+        .no_proxy()
         .build()
         .map_err(|error| format!("创建 HTTP 客户端失败: {error}"))
 }
