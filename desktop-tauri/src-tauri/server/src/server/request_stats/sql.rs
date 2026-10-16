@@ -746,6 +746,21 @@ pub(super) fn delete_all_requests(conn: &Connection) -> rusqlite::Result<usize> 
     conn.execute("DELETE FROM requests", [])
 }
 
+/// 删掉 `ts < cutoff` 的过期明细（保留期裁剪：`record` 每次记账与 `prune` 都走它）。
+///
+/// **先删**这批明细对应的 request_raw 行再删明细本身（顺序理由同 `delete_raw_matching`）：
+/// 过期行通常为 0～少量，`ts` 索引让子查询的代价可以忽略 —— 记账热路径上
+/// 多一条带子查询的 DELETE，代价可忽略（明细默认按 99999 天近似全量保留，
+/// 真正频繁触发删除的是用户把天数改小的那段时间窗）。
+pub(super) fn delete_expired_requests(conn: &Connection, cutoff: i64) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM request_raw WHERE id IN \
+         (SELECT id FROM requests WHERE ts < ?1 AND id <> '')",
+        params![cutoff],
+    )?;
+    conn.execute("DELETE FROM requests WHERE ts < ?1", params![cutoff])
+}
+
 // ─── 原始报文：request_raw ──────────────────────────────────
 
 /// 写一条原始正文（存在即覆盖；`id` 为空由调用方拦下）。

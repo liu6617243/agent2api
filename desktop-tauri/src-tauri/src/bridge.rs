@@ -376,6 +376,12 @@ const BRIDGE_JS: &str = r#"
     //   · create/update/remove   写操作都返回同一份最新列表（就地替换）；
     //                            Clash 同步来的条目是只读镜像，update/remove
     //                            会被后端拒绝（400 + 一句可读的中文）
+    //   · setProxyPoolItemEnabled 启用 / 禁用一条（三种来源都放行：manual 写它
+    //                            自己的 enabled，镜像条目写本地禁用位）。订阅
+    //                            节点禁用时后端走「关闭监听端口」流程、启用时
+    //                            走补建，响应里多一个 `listener`
+    //                            （none / closing / opening）—— 页面按它轮询列表
+    //                            看端口落地，不在请求里等内核重建
     //   · testProxyPoolItem      测一条并把结果记进条目；测试失败也是**成功响应**
     //                            （`success:false` + error 文案）
     //   · syncClashToProxyPool   手动同步 Clash Verge 出口，返回里多一个
@@ -384,14 +390,10 @@ const BRIDGE_JS: &str = r#"
     getProxyPool: () => call('GET', '/api/proxies/pool'),
     createProxyPoolItem: payload => call('POST', '/api/proxies/pool', payload || {}),
     updateProxyPoolItem: payload => call('POST', '/api/proxies/pool/update', payload || {}),
+    setProxyPoolItemEnabled: payload => call('POST', '/api/proxies/pool/enable', payload || {}),
     removeProxyPoolItem: id => call('POST', '/api/proxies/pool/remove', { id: String(id || '') }),
     testProxyPoolItem: id => call('POST', '/api/proxies/pool/test', { id: String(id || '') }),
     syncClashToProxyPool: () => call('POST', '/api/proxies/pool/sync-clash', {}),
-    // 补建订阅节点监听器（lazy listeners：账号保存引用后由壳侧自动触发；
-    // 这里给前端一个手动兜底入口。响应 `{pending, missing, ready}`，pending=true
-    // 表示投了内核重启命令、端口要等重建完成；payload 可选 `{ids}`
-    // （批量测试把那一批条目一次性钉住 + 补建，ready=false 表示端口始终没建出来）
-    provisionProxyPool: payload => call('POST', '/api/proxies/pool/provision', payload || {}),
     // ── 代理设置（「网络代理」页的设置弹窗：节点端口范围 + 测试网址）──
     // 与 web_shim.rs 的同名方法成对存在（教训同上）。契约见 `api::proxies`
     // 的模块头 settings 两条：GET 带 `defaults`（弹窗的默认值读它），
@@ -417,6 +419,9 @@ const BRIDGE_JS: &str = r#"
     //   · cancelKernelDownload    停止正在进行的下载（删掉半截文件；不在下载中时
     //                             回 `{canceled: false}`，不假装停成功了）
     //   · restartKernel           手动启动 / 重启内核（重建配置）
+    //   · stopKernel              手动关闭内核（只停进程；订阅与端口注册表保留，
+    //                             「启动内核」后原位恢复 —— 与「最后一条订阅没了」
+    //                             那条自动停不同，那条会清空订阅节点镜像）
     //   · removeKernel            删除已下载的内核（停进程 + 清内核目录；订阅
     //                             与账号引用保留，订阅节点端口被回收成「未分配」）
     //   · pickFolder              弹系统文件夹选择框（下载弹窗的「选择目录…」）
@@ -431,6 +436,7 @@ const BRIDGE_JS: &str = r#"
     downloadKernel: payload => call('POST', '/api/subscriptions/kernel/download', payload || {}),
     cancelKernelDownload: () => call('POST', '/api/subscriptions/kernel/download/cancel', {}),
     restartKernel: () => call('POST', '/api/subscriptions/kernel/restart', {}),
+    stopKernel: () => call('POST', '/api/subscriptions/kernel/stop', {}),
     removeKernel: () => call('POST', '/api/subscriptions/kernel/remove', {}),
     // 桌面壳的文件夹选择框：参数名与命令签名一致（camelCase ← Rust 的 snake_case）
     pickFolder: defaultDir => invoke('pick_folder', { defaultDir: defaultDir == null ? null : String(defaultDir) }),

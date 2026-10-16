@@ -357,13 +357,18 @@ function ChartLineShape({ line, cls, radius }: {
   )
 }
 
-/** 点上的读数标注（命中率 / Token 各一串，颜色与所属那条线同源） */
+/** 点上的读数标注（命中率 / Token 各一串，颜色与所属那条线同源）。
+ *  `rotate` 的读数竖排（柱状图的密区间）：绕自己的锚点转 -90°、自下而上读；锚点的 x
+ *  是这一列的中线，靠 dominantBaseline='central' 把字身在列内摆正（手工加半个字高的
+ *  偏移会在不同字号 / 字体下偏，交给渲染器算更稳）。 */
 function ChartLabels({ items, cls }: { items: ChartText[]; cls: string }) {
   return (
     <>
       {items.map(item => (
         <text className={`chart-label ${cls}`} x={item.x} y={item.y}
-          textAnchor={item.anchor} key={item.key}>{item.text}</text>
+          textAnchor={item.anchor} key={item.key}
+          transform={item.rotate ? `rotate(-90 ${item.x} ${item.y})` : undefined}
+          dominantBaseline={item.rotate ? 'central' : undefined}>{item.text}</text>
       ))}
     </>
   )

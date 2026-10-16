@@ -99,8 +99,10 @@ const RACCOON: ProviderConfig = {
   label: '小浣熊',
   addButton: t('添加小浣熊账号'),
   // 网页登录（后端 providers::raccoon::oauth）：官方登录页 + 一次性授权码回调。
-  // 桌面端仍优先用内嵌窗口；网页端 / Docker 远程面板会在授权完成后
-  // 提示用户粘贴 office-raccoon:// 回调地址，不依赖本机协议注册。
+  // 桌面端仍优先用内嵌窗口；网页端 / Docker 远程面板会把授权页切到官方
+  // redirect 分支自动回调，前提是浏览器以 127.0.0.1/localhost（http + 端口）
+  // 访问面板 —— 上游白名单如此，不满足时网页端发起前就会弹指引拦下
+  // （见 web_shim 的 raccoonCallbackOriginProblem）。
   webLogin: {
     noteHtml: t('在<strong>内嵌窗口</strong>里完成官方登录，成功后自动加入账号列表。'),
     button: t('打开网页登录'),

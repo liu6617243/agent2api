@@ -123,6 +123,16 @@ async fn dispatch(
         };
         let raw = payload.get("proxy").cloned().unwrap_or(Value::Null);
         return match normalize_account_proxy(&raw) {
+            // 轮询档只属于**账号级**出网（逐请求换出口，见 `core::proxy_rotate`）：
+            // 软件更新是一条检查 / 下载动作，没有这个语义。归一放行它（那份归一
+            // 与账号共用）之后必须在这里挡下 —— 否则会存进一条解析不出地址的
+            // 配置，检查更新静默回退直连（界面上却显示「已换线路」）。
+            Ok(Some(value)) if crate::server::core::proxies::is_rotate_config(&value) => {
+                GatewayError::bad_request(
+                    "更新出网线路不支持「轮询」档（轮询用于 OpenCode Zen 账号的出网）",
+                )
+                .into_response()
+            }
             Ok(normalized) => {
                 // 「换」才算数：重复选中当前线路不该被当成换线路（否则就成了
                 // 绕开失败冷却的口子，见下面 clear_check_cooldown 的说明）

@@ -33,12 +33,19 @@ pub const DEFAULT_LOCALE: &str = "zh-CN";
 // 命名风格与既有字段（apiKey / locale / lastRequestModel / autoCheckin）一致：
 // camelCase。这里把键名提成常量，是因为**读侧与写侧必须用同一个字符串** ——
 // 任一处手写拼错都不会报错，只会静默地读到默认值。
-//
-// 只剩事件日志一项：`requestRetentionDays` / `dailyRetentionDays` 两个键随
-// 「请求统计全量保留」一起退役（老配置里残留的值不再被读取，也无害）。
 
 /// 事件日志（统一库的 `logs` 表）保留天数
 pub const KEY_LOG_RETENTION_DAYS: &str = "logRetentionDays";
+/// 请求日志（统一库的 `requests` 表）保留天数。
+///
+/// 为什么不是旧版的 `requestRetentionDays`：那个键在「全量保留」时期
+/// （`4a0e104`）退役过，老库 / 旧 config.json 里残留的值是**旧默认**（30 天）。
+/// 恢复这项设置时默认改成了 99999 天 —— 沿用旧键会让那些残留值悄悄生效，
+/// 升级后的第一次记账就把老日志裁掉。换新键让它从新默认起步；旧键残留
+/// 不被读取、也无害（与全量保留时期的口径一致）。
+pub const KEY_REQUEST_RETENTION_DAYS: &str = "requestLogRetentionDays";
+/// 按天聚合（统一库的 `request_daily` 表）保留天数（改名理由同上）
+pub const KEY_DAILY_RETENTION_DAYS: &str = "dailyAggregateRetentionDays";
 
 /// 事件日志的保存目录（config.json 键）。
 ///
@@ -359,8 +366,15 @@ pub struct ProviderPrompt {
     pub file_error: Option<String>,
 }
 
-/// 事件日志保留天数的默认值（缺失时用它）
+/// 三档保留天数的默认值（缺失时用它们）。
+///
+/// 请求日志与按天聚合的默认是 99999 天（约 274 年）：效果上等于「全量保留」，
+/// 同时界面仍是一个普通的天数输入框 —— 想清理历史数据的用户可以把它改小，
+/// 不必再专程去各页面找「清空」入口（旧「全量保留」版本的行为仍是兜底：
+/// 清空 / 按筛选删除的入口保留）。
 pub const DEFAULT_LOG_RETENTION_DAYS: i64 = 30;
+pub const DEFAULT_REQUEST_RETENTION_DAYS: i64 = 99999;
+pub const DEFAULT_DAILY_RETENTION_DAYS: i64 = 99999;
 
 /// **历史**路由优先级键：`{"workbuddy": 10, "raccoon": 20}`。
 ///
@@ -371,31 +385,39 @@ pub const DEFAULT_LOG_RETENTION_DAYS: i64 = 30;
 pub const KEY_PROVIDER_ROUTE: &str = "providerRoute";
 
 /// 保留天数的合法范围：下限 1 天（保留 0 天等于什么都不存，不是有效配置），
-/// 上限 10 年（防手改 config.json 写个天文数字让裁剪逻辑空转）。
+/// 上限即「近似无限」的默认值 99999 天 —— 再往上没有语义（99999 天已约 274 年），
+/// 又能防手改 config.json 写个天文数字让裁剪逻辑空转。
 ///
 /// **写侧（`stats_api::parse_days`）与读侧（`days_field`）共用这两个常量**：
 /// 若两边各写一套数字，手改文件与走接口设值就会出现两套口径
 /// （比如接口拒绝 5000 而读侧接受它）。两侧的处理方式不同是有意的：
 /// 走接口的非法值给 400（用户当场能改），手改文件的非法值回落到默认（不打扰）。
 pub const RETENTION_MIN_DAYS: i64 = 1;
-pub const RETENTION_MAX_DAYS: i64 = 3650;
+pub const RETENTION_MAX_DAYS: i64 = 99999;
 
-/// 保留期设置（设置页「数据保留」区域）。
+/// 三档保留天数（设置页「数据保留」区域）。
 ///
-/// 现在只剩**事件日志**一项：请求日志 / 按天聚合 / 签到记录都已全量保留
-/// （没有保留天数、没有条数上限），对应的两个设置项与接口字段一并移除。
-/// 保留结构而不直接摊成一个函数：GET / PUT 与日志存储的回调都按「一份
-/// `Copy` 值」的形状传，将来若再加保留项，调用方不必跟着改签名。
+/// 请求日志与按天聚合的默认 99999 天是**故意的近似无限**：默认行为与
+/// 「全量保留」一致，但用户随时可以把某一项改小 —— 保存后立即裁剪
+/// （`stats_api::put_retention`），不用去各页面手动清。事件日志维持 30 天默认
+/// 不变。保留结构而不直接摊成三个函数：GET / PUT 与日志存储的回调都按
+/// 「一份 `Copy` 值」的形状传，将来若再加保留项，调用方不必跟着改签名。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionSettings {
     /// 事件日志保留天数
     pub log_days: i64,
+    /// 请求日志保留天数
+    pub request_days: i64,
+    /// 按天聚合保留天数
+    pub daily_days: i64,
 }
 
 impl Default for RetentionSettings {
     fn default() -> Self {
         Self {
             log_days: DEFAULT_LOG_RETENTION_DAYS,
+            request_days: DEFAULT_REQUEST_RETENTION_DAYS,
+            daily_days: DEFAULT_DAILY_RETENTION_DAYS,
         }
     }
 }
@@ -405,6 +427,8 @@ impl Default for RetentionSettings {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RetentionPatch {
     pub log_days: Option<i64>,
+    pub request_days: Option<i64>,
+    pub daily_days: Option<i64>,
 }
 
 // ─── 定时任务设置的键名与边界（config.json 里的字段名**就是契约**）─────

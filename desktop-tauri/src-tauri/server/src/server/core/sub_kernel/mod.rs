@@ -148,8 +148,15 @@ pub struct ProviderInput {
     pub id: String,
     /// 订阅名（代理池节点条目的命名来源）
     pub name: String,
-    /// 订阅链接
+    /// 订阅链接（本地文件订阅为空串）
     pub url: String,
+    /// 本地 YAML 原文（`kind: local` 的订阅才有；http 订阅为空串）。
+    ///
+    /// **content 非空 = file provider**（配置生成与文件落位都以它判别，不另设
+    /// kind 字段 —— 订阅存储侧已保证 local 条目的 content 必非空，空内容进
+    /// 不了库）。内容不写死在配置里：runtime 每次重启前把它写进 provider
+    /// 缓存位（`providers/sub_<id>.yaml`），内核照普通 file provider 读它。
+    pub content: String,
 }
 
 /// 内核状态快照（worker 每步操作后更新；status_json 读它）
@@ -224,7 +231,13 @@ enum Command {
     Download(Vec<ProviderInput>),
     /// 停掉内核并删除已下载的内核（二进制 / 配置 / 端口映射）
     Remove,
-    Stop,
+    /// 停掉内核。`clear_pool` = 是否把订阅节点镜像一并摘掉：
+    ///   · `true`  ——「一条启用订阅都不剩」的自动停（订阅删光 / 全部禁用后调用），
+    ///              镜像要清（理由见 execute 分支里的说明）；
+    ///   · `false` —— 手动「关闭内核」（内核状态条的按钮）：订阅还在、账号引用
+    ///              还在，池条目与端口注册表**原样保留**，「启动内核」后原位
+    ///              恢复（端口沿用注册表，账号引用不漂移）。
+    Stop { clear_pool: bool },
 }
 
 static SENDER: OnceLock<mpsc::UnboundedSender<Command>> = OnceLock::new();
@@ -360,15 +373,19 @@ async fn execute(command: Command) {
                 }
             }
         }
-        Command::Stop => {
+        Command::Stop { clear_pool } => {
             runtime::stop_kernel().await;
-            // 一条启用订阅都不剩 → 订阅节点镜像一并清空（空目标集合 = 摘掉
-            // 全部 subscription 条目，见 `proxy_pool::sync_subscription_nodes`）。
-            //
-            // **必须在停内核这条路径上清**：只有「还有其它启用订阅」时才会走
-            // 重启路径顺带同步，删掉最后一条订阅时若不清，节点镜像就留在池里
-            // 成了孤儿 —— 归属订阅已不存在，界面上挂着且删不掉（实测踩过）。
-            sync_nodes_to_pool(&[]);
+            if clear_pool {
+                // 一条启用订阅都不剩 → 订阅节点镜像一并清空（空目标集合 = 摘掉
+                // 全部 subscription 条目，见 `proxy_pool::sync_subscription_nodes`）。
+                //
+                // **必须在停内核这条路径上清**：只有「还有其它启用订阅」时才会走
+                // 重启路径顺带同步，删掉最后一条订阅时若不清，节点镜像就留在池里
+                // 成了孤儿 —— 归属订阅已不存在，界面上挂着且删不掉（实测踩过）。
+                // 手动「关闭内核」（clear_pool=false）**不清**：订阅与引用都还在，
+                // 清了会让账号引用全部悬空、重开内核后条目换新 id。
+                sync_nodes_to_pool(&[]);
+            }
             patch_status(|snapshot| {
                 snapshot.running = false;
             });
@@ -424,9 +441,19 @@ pub fn request_refresh(sub_id: String, providers: Vec<ProviderInput>) {
     send(Command::Refresh { sub_id, providers });
 }
 
-/// 请求停掉内核（一条启用订阅都不剩时调用；空跑的内核只会白占端口）
+/// 请求停掉内核并**清空订阅节点镜像**（一条启用订阅都不剩时调用；
+/// 空跑的内核只会白占端口）。
 pub fn request_stop() {
-    send(Command::Stop);
+    send(Command::Stop { clear_pool: true });
+}
+
+/// 请求**手动关闭**内核（内核状态条的「关闭内核」）。
+///
+/// 与 [`request_stop`] 的唯一区别是**不清订阅节点镜像**：订阅与账号引用都在，
+/// 池条目与端口注册表原样保留，「启动内核」（`request_restart`）后原位恢复。
+/// 已停止时是幂等的 no-op（stop_kernel 没有子进程可停，直接落状态）。
+pub fn request_halt() {
+    send(Command::Stop { clear_pool: false });
 }
 
 /// 请求停掉内核并删除已下载的内核（界面上的「删除内核」）。
@@ -464,6 +491,8 @@ pub fn status_json() -> Value {
             "running": running,
             "controllerPort": controller_port,
             "listenerCount": listener_count,
+            // 统一测试口（「网络代理」页的节点测试全走它；见 runtime::select_test_node）
+            "testPort": runtime::test_port(),
             "kernelDir": kernel_dir().to_string_lossy(),
             // 默认目录单列一个读数：下载弹窗要给「恢复默认」一个具体的目标值
             // （界面不该自己去拼 `{config_dir}/proxy-kernel`，那是后端的布局）

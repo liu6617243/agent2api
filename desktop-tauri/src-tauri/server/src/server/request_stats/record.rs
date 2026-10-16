@@ -45,6 +45,41 @@ pub const MAX_RAW_BODY_BYTES: usize = 128 * 1024;
 pub const DEFAULT_LIMIT: usize = 50;
 pub const MAX_LIMIT: usize = 500;
 
+/// 保留期设置（对应设置页「数据保留」里的两个天数，带默认值）。
+///
+/// 用独立结构而不是把天数直接摊进构造函数：将来设置里加字段时
+/// `with_db(db, get_retention)` 的签名不用变，调用方也不用跟着改。
+///
+/// 默认 99999 天（约 274 年）是**故意的近似无限**：默认行为与「全量保留」
+/// 一致，用户随时可以把某一项改小、保存后立即裁剪。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retention {
+    /// 明细保留天数
+    pub request_days: i64,
+    /// 按天聚合保留天数
+    pub daily_days: i64,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Self { request_days: 99999, daily_days: 99999 }
+    }
+}
+
+impl Retention {
+    /// 归一化：夹到与后端同一套范围里（`config::RETENTION_MIN_DAYS` /
+    /// `RETENTION_MAX_DAYS`，常量注释写明两侧必须同源）。读侧（config 解析）
+    /// 与写侧（PUT 校验）都已按这套范围处理过，这里再夹一次是防御：
+    /// `Retention` 还会被手改的库值构造出来。
+    pub(super) fn normalized(self) -> Self {
+        use crate::server::config::{RETENTION_MAX_DAYS, RETENTION_MIN_DAYS};
+        Self {
+            request_days: self.request_days.clamp(RETENTION_MIN_DAYS, RETENTION_MAX_DAYS),
+            daily_days: self.daily_days.clamp(RETENTION_MIN_DAYS, RETENTION_MAX_DAYS),
+        }
+    }
+}
+
 /// 一条请求日志。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestEntry {

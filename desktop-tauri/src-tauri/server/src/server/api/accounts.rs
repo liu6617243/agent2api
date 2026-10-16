@@ -150,13 +150,13 @@ pub async fn accounts_entry(State(state): State<ServerState>, request: axum::ext
 
 /// `/api/proxies*` 的入口（同样接受任意方法）。
 ///
-/// 七条已注册路径：`/api/proxies`、`/api/proxies/test`（Node 版原有的出口
-/// 能力）与 `/api/proxies/pool`、`/pool/update`、`/pool/remove`、`/pool/test`、
-/// `/pool/sync-clash`（「网络代理」页的代理池 CRUD + 测试 + Clash 同步，
-/// 见 `api::proxies` 的模块头）。池那几条的 id 走 body，不做路径段 ——
-/// 判定的写法因此还是一张 (方法, 剩余路径) 的表，与原来的两条完全同形。
+/// 已注册路径：`/api/proxies`、`/api/proxies/test`（Node 版原有的出口能力）与
+/// `/api/proxies/pool`、`/pool/update`、`/pool/enable`、`/pool/remove`、
+/// `/pool/test`、`/pool/sync-clash`（「网络代理」页的代理池 CRUD + 启停 + 测试
+/// + Clash 同步，见 `api::proxies` 的模块头）。池那几条的 id 走 body，不做
+/// 路径段 —— 判定的写法因此还是一张 (方法, 剩余路径) 的表，与原来的两条完全同形。
 /// 账号写操作收尾：引用集合若新增了「还没有监听器的订阅节点」，请求内核
-/// 补建（lazy listeners 的触发点，见 `api::proxies::pool_provision`）。
+/// 补建（lazy listeners 的触发点，见 `api::proxies::provision_missing_listeners`）。
 ///
 /// 对账用「改动前后引用 id 集合」的**差集**而不是无脑重启：改个备注名不该
 /// 付一次内核重启的等待（重启要重建全部监听器，几秒）；只有新增引用才投。
@@ -192,12 +192,12 @@ pub async fn proxies_entry(State(state): State<ServerState>, request: axum::extr
         ("GET", "pool") => super::proxies::pool_list(&state).await,
         ("POST", "pool") => super::proxies::pool_create(&state, &body).await,
         ("POST", "pool/update") => super::proxies::pool_update(&state, &body).await,
+        ("POST", "pool/enable") => super::proxies::pool_enable(&state, &body).await,
         ("POST", "pool/remove") => super::proxies::pool_remove(&state, &body).await,
         ("POST", "pool/test") => super::proxies::pool_test(&state, &body).await,
         ("POST", "pool/sync-clash") => super::proxies::pool_sync_clash(&state).await,
         ("GET", "settings") => super::proxies::settings_get().await,
         ("POST", "settings") => super::proxies::settings_save(&body).await,
-        ("POST", "pool/provision") => super::proxies::pool_provision(&state, &body).await,
         // 已注册路径上的其它方法：Node 的 tryHandleProxies 落到它自己的 404 信封
         _ => management_error(
             404,
@@ -1461,6 +1461,36 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
             }
         }
         match state.store().update_custom_credentials(&id, &Value::Object(scoped)) {
+            Ok(changes) => balance_changes.extend(changes),
+            Err(error) => return store_error(error),
+        }
+    }
+    // 自定义账号的**余额查询配置**（`balanceQuery`）：与上面 apiKey 那一段同一
+    // 处境 —— 只有「登记了余额方案的自定义家」认这个键（判据在 core 层：不是
+    // 自定义家、或那一家没登记方案，一律 400，见 `update_custom_balance_query`）。
+    // 三个密字段（访问令牌 / 密码 / 控制台令牌）只在这一次请求里以明文出现，
+    // 落库即被整行加密信封包住（见 `account_store::sql` 的模块头）；响应侧
+    // 永远只有 `has*` 标记（见 `store_view::balance_query_public`）。
+    if let Some(value) = patch.get("balanceQuery") {
+        if state.store().custom_account_provider(&id).is_none() {
+            let known = state
+                .store()
+                .list_accounts()
+                .get("accounts")
+                .and_then(Value::as_array)
+                .map(|accounts| {
+                    accounts
+                        .iter()
+                        .any(|item| item.get("id").and_then(Value::as_str) == Some(id))
+                })
+                .unwrap_or(false);
+            return if known {
+                management_error(400, "只有自定义提供商的账号有余额查询配置（balanceQuery）")
+            } else {
+                store_error(AccountStoreError::new("账号不存在", 404))
+            };
+        }
+        match state.store().update_custom_balance_query(&id, value) {
             Ok(changes) => balance_changes.extend(changes),
             Err(error) => return store_error(error),
         }

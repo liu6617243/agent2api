@@ -319,17 +319,17 @@ pub fn panel_router(state: ServerState) -> Router {
         // ── 出网代理（Clash Verge 实时读取 + 出口连通性测试 + 代理池）──
         // /api/proxies 与 /api/proxies/pool* 之外（如 /api/proxies/zzz）不注册
         // → 落到全局 404 兜底，与 Node 版「前缀判定不通过 → 全局兜底」一致。
-        // pool 的六条都是固定路径（id 走 body / query，不用 {id} 段 ——
+        // pool 各条都是固定路径（id 走 body / query，不用 {id} 段 ——
         // 理由见 api::proxies 的模块头），方法判定在 proxies_entry 里。
         .route("/api/proxies", any(api::accounts::proxies_entry))
         .route("/api/proxies/test", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/update", any(api::accounts::proxies_entry))
+        .route("/api/proxies/pool/enable", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/remove", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/test", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/sync-clash", any(api::accounts::proxies_entry))
         .route("/api/proxies/settings", any(api::accounts::proxies_entry))
-        .route("/api/proxies/pool/provision", any(api::accounts::proxies_entry))
         // ── 订阅（「网络代理」页的订阅区块：机场订阅 → 内核本地监听器）──
         // 固定路径 + api::subscriptions::entry 按 (方法, 剩余段) 分发（理由同上：
         // 通配段与 404 兜底互相干扰）。内核命令是异步的（重启 / 拉订阅要几秒
@@ -348,6 +348,7 @@ pub fn panel_router(state: ServerState) -> Router {
         // 「按方法区分」的相邻语义（POST=开始）在同一个路径上出现两种含义
         .route("/api/subscriptions/kernel/download/cancel", any(api::subscriptions::entry))
         .route("/api/subscriptions/kernel/restart", any(api::subscriptions::entry))
+        .route("/api/subscriptions/kernel/stop", any(api::subscriptions::entry))
         .route("/api/subscriptions/kernel/remove", any(api::subscriptions::entry))
         // ── 积分 / 签到 / 运营活动（对照 server.mjs 871-911 行）──
         // 六条都挂在 protected（Node 版每条都调了 checkApiKey），
@@ -454,6 +455,17 @@ pub fn panel_router(state: ServerState) -> Router {
         // 结论失败也返回 2xx（上游的错误放在响应体的 status / error 里，
         // 理由见 api::model_test 模块头）
         .route("/api/models/test", post(api::model_test::run_model_test))
+        // ── AI 助手（侧边栏「AI 助手」页 + 设置页「AI 助手」分类）──
+        // 对话那条会**真打上游、消耗额度**（与 /v1/chat/completions、
+        // /api/models/test 同一量级），设置那条写配置，三条一起挂 protected。
+        // 对话做成流式（SSE），前端必须绕开桌面壳的桥（桥无流式且 60 秒超时）
+        // 直接 fetch —— 挂在面板路由而不是 /v1/*，是为了不要求用户打开
+        // 网关面的 CORS 开关，理由见 api::assistant 模块头。
+        .route(
+            "/api/assistant/config",
+            get(api::assistant::get_config).put(api::assistant::put_config),
+        )
+        .route("/api/assistant/chat", post(api::assistant::chat))
         // ── 自定义提供商（用户自建上游端点：存储 + 管理）──
         // 与 /api/models/manage 同级敏感：写配置（customProviders 键）且「新建」
         // 会顺带写账号库，挂 protected。账号侧不经这里 —— 客户端走
@@ -781,7 +793,8 @@ async fn cors_gateway(request: Request, next: Next) -> Response {
     cors(request, next).await
 }
 
-/// 写入三个 CORS 头（值固定，不会失败；失败时静默跳过而不是 panic）
+/// 写入三个 CORS 头 + 一个 Private Network Access 许可（值固定，不会失败；
+/// 失败时静默跳过而不是 panic）
 fn attach_cors(headers: &mut axum::http::HeaderMap) {
     if let Ok(value) = HeaderValue::from_str("*") {
         headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
@@ -791,6 +804,19 @@ fn attach_cors(headers: &mut axum::http::HeaderMap) {
     }
     if let Ok(value) = HeaderValue::from_str(CORS_HEADERS) {
         headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, value);
+    }
+    // Private Network Access（Chromium 的「页面打私有网络要先拿到许可」草案）：
+    // 桌面壳的页面 origin 是自定义协议（`http://tauri.localhost`），从它 fetch 到
+    // `http://127.0.0.1:{port}` 会被 WebView2 判为 private network request，
+    // 没有这个头时请求会被浏览器拦下 —— 页面侧看到的只是一句
+    // `TypeError: Failed to fetch`，什么原因都查不到。多回这一个头对非浏览器
+    // 客户端是空操作（它们不读 CORS 头），对已经在放行的面板路由也不收紧
+    // 任何东西 —— 这条路由的暴露面由上面的 `*` 决定，与这个头无关。
+    if let Ok(value) = HeaderValue::from_str("true") {
+        headers.insert(
+            axum::http::HeaderName::from_static("access-control-allow-private-network"),
+            value,
+        );
     }
 }
 
