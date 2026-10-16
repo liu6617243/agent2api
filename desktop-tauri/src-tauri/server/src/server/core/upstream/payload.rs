@@ -438,3 +438,45 @@ fn apply_reasoning(
         }
     }
 }
+
+/// 这次请求里有没有**视觉输入**（图片块）—— 图片能力过滤（见
+/// `provider_loop::filter_by_image_capability`）的判定输入。
+///
+/// 为什么在**转发前**对原始体做一次探测，而不是转发时逐家看发送体：候选链的
+/// 过滤发生在任何一家真正发送之前（那时还没决定发谁），而发送体的逐家改写
+/// （model 名、提示词、脱敏）都动不了内容里的图片块 —— 所以在原始体上判定
+/// 一次，与「过滤是逐请求的、与发送无关」的定位一致。
+///
+/// 只做**结构探测**、不做深度遍历（serde_json 没有便宜的同值谓词遍历）：
+/// 递归走过对象 / 数组，看到三种「图片块类型字符串」之一就返回 `true`——
+///   - OpenAI Chat Completions：`{"type":"image_url", "image_url":{...}}`
+///     （`input_image` 是 Responses API 的名字，一并认了，容忍客户端混用）；
+///   - Anthropic Messages：`{"type":"image", "source":{...}}`（base64 / url）。
+///
+/// 代价（规格 §2.2 论证过的取舍）：一次对整份请求体的递归字符串比较，最坏
+/// O(块数)；不带图的纯文本请求（绝大多数）扫完即走，成本可忽略。
+/// `type` 字段缺失或形态不认识的块一律按「无图」处理 —— 判 `false` 是
+/// fail-open 的（过滤层对 `false` 的动作只是「不收窄」，不会拒绝请求）。
+pub(super) fn request_has_image(body: &Value) -> bool {
+    const IMAGE_BLOCK_TYPES: [&str; 3] = ["image_url", "input_image", "image"];
+
+    /// 递归遍历：`type` 是字符串且落在图片块类型集合里 → 有图。
+    fn walk(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => {
+                if let Some(Value::String(ty)) = map.get("type") {
+                    if IMAGE_BLOCK_TYPES.contains(&ty.as_str()) {
+                        return true;
+                    }
+                }
+                map.values().any(walk)
+            }
+            Value::Array(items) => items.iter().any(walk),
+            _ => false,
+        }
+    }
+
+    // 请求体是什么形态都直接交给 walk：非对象自然落入 `_ => false`（且正常
+    // 路径不会发生 —— chat 入口已校验过是对象）。
+    walk(body)
+}

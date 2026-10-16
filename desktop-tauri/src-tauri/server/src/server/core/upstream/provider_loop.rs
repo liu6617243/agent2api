@@ -448,6 +448,17 @@ pub(super) async fn forward_with_providers(
     // 过滤与「全被排除时的错误」都在 `filter_by_key_scope` 里（它要能提前返回
     // 错误，所以返回 Result）。
     let candidates = filter_by_key_scope(candidates, ctx.key_scope, &model)?;
+    // ── 图片能力过滤（含图请求的候选收窄，规格 §2.2 / §3.5）────────────
+    // 位置紧跟 Key 白名单之后：两者都是「逐请求的收窄条件」，且都不改动
+    // `route_for_forward` 的语义（能力事实 vs 请求相关的收窄，论证同上）。
+    // 无图的请求在这里零成本直通（一次 `type` 字段探测）；含图请求把候选收窄
+    // 到「真发出去的模型名声明支持图片」的家，全不支持则 fail-open 保留原链
+    // —— 见 `filter_by_image_capability` 的说明。
+    let candidates = if super::payload::request_has_image(ctx.body) {
+        filter_by_image_capability(candidates, &model)
+    } else {
+        candidates
+    };
     // 候选链已是 id 空间（`route_for_forward` 的返回值，见 router 的模块头）：
     // 内置家与自定义家的 id 同列，自定义 id 直接透传给选路与分派。
     let provider_ids: Vec<&str> = candidates.iter().map(String::as_str).collect();
@@ -521,6 +532,60 @@ fn filter_by_key_scope(
         ),
     )
     .with_code("model_not_found"))
+}
+
+/// 按图片能力收窄候选链（方案 A，规格 `.workbuddy/specs/2026-10-16-vision-aware-
+/// routing-and-image-delegation.md` §2.2 / §3.5）：请求带图时，只把图交给
+/// 「声明支持图片」的那几家。
+///
+/// ── 为什么在 key_scope 之后、选路之前 ─────────────────────────
+/// KeyScope 是「这把 Key 允许谁」（权限），图片能力是「这家接得住吗」（能力）：
+/// 先按权限剔除、再按能力收窄，两层各自单调收窄候选链，互不覆盖。与
+/// `filter_by_key_scope` 一样**不塞进** `route_for_forward` —— 那个函数背着
+/// 「未知模型 / 全被禁用」的区分语义，过滤是逐请求的量，不能混进去。
+///
+/// ── 判据：以「该家**真发出去的模型名**」查能力，不用请求名 ──────────
+/// 映射别名（用户的 `deepseek-v4.1-flash` → glm/qwen/deepseek 多家）不在 glm
+/// /qwen 自己的目录里，拿请求名去查任何一家的清单都查不到。必须先经
+/// `catalog::wire_target_for_provider` 解析出该家实际发送的模型名，再按那个
+/// 名字在聚合目录里读 `supportsImages`（`catalog::provider_supports_images`
+/// 已封好这套两步；自定义家读自己的 `models[]`，同一真值口径 `js_truthy`）。
+///
+/// ── 全都不支持时 fail-open ─────────────────────────────────
+/// 保留**原链**而不是报错：能力声明只是声明（models.dev 有标错先例，
+/// deepseek-v4-pro 静态表与 models.dev 打架），把带图请求整条拒掉的风险远大于
+/// 「让上游自己报错」。直发失败会走既有的换号 / 换家 / 重试路径，客户端拿到的
+/// 反馈与今天完全一致 —— 这层过滤只是「优先挑对的」，不是「守门」。
+fn filter_by_image_capability(candidates: Vec<String>, entry_model: &str) -> Vec<String> {
+    let supporting =
+        crate::server::core::providers::catalog::providers_supporting_images_in_chain(
+            &candidates,
+            entry_model,
+        );
+    // 正常收窄：留声明支持的家（数量必然 ≥1，调用点已保证 candidates 非空）
+    if supporting.len() < candidates.len() && !supporting.is_empty() {
+        logging::verbose(
+            "[Upstream]",
+            &format!(
+                "请求含图片输入，候选提供商 {} → 收窄到 {}（声明支持图片）",
+                candidates.join(" / "),
+                supporting.join(" / "),
+            ),
+        );
+        return supporting;
+    }
+    // fail-open：全链都声明支持（无需收窄）或全都不支持（保留原链让上游给
+    // 真实错误）。只在终端留痕一条，方便日后从运行日志反查「为什么没收窄」。
+    if supporting.is_empty() {
+        logging::console_line(
+            "[Upstream]",
+            &format!(
+                "⚠️ 请求含图片输入，但候选提供商 {} 都未声明支持图片，按原链转发（fail-open）",
+                candidates.join(" / "),
+            ),
+        );
+    }
+    candidates
 }
 
 /// 账号循环：每一轮从候选池里按全局优先级选一个账号，用它所属家的适配器发一次。
