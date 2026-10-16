@@ -43,6 +43,11 @@
    拖拽表达（组内序号 `#N` + 拖动把手，见下方「顺序列」）。固定列合计
    1193 → 1013，表格的横滚线随之从 1493 降到 1313（= 1013 + 弹性列下限 300）。
 
+   **2026-10-16 新增「最先过期积分」列 108**：积分批次制（Minimax）专属，
+   显示最先作废的那批的金额 + 到期日（与「有效期」列是同一批数据的两个切面：
+   一个是倒计时、一个是会损失多少）。固定列合计 1013 → 1121，横滚线
+   1313 → 1421。
+
    **勾选列 26 → 47**（本轮）：26px 的列里居中的复选框只离表格左缘 5.5px，
    看起来是「贴边」而不是居中，还与批量栏那颗「全选」错开 10.5px。
    47 = 16 + 15 + 16 让它与批量栏全选落在同一条竖轴上，算式与理由见下方 .cell-pick。
@@ -193,6 +198,29 @@
 .cell-status { width: 80px; }
 .cell-limits { width: 148px; }
 .cell-expiry { width: 80px; }
+/* 最先过期积分列：金额 + 到期日两行并排（见 accounts-columns.ts 的 DEFAULTS）。
+   与有效期列同档偏宽一点 —— 「1055 积分」带千分位后约 42px，「11-17」约 30px，
+   两行并排 + 间隔约 108px。表头与单元格一起居中，与相邻读数列同一中轴。 */
+.cell-nearestCredit { width: 108px; }
+.acct-table th.cell-nearestCredit,
+.acct-table td.cell-nearestCredit { text-align: center; }
+.acct-table td.cell-nearestCredit .nearest-credit {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  line-height: 1.25;
+  font-variant-numeric: tabular-nums;
+}
+.acct-table td.cell-nearestCredit .nearest-credit-amount {
+  font-size: 11.5px;
+  color: var(--text-1);
+}
+.acct-table td.cell-nearestCredit .nearest-credit-time {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.acct-table td.cell-nearestCredit .muted { color: var(--text-3); }
 /* 余额列：主额度桶的两行形态（套餐名 + 进度条与读数）需要比纯读数宽一档 ——
    84px 放不下「ZCode Trust Build」+「8800万 / 1亿 token」，套餐名会被省略成
    「ZCode Tr…」而失去意义。132 与优先级列同档，是「一行塞得下套餐名」的最小值。

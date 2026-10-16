@@ -343,13 +343,20 @@ impl AccountStore {
     /// <= now` 的批次上不产出到期值（上游已清零），此时传 0 表示「没有待过期
     /// 批次」，界面回落显示令牌到期 / 「—」。
     ///
+    /// `nearest_balance` 是**那批积分自己的剩余量**（不是账号总余额）：
+    /// 账号列表「最先过期积分」列要显示「哪笔积分会在什么时候作废」，光有到期
+    /// 时刻不够 —— 3000 积分里哪 800 会在 3 天后没了才是用户要判断的事。传 0
+    /// 表示「没有待过期批次」，两个字段一起清零（否则会留下「有时间没金额」的
+    /// 半截状态）。
+    ///
     /// ── 防抖 ────────────────────────────────────────────────────
-    /// 余额 sweep 默认每分钟跑一轮；值没变就跳过写库，否则一张账号卡每分钟
+    /// 余额 sweep 默认每分钟跑一轮；两个值都没变就跳过写库，否则一张账号卡每分钟
     /// 白挨一次磁盘写。
     pub fn set_minimax_credit_expiry(
         &self,
         id: &str,
         expire_at_ms: i64,
+        nearest_balance: f64,
     ) -> Result<bool, AccountStoreError> {
         let guard = self.guard();
         let Some(mut record) = self.record_by_id(&guard, id) else {
@@ -360,12 +367,22 @@ impl AccountStore {
             return Ok(false);
         }
         let normalized = if expire_at_ms > 0 { expire_at_ms } else { 0 };
-        if record.get("creditExpiresAt").and_then(Value::as_i64) == Some(normalized) {
+        let balance = if normalized > 0 && nearest_balance.is_finite() && nearest_balance > 0.0 {
+            nearest_balance
+        } else {
+            0.0
+        };
+        let unchanged = record.get("creditExpiresAt").and_then(Value::as_i64) == Some(normalized)
+            && record.get("creditNearestBalance").and_then(Value::as_f64) == Some(balance);
+        if unchanged {
             return Ok(false);
         }
         record
             .fields_mut()
             .insert("creditExpiresAt".to_string(), Value::from(normalized));
+        record
+            .fields_mut()
+            .insert("creditNearestBalance".to_string(), Value::from(balance));
         self.with_conn(&guard, |conn| sql::update_in_place(conn, &record))?;
         Ok(true)
     }
@@ -408,6 +425,13 @@ impl AccountStore {
         public.insert(
             "creditExpiresAt".to_string(),
             Value::from(record.get("creditExpiresAt").and_then(Value::as_i64).unwrap_or(0)),
+        );
+        // 最近会作废那批积分**自己的剩余量**（「最先过期积分」列的金额部分）。
+        // 与 creditExpiresAt 同源同清零：没有待过期批次时两个都是 0，
+        // 界面据此显示「—」而不是一个没有上下文的数字。
+        public.insert(
+            "creditNearestBalance".to_string(),
+            Value::from(record.get("creditNearestBalance").and_then(Value::as_f64).unwrap_or(0.0)),
         );
         public.insert("desktop".to_string(), Value::Bool(false));
         public.insert("priority".to_string(), Value::from(record.priority()));

@@ -349,8 +349,9 @@
    格子推成整行（实测每张卡 9 个网格行、581px 高，8 个账号撑出 4749px 滚动区，
    一屏只看得到半张卡，这就是「乱」）。
 
-   按内容分区重排成 6 行：头部（勾选 / 账号名 / 启停）、身份（提供商 / 优先级）、
-   代理整行、读数两两并排（限流 + 有效期、余额 + 连接数）、操作整行。 */
+   按内容分区重排成 7 行：头部（勾选 / 账号名 / 启停）、身份（提供商 / 优先级）、
+   代理整行、读数（限流 + 有效期）、（最先过期积分整行）、（余额 + 连接数）、
+   操作整行。 */
 @media (max-width: 767px) {
   .acct-table tr.acct-row {
     grid-template-columns: auto minmax(0, 1fr) auto;
@@ -369,10 +370,11 @@
   /* 读数两两并排 */
   .acct-table tr.acct-row .cell-limits      { grid-area: 4 / 1 / 5 / 3; }
   .acct-table tr.acct-row .cell-expiry      { grid-area: 4 / 3; }
-  .acct-table tr.acct-row .cell-usage       { grid-area: 5 / 1 / 6 / 3; }
-  .acct-table tr.acct-row .cell-connections { grid-area: 5 / 3; }
+  .acct-table tr.acct-row .cell-nearestCredit { grid-area: 5 / 1 / 6 / 3; }
+  .acct-table tr.acct-row .cell-usage       { grid-area: 6 / 1 / 7 / 3; }
+  .acct-table tr.acct-row .cell-connections { grid-area: 6 / 3; }
   /* 操作整行 */
-  .acct-table tr.acct-row .cell-actions  { grid-area: 6 / 1 / 7 / 4; }
+  .acct-table tr.acct-row .cell-actions  { grid-area: 7 / 1 / 8 / 4; }
 
   /* 单元格内边距收窄：桌面 7px 上下是给表格行高用的，卡片里每格都带一份，
      6 行就是 84px 白边 */
@@ -391,6 +393,9 @@
     align-items: center;
     gap: 8px;
   }
+  /* 「最先过期积分」不在上面的横排名单里：它内部本来就是「金额 / 日期」两行
+     （金额要压过日期），被横排抹平后两行会挤成同一基线上的两个数字。 */
+  .acct-table tr.acct-row td.cell-nearestCredit::before { align-self: start; }
   .acct-table tr.acct-row td::before { flex: 0 0 auto; }
   /* 横排后值一侧要能收缩，否则 Select 触发器把卡片顶出去 */
   .acct-table tr.acct-row .cell-proxy > * { min-width: 0; }

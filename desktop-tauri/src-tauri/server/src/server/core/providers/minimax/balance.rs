@@ -145,7 +145,7 @@ pub async fn query_usage(store: &AccountStore, account_id: &str) -> Result<Value
         //    剩余 + 领取 → 到期）。**按到期升序**（最近作废在最前，与 Trae 的
         //    排序口径一致；前端不再重排，见 creditRowsOf 的注释）。
         if let Some(batch) = nearest_expiring(items, now) {
-            let _ = store.set_minimax_credit_expiry(&resolved_id, batch.expire_at);
+            let _ = store.set_minimax_credit_expiry(&resolved_id, batch.expire_at, batch.remaining);
             let mut credits: Vec<Value> = items
                 .iter()
                 .map(|item| {
@@ -176,9 +176,10 @@ pub async fn query_usage(store: &AccountStore, account_id: &str) -> Result<Value
                 "raw": payload,
             }));
         }
-        // 没有会作废的批次：清掉记录里的旧值（传 0 → 有效期列回落令牌到期），
-        // 并照常返回读数（不给 credits 键，弹层也就不会有明细行）。
-        let _ = store.set_minimax_credit_expiry(&resolved_id, 0);
+        // 没有会作废的批次：清掉记录里的旧值（传 0 → 有效期列回落令牌到期、
+        // 「最先过期积分」列显示「—」），并照常返回读数（不给 credits 键，
+        // 弹层也就不会有明细行）。
+        let _ = store.set_minimax_credit_expiry(&resolved_id, 0, 0.0);
     }
     Ok(json!({
         "available": total,

@@ -284,7 +284,42 @@ export function LimitsCell({ account, open }: { account: AccountRecord; open: bo
   )
 }
 
-/* ─── 有效期 / 连接数 / 余额列 ──────────────── */
+/* ─── 有效期 / 最先过期积分 / 连接数 / 余额列 ──────────────── */
+
+/**
+ * 积分金额 → 展示串（带千分位）。
+ *
+ * 与余额列的 `numberText` 分开：余额列沿用上游读数的原样数字（上游给什么
+ * 显示什么，不二次加工），而本列是**我们自己算出来的派生值**（后端挑出的那批），
+ * 四位数的积分（1055 / 3384）在窄列里没有千分位很难一眼比大小。
+ *
+ * 小数最多两位：上游的积分是整数分派、按次扣减，可能出现 0.01 这类尾数，
+ * 但展示到分以下没有意义（截断而非四舍五入到 0 位是刻意的 —— 800.4 显示成
+ * 800 会让人以为少算了）。
+ */
+function formatCreditAmount(value: number): string {
+  if (!Number.isFinite(value)) return '—'
+  const fixed = Math.abs(value) < 100 ? value.toFixed(2).replace(/\.?0+$/, '') : Math.round(value).toLocaleString('zh-CN')
+  return fixed || '0'
+}
+
+/**
+ * 到期时刻 → 短日期（`11-17` / `2026-11-17`）。
+ *
+ * 跨年时补年份：12 月底的批次与 1 月底的批次只差几天，不带年份会把「今年 1 月」
+ * 读成「明年 1 月」。其余年份一律省掉 —— 这一列的语境是「最近要作废的那笔」，
+ * 用户看的是「还有几天」，年份不是信息。
+ */
+function formatShortDate(ms: number): string {
+  const date = new Date(ms)
+  if (Number.isNaN(date.getTime())) return '—'
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return date.getFullYear() === new Date().getFullYear()
+    ? `${month}-${day}`
+    : `${date.getFullYear()}-${month}-${day}`
+}
+
 
 /**
  * 有效期：按「这家有没有版本概念」选字段（workbuddy 是 expiresAt，其余是
@@ -324,6 +359,45 @@ export function ExpiryCell({ account }: { account: AccountRecord }) {
   // 直接拼会留下一个空的「（）」
   const full = formatTime(expiresAt)
   return <span title={full ? t('{text}过期（{full}）', { text, full }) : t('{text}过期', { text })}>{text}</span>
+}
+
+/**
+ * 最先过期积分：**最先会作废的那批积分**的「金额 + 到期时刻」。
+ *
+ * 与「有效期」列是同一批数据的两个切面，刻意分成两列而不是并成一格：
+ *   - 有效期 = 距作废还有多久（倒计时，回答「还能用多久」）；
+ *   - 本列 = 作废的是**哪一笔**（金额 + 具体日期，回答「会损失多少、几号损失」）。
+ * 一格塞两件事会在窄列里挤成两行小字，两列各自短、表头各自说清自己在说什么。
+ *
+ * 只有积分批次制的家（Minimax，`creditExpiry` 能力位）有这一列的内容；
+ * 别家一律「—」——不是「没数据」，是「这家没有批次制积分」，
+ * 与「查过余额但没有待过期批次」在语义上不同但显示上同样不必展开。
+ *
+ * 数据来自后端余额查询回写的 `creditNearestBalance` + `creditExpiresAt`
+ * （`set_minimax_credit_expiry`）：没查过余额时两个都是 0 → 「—」。
+ */
+export function NearestCreditCell({ account }: { account: AccountRecord }) {
+  const features = providerFeatures(providerOf(account))
+  if (!features.creditExpiry) {
+    return <span className='muted' title={t('该提供商的积分不是批次制，没有「最先过期」这一说')}>—</span>
+  }
+  const amount = Number(account.creditNearestBalance || 0)
+  const expiresAt = expiryMillis(account.creditExpiresAt)
+  // 两个值同源回写，正常不会只到一半；任一缺失就当「还没有待过期批次」
+  if (!(amount > 0) || !expiresAt) {
+    return <span className='muted' title={t('没有待过期的积分批次（查一次余额即可显示）')}>—</span>
+  }
+  const amountText = formatCreditAmount(amount)
+  const full = formatTime(expiresAt)
+  return (
+    <span className='nearest-credit'
+      title={full
+        ? t('{amount} 积分将于 {full} 到期作废', { amount: amountText, full })
+        : t('{amount} 积分即将到期作废', { amount: amountText })}>
+      <span className='nearest-credit-amount'>{amountText}</span>
+      <span className='nearest-credit-time'>{formatShortDate(expiresAt)}</span>
+    </span>
+  )
 }
 
 /**
@@ -1552,6 +1626,9 @@ export function TableHead({ namesHidden, allPicked, somePicked, disabled, onTogg
         </th>
         <th className='cell-expiry' data-col='expiry'>
           <span className='th-label'>{t('有效期')}</span>{grip}
+        </th>
+        <th className='cell-nearestCredit' data-col='nearestCredit'>
+          <span className='th-label'>{t('最先过期积分')}</span>{grip}
         </th>
         <th className='cell-usage' data-col='usage'>
           <span className='th-label'>{t('余额')}</span>{grip}

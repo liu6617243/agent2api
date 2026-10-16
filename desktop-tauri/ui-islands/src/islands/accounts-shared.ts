@@ -111,6 +111,12 @@ export type AccountRecord = {
    *  （口径 =「最先过期积分的剩余时间」）。0 / 缺失 = 没有待过期批次
    *  （或还没查过余额），有效期列此时回落令牌到期。 */
   creditExpiresAt?: number
+  /** 最近会作废那批积分**自己的剩余量**（只有 Minimax，后端余额查询与
+   *  `creditExpiresAt` 同源回写，见 `set_minimax_credit_expiry`）：
+   * 「最先过期积分」列显示的金额 —— 与账号总余额不同，它回答的是
+   * 「多少积分会在最近的那个时点被作废」。0 / 缺失 = 没有待过期批次
+   * （或还没查过余额），该列显示「—」。 */
+  creditNearestBalance?: number
   /** 桌面端实时登录态（凭证每次从客户端登录态文件读取） */
   desktop?: boolean
   /**

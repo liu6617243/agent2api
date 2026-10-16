@@ -79,7 +79,7 @@ import {
   snapshot, startConnectionsPolling, subscribe, tokenUsageOf, togglePick, usageEntryOf,
 } from './accounts-data'
 import {
-  AccountCell, ActionsCell, ConnectionsCell, ExpiryCell, GroupBandRow, LimitsCell, OrderCell,
+  AccountCell, ActionsCell, ConnectionsCell, ExpiryCell, GroupBandRow, LimitsCell, NearestCreditCell, OrderCell,
   PanelsRow, ProxyCell, StatusCell, TableHead, UsageCell,
 } from './accounts-panels'
 import { bindQueueDrag, type QueueDrop } from './accounts-queue-drag'
@@ -355,6 +355,8 @@ function AccountsPage() {
         return <LimitsCell account={account} open={ctx.limitsOpen} />
       case 'expiry':
         return <ExpiryCell account={account} />
+      case 'nearestCredit':
+        return <NearestCreditCell account={account} />
       case 'usage':
         return <UsageCell account={account} />
       case 'actions':
@@ -594,6 +596,7 @@ function ColGroup() {
       {col('status')}
       {col('limits')}
       {col('expiry')}
+      {col('nearestCredit')}
       {col('usage')}
       {col('actions')}
     </colgroup>
