@@ -107,6 +107,9 @@ jobs:
           if-no-files-found: error
 
   # ── Windows ─────────────────────────────────────────────────
+  # 产物上传用 archive:false 直传（见该 step 的注释）：Actions 页直接下到
+  # exe，不用解压。注意 artifact 名因此是 exe 文件名本身而非 "windows-nsis"
+  # —— release.sh 已按「名称含 .exe 即认」适配。
   windows:
     runs-on: windows-latest
     steps:
@@ -137,8 +140,12 @@ jobs:
       - name: 上传产物
         uses: actions/upload-artifact@v7
         with:
-          name: windows-nsis
+          # v7 的 archive:false = 单文件直传：Actions 页下载下来的就是 exe
+          # 本体，不再被 GitHub 包一层 zip（官方 action.yml：该模式下 name
+          # 参数被忽略，artifact 名即文件名，故这里不写 name）。发版收尾
+          # 脚本 release.sh 已按新旧两种形态适配（zip 包裹 / 直传）。
           path: target/release/bundle/nsis/*.exe
+          archive: false
           if-no-files-found: error
 
   # ── Linux 服务端包（容器内一键更新的 Release 资产）──────────

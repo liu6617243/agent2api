@@ -5,8 +5,8 @@
 #   bash scripts/release.sh vX.Y.Z <run-id>   # 或显式指定 run
 #
 # 做三件事：
-#   1. 下载 build 工作流的产物 artifact（windows-nsis / macos-universal，以及
-#      新版的 linux-server-amd64 / -arm64 两个容器内更新包）到 dist/；
+#   1. 下载 build 工作流的产物 artifact（Windows exe 安装包 / macos-universal，
+#      以及新版的 linux-server-amd64 / -arm64 两个容器内更新包）到 dist/；
 #   2. 用 tag 所指提交的提交信息（= 更新日志，见 agent.md 第 5 节）创建 / 更新
 #      GitHub Release 并挂全部附件；
 #   3. 打印验收提示。
@@ -52,26 +52,38 @@ fi
 if [ -z "$RUN_ID" ]; then
   echo "→ 查找 $TAG 触发的 build 工作流…"
   # 不按 run 整体 conclusion 过滤：只验「两个安装包 artifact 是否齐全」，
-  # 构建成功但别处失败的 run 里安装包照旧可用
+  # 构建成功但别处失败的 run 里安装包照旧可用。
+  # macos 的 artifact 名恒为 "macos-universal"；windows 的 artifact 名有两代
+  # 形态——老 workflow 是 "windows-nsis"（GitHub 包一层 zip），新 workflow
+  # 用 archive:false 直传、artifact 名就是 exe 文件名本身（name 参数被
+  # upload-artifact v7 忽略，见 build.yml windows job 注释）——所以按
+  # 「名字以 .exe 结尾」认，两种形态都覆盖。
   for id in $(gh run list --workflow=build --limit 30 --json databaseId,headBranch \
       | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{JSON.parse(s).filter(r=>r.headBranch===process.argv[1]).forEach(r=>process.stdout.write(r.databaseId+"\n"))})' "$TAG"); do
     if gh api "repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/actions/runs/$id/artifacts" \
-         --jq 'any(.artifacts[].name; . == "macos-universal") and any(.artifacts[].name; . == "windows-nsis")' >/dev/null 2>&1; then
+         --jq 'any(.artifacts[].name; . == "macos-universal") and any(.artifacts[].name; endswith(".exe"))' >/dev/null 2>&1; then
       RUN_ID=$id
       break
     fi
   done
   [ -n "$RUN_ID" ] || {
-    echo "错误: 没找到 $TAG 的可用 build run（需 macos-universal 与 windows-nsis 两个 artifact 齐全）—— 先确认 CI 跑完（gh run list），或手动传 run-id" >&2
+    echo "错误: 没找到 $TAG 的可用 build run（需 macos-universal 与 Windows exe 两个 artifact 齐全）—— 先确认 CI 跑完（gh run list），或手动传 run-id" >&2
     exit 1
   }
 fi
 echo "→ build run: $RUN_ID"
 
 rm -rf dist
+# 下载全部 artifact（windows 的 artifact 名两代不同：老 "windows-nsis"、
+# 新为 exe 文件名本身，见上面探测处的说明，所以不能只下那一个名字）。
 gh run download "$RUN_ID" -D dist
-EXE=$(ls dist/windows-nsis/*.exe)
-DMG=$(ls dist/macos-universal/*.dmg)
+# windows 两种形态 gh run download 都落成目录：zip 包裹形态解开是
+# dist/windows-nsis/*.exe，直传形态是 dist/<exe文件名>/*.exe —— 按
+# 「递归找到 .exe」取，不猜目录名。dmg 同理按名找（目录恒 macos-universal）。
+EXE=$(find dist -name '*.exe' | head -1)
+DMG=$(find dist -name '*.dmg' | head -1)
+[ -n "$EXE" ] || { echo "错误: run $RUN_ID 的 artifact 里没有 .exe" >&2; exit 1; }
+[ -n "$DMG" ] || { echo "错误: run $RUN_ID 的 artifact 里没有 .dmg" >&2; exit 1; }
 echo "→ 已下载 $(basename "$EXE") / $(basename "$DMG")"
 
 # 容器内更新包：两个架构的 tar.gz + 同名 .sha256（面板按名找校验文件，
