@@ -447,8 +447,9 @@ fn apply_reasoning(
 /// （model 名、提示词、脱敏）都动不了内容里的图片块 —— 所以在原始体上判定
 /// 一次，与「过滤是逐请求的、与发送无关」的定位一致。
 ///
-/// 只做**结构探测**、不做深度遍历（serde_json 没有便宜的同值谓词遍历）：
-/// 递归走过对象 / 数组，看到三种「图片块类型字符串」之一就返回 `true`——
+/// 只做**结构探测**：对整份请求体递归走一遍（serde_json 没有现成的谓词
+/// 遍历，所以手写这段 walk），看到三种「图片块类型字符串」之一就返回
+/// `true`——
 ///   - OpenAI Chat Completions：`{"type":"image_url", "image_url":{...}}`
 ///     （`input_image` 是 Responses API 的名字，一并认了，容忍客户端混用）；
 ///   - Anthropic Messages：`{"type":"image", "source":{...}}`（base64 / url）。
