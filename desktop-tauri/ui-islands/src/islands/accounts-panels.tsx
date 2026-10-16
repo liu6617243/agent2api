@@ -369,18 +369,40 @@ export function ExpiryCell({ account }: { account: AccountRecord }) {
  *   - 本列 = 作废的是**哪一笔**（金额 + 具体日期，回答「会损失多少、几号损失」）。
  * 一格塞两件事会在窄列里挤成两行小字，两列各自短、表头各自说清自己在说什么。
  *
- * 只有积分批次制的家（Minimax，`creditExpiry` 能力位）有这一列的内容；
- * 别家一律「—」——不是「没数据」，是「这家没有批次制积分」，
- * 与「查过余额但没有待过期批次」在语义上不同但显示上同样不必展开。
+ * 两条数据路径（取到哪个用哪个，通用优先）：
+ *   ① 通用实时路径 —— `usageEntryOf` 拿到本次余额查询的 `credits[]`（与「积分
+ *      明细」弹层同源），`nearestExpiringCreditOf` 从中选最先过期的未过期批次。
+ *      覆盖所有 `creditDetail` 家（WorkBuddy 两家 / Trae / Minimax…）；查过一次
+ *      余额才有值，与余额列自身的可用性节奏一致。
+ *   ② 落盘回退路径 —— Minimax 的 `creditNearestBalance` + `creditExpiresAt`
+ *      （`set_minimax_credit_expiry` 回写）：实时明细还没拉到时保持显示，没查过
+ *      余额时两个都是 0 → 「—」。
  *
- * 数据来自后端余额查询回写的 `creditNearestBalance` + `creditExpiresAt`
- * （`set_minimax_credit_expiry`）：没查过余额时两个都是 0 → 「—」。
+ * 两类「—」在语义上不同但显示上同样不必展开：
+ *   - 该家没有批次制积分（非 `creditExpiry`/`creditDetail` 家）；
+ *   - 有批次但这次没有待过期批次（查过余额、全过期或不给）。
  */
 export function NearestCreditCell({ account }: { account: AccountRecord }) {
   const features = providerFeatures(providerOf(account))
-  if (!features.creditExpiry) {
+  if (!features.creditExpiry && !features.creditDetail) {
     return <span className='muted' title={t('该提供商的积分不是批次制，没有「最先过期」这一说')}>—</span>
   }
+  // ① 通用实时路径：与「积分明细」弹层同一份 credits[]，取最先过期的未过期批次
+  const live = nearestExpiringCreditOf(usageEntryOf(account))
+  if (live) {
+    const amountText = formatCreditAmount(live.amount)
+    const full = formatTime(live.expireAt)
+    return (
+      <span className='nearest-credit'
+        title={full
+          ? t('{amount} 积分将于 {full} 到期作废', { amount: amountText, full })
+          : t('{amount} 积分即将到期作废', { amount: amountText })}>
+        <span className='nearest-credit-amount'>{amountText}</span>
+        <span className='nearest-credit-time'>{formatShortDate(live.expireAt)}</span>
+      </span>
+    )
+  }
+  // ② 落盘回退路径（Minimax：set_minimax_credit_expiry 回写的两个字段）
   const amount = Number(account.creditNearestBalance || 0)
   const expiresAt = expiryMillis(account.creditExpiresAt)
   // 两个值同源回写，正常不会只到一半；任一缺失就当「还没有待过期批次」
@@ -434,6 +456,41 @@ function numberText(value: unknown): string {
 function creditSubscriptionOf(entry: UsageEntry): string {
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return ''
   return subscriptionText((entry as Record<string, unknown>).subscription)
+}
+
+/**
+ * 余额明细（`credits[]`）→「最先过期的那批积分」：{ amount, expireAt } | null。
+ *
+ * 与 `creditRowsOf`（积分明细弹层）读同一份数据，但只回答一个问题：
+ * 哪一笔最先作废、作废多少。选取规则：
+ *   - 只看带 `expireAt` 的行（没给到期时刻的包不存在「最先过期」）；
+ *   - `expireAt` 必须在未来（已作废的批次不再「将要」损失）；
+ *   - `remain > 0`（作废 0 积分没有信息量）；`unlimited` / `daily` 行跳过
+ *     （不限量没有「损失多少」、日额度包每天重置本就不会作废，见后端
+ *     billing/usage.rs 的 daily 标记说明）;
+ *   - 取 expireAt 最小的一行。
+ * 解析走 `expiryMillis`（domain 层）：秒/毫秒漂移与各家口径已在那一处归一，
+ * 这里不再各写一份。`expireAt` 是字符串日期的家（accio）经它读成 0 → 该行
+ * 自然跳过，不会误显示 —— 缺数据回落「—」比硬造一个日期诚实。
+ * 额度字段只认有限数（`numberOrNull`）。
+ */
+function nearestExpiringCreditOf(entry: UsageEntry): { amount: number; expireAt: number } | null {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null
+  const packs = (entry as Record<string, unknown>).credits
+  if (!Array.isArray(packs)) return null
+  const now = Date.now()
+  let best: { amount: number; expireAt: number } | null = null
+  for (const pack of packs) {
+    if (!pack || typeof pack !== 'object') continue
+    const row = pack as Record<string, unknown>
+    if (row.daily === true || row.unlimited === true) continue
+    const expireAt = expiryMillis(row.expireAt ?? row.expiresAt)
+    if (!expireAt || expireAt <= now) continue
+    const remain = numberOrNull(row.remain)
+    if (remain === null || remain <= 0) continue
+    if (!best || expireAt < best.expireAt) best = { amount: remain, expireAt }
+  }
+  return best
 }
 
 /**
