@@ -61,6 +61,15 @@ const REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// 上游没给 `expires_in` 时的保守默认（MiniMax 实测 3600）
 const DEFAULT_EXPIRES_IN_SECONDS: i64 = 3600;
 
+/// 供同 provider 的登录链路复用的默认有效期（秒）。
+///
+/// 与 [`DEFAULT_EXPIRES_IN_SECONDS`] 同值，但公开出来给 `login.rs` 用 ——
+/// 两处各写一份常量的话，改了登录那处就与刷新链不一致，而这种偏差要等到
+/// 令牌提前失效时才暴露出来。
+pub fn oauth_default_expires_in_seconds() -> i64 {
+    DEFAULT_EXPIRES_IN_SECONDS
+}
+
 /// 上游错误文在报错里的截断长度
 const MAX_ERROR_CHARS: usize = 300;
 
