@@ -106,7 +106,7 @@ export const PROVIDER_ICONS: Record<string, string> = {
  * 账号表徽章、模型管理页都不跟着变；判据是「转发通道刚上线」，
  * 观察期结束后从这张表里删掉即可。
  */
-const BETA_PROVIDERS = new Set(['monkeycode', 'monkeycode-intl', 'commandcode', 'antigravity', 'minimax'])
+const BETA_PROVIDERS = new Set(['monkeycode', 'monkeycode-intl', 'commandcode', 'antigravity'])
 
 type CardItem = {
   id: string
