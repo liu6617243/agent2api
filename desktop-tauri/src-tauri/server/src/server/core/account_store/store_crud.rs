@@ -110,8 +110,25 @@ impl AccountStore {
         let auth = object_or_empty(payload_object.get("auth"));
         let account = object_or_empty(payload_object.get("account"));
 
-        let access_token = pick_token(&auth, &["accessToken", "token", "access_token"]);
-        let refresh_token = pick_token(&auth, &["refreshToken", "refresh_token"]);
+        // 嵌套形（官方客户端凭证文件 / wb2api 导出）优先读 `auth` 对象；里面没有
+        // 再回退顶层键 —— wb2api 的手写扁平形（`{"accessToken":…,"refreshToken":…}`）
+        // 没有 `auth` 壳，以前在这里被误判成「缺少 accessToken」。
+        let access_token = {
+            let nested = pick_token(&auth, &["accessToken", "token", "access_token"]);
+            if nested.is_empty() {
+                pick_token(payload_object, &["accessToken", "token", "access_token"])
+            } else {
+                nested
+            }
+        };
+        let refresh_token = {
+            let nested = pick_token(&auth, &["refreshToken", "refresh_token"]);
+            if nested.is_empty() {
+                pick_token(payload_object, &["refreshToken", "refresh_token"])
+            } else {
+                nested
+            }
+        };
         if access_token.is_empty() {
             return Err(AccountStoreError::bad_request("缺少 accessToken"));
         }

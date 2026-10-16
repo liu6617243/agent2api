@@ -360,6 +360,12 @@ impl AccountStore {
             // 去掉令牌本体、只留 refreshToken 尾号与「有没有 refreshToken /
             // accessToken」+ expiresAt（见 `minimax_accounts.rs`）
             self.to_minimax_public_account(record)
+        } else if record.provider() == super::orcaterm_accounts::ORCATERM_PROVIDER_ID {
+            // OrcaTerm（腾讯云遨驰终端桌面客户端）：单一入口（粘贴 accessToken /
+            // 导入桌面端登录态），公开形态带 uid(=userId) / loginName(=昵称) /
+            // tokenTail / tokenExpireAt（续期是否在工作可被肉眼校验，见
+            // `orcaterm_accounts.rs`）
+            self.to_orcaterm_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)

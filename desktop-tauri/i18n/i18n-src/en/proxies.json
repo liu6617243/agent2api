@@ -61,6 +61,8 @@
   "内核已停止": "Kernel stopped",
   "内核已停止，点「启动内核」拉起": "Kernel stopped — click \"Start kernel\" to launch it",
   "内核已关闭（订阅与端口注册表保留，「启动内核」后原位恢复）": "Kernel stopped (subscriptions and the port registry are kept; ports are restored in place after \"Start kernel\")",
+  "内核已手动关闭": "Kernel manually stopped",
+  "内核已手动关闭（点「启动内核」拉起）": "Kernel manually stopped — click \"Start kernel\" to launch it",
   "内核未安装": "Kernel not installed",
   "内核正在启动…": "Kernel is starting…",
   "内核没有在超时内停下来": "the kernel did not stop within the timeout",

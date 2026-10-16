@@ -844,16 +844,82 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             }
             store.add_minimax_account(&payload, import_name, "manual")
         }
+        // OrcaTerm（腾讯云遨驰终端桌面客户端）：**粘贴 accessToken**（OAuth JWT）
+        // → 本地归一化（剥 `Bearer ` / `ot_session=` 前缀；整段 data.bin JSON
+        // 直接粘也行）→ 打一次 `GetUserInfo` 做**真实校验**（顺带补 userId 与
+        // 昵称；JWT 里本来就有 userId，这一步同时确认 token 没被上游拒绝）→
+        // 落账号（续期由网关接管，见 `orcaterm::credentials` 模块头）。
+        //
+        // `importDesktop: true` → 读桌面客户端登录态
+        // （`%APPDATA%\com.orcaterm-desktop.app\data.bin`，Tauri store 明文 JSON
+        // 无需解密，见 `orcaterm::credentials::read_desktop_credentials`）→
+        // 同样校验 → 落账号。校验失败（token 无效 / 文件不存在）→ 400，不落空记录。
+        Some(crate::server::core::providers::ProviderKind::OrcaTerm) => {
+            let parsed = if import_desktop {
+                match crate::server::core::providers::orcaterm::credentials::read_desktop_credentials()
+                {
+                    Ok(credentials) => credentials,
+                    Err(reason) => return management_error(400, reason),
+                }
+            } else {
+                match crate::server::core::providers::orcaterm::credentials::credentials_from_payload(
+                    &payload,
+                ) {
+                    Ok(credentials) => credentials,
+                    Err(reason) => return management_error(400, reason),
+                }
+            };
+            // 真实校验 + 补身份：GetUserInfo 失败（token 无效 / 上游拒绝）→ 400。
+            // 网络失败同样 400 —— 添加时验证与 kuku 同一口径（要的是「现在真的能用」）。
+            let verified = match crate::server::core::providers::orcaterm::credentials::fetch_user_info(
+                &parsed, None,
+            )
+            .await
+            {
+                Ok((user_id, nickname)) => {
+                    let mut credentials = parsed;
+                    if credentials.user_id.is_empty() {
+                        credentials.user_id = user_id;
+                    }
+                    if credentials.nickname.is_empty() {
+                        credentials.nickname = nickname;
+                    }
+                    credentials
+                }
+                Err(error) => return management_error(error.status_code, error.message),
+            };
+            store.add_orcaterm_account(
+                &verified,
+                import_name,
+                if import_desktop { "desktop" } else { "manual" },
+            )
+        }
         // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
         // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的
         // `edition` 反推：那是账号的属性，而落哪一家是身份问题）。
         // `None`（老客户端不带 provider 字段）按国内版，历史契约不变。
+        // `importDesktop: true` → 读本机官方客户端（Tencent WorkBuddy）的登录态
+        // 文件（`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\`，国内版
+        // `workbuddy-desktop*.info`、国际版 `workbuddy-desktop-ai*.info`，见
+        // `account_store::workbuddy_import` 的模块头）；文件内容原样交
+        // `add_account` 落库，备注名取 payload 的 `name`（可选）。老客户端不带
+        // provider 字段时无从选文件组，直接 400 而不是静默按国内版。
         Some(crate::server::core::providers::ProviderKind::WorkBuddy)
         | Some(crate::server::core::providers::ProviderKind::WorkBuddyIntl)
         | None => {
             let provider = crate::server::core::providers::kind_from_id(provider)
                 .map(crate::server::core::providers::kind_id);
-            store.add_account(&payload, None, provider)
+            if import_desktop {
+                let Some(provider) = provider else {
+                    return management_error(
+                        400,
+                        "导入桌面端登录态需要 provider 字段（workbuddy / workbuddy-intl）",
+                    );
+                };
+                store.import_workbuddy_desktop_account(provider, import_name)
+            } else {
+                store.add_account(&payload, import_name, provider)
+            }
         }
     };
     match result {

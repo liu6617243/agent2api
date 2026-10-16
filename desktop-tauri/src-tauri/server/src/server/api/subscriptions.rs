@@ -81,6 +81,13 @@ fn sync_kernel_after_change() {
     let enabled = subscriptions::enabled_provider_inputs();
     if enabled.is_empty() {
         sub_kernel::request_stop();
+    } else if sub_kernel::is_manually_halted() {
+        // 手动关闭闩：订阅变更先落库，但不悄悄把内核拉起来；变更在下次
+        // 「启动内核」重建配置时生效（订阅、节点、监听器都在重建范围里）
+        logging::log(
+            "[Subscription]",
+            "内核已手动关闭 —— 订阅变更已保存，「启动内核」后生效",
+        );
     } else {
         sub_kernel::request_restart(enabled);
     }

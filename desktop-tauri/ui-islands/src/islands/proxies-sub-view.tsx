@@ -116,7 +116,9 @@ export function KernelBar({ showPortRange = false }: { showPortRange?: boolean }
           {status?.running
             ? t('内核运行中')
             : status?.installed
-              ? t('内核已停止')
+              ? status.halted
+                ? t('内核已手动关闭')
+                : t('内核已停止')
               : t('内核未安装')}
         </Badge>
         <span className='text-[12.5px] text-text-2'>
@@ -128,7 +130,9 @@ export function KernelBar({ showPortRange = false }: { showPortRange?: boolean }
           {status?.running
             ? t('控制端口 {port} · {n} 个节点监听器', { port: status?.controllerPort ?? '—', n: status?.listenerCount ?? 0 })
             : status?.installed
-              ? t('内核已停止，点「启动内核」拉起')
+              ? status.halted
+                ? t('内核已手动关闭（点「启动内核」拉起）')
+                : t('内核已停止，点「启动内核」拉起')
               : t('按需下载（约 20-40MB）')}
         </span>
         {showPortRange && range ? (

@@ -58,17 +58,43 @@ fn database() -> Option<&'static Db> {
 
 /// 行的 `activity` 段是否携带「活跃上报成功」读数（`report.succeeded`）。
 ///
-/// 国际版每日活跃的三件事里，**只有活跃上报点亮连登**（`/v2/report` 实测，
-/// 见 `billing::activity::report_chat_activity`）；领取依赖上游活动开放、
-/// 保活对话不参与活跃计数。「活动未开启」轮次的成败就认这一格 —— 与
-/// `claim_pending` 只认中性文案是同一条克制原则：上报失败、网络错误都照旧
-/// 落 failed，不会把真故障美化成成功。
+/// 国际版每日活跃的几件事里，活跃上报（`/v2/report`）点亮**成长中心连登**
+/// （见 `billing::activity::report_chat_activity`）；「当日活跃」计数的判定
+/// 通道是网页会话（[`web_conversation_ok`]，issue #277）。领取依赖上游活动
+/// 开放。「活动未开启」轮次的成败认 `activity_report_ok || web_conversation_ok`
+/// —— 与 `claim_pending` 只认中性文案是同一条克制原则：上报/建会话失败、
+/// 网络错误都照旧落 failed，不会把真故障美化成成功。
 fn activity_report_ok(row: &Value) -> bool {
     row.get("activity")
         .and_then(|activity| activity.get("report"))
         .and_then(|report| report.get("succeeded"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// 行的 `activity` 段是否携带「网页会话建成」读数（`webConversation.succeeded`）。
+///
+/// 国际版上游把「当日活跃」（每日 30 积分的判定）记在网页通道的 agent 会话
+/// 上：`/console/as/conversations/` 建会话即计，桌面端调用不计（issue #277
+/// 的抓包结论，见 `billing::activity::create_web_conversation`）。因此这一格
+/// 与活跃上报一起，构成「这一天的日活实际完成」的判据。
+fn web_conversation_ok(row: &Value) -> bool {
+    row.get("activity")
+        .and_then(|activity| activity.get("webConversation"))
+        .and_then(|web| web.get("succeeded"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// 台账的「保活」标记：桌面端保活对话（`pokeSucceeded`）或网页会话任一建成
+/// 即算 —— 两者互补（网页会话点亮「当日活跃」计数，桌面端对话维持「账号有
+/// 调用」），落同一格 `kept_active`，不另开列。
+fn kept_active_of(row: &Value) -> bool {
+    row.get("activity")
+        .and_then(|activity| activity.get("pokeSucceeded"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || web_conversation_ok(row)
 }
 
 /// 签到结果行的记账（`run_checkin` 的每账号行，`{id, name, claim, activity?,
@@ -102,7 +128,7 @@ pub fn record_row(row: &Value, provider: &str, source: &str, reason: &str) {
         (outcome, None)
     } else if claim_pending(&claim) {
         (OUTCOME_PENDING, None)
-    } else if activity_report_ok(row) {
+    } else if activity_report_ok(row) || web_conversation_ok(row) {
         (OUTCOME_ALREADY, None)
     } else {
         // 失败且行上没有 error：失败文案在 claim.msg 里（claim_result 的
@@ -115,11 +141,7 @@ pub fn record_row(row: &Value, provider: &str, source: &str, reason: &str) {
             .map(str::to_string);
         (OUTCOME_FAILED, message)
     };
-    let kept_active = row
-        .get("activity")
-        .and_then(|activity| activity.get("pokeSucceeded"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let kept_active = kept_active_of(row);
     insert(Entry {
         account_id: text_or(row.get("id"), ""),
         account_name: text_or(row.get("name"), &text_or(row.get("id"), "")),
@@ -141,11 +163,11 @@ pub fn record_row(row: &Value, provider: &str, source: &str, reason: &str) {
 /// 国际版活动的手动领取 / 保活（`api::billing::run_activity` 的返回行，
 /// `{id, name, mode, claim, activity}`）。
 ///
-/// 判定按 mode 分两条：`keepalive` 看「上报成功或保活成功」任一 —— 它的
-/// claim 是 `{success:false, msg:"活跃保活完成"}` 的形态，走 claim 判据会被
-/// 误判成 failed，而这一颗按钮的本意就是「维持账号活跃」，活跃上报（点亮
-/// 连登的那条通道）成功同样算数；`full` / `claim` 与签到同判据（claim），
-/// 「活动未开启但活跃上报成功」按 `record_row` 同款落到 already。
+/// 判定按 mode 分两条：`keepalive` 看「上报 / 保活对话 / 网页会话」任一成功
+/// —— 它的 claim 是 `{success:false, msg:"活跃保活完成"}` 的形态，走 claim
+/// 判据会被误判成 failed，而这一颗按钮的本意就是「维持账号活跃」，三件事
+/// 任一做成即算数；`full` / `claim` 与签到同判据（claim），
+/// 「活动未开启但活跃上报成功（或网页会话建成）」按 `record_row` 同款落到 already。
 /// reason 用人话（界面的「来源/说明」列直接展示）。
 pub fn record_activity(row: &Value, provider: &str, mode: &str) {
     let reason = match mode {
@@ -154,12 +176,8 @@ pub fn record_activity(row: &Value, provider: &str, mode: &str) {
         _ => "手动活动",
     };
     let claim = row.get("claim").cloned().unwrap_or(Value::Null);
-    let kept_active = row
-        .get("activity")
-        .and_then(|activity| activity.get("pokeSucceeded"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let report_ok = activity_report_ok(row);
+    let kept_active = kept_active_of(row);
+    let report_ok = activity_report_ok(row) || web_conversation_ok(row);
     let (outcome, error, ok) = if mode == "keepalive" {
         match kept_active || report_ok {
             true => (OUTCOME_SUCCESS, None, true),

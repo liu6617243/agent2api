@@ -145,6 +145,12 @@ pub mod minimax;
 /// 见 `monkeycode/mod.rs` 的模块头。
 pub mod monkeycode;
 pub mod officeace;
+/// OrcaTerm（腾讯云遨驰终端桌面客户端）。适配实现在 `orcaterm/`：
+/// 账号管理（**粘贴 accessToken** / 导入桌面端 `data.bin` 登录态）+
+/// OAuth 续期（上游有真续期接口）+ **会话转发**（建会话 → assistant SSE，
+/// 多轮拍平为单条输入）+ 余额（月度 AI 配额）全部已接通；
+/// `is_stateful` 为 true（请求内会话，与 KukuAI 同形态），见 `orcaterm/mod.rs`。
+pub mod orcaterm;
 pub mod onboarding_memory;
 /// **本地就绪闸门**：一条通道在「还没出本机就注定发不出去」时，让选路绕开它
 /// （当前唯一的用户是 ZCode 活动套餐的令牌池，判据与取舍见模块头）。
@@ -488,6 +494,11 @@ pub enum ProviderKind {
     /// [`adapter::UpstreamResponse::Anthropic`] 变体与翻译层（ZCode 活动套餐
     /// 通道的先例），`is_stateful` 保持 false，不新增协议变体。
     Minimax,
+    /// OrcaTerm（腾讯云遨驰终端桌面客户端）。适配实现在 `orcaterm/`：
+    /// 账号管理（粘贴 accessToken / 导入桌面端登录态）+ OAuth 续期 +
+    /// 会话转发（建会话 → assistant SSE）+ 余额（月度 AI 配额）；
+    /// `is_stateful` 为 true（请求内会话），见 `orcaterm/mod.rs` 的模块头。
+    OrcaTerm,
 }
 
 /// 一个提供商的静态元数据。
@@ -583,6 +594,11 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // 排末尾（新家按约定追加在末尾，与 Kuku / Command Code / Antigravity /
     // OfficeAce 同一处置）。
     ProviderMeta { id: "minimax", label: "Minimax中国" },
+    // OrcaTerm（腾讯云遨驰终端桌面客户端）：单一入口（粘贴 accessToken /
+    // 导入桌面端登录态），没有地区伴生。排在末尾（2026-10 接入，后到居后）。
+    // 它的模型名（glm-5.3 / kimi-k3 / deepseek-v4-* 等）与 codearts / catpaw /
+    // zcode 大面积同名，同样靠末位让同名模型优先归已有各家。
+    ProviderMeta { id: "orcaterm", label: "OrcaTerm" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -667,6 +683,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "antigravity" => Some(ProviderKind::Antigravity),
         "officeace" => Some(ProviderKind::OfficeAce),
         "minimax" => Some(ProviderKind::Minimax),
+        "orcaterm" => Some(ProviderKind::OrcaTerm),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -709,6 +726,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::Antigravity => "antigravity",
         ProviderKind::OfficeAce => "officeace",
         ProviderKind::Minimax => "minimax",
+        ProviderKind::OrcaTerm => "orcaterm",
     }
 }
 

@@ -54,20 +54,26 @@ use super::region::Region;
 /// 留足回溯余量。
 const LEDGERS_PATH: &str = "/agent-assetmgr/api/v1/ledgers_std?asset_type=point&wallet_type=all&cursor=&page_size=50&flow_direction=income";
 
-/// 「活跃即发」活动的流水事件名（`metadata.event_type`）。
+/// 「活跃即发」活动的流水事件名前缀（`metadata.event_type`）。
 ///
-/// 2026-10-15 实测：登录奖励的每一笔（一次性大礼包与日福利）都带它，是比
-/// activity_id 前缀更稳的判据 —— 活动换期会换 activity_id 后缀，甚至换前缀
-/// 家族（见模块头）。
-const ACTIVE_EVENT_TYPE: &str = "autoclaw_user_active";
+/// 2026-10-15 实测：登录奖励的每一笔（一次性大礼包与日福利）都带
+/// `autoclaw_user_active`，是比 activity_id 前缀更稳的判据 —— 活动换期会换
+/// activity_id 后缀，甚至换前缀家族（见模块头）。
+/// `autoclaw_user_signup_day`：登录动作还会带出**新手期**的「注册 Day 1-7 奖励」
+/// （event_type 形如 `autoclaw_user_signup_day_1`，实测 2026-09-22 国际版
+/// +10000「New-user credits (Day 1/7)」）—— 同一个发放钩子，一并确认。
+const ACTIVE_EVENT_TYPE_PREFIXES: [&str; 2] =
+    ["autoclaw_user_active", "autoclaw_user_signup_day"];
 
 /// activity_id 前缀兜底（event_type 缺失的老数据 / 变体）。
 ///
 /// `autoclaw_user_active_reward`：日福利（Weekly Perks，如 202609 期）；
-/// `autoclaw_user_active_bonus`：一次性大礼包（如 20261015 那次 20000）。
-const ACTIVE_ACTIVITY_PREFIXES: [&str; 2] = [
+/// `autoclaw_user_active_bonus`：一次性大礼包（如 20261015 那次 20000）；
+/// `autoclaw_new_user_day_1_to_7_bonus`：新手 7 天登录礼。
+const ACTIVE_ACTIVITY_PREFIXES: [&str; 3] = [
     "autoclaw_user_active_reward",
     "autoclaw_user_active_bonus",
+    "autoclaw_new_user_day_1_to_7_bonus",
 ];
 
 /// 今天的活动福利到账状态。
@@ -80,7 +86,7 @@ const ACTIVE_ACTIVITY_PREFIXES: [&str; 2] = [
 ///
 /// 判据是**流水里存在今天的**活动入账：`metadata.grant_date` 等于北京今天的
 /// 日期键（`core::beijing`，与签到链路同一个「今天」口径），且 `event_type`
-/// 命中 [`ACTIVE_EVENT_TYPE`]（缺失时退回 activity_id 前缀匹配，见模块头）。
+/// 命中 [`ACTIVE_EVENT_TYPE_PREFIXES`]（缺失时退回 activity_id 前缀匹配，见模块头）。
 pub async fn today_reward(
     region: Region,
     store: &AccountStore,
@@ -145,7 +151,8 @@ fn entry_detail(entry: &Value) -> Value {
 
 /// 这条流水是不是「今天的活动福利」。
 ///
-/// 判据见模块头：`grant_date` 必须是今天，且 `event_type` 命中（前缀兜底）。
+/// 判据见模块头：`grant_date` 必须是今天，且 `event_type` 命中前缀
+/// （activity_id 前缀兜底）。
 fn is_today_reward(entry: &Value, today: &str) -> bool {
     let Some(metadata) = entry.get("metadata") else {
         return false;
@@ -154,7 +161,8 @@ fn is_today_reward(entry: &Value, today: &str) -> bool {
     if grant_date != today {
         return false;
     }
-    if metadata.get("event_type").and_then(Value::as_str) == Some(ACTIVE_EVENT_TYPE) {
+    let event_type = metadata.get("event_type").and_then(Value::as_str).unwrap_or("");
+    if ACTIVE_EVENT_TYPE_PREFIXES.iter().any(|prefix| event_type.starts_with(prefix)) {
         return true;
     }
     let activity_id = metadata.get("activity_id").and_then(Value::as_str).unwrap_or("");

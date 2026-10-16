@@ -51,6 +51,12 @@ export type KernelStatus = {
   running: boolean
   controllerPort?: number
   listenerCount: number
+  /**
+   * 手动关闭闩（`StatusSnapshot.halted`）：刚点过「关闭内核」时为 true，
+   * 「启动内核」执行后清零。停止态文案据此区分「手动关闭」与「已停止」；
+   * 后端同时用它拒掉测试 / 保存引用的静默重启。
+   */
+  halted?: boolean
   /** 当前内核目录（配置里选了别的位置就是它） */
   kernelDir: string
   /** 默认内核目录（下载弹窗「恢复默认」的目标值，由后端给） */

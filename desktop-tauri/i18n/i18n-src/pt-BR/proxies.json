@@ -59,6 +59,8 @@
   "内核已停止": "Kernel parado",
   "内核已停止，点「启动内核」拉起": "Kernel parado — clique em \"Iniciar kernel\" para ativá-lo",
   "内核已关闭（订阅与端口注册表保留，「启动内核」后原位恢复）": "Kernel parado (assinaturas e o registro de portas são mantidos; as portas voltam ao lugar após \"Iniciar kernel\")",
+  "内核已手动关闭": "Kernel parado manualmente",
+  "内核已手动关闭（点「启动内核」拉起）": "Kernel parado manualmente — clique em \"Iniciar kernel\" para ativá-lo",
   "内核未安装": "Kernel não instalado",
   "内核正在启动…": "Kernel iniciando…",
   "内核没有在超时内停下来": "o kernel não parou dentro do tempo limite",

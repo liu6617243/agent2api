@@ -728,7 +728,8 @@ ALTER TABLE requests ADD COLUMN route TEXT;
 ///     免得每个读点都写 `(outcome='success' OR outcome='already')`）；
 ///   - `message`：claim.msg 原文（「今日积分 +100」等**收益就在这里**）；
 ///   - `error`：执行错误原文（失败行的原因）；
-///   - `kept_active`：国际版保活成功（`activity.pokeSucceeded`）标记。
+///   - `kept_active`：国际版保活成功标记（保活对话 `pokeSucceeded` 或网页
+///     会话 `webConversation.succeeded` 任一，见 `checkin_records::kept_active_of`）。
 ///
 /// 为什么 row_id 用 AUTOINCREMENT：与 `requests` 同一理由 —— 它当翻页游标，
 /// 复用 rowid 会让「翻页漏行 / 重行」。

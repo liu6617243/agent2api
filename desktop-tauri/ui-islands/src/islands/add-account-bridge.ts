@@ -198,6 +198,20 @@ export function existingCustomOfPreset(
   return (shared().wbProviders?.customList?.() || []).find(item => (item.name || '') === name)
 }
 
+/**
+ * 该自定义家是否与某个预置模板同名 —— 是的话它**不进「自定义」段的卡片列表**：
+ * 预置家与 Agent 内置家同一形态，卡片常驻在「预置 API」段、点卡加账号，再在
+ * 「自定义」段重复出现一份只会让人以为建了两个家。与 existingCustomOfPreset
+ * 是同一件事的两个方向，共用「按 name 字面量比对」这一条口径：模板家改了名
+ * （不再对应任何模板）就自然回到「自定义」段；手动新建时起了与模板相同的名字
+ * 也会被归到预置段（看起来一样，入口合一没有坏处）。
+ */
+export function matchesPresetName(provider: CustomProviderRecord | null | undefined): boolean {
+  const name = provider?.name || ''
+  if (!name) return false
+  return (shared().wbPresetProviders?.list || []).some(preset => preset.name === name)
+}
+
 /* ─── 提交与收尾 ─────────────────────────────── */
 
 /** 统一提交入口：POST /api/accounts，保留各提供商自己的凭证字段 */

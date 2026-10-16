@@ -447,6 +447,15 @@ fn listener_flow(state: &ServerState, id: &str, change: &proxy_pool::EnabledChan
     if stale.is_empty() || !sub_kernel::installed() {
         return "none";
     }
+    // 手动关闭闩：内核已停着，端口本来就全下线了 —— 禁用标志已落库，下次
+    // 「启动内核」重建配置时自然不带这些端口，不必为关端口把内核拉起来
+    if sub_kernel::is_manually_halted() {
+        logging::log(
+            "[Proxies]",
+            "内核已手动关闭 —— 禁用已记录，「启动内核」后端口不再开",
+        );
+        return "none";
+    }
     sub_kernel::request_restart(crate::server::core::subscriptions::enabled_provider_inputs());
     logging::log(
         "[Proxies]",
@@ -621,6 +630,18 @@ pub fn provision_missing_listeners(state: &ServerState) -> bool {
             .collect::<Vec<_>>()
     };
     if missing.is_empty() {
+        return false;
+    }
+    // 手动关闭闩：用户刚点过「关闭内核」，保存引用不悄悄把内核带起来 ——
+    // 缺口记在这条日志里，「启动内核」重建配置时会把这些监听器一并建出来
+    if sub_kernel::is_manually_halted() {
+        logging::log(
+            "[Proxies]",
+            &format!(
+                "内核已手动关闭 —— {} 个被引用节点的监听器暂不补建，「启动内核」后自动补上",
+                missing.len()
+            ),
+        );
         return false;
     }
     // 有缺口才重启内核（重建配置把缺的监听器建出来）。内核未安装时投命令

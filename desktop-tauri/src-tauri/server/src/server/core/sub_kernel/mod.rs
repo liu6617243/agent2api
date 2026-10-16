@@ -168,6 +168,10 @@ pub struct StatusSnapshot {
     /// 各订阅最后一次成功同步：`subId → {name, count, at}`
     pub provider_sync: Map<String, Value>,
     pub download: DownloadProgress,
+    /// 手动关闭闩：「关闭内核」（[`request_halt`]）置位，任何 Restart 执行时
+    /// 清零。置位期间测试 / 保存引用 / 订阅同步不再悄悄把内核拉起来，
+    /// 改为提示先点「启动内核」。
+    pub halted: bool,
 }
 
 /// 下载进度（状态机：idle → downloading → done / error / canceled）
@@ -195,6 +199,7 @@ impl Default for StatusSnapshot {
                 total: 0,
                 error: None,
             },
+            halted: false,
         }
     }
 }
@@ -267,7 +272,9 @@ pub fn spawn_worker() {
 async fn execute(command: Command) {
     match command {
         Command::Restart(providers) => {
+            // 启动 / 重启 = 用户明确要内核起来，手动关闭闩在此清零
             patch_status(|snapshot| {
+                snapshot.halted = false;
                 snapshot.download.error = None;
             });
             if let Err(error) = runtime::run_restart(&providers).await {
@@ -388,6 +395,10 @@ async fn execute(command: Command) {
             }
             patch_status(|snapshot| {
                 snapshot.running = false;
+                // 手动「关闭内核」置闩（测试 / 保存引用不再悄悄重启内核）；
+                // 自动停（clear_pool=true）不置 —— 那是「没订阅了」，不是用户
+                // 要内核一直停着。
+                snapshot.halted = !clear_pool;
             });
         }
     }
@@ -456,6 +467,15 @@ pub fn request_halt() {
     send(Command::Stop { clear_pool: false });
 }
 
+/// 手动关闭闩当前是否置位（见 [`StatusSnapshot::halted`]）。
+///
+/// 「测试 / 保存引用 / 订阅同步」这些路径在置位时**不投 Restart 命令** ——
+/// 静默把内核带起来会推翻用户刚刚按下的「关闭」；改由各自路径提示
+/// 「先点启动内核」。
+pub fn is_manually_halted() -> bool {
+    with_status(|snapshot| snapshot.halted)
+}
+
 /// 请求停掉内核并删除已下载的内核（界面上的「删除内核」）。
 ///
 /// 走命令队列而不是直接在 handler 里删文件：删除与重启 / 下载会互相踩
@@ -480,6 +500,7 @@ pub fn status_json() -> Value {
         let download_received = snapshot.download.received;
         let download_total = snapshot.download.total;
         let download_error = snapshot.download.error.clone();
+        let halted = snapshot.halted;
         let running = snapshot_running
             && controller_port
                 .map(|port| controller_alive(port))
@@ -503,6 +524,8 @@ pub fn status_json() -> Value {
                 crate::server::config::kernel_proxy().as_ref(),
             ),
             "lastError": last_error,
+            // 手动关闭闩（前端用它把停止态的文案从「已停止」换成「已手动关闭」）
+            "halted": halted,
             "providerSync": provider_sync,
             "download": {
                 "state": download_state,
