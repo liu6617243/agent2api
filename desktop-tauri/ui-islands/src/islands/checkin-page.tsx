@@ -60,6 +60,11 @@ const PROVIDER_DESC: Record<string, string> = {
   // MiniMax：先 GET signin/status 看今日是否已领，未领才 POST signin/claim
   // （上游接口幂等，重复领不报错也不重复发，见后端 providers::minimax::checkin）
   minimax: t('先查签到状态再领取积分 · 幂等 · 按自然日重置'),
+  // 智谱清言：本家的「签到」就是会员的每日登录积分（一次 POST，到账数在
+  // `result.score`）；后面的活动领取一并执行（活动期才有得领）。
+  // 访客账号没有积分体系，实现会如实跳过（不算失败），说明里点出这一点，
+  // 免得用户以为漏签了。
+  chatglm: t('每日登录积分 · 顺带领取会员活动 · 访客账号无积分体系（跳过）'),
 }
 
 /** 页内标签页的档位（值与 checkin-state 的 CheckinTab 一致） */
@@ -71,11 +76,12 @@ const CHECKIN_TAB_OPTIONS = [
 
 /* ─── 小组件 ───────────────────────────────── */
 
-/** 新手福利分组的提供商展示名（缺省回落 provider id 本身） */
+/** 新手福利分组的提供商展示名（缺省回落 provider id 本身）；名字进词典，非中文界面才翻得动 */
 function onboardingProviderLabel(provider: string): string {
-  return provider === 'raccoon' ? '小浣熊' : provider === 'loomy' ? 'Loomy'
+  return t(provider === 'raccoon' ? '小浣熊' : provider === 'loomy' ? 'Loomy'
     : provider === 'codearts' ? 'CodeArts'
-    : provider === 'officeace' ? 'OfficeAce 果办' : provider
+    : provider === 'chatglm' ? '智谱清言'
+    : provider === 'officeace' ? 'OfficeAce 果办' : provider)
 }
 
 function useCheckinStore(): CheckinStore {
