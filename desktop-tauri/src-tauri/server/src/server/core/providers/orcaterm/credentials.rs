@@ -455,10 +455,17 @@ pub fn snapshot_for(
     let (jwt_user_id, jwt_exp) = claims_of(&token);
     Ok(OrcatermCredentials {
         access_token: token,
+        // 记录里 tokenExpireAt 是**毫秒**（add / update 都写 `expires_at * 1000`），
+        // 而本结构体的 expires_at 全程按**秒**消费（JWT exp 是秒；
+        // `is_expiring` 与 `now_ms() / 1000` 比）。这里必须 ÷1000 归一 —
+        // 否则 ms 量级的值（~1.79e12）让 `is_expiring()` 恒为 false，
+        // 临期主动续期永不触发（2026-10-19 实测：token 过期约 2.5 小时后
+        // 建会话被拒，报 `Invalid or expired AccessToken` 并 502 到客户端）。
         expires_at: record
             .get("tokenExpireAt")
             .and_then(Value::as_i64)
             .filter(|value| *value > 0)
+            .map(|millis| millis / 1000)
             .unwrap_or(jwt_exp),
         user_id: record
             .get("uid")

@@ -186,6 +186,23 @@ async fn create_conversation(
     let code = value.get("code").and_then(Value::as_i64).unwrap_or(-1);
     if code != 0 {
         let message = value.get("message").and_then(Value::as_str).unwrap_or("未知错误");
+        // lightai（assistant 网关）把登录态失效放在 **HTTP 200 的业务体**里
+        // （实测形态：`code=-1` + `Invalid or expired AccessToken`），并非
+        // HTTP 401 —— 一律按 502 译的话，`run_chat` 的 401 自愈（强制续期 +
+        // 重发一次）永远接不到火，令牌每次过期都直接 502 到客户端。
+        // 这里按业务文案认出「登录态失效」并译成 401，让自愈链路接管；
+        // 自愈也失败时，这句文案直接告诉用户该重新登录。
+        let auth_flavored = ["AccessToken", "accessToken", "access_token", "未登录", "登录态"]
+            .iter()
+            .any(|needle| message.contains(needle));
+        if auth_flavored {
+            return Err(GatewayError::with_status(
+                401,
+                format!(
+                    "OrcaTerm 登录态已失效（建会话被拒：code={code}：{message}）；请重新导入或重新粘贴该账号的 accessToken"
+                ),
+            ));
+        }
         return Err(GatewayError::with_status(
             502,
             format!("OrcaTerm 建会话失败（code={code}：{message}）"),

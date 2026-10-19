@@ -1621,6 +1621,14 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     if state.store().raccoon_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::Raccoon).await;
     }
+    // OrcaTerm 账号：OAuth JWT 的 `OAuthRefreshToken` 续期（强制刷新，单飞 +
+    // 回写账号记录）。**这条分派不能省**：漏了会落到下面的 workbuddy 兜底链路，
+    // 用户点「刷新 Token」收到的是「没有 refreshToken，无法刷新」——与 OrcaTerm
+    // 「传旧 accessToken 就能换新」的真实机制毫无关系（实测 2026-10-19：
+    // 过期 4 小时以上的旧 token 仍可换新，见 `orcaterm::credentials` 模块头）。
+    if state.store().orcaterm_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::OrcaTerm).await;
+    }
     // AutoClaw 账号：同一套「读凭证 → 强制刷新 → 按来源回写」的适配器链路。
     // **桌面端实时登录态不主动刷新**（原项目 `account-routes.mjs` 的同款拒绝）：
     // 网关与桌面端共用同一个 refresh_token，网关侧刷新会造成轮换竞态，
