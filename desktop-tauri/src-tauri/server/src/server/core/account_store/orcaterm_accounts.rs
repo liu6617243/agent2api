@@ -240,6 +240,22 @@ impl AccountStore {
             "tokenExpireAt".to_string(),
             Value::from(record.get("tokenExpireAt").and_then(Value::as_i64).unwrap_or(0)),
         );
+        // 「刷新 Token」菜单项由前端按 `hasRefreshToken` 门控（accounts-panels.tsx
+        // 的 MoreMenu）。OrcaTerm **没有独立 refreshToken** —— 续期接口
+        // `OAuthRefreshToken` 是拿旧 accessToken 换新，所以本家的语义是
+        // 「记录里有 accessToken 即可刷新」。缺这个字段时菜单不出现该项，
+        // 用户连手动刷新的入口都没有（2026-10-19 实测复现）。
+        public.insert(
+            "hasRefreshToken".to_string(),
+            Value::Bool(
+                !record
+                    .get("accessToken")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty(),
+            ),
+        );
         public.insert("desktop".to_string(), Value::Bool(record.is_desktop()));
         public.insert("source".to_string(), Value::String(record.source()));
         public.insert("priority".to_string(), Value::from(record.priority()));
