@@ -54,6 +54,21 @@ impl AccountStore {
             "tokenExpireAt".to_string(),
             Value::from(record.get("tokenExpireAt").and_then(Value::as_i64).unwrap_or(0)),
         );
+        // 「刷新 Token」菜单项的显隐判据（前端 MoreMenu 纯按这一位，见
+        // `accounts-panels.tsx`）。存量记录没有 `pluginSecret`，界面走的正是
+        // 这份投影 —— 缺了这一位就等于**没有手动续期入口**。而 OrcaTerm 的 JWT
+        // 只有 2 小时，过期后用户除了重新导入登录态没有别的动作可做。
+        // 判据是「有 accessToken 即可刷新」：`OAuthRefreshToken` 收的就是旧
+        // accessToken，不另需 refreshToken。
+        public.insert(
+            "hasRefreshToken".to_string(),
+            Value::Bool(
+                record
+                    .get("accessToken")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty()),
+            ),
+        );
         public.insert("desktop".to_string(), Value::Bool(record.is_desktop()));
         public.insert("source".to_string(), Value::String(record.source()));
         public.insert("priority".to_string(), Value::from(record.priority()));
