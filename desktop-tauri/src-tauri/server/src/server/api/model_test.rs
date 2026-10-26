@@ -493,6 +493,9 @@ pub async fn run_model_test(State(state): State<ServerState>, body: Bytes) -> Re
             ),
         );
     }
+    if crate::server::core::providers::images::provider_model_is_image(&provider, &model) {
+        return errors::management_error(400, "图片生成模型请通过 /v1/images/generations 调用，暂不支持对话测试");
+    }
     let protocol_raw = text_field(&payload, "protocol", 32);
     let protocol = match TestProtocol::parse(&protocol_raw) {
         Ok(protocol) => protocol,
@@ -599,7 +602,7 @@ pub async fn run_model_test(State(state): State<ServerState>, body: Bytes) -> Re
     // 那件事已经由 `is_test` 表达（见 `request_stats::RequestEntry::client`）
     state
         .request_stats()
-        .record_started(&test_id, started_at, &model, &model, &reasoning, "", true);
+        .record_started(&test_id, started_at, &model, &model, &reasoning, &Default::default(), true);
     if let Some(token) = cancellation::register(&test_id) {
         telemetry.set_cancel_token(token);
     }
@@ -643,7 +646,7 @@ pub async fn run_model_test(State(state): State<ServerState>, body: Bytes) -> Re
         raw_response: outcome.raw_response.clone(),
         is_test: true,
         // 客户端空串：测试没有下游 UA（与上面的 record_started 同口径）
-        client: String::new(),
+        source: Default::default(),
     };
     pipeline::record_entry(&context, None);
     guard.complete();

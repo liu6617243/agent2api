@@ -52,7 +52,7 @@ import {
   Progress,
   SegmentedControl,
   Switch,
-} from '@ui'
+  Table, TableHeader, TableRow, TableHead, TableBody, TableCell } from '@ui'
 import {
   addSubscription, decodeQrImage, errorMessage, kernel, loadSection,
   readFileAsBase64, refreshSubscription, removeKernel, removeSubscription, restartKernel, saveSubscription,
@@ -242,7 +242,7 @@ export function SubscriptionManagerDialog({ onClose }: { onClose: () => void }) 
           <KernelBar />
 
           <div className='models-table-wrap'>
-            <table className='models-table'>
+            <Table container={false} className='models-table'>
               <colgroup>
                 <col className='w-[18%]' />
                 <col className='w-[31%]' />
@@ -251,25 +251,25 @@ export function SubscriptionManagerDialog({ onClose }: { onClose: () => void }) 
                 <col className='w-[8%]' />
                 <col className='w-[20%]' />
               </colgroup>
-              <thead>
-                <tr>
-                  <th>{t('名称')}</th>
-                  <th>{t('订阅来源')}</th>
-                  <th className='ta-center'>{t('节点')}</th>
-                  <th>{t('上次同步')}</th>
-                  <th className='ta-center'>{t('启用')}</th>
-                  <th className='ta-right'>{t('操作')}</th>
-                </tr>
-              </thead>
-              <tbody>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>{t('名称')}</TableHead>
+                  <TableHead>{t('订阅来源')}</TableHead>
+                  <TableHead className='ta-center'>{t('节点')}</TableHead>
+                  <TableHead>{t('上次同步')}</TableHead>
+                  <TableHead className='ta-center'>{t('启用')}</TableHead>
+                  <TableHead className='ta-right'>{t('操作')}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
                 {items.length ? items.map(item => {
                   const sync = kernel()?.providerSync?.[item.id]
                   return (
-                    <tr key={item.id} className={item.enabled ? '' : 'off'}>
-                      <td><b>{item.name || t('未命名')}</b></td>
+                    <TableRow key={item.id} className={item.enabled ? '' : 'off'}>
+                      <TableCell><b>{item.name || t('未命名')}</b></TableCell>
                       {/* 来源列：链接订阅显示主机段 + hover 复制；本地文件订阅
                           显示文件名（没有链接可复制，「立即更新」对它也无意义） */}
-                      <td className='group'>
+                      <TableCell className='group'>
                         <div className='flex min-w-0 items-center gap-1'>
                           {item.kind === 'local' ? (
                             <>
@@ -287,32 +287,32 @@ export function SubscriptionManagerDialog({ onClose }: { onClose: () => void }) 
                             </>
                           )}
                         </div>
-                      </td>
+                      </TableCell>
                       {/* 节点列只放读数；同步时间归「上次同步」列（两列各就各位）。
                           节点数优先取内核状态里的**实时**同步结果：条目上的 nodeCount
                           是列表响应注入的快照，写操作后的轮询窗口里可能还是旧的 0
                           （徽标曾冻在「—」上 —— 列表与内核一起轮询 + 这里的实时兜底，
                           双保险） */}
-                      <td className='ta-center'>
+                      <TableCell className='ta-center'>
                         {liveNodeCount(sync, item) > 0 ? (
                           <Badge variant='secondary'>{t('{n} 个', { n: liveNodeCount(sync, item) })}</Badge>
                         ) : (
                           <span className='text-subtle'>{t('—')}</span>
                         )}
-                      </td>
-                      <td>
+                      </TableCell>
+                      <TableCell>
                         {sync?.at ? (
                           <span className='text-[12px] text-text-2'>{formatTime(sync.at)}</span>
                         ) : (
                           <span className='text-subtle'>{t('未同步')}</span>
                         )}
-                      </td>
-                      <td className='ta-center'>
+                      </TableCell>
+                      <TableCell className='ta-center'>
                         <Switch checked={item.enabled} disabled={snapshot.pending}
                           aria-label={t('启用订阅「{name}」', { name: item.name || t('未命名') })}
                           onCheckedChange={next => void toggleSubscription(item, next)} />
-                      </td>
-                      <td>
+                      </TableCell>
+                      <TableCell>
                         <div className='row-actions'>
                           {/* 本地文件订阅没有链接可拉，「立即更新」对它无意义
                               （后端也会拒）—— 停用并说明，而不是让它白报一次错 */}
@@ -329,12 +329,12 @@ export function SubscriptionManagerDialog({ onClose }: { onClose: () => void }) 
                           <Button size='sm' variant='destructive' disabled={snapshot.pending}
                             onClick={() => void removeSubscription(item)}>{t('删除')}</Button>
                         </div>
-                      </td>
-                    </tr>
+                      </TableCell>
+                    </TableRow>
                   )
                 }) : (
-                  <tr>
-                    <td colSpan={6} className='empty'>
+                  <TableRow>
+                    <TableCell colSpan={6} className='empty'>
                       {ready ? (
                         /* 空态内嵌主操作按钮（视线不用跳到页脚）：一句话 + 按钮 +
                            一句「接下来会发生什么」的副提示 */
@@ -347,11 +347,11 @@ export function SubscriptionManagerDialog({ onClose }: { onClose: () => void }) 
                           </span>
                         </div>
                       ) : t('加载中…')}
-                    </td>
-                  </tr>
+                    </TableCell>
+                  </TableRow>
                 )}
-              </tbody>
-            </table>
+              </TableBody>
+            </Table>
           </div>
 
           <p className='text-xs leading-[1.65] text-subtle'>
@@ -629,7 +629,7 @@ function SubModal({
                   {decoding ? t('识别中…') : t('从图片识别二维码')}
                 </Button>
                 <span className='text-[11px] text-subtle'>{t('也可以把二维码截图直接粘贴到弹窗里（Ctrl+V）')}</span>
-                <input ref={fileInput} type='file' accept='image/*' className='hidden'
+                <Input ref={fileInput} type='file' accept='image/*' className='hidden'
                   onChange={event => {
                     const file = event.currentTarget.files?.[0]
                     if (file) void decodeFrom(file)
@@ -657,7 +657,7 @@ function SubModal({
                   {t('本地文件不会自动更新：要更新节点，重新选择文件后保存；不重选则内容保持不变。')}
                 </span>
               ) : null}
-              <input ref={fileInput} type='file' accept='.yaml,.yml,text/yaml,application/yaml,text/plain'
+              <Input ref={fileInput} type='file' accept='.yaml,.yml,text/yaml,application/yaml,text/plain'
                 className='hidden'
                 onChange={event => {
                   const file = event.currentTarget.files?.[0]

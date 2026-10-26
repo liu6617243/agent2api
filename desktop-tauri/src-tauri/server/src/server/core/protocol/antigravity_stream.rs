@@ -335,7 +335,7 @@ impl ChatFromAntigravityStream {
         if let Some(signature) = signature.as_deref() {
             // 签名入服务端缓存（issue #291，见模块头）：多数客户端下一轮不会
             // 回带非标的 `extra_content`，请求侧按这两档键回填
-            super::antigravity_signature_cache::remember_call(&id, signature);
+            super::antigravity_signature_cache::remember_call(&self.session, &id, signature);
             super::antigravity_signature_cache::remember_for_session(&self.session, &name, signature);
         }
         let index = self.tool_index;

@@ -1,4 +1,5 @@
 import React, { useEffect } from 'react'
+import { AppFrame } from '@ui'
 import { store, useStore, bootstrapTheme } from './state/store'
 import { TabBar, Toast, AuthGate, ThemeSync } from './components/Shell'
 import { PwaNotice } from './components/PwaNotice'
@@ -18,9 +19,9 @@ import { SettingsPage } from './pages/SettingsPage'
 import { DocsPage } from './pages/DocsPage'
 import { AgentPage } from './pages/AgentPage'
 import { ServersPage } from './pages/ServersPage'
-import { PluginPageView } from './pages/PluginPage'
-import { resolveUrl } from './api/client'
-import { isPluginKey } from './lib/pluginPages'
+import { CheckinPage } from './pages/CheckinPage'
+import { PluginsPage } from './pages/PluginsPage'
+import type { ScreenId } from './lib/routes'
 import { NavBar } from './components/NavBar'
 import { t } from './i18n'
 
@@ -37,7 +38,7 @@ type ScreenDef = {
   primary?: boolean
 }
 
-const SCREENS: Record<string, ScreenDef> = {
+const SCREENS: Record<ScreenId, ScreenDef> = {
   home: { title: t('首页'), component: HomePage, primary: true },
   report: { title: t('报表'), component: ReportPage, primary: true },
   accounts: { title: t('账号'), component: AccountsPage, primary: true },
@@ -51,34 +52,20 @@ const SCREENS: Record<string, ScreenDef> = {
   logs: { title: t('运行日志'), component: LogsPage },
   settings: { title: t('设置'), component: SettingsPage },
   docs: { title: t('接口文档'), component: DocsPage },
-  agent: { title: t('Agent 接管'), component: AgentPage },
+  agent: { title: t('Agent 配置'), component: AgentPage },
   servers: { title: t('服务器'), component: ServersPage },
+  checkin: { title: t('签到中心'), component: CheckinPage },
+  plugins: { title: t('网关插件'), component: PluginsPage },
 }
 
 export function App() {
   const state = useStore()
   const pwa = usePwa()
-  /**
-   * 页面分派：静态路由表 → 插件申报的页面。
-   *
-   * 插件页面的键（`plugin:<pack>:<page>`）是运行时才知道的，进不了静态表。
-   * 查不到（装插件前存下的 hash、或插件刚被卸掉）时回落首页 —— 与 store 的
-   * 「未知 hash 不渲染空白屏」同一口径。
-   */
-  const pluginPage = isPluginKey(state.route.screen)
-    ? state.pluginPages.find(page => page.key === state.route.screen)
-    : undefined
-  const def: ScreenDef = pluginPage
-    ? {
-      title: pluginPage.title,
-      component: () => <PluginPageView page={pluginPage} resolveUrl={resolveUrl} />,
-    }
-    : SCREENS[state.route.screen] || SCREENS.home
+  const def = SCREENS[state.route.screen]
   const Page = def.component
   const isPrimary = Boolean(def.primary)
-  // 助手页要撑满：它自己内部滚动（对话区），外层不能滚。
-  // 插件页面同理 —— iframe 自己滚，外面再滚一层会出现双滚动条。
-  const fillHeight = state.route.screen === 'assistant' || Boolean(pluginPage)
+  // 助手页自己滚动对话区，外层不再创建第二个滚动容器。
+  const fillHeight = state.route.screen === 'assistant'
   /**
    * APK 首次启动、一台服务器都没配：**没有地址就什么都拉不到**，所以直接
    * 顶掉整个界面（不显示标签栏 —— 切到别的标签也是空的）。配好一台之后
@@ -93,8 +80,6 @@ export function App() {
     // 而真实原因是「还没填地址」。
     if (!state.packaged || state.server) {
       void store.refresh(true)
-      // 插件页面清单与会话分开拉（见 store.refreshPluginPages 的说明）
-      void store.refreshPluginPages()
     }
     // 浏览器前进 / 后退（PWA 与 APK 的 WebView 都会触发）。走 store 的
     // handlePopState 而不是直接 restoreFromHash：前者会同步弹掉二级栈，
@@ -157,18 +142,18 @@ export function App() {
 
   if (needsServer) {
     return (
-      <div className='m-app'>
+      <AppFrame className='m-app'>
         <ThemeSync />
         <div className='m-scroll' data-screen='servers'>
-          <ServersPage />
+          <ServersPage key={state.serverRevision} />
         </div>
         <Toast />
-      </div>
+      </AppFrame>
     )
   }
 
   return (
-    <div className='m-app' data-offline={pwa.offline ? 'true' : undefined}>
+    <AppFrame className='m-app' data-offline={pwa.offline ? 'true' : undefined}>
       <ThemeSync />
       <PwaNotice />
       {isPrimary ? null : <NavBar title={def.title} onBack={() => store.back()} />}
@@ -177,11 +162,11 @@ export function App() {
         style={fillHeight ? { overflow: 'hidden' } : undefined}
         data-screen={state.route.screen}
       >
-        <Page />
+        <Page key={state.serverRevision} />
       </div>
       <TabBar />
       <Toast />
-      <AuthGate />
-    </div>
+      <AuthGate key={state.serverRevision} />
+    </AppFrame>
   )
 }

@@ -35,6 +35,8 @@ pub struct PackSummary {
     pub installed_at: i64,
     /// 包声明的 provider（id / 展示名 / 是否启用）。
     pub providers: Vec<PackProviderSummary>,
+    pub host: Option<serde_json::Value>,
+    pub provider_category: super::ProviderCategory,
     /// 入口二进制是否存在于磁盘（false = 包被外部删了 / 移动了）。
     pub entry_present: bool,
     /// 这个包声明的协议版本（与网关不一致时界面要提示升级）。
@@ -247,7 +249,8 @@ pub fn list_packs() -> Vec<PackSummary> {
                     let id = item.id.0.clone();
                     let enabled = pack.providers.get(&id).copied().unwrap_or(true);
                     PackProviderSummary {
-                        loaded: enabled && super::serves_provider(&id),
+                        loaded: pack.enabled && enabled && super::serves_provider(&id)
+                            && super::provider_pack(&id).as_deref() == Some(pack.id.as_str()),
                         enabled,
                         label: item.label,
                         id,
@@ -263,6 +266,15 @@ pub fn list_packs() -> Vec<PackSummary> {
                 signed: pack.signed,
                 installed_at: pack.installed_at,
                 providers,
+                host: super::host_for_pack(&pack.id).map(|host| {
+                    let status = host.status();
+                    serde_json::json!({
+                        "running": status.running, "providers": status.providers,
+                        "crashes": status.crashes, "disabled": status.disabled,
+                        "lastError": status.last_error,
+                    })
+                }),
+                provider_category: super::ownership::category(&dir),
                 entry_present: dir.join(&pack.entry).exists(),
                 protocol,
                 homepage,

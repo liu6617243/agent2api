@@ -111,7 +111,8 @@ pub async fn fetch_checksum(url: &str) -> Result<String, UpdateError> {
         ("User-Agent".to_string(), USER_AGENT.to_string()),
         ("Accept".to_string(), "text/plain".to_string()),
     ];
-    let response = client::fetch_with_egress(url, &headers, Some(CHECKSUM_TIMEOUT_MS)).await?;
+    super::assert_downloadable(url)?;
+    let response = client::fetch_official(url, &headers, Some(CHECKSUM_TIMEOUT_MS)).await?;
     if !response.status().is_success() {
         return Err(UpdateError::new(format!(
             "下载校验文件失败：GitHub 返回 HTTP {}",

@@ -39,6 +39,8 @@ const SHELL = [
   './m/mobile.js',
   './m/mobile.css',
   './m/manifest.webmanifest',
+  './i18n.js',
+  './aliyun-captcha.js',
   './assets/app-icon-192.png',
   './assets/app-icon-512.png',
   './assets/app-icon-maskable-512.png',
@@ -47,7 +49,7 @@ const SHELL = [
 /** 这个请求属不属于手机端（决定要不要拦） */
 function isMobileAsset(pathname) {
   if (pathname === '/m' || pathname === '/m.html') return true
-  return pathname.startsWith('/m/')
+  return pathname.startsWith('/m/') || pathname === '/i18n.js' || pathname === '/aliyun-captcha.js' || pathname.startsWith('/i18n/')
 }
 
 /** 是不是入口页导航（`/m` 或 `/m.html`，含 query / hash 之外的路径部分） */
@@ -169,10 +171,19 @@ self.addEventListener('fetch', event => {
 
   // 手机端其余资源：network-first，离线时回退缓存
   event.respondWith(
-    fetch(request).catch(async () => {
-      const cached = await caches.match(request)
-      if (cached) return cached
-      throw new Error('offline')
+    caches.open(CACHE).then(async cache => {
+      try {
+        const response = await fetch(request)
+        if (response.ok && !response.redirected) {
+          const copy = response.clone()
+          event.waitUntil(cache.put(request, copy).catch(() => undefined))
+        }
+        return response
+      } catch {
+        const cached = await cache.match(request)
+        if (cached) return cached
+        throw new Error('offline')
+      }
     }),
   )
 })

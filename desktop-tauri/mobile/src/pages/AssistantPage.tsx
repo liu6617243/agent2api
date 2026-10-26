@@ -1,18 +1,26 @@
 import { useEffect, useRef, useState } from 'react'
 import { Icon } from '../components/Icon'
 import { MarkdownLite } from '../components/MarkdownLite'
-import { Sheet, SheetContent, SheetHeader, SheetBody, SheetTitle } from '@ui'
+import { Button, Textarea, confirmDialog } from '@ui'
 import { store } from '../state/store'
-import { fetchManage, type ManageModel } from '../api/gateway'
+import { AssistantModelPicker } from '../components/AssistantModelPicker'
+import { useAssistantModels, unavailableModelMessage } from '../lib/assistant-models'
+import { selectedModel } from '../../../ui-shared/assistant-models'
 import {
   fetchAssistantConfig,
   streamAssistantChat,
+  saveAssistantSession,
   type ChatMessage,
   type ToolCall,
 } from '../api/assistant'
 import { toolsPayload, toolById } from '../lib/assistantTools'
 import { ellipsisMiddle } from '../lib/format'
 import { t } from '../i18n'
+import { imageContext, type ImageAsset } from '../../../ui-shared/assistant-image-tools'
+import { AssistantImageResults } from '../../../ui-shared/assistant-image-results'
+import { loadAssistantImage } from '../api/assistant-images'
+import { readMobileImages } from '../lib/assistant-attachments'
+import { serverIdentity } from '../lib/servers'
 
 /**
  * AI 助手（手机端）。
@@ -45,6 +53,8 @@ type Bubble = {
   error?: string
   /** 这一轮里执行过的工具（显示成一行小字，让用户知道模型查了什么） */
   tools?: string[]
+  attachments?: string[]
+  images?: ImageAsset[]
 }
 
 type QuickAsk = {
@@ -64,18 +74,46 @@ let nextId = 1
 export function AssistantPage() {
   const [bubbles, setBubbles] = useState<Bubble[]>([])
   const [draft, setDraft] = useState('')
+  const [attachments, setAttachments] = useState<string[]>([])
+  const [readingImages, setReadingImages] = useState(false)
   const [busy, setBusy] = useState(false)
   /** 默认模型（来自网关配置）；null = 还没读到 */
   const [defaultModel, setDefaultModel] = useState<string | null | undefined>(undefined)
   /** 本次会话临时选的模型；空串 = 跟随配置 */
   const [model, setModel] = useState('')
-  const [models, setModels] = useState<ManageModel[]>([])
+  const { models, ready: modelsReady, loading: modelsLoading, error: modelsError, refresh: refreshModels } = useAssistantModels()
   const [pickerOpen, setPickerOpen] = useState(false)
+  const checkingModelRef = useRef(false)
+  const [checkingModel, setCheckingModel] = useState(false)
   /** 网关里勾选过的工具表（空 = 纯聊天，后端也不会注入系统提示词） */
   const [tools, setTools] = useState<Array<Record<string, unknown>>>([])
+  const enabledToolsRef = useRef<Record<string, boolean>>({})
+  const modeRef = useRef<'confirm' | 'full'>('confirm')
+  const sessionRef = useRef(crypto.randomUUID())
+  const mountedRef = useRef(true)
+  const saveQueueRef = useRef<Promise<void>>(Promise.resolve())
+  const historyRef = useRef<ChatMessage[]>([])
+  const fileRef = useRef<HTMLInputElement | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
+
+  const persist = (session: string, messages: ChatMessage[], selected: string, identity: string): Promise<void> => {
+    const snapshot = messages.slice()
+    const pending = saveQueueRef.current.catch(() => {}).then(async () => {
+      if (serverIdentity() !== identity) return
+      await saveAssistantSession(session, snapshot, selected)
+    })
+    saveQueueRef.current = pending.catch(failure => {
+      if (mountedRef.current && serverIdentity() === identity) store.toast(t('这条会话没能存进历史：{message}', { message: failure instanceof Error ? failure.message : String(failure) }), 'err')
+    })
+    return pending
+  }
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false; abortRef.current?.abort() }
+  }, [])
 
   // 读默认模型与工具勾选表：工具表决定后端注不注入系统提示词，必须一起读
   useEffect(() => {
@@ -85,6 +123,8 @@ export function AssistantPage() {
         if (cancelled) return
         setDefaultModel(config.model || null)
         const enabled = config.tools || {}
+        enabledToolsRef.current = enabled
+        modeRef.current = config.mode === 'full' ? 'full' : 'confirm'
         setTools(toolsPayload(enabled))
       })
       .catch(() => {
@@ -95,22 +135,9 @@ export function AssistantPage() {
     }
   }, [])
 
-  // 模型清单只在打开选择器时拉：不进页面就不该打这个请求
   useEffect(() => {
-    if (!pickerOpen || models.length) return
-    let cancelled = false
-    fetchManage()
-      .then(view => {
-        if (cancelled) return
-        setModels((view.models || []).filter(item => item.enabled !== false && item.id))
-      })
-      .catch(() => {
-        if (!cancelled) store.toast(t('读取模型清单失败'), 'err')
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [pickerOpen, models.length])
+    if (pickerOpen) void refreshModels().catch(() => {})
+  }, [pickerOpen, refreshModels])
 
   // 新内容到达时贴底（用户往上翻看历史时不打扰：只有本来就在底部才跟随）
   useEffect(() => {
@@ -121,26 +148,56 @@ export function AssistantPage() {
   }, [bubbles])
 
   const effectiveModel = model || defaultModel || ''
+  const currentOption = selectedModel(models, effectiveModel)
+  const modelWarning = modelsError
+    ? t('读取模型清单失败：{message}', { message: modelsError })
+    : !modelsReady ? t('正在读取可用模型…')
+    : effectiveModel && !currentOption ? unavailableModelMessage(effectiveModel) : ''
 
   /** 发一条消息（`text` 为空时取输入框） */
   const send = async (text?: string) => {
     const content = (text ?? draft).trim()
-    if (!content || busy) return
-
-    // 历史 = 已完成的对话（失败 / 空回复的气泡不进上下文）
-    const history: ChatMessage[] = bubbles
-      .filter(item => item.text.trim() && !item.error)
-      .map(item => ({ role: item.role, content: item.text }))
-    history.push({ role: 'user', content })
+    if ((!content && !attachments.length) || busy || readingImages || checkingModelRef.current) return
+    if (!effectiveModel) {
+      setPickerOpen(true)
+      return
+    }
+    const session = sessionRef.current
+    const identity = serverIdentity()
+    checkingModelRef.current = true
+    setCheckingModel(true)
+    let requestModel: string
+    try {
+      const options = await refreshModels()
+      if (!mountedRef.current || sessionRef.current !== session || serverIdentity() !== identity) return
+      const option = selectedModel(options, effectiveModel)
+      if (!option) {
+        store.toast(unavailableModelMessage(effectiveModel), 'err')
+        setPickerOpen(true)
+        return
+      }
+      requestModel = option.name
+    } catch (failure) {
+      if (!(failure instanceof DOMException && failure.name === 'AbortError') && sessionRef.current === session && serverIdentity() === identity) {
+        store.toast(t('读取模型清单失败：{message}', { message: failure instanceof Error ? failure.message : String(failure) }), 'err')
+      }
+      return
+    } finally {
+      checkingModelRef.current = false
+      if (serverIdentity() === identity) setCheckingModel(false)
+    }
+    const attached = [...attachments]
+    const history: ChatMessage[] = [...historyRef.current, { role: 'user', content, images: attached }]
 
     const userId = nextId++
     const replyId = nextId++
     setBubbles(prev => [
       ...prev,
-      { id: userId, role: 'user', text: content },
+      { id: userId, role: 'user', text: content, attachments: attached },
       { id: replyId, role: 'assistant', text: '', streaming: true, tools: [] },
     ])
     setDraft('')
+    setAttachments([])
     setBusy(true)
 
     const controller = new AbortController()
@@ -148,28 +205,29 @@ export function AssistantPage() {
     const patch = (next: Partial<Bubble>) =>
       setBubbles(prev => prev.map(item => (item.id === replyId ? { ...item, ...next } : item)))
 
+    let messages = history
+    let unfinishedText = ''
     try {
-      /**
-       * 工具循环：模型可能连续调几轮工具，每轮都要把结果回灌再发一次。
-       *
-       * 上限 6 轮 —— 与桌面端同一道闸：正常任务两三轮就收敛，跑到第六轮还在
-       * 调工具，多半是模型在绕圈（或者某只工具一直失败），继续烧额度没有意义。
-       */
-      let messages = history
+      await persist(session, messages, requestModel, identity).catch(() => {})
       /** 本轮执行过的工具（显示在气泡下方，让用户知道模型查了什么） */
       const usedTools: string[] = []
+      const generatedImages: ImageAsset[] = []
       for (let round = 0; round < 6; round++) {
+        if (controller.signal.aborted || !mountedRef.current || serverIdentity() !== identity) break
         let pendingCalls: ToolCall[] = []
         let roundText = ''
+        unfinishedText = ''
 
         await streamAssistantChat({
           messages,
           tools,
-          model: effectiveModel || null,
+          model: requestModel,
           signal: controller.signal,
           onEvent: event => {
+            if (!mountedRef.current || sessionRef.current !== session || serverIdentity() !== identity) return
             if (event.type === 'delta') {
               roundText += event.text
+              unfinishedText = roundText
               setBubbles(prev =>
                 prev.map(item =>
                   item.id === replyId ? { ...item, text: item.text + event.text } : item,
@@ -180,8 +238,13 @@ export function AssistantPage() {
             }
           },
         })
+        if (!mountedRef.current || sessionRef.current !== session || serverIdentity() !== identity) return
+        unfinishedText = ''
 
-        if (!pendingCalls.length) break
+        if (!pendingCalls.length) {
+          messages = [...messages, { role: 'assistant', content: roundText }]
+          break
+        }
 
         // 把这一轮的 assistant 消息（含工具调用）与工具结果一起回灌
         messages = [
@@ -189,14 +252,40 @@ export function AssistantPage() {
           { role: 'assistant', content: roundText, toolCalls: pendingCalls },
         ]
         for (const call of pendingCalls) {
+          if (!mountedRef.current || sessionRef.current !== session || serverIdentity() !== identity) break
+          if (controller.signal.aborted) {
+            messages = [...messages, { role: 'tool', toolCallId: call.id, content: '用户已停止，未执行这次操作。' }]
+            continue
+          }
           const tool = toolById(call.name)
           let result: string
+          let resultImages: ImageAsset[] | undefined
           try {
             if (!tool) throw new Error(t('未知的工具：{name}', { name: call.name }))
-            const outcome = await tool.run(parseArgs(call.arguments))
+            if (enabledToolsRef.current[tool.id] !== true) throw new Error(t('工具「{name}」未获授权，未执行。', { name: tool.label }))
+            const args = parseArgs(call.arguments)
+            const refreshingBalance = tool.id === 'list_account_balance' && args.refresh === true
+            if ((tool.kind !== 'read' || refreshingBalance) && modeRef.current !== 'full') {
+              const plan = tool.plan?.(args)
+              const description = [plan?.lead || t('将执行 {label}。', { label: tool.label }),
+                plan?.table ? plan.table.rows.map(row => row.join('：')).join('\n') : JSON.stringify(args, null, 2),
+                plan?.note, refreshingBalance ? t('实时余额查询会请求上游，并可能触发已配置的自动禁用规则。')
+                  : tool.kind === 'run' ? t('这会真实发起上游请求并消耗额度') : t('确认后立即生效'),
+              ].filter(Boolean).join('\n')
+              if (!await confirmDialog(description, { title: tool.label, confirmText: t('执行') })) {
+                messages = [...messages, { role: 'tool', toolCallId: call.id, content: '用户取消了这次操作，未执行。' }]
+                continue
+              }
+            }
+            if (controller.signal.aborted || !mountedRef.current || serverIdentity() !== identity) throw new DOMException('Aborted', 'AbortError')
+            if (tool.id === 'generate_images' || tool.id === 'edit_images') await persist(session, messages, requestModel, identity)
+            const outcome = await tool.run(args, { session, images: imageContext(messages), confirmed: true, signal: controller.signal })
+            if (serverIdentity() !== identity || sessionRef.current !== session) break
             result = outcome.text
+            resultImages = outcome.images
+            generatedImages.push(...(outcome.images || []))
             usedTools.push(tool.label)
-            patch({ tools: [...usedTools] })
+            patch({ tools: [...usedTools], images: [...generatedImages] })
           } catch (failure) {
             // 工具失败不中断对话：把错误如实回给模型，让它自己决定怎么解释
             result = JSON.stringify({
@@ -205,21 +294,32 @@ export function AssistantPage() {
           }
           messages = [
             ...messages,
-            { role: 'tool', toolCallId: call.id, content: result },
+            { role: 'tool', toolCallId: call.id, content: result, images: resultImages },
           ]
+          if (sessionRef.current === session && serverIdentity() === identity) historyRef.current = messages
+          if (resultImages?.length) await persist(session, messages, requestModel, identity).catch(() => {})
         }
-        if (controller.signal.aborted) break
+        await persist(session, messages, requestModel, identity).catch(() => {})
+        if (controller.signal.aborted || !mountedRef.current) break
+        if (round === 5) patch({ error: t('工具调用已达本轮上限，已停止继续执行。') })
       }
 
+      if (sessionRef.current !== session || serverIdentity() !== identity) return
+      historyRef.current = messages
+      await persist(session, messages, requestModel, identity).catch(() => {})
       // 流正常结束但一个字都没有：多半是上游只回了 tool_calls 或空响应
       setBubbles(prev =>
         prev.map(item => {
           if (item.id !== replyId) return item
-          if (item.text.trim()) return { ...item, streaming: false }
+          if (item.text.trim() || item.images?.length) return { ...item, streaming: false }
           return { ...item, streaming: false, error: t('模型没有返回内容') }
         }),
       )
     } catch (failure) {
+      if (sessionRef.current !== session || serverIdentity() !== identity) return
+      if (unfinishedText) messages = [...messages, { role: 'assistant', content: unfinishedText }]
+      historyRef.current = messages
+      void persist(session, messages, requestModel, identity).catch(() => {})
       const aborted = controller.signal.aborted
       patch({
         streaming: false,
@@ -231,10 +331,24 @@ export function AssistantPage() {
       })
       if (aborted) store.toast(t('已停止生成'))
     } finally {
-      abortRef.current = null
-      setBusy(false)
-      inputRef.current?.focus()
+      if (abortRef.current === controller) abortRef.current = null
+      if (mountedRef.current) {
+        setBusy(false)
+        inputRef.current?.focus()
+      }
     }
+  }
+
+  const addImages = async (files: FileList | File[]) => {
+    if (readingImages || busy || checkingModelRef.current) return
+    const session = sessionRef.current
+    setReadingImages(true)
+    try {
+      const images = await readMobileImages(files, attachments.length)
+      if (sessionRef.current === session) setAttachments(current => [...current, ...images])
+    } catch (failure) {
+      store.toast(failure instanceof Error ? failure.message : String(failure), 'err')
+    } finally { setReadingImages(false) }
   }
 
   const stop = () => {
@@ -242,9 +356,12 @@ export function AssistantPage() {
   }
 
   const clear = () => {
-    if (busy) abortRef.current?.abort()
+    if (busy || checkingModelRef.current) return
     setBubbles([])
     setDraft('')
+    setAttachments([])
+    historyRef.current = []
+    sessionRef.current = crypto.randomUUID()
   }
 
   return (
@@ -261,8 +378,9 @@ export function AssistantPage() {
       >
         <div style={{ flex: 1, minWidth: 0 }}>
           <b style={{ fontSize: 15 }}>{t('AI 助手')}</b>
-          <button
+          <Button size='default' variant='ghost'
             type='button'
+            disabled={busy || checkingModel}
             onClick={() => setPickerOpen(true)}
             style={{
               display: 'flex',
@@ -279,19 +397,20 @@ export function AssistantPage() {
           >
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {effectiveModel ? ellipsisMiddle(effectiveModel, 32) : t('选择对话模型')}
+              {effectiveModel && modelsReady && !currentOption ? ` · ${t('不可用')}` : ''}
             </span>
             <Icon name='chev' style={{ width: 11, height: 11, flex: 'none', transform: 'rotate(90deg)' }} />
-          </button>
+          </Button>
         </div>
-        <button
+        <Button size='icon-touch' variant='outline'
           type='button'
           className='m-icon-btn'
           aria-label={t('清空')}
           onClick={clear}
-          disabled={!bubbles.length}
+          disabled={!bubbles.length || busy || checkingModel}
         >
           <Icon name='refresh' />
-        </button>
+        </Button>
       </div>
 
       <div
@@ -321,6 +440,7 @@ export function AssistantPage() {
             return (
               <div key={bubble.id} style={{ display: 'flex', justifyContent: 'flex-end' }}>
                 <div style={{ ...bubbleStyle(true), whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                  {bubble.attachments?.map((url, index) => <img key={index} src={url} alt={t('图片 {n}', { n: index + 1 })} style={{ maxWidth: '100%', maxHeight: 160, borderRadius: 8, marginBottom: 6 }} />)}
                   {bubble.text}
                 </div>
               </div>
@@ -347,6 +467,7 @@ export function AssistantPage() {
                     />
                   ) : null}
                 </div>
+                {bubble.images?.length ? <AssistantImageResults images={bubble.images} load={loadAssistantImage} t={t} /> : null}
                 {bubble.error ? (
                   <div style={{ marginTop: 6, fontSize: 11.5, color: 'var(--m-danger)', lineHeight: 1.5 }}>
                     {bubble.error}
@@ -387,7 +508,7 @@ export function AssistantPage() {
         {bubbles.length === 0 ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 7, paddingTop: 2 }}>
             {QUICK_ASKS.map(item => (
-              <button
+              <Button size='default' variant='ghost'
                 key={item.label}
                 type='button'
                 onClick={() => void send(item.label)}
@@ -406,7 +527,7 @@ export function AssistantPage() {
               >
                 <Icon name={item.icon} style={{ width: 14, height: 14, color: 'var(--m-text-3)', flex: 'none' }} />
                 {item.label}
-              </button>
+              </Button>
             ))}
           </div>
         ) : null}
@@ -423,6 +544,17 @@ export function AssistantPage() {
           backdropFilter: 'blur(12px)',
         }}
       >
+        {attachments.length ? <div style={{ display: 'flex', gap: 6, paddingBottom: 8 }}>
+          {attachments.map((url, index) => <Button key={index} variant='ghost' disabled={checkingModel} onClick={() => setAttachments(current => current.filter((_, i) => i !== index))}
+            aria-label={t('移除图片 {n}', { n: index + 1 })} style={{ padding: 0, height: 56 }}>
+            <img src={url} alt={t('图片 {n}', { n: index + 1 })} style={{ height: 50, maxWidth: 70, objectFit: 'cover', borderRadius: 6 }} />
+          </Button>)}
+        </div> : null}
+        <input ref={fileRef} type='file' hidden multiple accept='image/png,image/jpeg,image/webp' onChange={event => {
+          const files = event.currentTarget.files
+          if (files) void addImages(files)
+          event.currentTarget.value = ''
+        }} />
         <div
           style={{
             display: 'flex',
@@ -434,10 +566,16 @@ export function AssistantPage() {
             border: '1px solid var(--m-line-strong)',
           }}
         >
-          <textarea
+          <Button variant='ghost' size='icon-touch' aria-label={t('添加图片')} disabled={busy || readingImages || checkingModel} onClick={() => fileRef.current?.click()}><Icon name='plus' /></Button>
+          <Textarea
             ref={inputRef}
+            disabled={checkingModel}
             value={draft}
             onChange={event => setDraft(event.target.value)}
+            onPaste={event => {
+              const files = Array.from(event.clipboardData.files)
+              if (files.length) { event.preventDefault(); void addImages(files) }
+            }}
             onKeyDown={event => {
               // 回车发送、Shift+回车换行（与桌面端同一手感）；输入法组合中的回车
               // 不算（中文输入时那是在选词，发出去就糟了）
@@ -463,10 +601,10 @@ export function AssistantPage() {
               fontFamily: 'inherit',
             }}
           />
-          <button
+          <Button size='default' variant='ghost'
             type='button'
             aria-label={busy ? t('停止') : t('发送')}
-            disabled={!busy && !draft.trim()}
+            disabled={readingImages || checkingModel || (!busy && (!modelsReady || !currentOption || (!draft.trim() && !attachments.length)))}
             onClick={() => (busy ? stop() : void send())}
             style={{
               width: 34,
@@ -478,7 +616,7 @@ export function AssistantPage() {
               display: 'grid',
               placeItems: 'center',
               flex: 'none',
-              opacity: busy || draft.trim() ? 1 : 0.45,
+              opacity: busy || draft.trim() || attachments.length ? 1 : 0.45,
             }}
           >
             {busy ? (
@@ -486,111 +624,31 @@ export function AssistantPage() {
             ) : (
               <Icon name='up' style={{ width: 17, height: 17 }} />
             )}
-          </button>
+          </Button>
         </div>
+        {modelWarning ? <p role='status' className='mb-2 text-[11.5px] leading-[1.6] text-subtle'>{modelWarning}</p> : null}
         <div style={{ textAlign: 'center', fontSize: 10.5, color: 'var(--m-text-3)', marginTop: 7 }}>
           {busy ? t('正在生成，点右侧按钮可停止') : t('对话由网关转发到上游模型，用量计入请求日志')}
         </div>
       </div>
 
-      <ModelPicker
+      <AssistantModelPicker
         open={pickerOpen}
         onClose={() => setPickerOpen(false)}
         models={models}
         current={effectiveModel}
         defaultModel={defaultModel || ''}
+        followingDefault={!model}
+        ready={modelsReady}
+        loading={modelsLoading}
+        warning={modelWarning}
+        onRefresh={() => { void refreshModels().catch(() => {}) }}
         onPick={value => {
           setModel(value)
           setPickerOpen(false)
         }}
       />
     </div>
-  )
-}
-
-/** 模型选择抽屉：本次会话临时生效，不写回网关配置 */
-function ModelPicker({
-  open,
-  onClose,
-  models,
-  current,
-  defaultModel,
-  onPick,
-}: {
-  open: boolean
-  onClose: () => void
-  models: ManageModel[]
-  current: string
-  defaultModel: string
-  onPick: (value: string) => void
-}) {
-  return (
-    <Sheet open={open} onOpenChange={next => { if (!next) onClose() }}>
-      <SheetContent>
-        <SheetHeader>
-          <SheetTitle>{t('选择对话模型')}</SheetTitle>
-        </SheetHeader>
-        <SheetBody>
-          <button
-            type='button'
-            className='m-row'
-            onClick={() => onPick('')}
-            style={{
-              borderRadius: 'var(--m-r-md)',
-              border: '1px solid var(--m-line)',
-              background: current === defaultModel ? 'var(--m-primary-soft)' : 'var(--m-surface)',
-            }}
-          >
-            <span className='m-logo'>
-              <Icon name='settings' />
-            </span>
-            <div className='m-grow'>
-              <div className='m-t1'>{t('跟随网关设置')}</div>
-              <div className='m-t2 m-mono' style={{ fontSize: 11.5 }}>
-                {defaultModel || t('还没有配置默认模型')}
-              </div>
-            </div>
-            {current === defaultModel ? <Icon name='check' style={{ width: 16, height: 16, color: 'var(--m-primary)' }} /> : null}
-          </button>
-
-          {models.length ? (
-            models.map(item => {
-              const id = String(item.id || '')
-              const picked = current === id
-              return (
-                <button
-                  key={`${item.provider || ''}:${id}`}
-                  type='button'
-                  className='m-row'
-                  onClick={() => onPick(id)}
-                  style={{
-                    borderRadius: 'var(--m-r-md)',
-                    border: '1px solid var(--m-line)',
-                    background: picked ? 'var(--m-primary-soft)' : 'var(--m-surface)',
-                  }}
-                >
-                  <div className='m-grow' style={{ minWidth: 0 }}>
-                    <div className='m-t1 m-mono' style={{ fontSize: 12.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {id}
-                    </div>
-                    <div className='m-t2'>{item.providerLabel || item.provider || ''}</div>
-                  </div>
-                  {picked ? <Icon name='check' style={{ width: 16, height: 16, color: 'var(--m-primary)' }} /> : null}
-                </button>
-              )
-            })
-          ) : (
-            <div style={{ fontSize: 12, color: 'var(--m-text-3)', padding: '4px 2px' }}>
-              {t('没有已启用的模型，请先在「模型管理」里启用')}
-            </div>
-          )}
-
-          <p style={{ margin: 0, fontSize: 11.5, lineHeight: 1.7, color: 'var(--m-text-3)' }}>
-            {t('这里只改本次会话用的模型，不会改网关里保存的默认值。')}
-          </p>
-        </SheetBody>
-      </SheetContent>
-    </Sheet>
   )
 }
 

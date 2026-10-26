@@ -72,12 +72,17 @@ export function readBase64(file: File): Promise<string> {
 }
 
 export function pluginName(id: string, name?: string | null): string {
-  return id === 'agent2api-providers' ? t('提供商增强') : name || id
+  if (id === 'agent2api-providers') return t('提供商增强')
+  if (id === 'agent2api-web-providers') return t('网页提供商')
+  return name || id
 }
 
 export function pluginDescription(id: string, description?: string | null): string {
   if (id === 'agent2api-providers') {
     return t('为网关扩展多家 AI 提供商，支持账号登录与导入、模型调用、凭证续期、模型目录、余额查询和签到。具体能力以各提供商的支持情况为准。')
+  }
+  if (id === 'agent2api-web-providers') {
+    return t('为 Agent2API 扩展网页提供商，支持智谱清言的模型调用、访客与登录账号、凭证续期、模型目录、积分查询、签到和任务领取。')
   }
   return description || t('作者尚未提供插件介绍。')
 }

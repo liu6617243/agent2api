@@ -148,16 +148,18 @@ fn routed_account_id(accounts: &Value, model: Option<&str>, counts: &HashMap<Str
     // 被限制器软跳过的账号先剔除（余额不足 / Token 限额，与转发选路同一判据，
     // 见 `upstream::rotate::filter_limiter_blocked`）：★ 标的是「下一个请求会先用
     // 谁」，被拦的账号不该标 ★ —— 否则两边说的又不是一件事了。
-    let facts = crate::server::core::usage_records::balance_facts();
-    let token_facts = crate::server::core::limiter::token_facts();
+    let facts = crate::server::core::limiter::sources::facts();
+    let limiter_counts = crate::server::core::limiter::counter::facts();
+    let keys = routing::CooldownKeys::new(model);
     let now = crate::server::logging::now_ms();
     let candidate_accounts: Vec<Value> = routing::accounts_of(accounts)
         .into_iter()
-        .filter(|account| {
-            !crate::server::core::usage_records::balance_blocked(account, &facts)
-                && !crate::server::core::limiter::token_skip_blocked(account, &token_facts, now)
-        })
+        .filter(|account| !crate::server::core::limiter::evaluate::blocked(
+            account, &keys.for_account(account), &facts, &limiter_counts, now,
+        ))
         .collect();
+    let candidate_accounts = crate::server::core::routing_scope::apply_accounts(&candidate_accounts, model);
+    if provider_chain.is_empty() { return Value::Null; }
     routing::pick_for_model(
         &candidate_accounts,
         model,
@@ -779,12 +781,13 @@ pub async fn login_loomy_sms_send(State(state): State<ServerState>, body: Bytes)
         Ok(result) => ok_json(result),
         Err(error) => management_error(error.status_code, error.message),
     }
-}/// 用手机号 + 验证码登录并**直接落成账号**（**Loomy 专用**）。
+}
+
+/// 用手机号 + 验证码登录并**直接落成账号**（**Loomy 专用**）。
 ///
 /// body `{phone, code, msgid, name?}` → `{account, list}` —— 响应形状与
-/// `POST /api/accounts` **逐字一致**：登录只是另一种拿到凭证的方式，落盘、
-/// 命名、去重、优先级分配全部复用既有的添加路径（`add_loomy_account`），
-/// 前端因此可以直接把结果交给同一个「已添加账号」收尾逻辑。
+/// `POST /api/accounts` **逐字一致**：登录只是另一种拿到凭证的方式，
+/// 账号保存与去重复用插件登录的落库通路，前端可以直接交给「已添加账号」收尾逻辑。
 pub async fn login_loomy_sms_verify(State(state): State<ServerState>, body: Bytes) -> Response {
     let payload = parse_body(&body).unwrap_or(Value::Null);
     let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
@@ -795,7 +798,7 @@ pub async fn login_loomy_sms_verify(State(state): State<ServerState>, body: Byte
     else {
         return management_error(400, "Loomy 的提供商插件没有安装，无法登录");
     };
-    let credentials = match adapter
+    let mut account = match adapter
         .admin_action(
             state.store(),
             "",
@@ -804,34 +807,50 @@ pub async fn login_loomy_sms_verify(State(state): State<ServerState>, body: Byte
         )
         .await
     {
-        Ok(credentials) => credentials,
+        Ok(value) => match serde_json::from_value::<agent2api_provider_protocol::NormalizedAccount>(value)
+        {
+            Ok(account) => account,
+            Err(error) => {
+                return management_error(502, format!("插件返回的登录结果无法解析：{error}"))
+            }
+        },
         Err(error) => return management_error(error.status_code, error.message),
     };
-    // 备注名：用户显式填的优先；没填则用脱敏手机号（`138****8000`）——
-    // 比默认的「Loomy 账号」更像用户自己认得出来的标识
-    let name = payload
+    if let Some(name) = payload
         .get("name")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            credentials
-                .get("phoneTail")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-    let store = state.store();
-    match store.add_loomy_account(&credentials, name.as_deref()) {
-        Ok(account) => {
+    {
+        if let Some(public) = account.public.as_object_mut() {
+            public.insert(
+                "name".to_string(),
+                Value::String(name.chars().take(100).collect()),
+            );
+        }
+    }
+    match adapter.persist_login_account(&account) {
+        Ok(account_id) => {
             let label = account
+                .public
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("Loomy 账号");
             logging::log("[Login]", &format!("✅ Loomy 登录成功: {label}"));
-            ok_json(json!({ "account": account, "list": store.list_visible_accounts() }))
+            let list = state.store().list_visible_accounts();
+            let account = list
+                .get("accounts")
+                .and_then(Value::as_array)
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| item.get("id").and_then(Value::as_str) == Some(&account_id))
+                })
+                .cloned()
+                .unwrap_or(account.public);
+            ok_json(json!({ "account": account, "list": list }))
         }
-        Err(error) => super::accounts::store_error(error),
+        Err(error) => management_error(error.status_code, error.message),
     }
 }
 

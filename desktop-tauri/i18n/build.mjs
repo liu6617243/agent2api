@@ -40,6 +40,8 @@ const OUT_DIR = path.join(DESKTOP, 'ui', 'i18n')
 
 /** 需要产出词典的语言（简体不需要：查不到就显示键本身，即简体原文） */
 const OUTPUT_LOCALES = ['en', 'zh-Hant', 'ja', 'ko', 'pt-BR']
+const ONLY_DOMAIN = process.argv.find(arg => arg.startsWith('--domain='))?.slice('--domain='.length)
+if (ONLY_DOMAIN && !DOMAIN_ORDER.includes(ONLY_DOMAIN)) throw new Error(`Unknown i18n domain: ${ONLY_DOMAIN}`)
 
 /* ─── 小工具 ───────────────────────────────── */
 
@@ -152,11 +154,11 @@ async function main() {
   const toHant = makeHantGenerator(converter, glossary)
 
   const { keys, values } = loadSources()
-  const produced = DOMAIN_ORDER.filter(domain => (keys.get(domain) || []).length > 0)
+  const produced = DOMAIN_ORDER.filter(domain => (!ONLY_DOMAIN || domain === ONLY_DOMAIN) && (keys.get(domain) || []).length > 0)
 
   // 先全部生成到内存并自校验，再落盘 —— 不写半套坏词典
   const outputs = []
-  outputs.push({ file: path.join(OUT_DIR, 'manifest.js'), content: manifestContent() })
+  if (!ONLY_DOMAIN) outputs.push({ file: path.join(OUT_DIR, 'manifest.js'), content: manifestContent() })
 
   let hantGenerated = 0
   let hantManual = 0
@@ -196,7 +198,7 @@ async function main() {
     if (!fs.existsSync(dir)) continue
     for (const name of fs.readdirSync(dir).filter(file => file.endsWith('.js'))) {
       const domain = name.slice(0, -'.js'.length)
-      if (!produced.includes(domain)) {
+      if ((!ONLY_DOMAIN || domain === ONLY_DOMAIN) && !produced.includes(domain)) {
         fs.unlinkSync(path.join(dir, name))
         process.stdout.write(`[build] 清理过期词典：${locale}/${name}\n`)
       }
@@ -210,7 +212,7 @@ async function main() {
 
   // 报告
   process.stdout.write(`\n[build] 产出域 ${produced.length} 个：${produced.join(', ') || '（无）'}\n`)
-  process.stdout.write(`[build] manifest.js + ${OUTPUT_LOCALES.length} 个语言目录，共 ${outputs.length} 个文件\n`)
+  process.stdout.write(`[build] ${ONLY_DOMAIN ? ONLY_DOMAIN : 'manifest.js'} + ${OUTPUT_LOCALES.length} 个语言目录，共 ${outputs.length} 个文件\n`)
   if (converter) {
     process.stdout.write(`[build] zh-Hant：opencc 全量生成 ${hantGenerated} 条，人工译文覆盖 ${hantManual} 条\n`)
   } else {

@@ -671,12 +671,15 @@ pub(super) fn daily_trend(daily: &BTreeMap<String, DailyEntry>, start: &str, end
         let key = date_key(cursor);
         let day = daily.get(&key);
         let (tokens, requests) = day.map(|item| (item.tokens, item.requests)).unwrap_or((0, 0));
-        let models = day.map(|item| model_breakdown_json(&item.model_tokens)).unwrap_or_default();
+        let models = day.map(|item| super::source_report::all_model_rows(&item.model_tokens)).unwrap_or_default();
+        let (clients, api_keys) = day.map(super::source_report::source_breakdown).unwrap_or_default();
         out.push(json!({
             "date": key,
             "tokens": tokens,
             "requests": requests,
             "models": models,
+            "clients": clients,
+            "apiKeys": api_keys,
         }));
         cursor += ChronoDuration::days(1);
     }

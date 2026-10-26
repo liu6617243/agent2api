@@ -12,7 +12,7 @@
 [![stars](https://img.shields.io/github/stars/aimod-cc/Agent2API?style=flat&color=yellow)](https://github.com/aimod-cc/Agent2API/stargazers)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/aimod-cc/Agent2API/releases/latest)
 
-[✨ 核心特性](#-核心特性) • [💬 社群與支援](#-社群與支援) • [🧩 插件擴充](#-插件擴充) • [🚀 快速開始](#-快速開始) • [📦 安裝與部署](./install.zh-Hant.md) • [📸 介面預覽](#-介面預覽) • [🔧 開發與建置](#-開發與建置) • [📜 使用聲明](#-使用聲明)
+[✨ 核心特性](#-核心特性) • [💬 社群與支援](#-社群與支援) • [🚀 快速開始](#-快速開始) • [📦 安裝與部署](./install.zh-Hant.md) • [📸 介面預覽](#-介面預覽) • [🔧 開發與建置](#-開發與建置) • [📜 使用聲明](#-使用聲明)
 
 </div>
 
@@ -24,7 +24,7 @@ Agent2API 是一個 **AI 路由閘道 + Agent 客戶端接管**專案。它將�
 
 ## ✨ 核心特性
 
-- 🔌 **統一模型介面** —— 支援 OpenAI Chat / Responses 與 Anthropic Messages 協定，以及統一模型清單
+- 🔌 **統一模型介面** —— 支援 OpenAI Chat / Responses / Images 與 Anthropic Messages 協定，以及統一模型清單；小浣熊、Loomy、Antigravity 提供文字生圖，Loomy 與 Antigravity 亦支援參考圖編輯；生圖與編輯也可由 AI 助手工具呼叫
 - 🧭 **AI 路由** —— 集中設定模型對應、帳號優先順序、負載平衡、工作階段黏性與失敗切換
 - 🤖 **Agent 客戶端接管** —— 管理本機客戶端的多套連線設定，匯入既有設定、預覽寫入內容並切換閘道或自訂服務
 - 🧩 **插件擴充** —— 供應商實作獨立安裝與更新，不隨主程式打包；不需要時可只使用路由閘道
@@ -49,20 +49,11 @@ Agent2API 是一個 **AI 路由閘道 + Agent 客戶端接管**專案。它將�
 
 ## 💬 社群與支援
 
-- **QQ 群**：Agent2API 交流群 —— **群 1（`1127656296`）即將滿員，請優先加群 2（`1130894674`）**；在 QQ 裡搜尋群號即可加入。
+- **QQ 群**：Agent2API 交流群 —— **群 1（`1127656296`）與群 2（`1130894674`）都即將滿員，請加群 3（`1108276647`）**；在 QQ 裡搜尋群號即可加入。
 - **Telegram 群**：<https://t.me/+9gM8YPvgRL02NGRl>
 - **Discord 群**：<https://discord.gg/z9GzSJMWp>
 - **💖 贊助**：如果 Agent2API 幫到了你，歡迎[請作者喝杯咖啡](./SPONSOR.md)；贊助完全自願，不解鎖任何功能。
 - **🤝 贊助 / 商務合作**：想贊助本專案，或想讓你的產品出現在這裡？寄信到 [541675139@qq.com](mailto:541675139@qq.com)。
-
-## 🧩 插件擴充
-
-主程式負責路由閘道、Agent 客戶端設定與插件管理，不內建供應商專屬實作。需要更多能力時，可在「插件」頁安裝「提供商增強」或其他相容插件。
-
-- [供應商插件原始碼與支援情況](https://github.com/ProvidersPlugin/Agent2Providers)
-- [插件索引](https://github.com/Agent2plugin/Agent2plugin)
-
-插件由使用者按需選擇，安裝、啟停與更新獨立於主程式。實際供應商與功能以插件清單和插件倉庫說明為準。
 
 ## 🚀 快速開始
 
@@ -146,10 +137,6 @@ npm run build:icon         # 產生圖示來源圖（改圖示設計後執行，
 macOS 的 `.dmg` **只能在 macOS 上建置**（`npm --prefix desktop-tauri run build -- --target universal-apple-darwin`），無法從 Windows 交叉編譯，因此正式產物由 CI 的 `build` 工作流產出（`macos-latest` + 雙目標合併）；Linux 桌面端包由同一工作流的 `linux-desktop` job 產出（deb + AppImage）；Docker 映像與容器內更新用的伺服器包由 `linux-server` job 產出（沿用 Dockerfile 的編譯路徑，包內執行檔與映像同源同工具鏈）。
 
 ## 📜 使用聲明
-
-### 專案範圍
-
-本專案提供 AI 路由閘道與本機 Agent 客戶端設定管理，不是任何模型服務或客戶端廠商的官方產品，也不代表其授權、認可或贊助。供應商專屬功能由獨立插件維護，使用前請確認相應服務條款、帳號權限與插件來源。
 
 ### 憑證與資料安全
 

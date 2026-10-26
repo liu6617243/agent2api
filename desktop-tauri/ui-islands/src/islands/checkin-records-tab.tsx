@@ -1,10 +1,12 @@
 import * as React from 'react'
-import { Badge, Button, Input, SegmentedControl } from '@ui'
+import { Badge, Button, Input, SegmentedControl, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Card, CardHeader, Table, TableHeader, TableRow, TableHead, TableBody, TableCell } from '@ui'
 import { clearRecords, loadRecords, patch, store } from './checkin-store'
 import {
   OUTCOME_VIEW, SOURCE_LABEL, formatShort, formatTime,
   type RecordRow,
 } from './checkin-types'
+import { confirmDialog } from '@ui'
+import { Empty } from '@ui'
 
 /**
  * 「签到记录」标签页：每账号一行的明细台账。
@@ -87,22 +89,22 @@ export function RecordsTab(): React.ReactElement {
 
   return (
     <div className="ck-main">
-      <section className="panel">
-        <div className="panel-head">
+      <Card render={<section />} className="panel">
+        <CardHeader className="panel-head">
           <h2>签到记录</h2>
           <span className="panel-sub">每执行一次签到 · 每个账号一条明细 · 结果与收益以后端落账为准</span>
           <Button
             size="sm"
             variant="destructive"
             className="ml-auto flex-none"
-            onClick={() => {
-              if (!window.confirm('确定清空全部签到记录？清空后无法恢复。')) return
+            onClick={async () => {
+              if (!await confirmDialog('确定清空全部签到记录？清空后无法恢复。')) return
               void clearRecords(true)
             }}
           >
             清空全部
           </Button>
-        </div>
+        </CardHeader>
 
         <div className="ck-filters">
           <SegmentedControl
@@ -111,15 +113,14 @@ export function RecordsTab(): React.ReactElement {
             onValueChange={changeRange}
             aria-label="时间范围"
           />
-          <select
-            className="ck-input ck-input-select"
-            value={query.outcome}
-            onChange={event => apply({ outcome: event.currentTarget.value })}
-          >
-            {OUTCOME_OPTIONS.map(option => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </select>
+          <Select value={query.outcome} onValueChange={value => apply({ outcome: String(value) })}>
+            <SelectTrigger aria-label='签到结果'>
+              <SelectValue>{OUTCOME_OPTIONS.find(option => option.value === query.outcome)?.label || '全部结果'}</SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              {OUTCOME_OPTIONS.map(option => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
+            </SelectContent>
+          </Select>
           <Input
             type="search"
             className="ck-input-search"
@@ -141,12 +142,12 @@ export function RecordsTab(): React.ReactElement {
         ) : null}
 
         {store.recordsLoading && store.records.length === 0 ? (
-          <div className="ck-empty">正在读取签到记录…</div>
+          <Empty className="ck-empty">正在读取签到记录…</Empty>
         ) : store.records.length === 0 ? (
-          <div className="ck-empty">这段时间里还没有签到记录。</div>
+          <Empty className="ck-empty">这段时间里还没有签到记录。</Empty>
         ) : (
           <div className="ck-records-scroll">
-            <table className="ck-table ck-records-table">
+            <Table container={false} className="ck-table ck-records-table">
               <colgroup>
                 <col className="ck-col-time" />
                 <col className="ck-col-account" />
@@ -155,45 +156,45 @@ export function RecordsTab(): React.ReactElement {
                 <col className="ck-col-outcome" />
                 <col className="ck-col-detail" />
               </colgroup>
-              <thead>
-                <tr>
-                  <th>时间</th>
-                  <th>账号</th>
-                  <th>提供商</th>
-                  <th>来源</th>
-                  <th>结果</th>
-                  <th>说明</th>
-                </tr>
-              </thead>
-              <tbody>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>时间</TableHead>
+                  <TableHead>账号</TableHead>
+                  <TableHead>提供商</TableHead>
+                  <TableHead>来源</TableHead>
+                  <TableHead>结果</TableHead>
+                  <TableHead>说明</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
                 {store.records.map((row, index) => {
                   const view = OUTCOME_VIEW[row.outcome ?? '']
                   return (
-                    <tr key={`${row.ts}-${row.accountId ?? index}`} className={row.outcome === 'failed' ? 'ck-row-fail' : undefined}>
-                      <td className="ck-col-time">
+                    <TableRow key={`${row.ts}-${row.accountId ?? index}`} className={row.outcome === 'failed' ? 'ck-row-fail' : undefined}>
+                      <TableCell className="ck-col-time">
                         <span>{formatShort(row.ts)}</span>
                         {row.date ? <span className="ck-record-date">{row.date}</span> : null}
-                      </td>
-                      <td>{row.accountName || row.accountId || '—'}</td>
-                      <td className="ck-record-source">{row.provider || '—'}</td>
-                      <td>
+                      </TableCell>
+                      <TableCell>{row.accountName || row.accountId || '—'}</TableCell>
+                      <TableCell className="ck-record-source">{row.provider || '—'}</TableCell>
+                      <TableCell>
                         <span>{SOURCE_LABEL[row.source ?? ''] ?? row.source ?? '—'}</span>
                         {row.reason ? <span className="ck-record-reason">{row.reason}</span> : null}
-                      </td>
-                      <td>
+                      </TableCell>
+                      <TableCell>
                         {view
                           ? <Badge variant={view.variant} shape="tag">{view.label}</Badge>
                           : <Badge variant="outline" shape="tag">{row.outcome || '—'}</Badge>}
                         {row.keptActive ? <Badge variant="outline" shape="tag">保活</Badge> : null}
-                      </td>
-                      <td className={row.error ? 'ck-record-detail-fail' : undefined}>
+                      </TableCell>
+                      <TableCell className={row.error ? 'ck-record-detail-fail' : undefined}>
                         {detailText(row)}
-                      </td>
-                    </tr>
+                      </TableCell>
+                    </TableRow>
                   )
                 })}
-              </tbody>
-            </table>
+              </TableBody>
+            </Table>
           </div>
         )}
 
@@ -206,7 +207,7 @@ export function RecordsTab(): React.ReactElement {
             <Button size="sm" variant="outline" disabled={page >= pageCount} onClick={() => goPage(pageCount)}>末页</Button>
           </div>
         ) : null}
-      </section>
+      </Card>
     </div>
   )
 }

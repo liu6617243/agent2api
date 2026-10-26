@@ -26,37 +26,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// 原始正文的**单侧**字节上限：请求侧 / 响应侧各自独立计，超出截断。
-///
-/// 为什么放在存储层而不是采集处（`api::pipeline`）：`raw_body` 读取时要按
-/// 同一个值做「是否被截断」的判定，采集与读取共用一份常量才不会漂 ——
-/// 而依赖方向必须是 api → request_stats（存储层不该回头依赖路由层）。
-///
-/// 为什么是 128 KiB：足够装下绝大多数对话轮的完整 JSON（含 system 与工具
-/// 定义）；更长的报文通常是超大上下文或附件 —— 那种报文的前 128 KiB 已足够
-/// 「预览对话」辨认这一轮聊了什么。采集与调试模式同一个开关（见
-/// `api::pipeline::capture_raw_body`）：关着时两侧都不采，本上限只约束
-/// 开着时的单条体积。两侧各自截断：一侧超长不该吃掉另一侧的配额。
-pub const MAX_RAW_BODY_BYTES: usize = 128 * 1024;
+use super::source::{ApiKeyAccum, ClientAccum, RequestSource, SOURCE_STATS_VERSION};
 
-/// `request_raw`（原始正文）的**总条数上限**：超出时按 `ts` 从旧到新删。
-///
-/// 为什么需要它：`MAX_RAW_BODY_BYTES` 只管「一条多大」，不管「一共存多少条」——
-/// 调试模式开着跑一阵，这张表就会攒成整个库里最大的一块。实测某用户的库：
-/// 明细三万余行、原始正文只有 1,455 条，后者却占 **244 MB**（平均每条 168 KB，
-/// 因为对话轮次的完整 JSON 基本都贴着上限）。库文件因此膨胀到 470 MB，而
-/// SQLite 的页面缓存只有几 MB 量级 —— 受影响的已经不只是这张表的读取，而是
-/// 同库所有查询的页命中率。
-///
-/// 为什么按**条数**判而不是按字节：条数一条 `COUNT(*)` 就数出来（主键索引上
-/// 零点几毫秒），而按字节要 `SUM(size)` / `SUM(length(...))` —— 实测在同一个库上
-/// 分别要 180 ms / 270 ms（要走 overflow 页读大字段），放进每请求都要跑的记账
-/// 路径是拿一个真问题换一个更大的问题（见 `sql::count_raw` 的原话）。
-///
-/// 1,000 条的取舍：预览对话服务的是排查（「刚才那条请求发了什么」），最近的
-/// 一千条覆盖了全部近期排查场景；按当前库的平均体积折算约 160 MB，比不限量
-/// 好得多，又不必让用户去找开关。真要看更早的正文，`ts` 与明细都还在 ——
-/// 少的是正文，不是记录本身。
+/// `request_raw` 的留存条数上限；正文完整保存，仅淘汰最旧的记录。
 pub const MAX_RAW_ROWS: usize = 1000;
 
 /// 查询分页的默认条数与上限。
@@ -64,41 +36,6 @@ pub const MAX_RAW_ROWS: usize = 1000;
 /// 与 `api::stats_api` 的 `limit` 解析使用。
 pub const DEFAULT_LIMIT: usize = 50;
 pub const MAX_LIMIT: usize = 500;
-
-/// 保留期设置（对应设置页「数据保留」里的两个天数，带默认值）。
-///
-/// 用独立结构而不是把天数直接摊进构造函数：将来设置里加字段时
-/// `with_db(db, get_retention)` 的签名不用变，调用方也不用跟着改。
-///
-/// 默认 99999 天（约 274 年）是**故意的近似无限**：默认行为与「全量保留」
-/// 一致，用户随时可以把某一项改小、保存后立即裁剪。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Retention {
-    /// 明细保留天数
-    pub request_days: i64,
-    /// 按天聚合保留天数
-    pub daily_days: i64,
-}
-
-impl Default for Retention {
-    fn default() -> Self {
-        Self { request_days: 99999, daily_days: 99999 }
-    }
-}
-
-impl Retention {
-    /// 归一化：夹到与后端同一套范围里（`config::RETENTION_MIN_DAYS` /
-    /// `RETENTION_MAX_DAYS`，常量注释写明两侧必须同源）。读侧（config 解析）
-    /// 与写侧（PUT 校验）都已按这套范围处理过，这里再夹一次是防御：
-    /// `Retention` 还会被手改的库值构造出来。
-    pub(super) fn normalized(self) -> Self {
-        use crate::server::config::{RETENTION_MAX_DAYS, RETENTION_MIN_DAYS};
-        Self {
-            request_days: self.request_days.clamp(RETENTION_MIN_DAYS, RETENTION_MAX_DAYS),
-            daily_days: self.daily_days.clamp(RETENTION_MIN_DAYS, RETENTION_MAX_DAYS),
-        }
-    }
-}
 
 /// 一条请求日志。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -319,8 +256,8 @@ pub struct RequestEntry {
     /// 空串显示成占位符。请求日志的「客户端」列读它。
     ///
     /// 与 `phase` 同一位置纪律：新加的列排在结构体末尾。
-    #[serde(default)]
-    pub client: String,
+    #[serde(flatten)]
+    pub source: RequestSource,
 }
 
 /// 一个被命中的敏感词及其次数（存储契约）。
@@ -357,6 +294,22 @@ pub struct AttemptDetail {
     /// 这一轮承载的账号展示名（空串 = 该轮没有账号记录）
     #[serde(default)]
     pub account: String,
+    #[serde(rename = "accountId", default)]
+    pub account_id: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub reasoning: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(rename = "stickyHit", default)]
+    pub sticky_hit: bool,
+    #[serde(rename = "startedAt", default)]
+    pub started_at: Option<i64>,
+    #[serde(rename = "responseAt", default)]
+    pub response_at: Option<i64>,
+    #[serde(rename = "finishedAt", default)]
+    pub finished_at: Option<i64>,
     /// 这一轮的 HTTP 状态码（None = 未定论或传输层失败，见采集侧的说明）
     #[serde(default)]
     pub status: Option<i64>,
@@ -489,7 +442,7 @@ pub struct NewRequestEntry {
     /// 请求来源客户端（入口由 `User-Agent` 判别后带入，见 `RequestEntry::client`；
     /// 不采集的路径为空串）。模型测试没有下游 UA，保持空串 —— 「谁发起的」
     /// 那件事已经由 `is_test` 表达，这里不编一个 `test` 值出来。
-    pub client: String,
+    pub source: RequestSource,
 }
 
 impl NewRequestEntry {
@@ -528,7 +481,7 @@ impl NewRequestEntry {
             is_test: false,
             // 客户端同样「有采集才有值」：入口取到 UA 才填（见 `RequestEntry::client`），
             // 拿不到 UA 的路径保持空串，前端显示占位符
-            client: String::new(),
+            source: RequestSource::default(),
         }
     }
 
@@ -603,6 +556,14 @@ impl NewRequestEntry {
                     // 账号名 trim 的理由与 provider 相同（空白不该造出一个
                     // 「看起来不同的名字」）；空串语义 = 该轮没有账号记录
                     account: item.account.trim().to_string(),
+                    account_id: item.account_id.trim().to_string(),
+                    model: item.model.trim().to_string(),
+                    reasoning: item.reasoning.trim().to_string(),
+                    reason: item.reason,
+                    sticky_hit: item.sticky_hit,
+                    started_at: item.started_at,
+                    response_at: item.response_at,
+                    finished_at: item.finished_at,
                     status: item.status,
                     error: item.error.filter(|text| !text.is_empty()),
                     // 重试链：reason 为空的项丢弃（同敏感词的 word 空项 ——
@@ -644,7 +605,7 @@ impl NewRequestEntry {
             // 客户端同理原样透传（trim 的理由与 provider 相同）：入口已经过
             // `core::client::classify`，存储层不再重新归类 —— 存储层不认识
             // UA 规则，两处各判一遍迟早会漂
-            client: self.client.trim().to_string(),
+            source: self.source.normalized(),
         }
     }
 }
@@ -705,6 +666,7 @@ pub struct RunningProgress {
     /// 到此刻为止的尝试明细（含**还没定局**的那一轮：`status` / `error` 都为空
     /// —— 前端据此把最后一条渲染成「进行中」，见 `ui/request-hover.js`）
     pub attempt_details: Vec<AttemptDetail>,
+    pub route: Option<Value>,
     /// 本次请求命中的脱敏规则（空表 = 没命中）
     pub sensitive_hits: Vec<SensitiveHit>,
 }
@@ -756,6 +718,13 @@ pub struct DailyEntry {
     /// 窗口，只有明细的话 `all` / `month` 会少掉一大段。
     #[serde(rename = "accountStats", default, skip_serializing_if = "Vec::is_empty")]
     pub account_stats: Vec<AccountAccum>,
+    #[serde(rename = "clientStats", default, skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::server::request_stats) client_stats: Vec<ClientAccum>,
+    #[serde(rename = "apiKeyStats", default, skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::server::request_stats) api_key_stats: Vec<ApiKeyAccum>,
+    /// 来源维度回填版本，旧行默认 0；用于一次性修正历史回填口径。
+    #[serde(rename = "sourceStatsVersion", default)]
+    pub source_stats_version: i64,
 }
 
 impl DailyEntry {
@@ -771,6 +740,9 @@ impl DailyEntry {
             model_tokens: Vec::new(),
             provider_stats: Vec::new(),
             account_stats: Vec::new(),
+            client_stats: Vec::new(),
+            api_key_stats: Vec::new(),
+            source_stats_version: SOURCE_STATS_VERSION,
         }
     }
 }
@@ -848,6 +820,12 @@ pub struct RequestQuery {
     /// 空 id 的行（一次都没发出去就失败的请求）**筛不到** —— 那不是某一家的问题，
     /// 用 `status=error` 看它们更直接。界面的下拉也只列出现过的非空 id。
     pub provider: Option<String>,
+    /// Some("") 精确匹配未记录客户端，None 不过滤。
+    pub client: Option<String>,
+    /// key:<id> / env / none / unknown，与报表的 filterValue 同口径。
+    pub api_key: Option<String>,
+    pub production_only: bool,
+    pub completed_only: bool,
     /// `"ok"` = 2xx / `"error"` = 非 2xx / None 不过滤
     pub status: Option<String>,
     /// 起始毫秒时间戳（闭区间下界）

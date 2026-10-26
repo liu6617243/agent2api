@@ -36,6 +36,7 @@
 import { shared, formatTime, type AccountRecord, type AccountsSnapshot, type LimiterRule, type RateLimitInfo, type TokenReading, type UsageEntry } from './accounts-shared'
 import { providerFeatures, type ProviderFeatures } from './accounts-features'
 import { t } from '../i18n'
+import { limiterHit } from './accounts-limiter-model'
 
 // 能力表与插件申报的读取在 accounts-features.ts（那边的模块头说明了查询顺序）。
 // 这里转出去，是因为域层的既有调用点（`providerFeatures` 被 app.js / report.js /
@@ -249,8 +250,17 @@ export function isLongLivedCredential(account: AccountRecord | null | undefined)
  * 「有方案但凭证没配」**照样算有**：后端那次查询回的是「未配置」的中性提示
  * （不是红色失败），按钮与「查询设置」段都得在，用户才有地方去补 —— 与
  * CatPaw / ZCode 的「未配置也给入口」同一取舍。
+ *
+ * ── 访客账号（`isGuest`）不参与（2026-10）─────────────────────
+ * 智谱清言的访客没有积分体系：上游那几个接口对访客一律 401，查询的结果**恒定
+ * 为失败**。它不是「这次没查到」而是「这条账号没有可查的东西」，与「这家没有
+ * 余额概念」是同一档事实 —— 所以这里一并返回 false：余额列显示「—」、
+ * 批量查询不把它算进分母、设置弹窗里也不出现「查询设置」段。后端
+ * `usage_query::supports_usage` 是同一判据（两处必须同口径，否则界面算的目标
+ * 集合与后端返回的行会对不上）。
  */
 export function supportsUsage(account: AccountRecord | null | undefined): boolean {
+  if (account?.isGuest === true) return false
   const provider = providerOf(account)
   if (provider.startsWith('custom-')) return Boolean(account?.balanceQuery?.scheme)
   return providerFeatures(provider).usage
@@ -439,6 +449,7 @@ export function balanceBlockedOf(
   account: AccountRecord | null | undefined,
   entry: UsageEntry,
 ): boolean {
+  if (Array.isArray(account?.limiterGroups)) return limiterHit(account, 'balance')
   const rules = limitersOf(account).filter(rule =>
     rule.type === 'balance' && rule.action === 'skip' && rule.enabled !== false && rule.threshold > 0)
   if (!rules.length) return false
@@ -467,6 +478,7 @@ export function tokenBlockedOf(
   account: AccountRecord | null | undefined,
   readings: TokenReading[] | undefined,
 ): boolean {
+  if (Array.isArray(account?.limiterGroups)) return limiterHit(account, 'token')
   const rules = limitersOf(account).filter(rule =>
     rule.type === 'token' && rule.action === 'skip' && rule.enabled !== false)
   if (!rules.length || !readings?.length) return false
@@ -487,6 +499,7 @@ export function tokenDisableTriggeredOf(
   account: AccountRecord | null | undefined,
   readings: TokenReading[] | undefined,
 ): boolean {
+  if (Array.isArray(account?.limiterGroups)) return limiterHit(account, 'token', 'disable')
   return limitersOf(account).some(rule => {
     if (rule.type !== 'token' || rule.action !== 'disable' || rule.enabled === false) return false
     const reading = tokenReadingForRule(rule, readings)
@@ -610,19 +623,6 @@ export function accountEdition(account: AccountRecord | null | undefined): 'cn' 
   return account?.edition === 'intl' ? 'intl' : 'cn'
 }
 
-/**
- * 这个账号能不能「领取体验套餐」（ZCode 独有的动作）。两道判据缺一不可：
- *   ① 能力位（claim）—— 只有 ZCode 那两家登记了它；
- *   ② `canClaim` —— 后端公开形态给的字段，表示这个账号确实带着套餐令牌（jwt）。
- * 只填了 accessToken 的账号没有 jwt，界面上就不该给一个点了必然 400 的按钮。
- * `canClaim` 缺省按 true：取不到时宁可让按钮出现、由后端如实报错，
- * 那比「按钮消失且没有任何解释」更容易排查。
- */
-export function supportsClaim(account: AccountRecord | null | undefined): boolean {
-  if (!providerFeatures(providerOf(account)).claim) return false
-  return account?.canClaim !== false
-}
-
 /** ZCode 的两条上游通道取值（与后端 `providers::zcode` 的常量逐字一致） */
 export const ZCODE_PLAN_CODING = 'coding-plan'
 export const ZCODE_PLAN_START = 'start-plan'
@@ -700,23 +700,6 @@ export function claimedPlanIdsToday(account: AccountRecord | null | undefined): 
   return Object.entries(ledger as Record<string, unknown>)
     .filter(([, at]) => Number(at) > 0 && beijingDay(Number(at)) === day)
     .map(([planId]) => planId)
-}
-
-/**
- * 今天是否领过至少一份。**只用于文案与悬停提示，不用来禁用按钮** ——
- * 「还有别的套餐能领吗」只有在弹窗里逐份比对才判得准（见 `claimedPlanIdsToday`）。
- */
-export function claimedToday(account: AccountRecord | null | undefined): boolean {
-  return claimedPlanIdsToday(account).length > 0
-}
-
-/** 「今天领过 N 份」的悬停说明：列出领过的套餐，并说清还能继续领别的 */
-export function claimDoneTitle(account: AccountRecord | null | undefined): string {
-  const planIds = claimedPlanIdsToday(account)
-  const names = planIds.length ? t('（{plans}）', { plans: planIds.join(t('、')) }) : ''
-  return t('今天（北京时间 {day}）已领取 {n} 份{names}；还有其他可领套餐时，点这里可以继续领；活动按自然日发新套餐，明天可再领', {
-    day: beijingDay(), n: planIds.length, names,
-  })
 }
 
 /**

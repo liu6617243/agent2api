@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
-import { Badge, Button, Progress } from '@ui'
+import { Badge, Button, Progress , Card, CardHeader, CardContent } from '@ui'
 import {
   errorMessage, handleExternalClick, markdownHtml, safeExternal, shared, toast,
   type DownloadTask, type UpdateInfo,
@@ -9,56 +9,10 @@ import { showUpdateModal } from './update-modal'
 import { UpdateSettingsDialog } from './update-settings'
 import { QqGroupDialog } from './update-qq-group'
 import { t } from '../i18n'
+import { HtmlContent } from '@ui'
+import { Empty } from '@ui'
 
-/**
- * Agent2API · 设置页「软件更新」面板（React 岛）。
- *
- * 替换 ui/update-panel.js，原有的四个方法一字不改（调用点也不用改）：
- *   load()           切到设置页时（settings-state.ts 的 load）；
- *   check()          「检查更新」按钮；
- *   syncFromCache()  首屏（app.js 的 DOMContentLoaded）读后端缓存回填；
- *   openAndDownload(info)  「检测到更新」弹窗的「去更新」。
- * 另多导出两个「结果已经在手上」的转发口：
- *   applyStatus(info)     把外部的检查结果铺进面板（不重查、不弹窗）——
- *                         app.js 的 60 秒轮询与定时任务页的「立即执行」走它；
- *   showUpdateModal(info) 弹与不弹的判定（跳过此次版本 / 本会话已弹过 / 人已在设置页）
- *                         连同弹窗本体都在 update-modal.tsx。旧 app.js 的轮询原来走
- *                         maybeShowUpdateModal，静态弹窗 DOM 一删那条路就断了。
- * 这两个口一起解决「后端查到了、界面不知道」：只喂导航徽标和弹窗的话，后端定时任务
- * 查到的新版本与新的检查时刻，都要等用户手点一次「检查更新」才出现在面板上。
- *
- * ── 文件分工（这一族拆成四个，单文件不过长的同时不引入循环依赖）──
- *   update-panel.tsx    常驻面板 + 命令式流程（本文件）：root 建在
- *                       `<div class="settings-pane" data-cat="about">` **本身**上
- *                       （清掉原有静态子节点后），不套宿主：显隐由 settings-panel.js
- *                       在它自己身上切 `.active`；中间插一层 wrapper 会让 `.panel`
- *                       的外边距与圆角裁切多出一层盒子，布局与接入前不等价。
- *   update-modal.tsx    「检测到更新」弹窗：按需建的命令式外壳（照 port-panel），
- *                       弹与不弹的判定也归它。
- *   update-settings.tsx 「更新设置」弹窗（自动检查更新 + 加入 beta 版 + 出网代理 +
- *                       GitHub 令牌；定时任务页的「软件版本检查」配置入口也收在
- *                       这个弹窗里）。
- *   update-shared.ts    三个 tsx 共用的类型、桥读取与工具（.ts 不被当岛挂载）。
- *
- * ── 两条贯穿全文件的约定（细节见各自函数）────────────────────
- * · 页面布局类名照旧、只换控件：`.panel` / `.panel-head` / `.panel-body` /
- *   `.head-actions` / `.update-version` / `.version-pill` / `.detail` / `.update-author` /
- *   `.update-log*` / `.rel-note*` / `.md-body` 全部保留（样式在 page-settings.css 与
- *   update-notes.css）—— 它们是这一页的排版而不是「组件」，换成 Tailwind 会让「软件更新」
- *   与设置页其它面板长得不一样。里面的**控件**才换：button → Button（`class="primary"` →
- *   `variant="default"`、无 class → `variant="outline"`、`class="sm"` → `size="sm"`）、
- *   .badge → Badge（bad/warn/ok → destructive/warning/success，无修饰 → outline）、
- *   .progress → Progress。
- * · 显隐一律**条件渲染**，不写 hidden / style.display：组件库的 Tailwind 工具类是分层
- *   + !important，会压掉 tokens.css 里未分层的 `[hidden]{display:none!important}`
- *   （important 的层序反转），内联 style 同样被压。命令式流程（四个契约方法 + 1 秒下载
- *   轮询）改的是模块级快照，React 侧用 useSyncExternalStore 订阅（照 port-panel）。
- *
- * ── 更新设置（「检查更新」左边那颗按钮）────────────────────
- * 头部不放代理直上下拉了，收进「更新设置」弹窗（update-settings.tsx）：弹窗里
- * 有出网代理与 GitHub 令牌两块设置，类型与读写函数在 update-shared.ts。本文件
- * 只管按钮的开关状态（useState）与弹窗的条件渲染。
- */
+
 
 /* ─── 常量 ─────────────────────────────────── */
 
@@ -113,8 +67,10 @@ type Snapshot = {
    *  仍然有效，只是不新鲜），这一位负责把「这次为什么没查成」标红说清楚。
    *  下一次成功检查（手动或定时）即清空。 */
   checkError: string
-  /** owner/repo，来自接口：作者行由它拼出来 */
-  repository: string
+  /** 项目源码仓库（owner/repo），来自接口：作者行与「收藏项目」由它拼出来。
+   *  注意**不是** `info.repository` —— 那个是安装包所在的构建账号仓库，
+   *  借来跑 Actions 的账号主页上什么都没有，指过去等于指错地方 */
+  sourceRepository: string
   badgeText: string
   badgeTone: BadgeTone
   /** 状态行文案（旧 #update-state） */
@@ -143,7 +99,7 @@ const INITIAL_SNAPSHOT: Snapshot = {
   currentVersion: '',
   checkedAt: 0,
   checkError: '',
-  repository: '',
+  sourceRepository: '',
   // 初值与 index.html 静态骨架逐字一致：首屏在 load() 跑起来之前就长这样
   badgeText: t('未检查'),
   badgeTone: '',
@@ -472,6 +428,16 @@ function renderCheckResult(): void {
  * 自己再点一次「检查更新」：功能都有，只是没串起来。
  */
 function applyStatus(info?: UpdateInfo | null): void {
+  if (info?.channelChanged && info.checked === false) {
+    failedOnCheckedAt = -1
+    publish({ info: null, checkedAt: 0, checkError: '' })
+    fillCurrentVersion(info)
+    if (snapshot.phase === 'idle') {
+      setBadge(t('未检查'))
+      setState(t('更新通道已改变，请重新检查更新。'))
+    }
+    return
+  }
   // checked === false：后端还没有任何成功结果，不能拿它清空面板上已有的读数
   if (!info || info.checked === false) {
     // 但「当前版本」可以取：这份缓存即使没成功检查过也带着后端自己的版本号，
@@ -488,7 +454,7 @@ function applyStatus(info?: UpdateInfo | null): void {
   }
   publish({ info, checkedAt: Number(info.checkedAt) || 0 })
   fillCurrentVersion(info)
-  if (info.repository) applyRepository(info.repository)
+  if (info.sourceRepository) applySourceRepository(info.sourceRepository)
   // ── 失败提示的保留与清除 ────────────────────────────────────
   // 判据不能只看 lastError 非空：手动检查被最短间隔 / 失败冷却挡下时，后端压根
   // 没记这一笔（Deferred 分支不发请求），那样刚显示的提示会被下一拍轮询抹掉。
@@ -528,11 +494,13 @@ function describeBackendError(value: string | null | undefined): string {
   return String(value || '').trim().replace(/^检查失败[：:]\s*/, '')
 }
 
-/** 仓库全名（owner/repo）来自接口；形态不对就不用，免得拼出个乱七八糟的链接 */
-function applyRepository(value: unknown): void {
+/** 项目源码仓库（owner/repo）来自接口；形态不对就不用，免得拼出个乱七八糟的链接。
+ *  取值一律是 `sourceRepository`：`repository` 指的是安装包所在的构建账号仓库，
+ *  它的主页不是项目地址（见 Snapshot 的字段说明）。 */
+function applySourceRepository(value: unknown): void {
   const repo = String(value || '').trim()
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return
-  publish({ repository: repo })
+  publish({ sourceRepository: repo })
 }
 
 /**
@@ -831,7 +799,7 @@ async function check(): Promise<UpdateInfo | null> {
     publish({ info: result, checkedAt: Number(result?.checkedAt) || Date.now(), checkError: '' })
     failedOnCheckedAt = -1
     rememberCurrentVersion(result)
-    if (result?.repository) applyRepository(result.repository)
+    if (result?.sourceRepository) applySourceRepository(result.sourceRepository)
     renderCheckResult()
   } catch (error) {
     result = null
@@ -881,6 +849,10 @@ async function syncFromCache(): Promise<void> {
     // 有没有成功过都交给 applyStatus：它负责「当前版本」、失败原因与
     // 「已恢复就清掉提示」这几条判定，两处各写一份迟早漂移
     applyStatus(cached)
+  }
+  if (cached?.channelChanged) {
+    shared().wbApp?.updateUpdateBadge?.(cached)
+    return
   }
   if (cached && cached.checked !== false) {
     // 导航提示与 check() 同一出口：定时任务查到新版本时也能亮起来
@@ -1037,7 +1009,7 @@ async function openAndDownload(checkedInfo?: UpdateInfo | null): Promise<void> {
     // 只填空：这份结果可能来自后端缓存（编译期版本），面板上已有的若来自壳的
     // 检查（运行时 package_info），以后者为准
     fillCurrentVersion(checkedInfo)
-    if (checkedInfo.repository) applyRepository(checkedInfo.repository)
+    if (checkedInfo.sourceRepository) applySourceRepository(checkedInfo.sourceRepository)
     renderCheckResult()
     shared().wbApp?.updateUpdateBadge?.(checkedInfo)
     // 此刻人已被「去更新」带到设置页，这次调用会被「人已在设置页」挡住（旧路径同）
@@ -1129,9 +1101,9 @@ function changelogCard(snap: Snapshot): React.ReactNode {
         {/* 正文是 wbMarkdown 渲染出来的 HTML（保持调用，不重写）：只能走
             dangerouslySetInnerHTML。外围标记仍由 React 渲染，版本号 / 日期 / 链接都是
             文本节点，于是旧实现那几处 esc() 在这里天然不需要。 */}
-        {html ? <div className='md-body' dangerouslySetInnerHTML={{ __html: html }} /> : (
+        {html ? <HtmlContent className='md-body' html={html} /> : (
           <div className='md-body'>
-            <p className='md-body-empty'>{t('这个版本没有填写发布说明。')}</p>
+            <Empty className='md-body-empty'>{t('这个版本没有填写发布说明。')}</Empty>
           </div>
         )}
       </div>
@@ -1157,8 +1129,10 @@ function UpdatePanel() {
   // 头部那句「GitHub Token 未填写」的首次读数（之后由 load 与弹窗关闭刷新）
   React.useEffect(() => { void refreshTokenHint() }, [])
 
-  const repo = snap.repository ? `https://github.com/${snap.repository}` : ''
-  const owner = snap.repository ? `https://github.com/${snap.repository.split('/')[0]}` : ''
+  // 作者主页与项目仓库都指向**源码仓库**：安装包放在借来的构建账号下，
+  // 那个账号的主页没有代码也没有 issue，不能拿来当「关于作者」的落点
+  const repo = snap.sourceRepository ? `https://github.com/${snap.sourceRepository}` : ''
+  const owner = snap.sourceRepository ? `https://github.com/${snap.sourceRepository.split('/')[0]}` : ''
   const selfUpdate = isSelfUpdate(snap.info)
   // 回滚入口：只有容器内更新、且上一次更新留下了备份时才出现。
   // 下载 / 安装途中不给（那两条流程各自持有按钮语义，混在一起只会误点）
@@ -1175,14 +1149,14 @@ function UpdatePanel() {
     : ''
 
   return (
-    <section className='panel' onClick={handleExternalClick}>
-      <div className='panel-head'>
+    <Card render={<section />} className='panel' onClick={handleExternalClick}>
+      <CardHeader className='panel-head'>
         <h2>{t('软件更新')}</h2>
         <span
           className='tip-q'
           data-tip={selfUpdate
             ? t('容器内更新：更新包从 GitHub 发布页下载，校验 sha256 后由面板替换容器内的程序与界面文件，再重启服务（容器由 restart 策略拉起，页面会自动刷新）。更新的是容器里的文件，compose 里的镜像标签不变 —— 之后执行 docker compose pull && up -d 会回到镜像里的版本；更新失败可一键回滚到上一版本。检查更新与下载的出网线路、GitHub 令牌都在「更新设置」里。')
-            : t('更新包从 GitHub 发布页下载，下载完成后可直接启动安装程序并自动重启本程序。安装包会先校验来源域名与文件完整性。检查更新与下载安装包的出网线路、GitHub 令牌都在「更新设置」里：线路默认直连（直连失败时自动借 Clash Verge 的混合端口重试一次），选定指定出口后只走该出口；填写 GitHub 令牌可把检查限额从 60 次/小时提高到 5000 次/小时。')}
+            : t('更新包从 GitHub Release 获取，下载后交给本平台安装器。GitHub 访问方式、加速前缀、出网代理和令牌在「更新设置」中配置。默认官方优先，连接失败后尝试加速源；镜像安装包必须匹配官方校验值，取不到时仅使用原始源。指定代理失效会明确报错，不会静默改走直连。')}
         ></span>
         {/* id 保留：app.js 的 renderTopbarStatus 按 id 镜像徽章文案与语义色（配色经
             data-tone 传；设置页顶栏那枚镜像目前还不读它，保持一致没坏处） */}
@@ -1208,7 +1182,7 @@ function UpdatePanel() {
           <Button
             id='btn-update-settings'
             variant='outline'
-            title={t('出网线路与 GitHub 令牌设置')}
+            title={t('更新设置')}
             onClick={() => setSettingsOpen(true)}
           >
             {t('更新设置')}
@@ -1240,8 +1214,8 @@ function UpdatePanel() {
             </Button>
           ) : null}
         </div>
-      </div>
-      <div className='panel-body'>
+      </CardHeader>
+      <CardContent className='panel-body'>
         {/* 当前版本 → 最新版本两个读数同一行，窗口放不下时靠 .update-version 的 wrap 换行 */}
         <div className='update-version'>
           <span className='version-pill'>
@@ -1266,8 +1240,8 @@ function UpdatePanel() {
           ? <Progress value={snap.percent} />
           : null}
 
-        {/* 关于作者 + 收藏项目：作者主页与仓库地址都从接口返回的 repository 现拼
-            （fork 后自动指向 fork 者），拿到数据前整行不渲染 */}
+        {/* 关于作者 + 收藏项目：作者主页与仓库地址都从接口返回的 sourceRepository
+            现拼（fork 后自动指向 fork 者），拿到数据前整行不渲染 */}
         {owner && repo ? (
           <div className='update-author' id='update-author'>
             <div className='update-author-text'>
@@ -1275,7 +1249,7 @@ function UpdatePanel() {
               <span>
                 {t('本工具由')}{' '}
                 <a id='update-author-link' href={owner} data-external={owner} target='_blank' rel='noopener'>
-                  {snap.repository.split('/')[0]}
+                  {snap.sourceRepository.split('/')[0]}
                 </a>{' '}
                 {t('个人开发并开源维护，免费使用，也不会收集你的账号数据。如果它帮到了你，欢迎到项目仓库点个 Star 支持一下。')}
               </span>
@@ -1318,7 +1292,7 @@ function UpdatePanel() {
             {changelogCard(snap)}
           </div>
         </div>
-      </div>
+      </CardContent>
 
       {/* 「更新设置」弹窗：条件渲染（Dialog 自带 Portal 挂 body，放在 section 里
           只是声明位置，不影响视觉层级）；关闭即卸载，状态在弹窗内部自生自灭。
@@ -1334,7 +1308,7 @@ function UpdatePanel() {
       ) : null}
       {/* 「加入交流群」：QQ 群号（可复制）+ Telegram / Discord 外链 */}
       {qqGroupOpen ? <QqGroupDialog open onClose={() => setQqGroupOpen(false)} /> : null}
-    </section>
+    </Card>
   )
 }
 

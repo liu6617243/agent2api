@@ -1,3 +1,4 @@
+import { Progress as UiProgress } from '@ui'
 import { useEffect, useRef, useState } from 'react'
 import { SectionHead } from './ui'
 import { Icon } from './Icon'
@@ -18,8 +19,12 @@ import {
   type ApkUpdateInfo,
   type DownloadProgress,
 } from '../lib/appUpdate'
+import { GithubAccessSettingsPanel } from './GithubAccessSettings'
+import { AppUpdateSettings } from './AppUpdateSettings'
 import { openExternal } from '../lib/community'
 import { t } from '../i18n'
+import { Card, Button } from '@ui'
+import { Switch as UiSwitch } from '@ui'
 
 /**
  * 应用内更新面板（Android / iOS 共用，行为按平台分叉）。
@@ -57,7 +62,10 @@ export function AppUpdatePanel() {
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [auto, setAuto] = useState(autoCheckEnabled)
-  /** 自动检查的间隔（0 = 电脑端关了这条任务） */
+  const [settingsRevision, setSettingsRevision] = useState(0)
+  const channelRevision = useRef(0)
+  const checkInFlight = useRef(false)
+  /** 自动检查的间隔（0 = 网关关了这条任务） */
   const [interval, setIntervalMs] = useState(0)
   /** 当前壳能不能自装安装包：只有 Android 能（见 lib/appUpdate） */
   const selfUpdate = canSelfUpdate()
@@ -80,8 +88,8 @@ export function AppUpdatePanel() {
    * 按新间隔走 —— 组件重挂时重新读一次即可（设置页每次进入都会重挂）。
    */
   useEffect(() => {
-    if (!auto) return
     let disposed = false
+    let effectiveInterval = 0
     let timer: number | null = null
 
     const clear = () => {
@@ -102,13 +110,14 @@ export function AppUpdatePanel() {
       const ms = await autoCheckIntervalMs()
       if (disposed) return
       setIntervalMs(ms)
-      // 进页面先查一次（用户打开设置就是想看有没有新版），再按间隔轮询
+      effectiveInterval = ms
+      if (!auto || ms <= 0) return
       await runCheck(true)
       start(ms)
     })()
 
     const onVisibility = () => {
-      if (document.visibilityState === 'visible') void runCheck(true)
+      if (auto && document.visibilityState === 'visible' && effectiveInterval > 0) void runCheck(true)
     }
     document.addEventListener('visibilitychange', onVisibility)
 
@@ -117,9 +126,9 @@ export function AppUpdatePanel() {
       clear()
       document.removeEventListener('visibilitychange', onVisibility)
     }
-    // auto 变化时重来一轮；interval 由 effect 内部读取
+    // 设置变更后重读全局检查计划；本机开关只决定是否启动轮询。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [auto])
+  }, [auto, settingsRevision])
 
   // 避免自动检查覆盖用户正在进行的下载 / 已下载待安装
   const phaseRef = useRef(phase)
@@ -128,7 +137,9 @@ export function AppUpdatePanel() {
   /** `silent` = 自动检查：失败不弹错误、不打断当前状态 */
   const runCheck = async (silent = false) => {
     const current = phaseRef.current
-    if (current === 'downloading' || current === 'downloaded') return
+    if (current === 'downloading' || current === 'downloaded' || checkInFlight.current) return
+    const revision = channelRevision.current
+    checkInFlight.current = true
     if (!silent) {
       setBusy(true)
       setPhase('checking')
@@ -136,17 +147,19 @@ export function AppUpdatePanel() {
     if (!silent) setError('')
     try {
       const result = await checkApkUpdate()
+      if (revision !== channelRevision.current) return
       setInfo(result)
       // hasUpdate 为 null = 版本无法比较（上游 tag 不是 semver）；
       // 这时只要挂了 APK 就允许手动更新，而不是卡在「未知」上
       const canUpdate = result.hasUpdate === true || (result.hasUpdate === null && result.asset !== null)
       setPhase(prev => (prev === 'downloading' || prev === 'downloaded' ? prev : canUpdate ? 'available' : 'latest'))
     } catch (failure) {
-      if (!silent) {
+      if (!silent && revision === channelRevision.current) {
         setError(failure instanceof Error ? failure.message : String(failure))
         setPhase('idle')
       }
     } finally {
+      checkInFlight.current = false
       if (!silent) setBusy(false)
     }
   }
@@ -202,10 +215,11 @@ export function AppUpdatePanel() {
   /**
    * iOS 的「更新」只能跳转：打开 GitHub Release 页面，由用户自己选渠道
    * （TestFlight / App Store / 侧载）。`pageUrl` 是网关从 GitHub API 拿到的
-   * release 页面地址，没有它时退回仓库的 releases 列表。
+   * release 页面地址，没有它时退回**源码仓库**的 releases 列表 —— 构建账号
+   * （安装包实际存放处）不是项目地址，不能拿来当兜底。
    */
   const openReleasePage = () => {
-    const target = info?.pageUrl || 'https://github.com/shadyrispy/Agent2API/releases'
+    const target = info?.pageUrl || 'https://github.com/aimod-cc/Agent2API/releases'
     openExternal(target)
   }
 
@@ -226,7 +240,7 @@ export function AppUpdatePanel() {
   return (
     <div className='m-section'>
       <SectionHead title={t('软件更新')} />
-      <div className='m-card'>
+      <Card className='m-card'>
         <div className='m-row' style={{ alignItems: 'flex-start' }}>
           <span className='m-logo' style={{ background: 'var(--m-primary-soft)', borderColor: 'transparent', color: 'var(--m-primary)' }}>
             <Icon name='up' />
@@ -257,31 +271,14 @@ export function AppUpdatePanel() {
                     : phase === 'latest'
                       ? t('当前版本 {version}', { version: APP_VERSION })
                       : selfUpdate
-                        ? t('版本 {version} · 从 GitHub 直接下载安装包', { version: APP_VERSION })
+                        ? t('版本 {version} · 按 GitHub 访问设置下载安装包', { version: APP_VERSION })
                         : t('版本 {version} · 更新包需从 Release 页面获取', { version: APP_VERSION })}
             </div>
 
             {/* 进度条：总长度未知（percent = null）时不画，只显示已下载量 */}
             {phase === 'downloading' ? (
               <div style={{ marginTop: 8 }}>
-                <div
-                  style={{
-                    height: 4,
-                    borderRadius: 2,
-                    background: 'var(--m-surface-3)',
-                    overflow: 'hidden',
-                  }}
-                >
-                  <div
-                    style={{
-                      height: '100%',
-                      width: percent === null ? '30%' : `${percent}%`,
-                      borderRadius: 2,
-                      background: 'var(--m-primary)',
-                      transition: 'width .2s linear',
-                    }}
-                  />
-                </div>
+                <UiProgress value={percent} aria-label={t('下载进度')} />
                 {progress ? (
                   <div style={{ marginTop: 4, fontSize: 11, color: 'var(--m-text-3)' }}>
                     {sizeText(progress.received)}
@@ -300,31 +297,31 @@ export function AppUpdatePanel() {
 
           {/* 动作按钮：按状态给唯一的主动作，避免一屏好几个可点的东西 */}
           {phase === 'downloading' ? (
-            <button type='button' className='m-btn m-ghost m-sm' onClick={() => void stop()}>
+            <Button size='touch-sm' variant='outline' type='button' className='m-btn m-ghost m-sm' onClick={() => void stop()}>
               {t('取消')}
-            </button>
+            </Button>
           ) : phase === 'downloaded' ? (
-            <button type='button' className='m-btn m-sm' disabled={busy} onClick={() => void install()}>
+            <Button size='touch-sm' variant='default' type='button' className='m-btn m-sm' disabled={busy} onClick={() => void install()}>
               {t('安装')}
-            </button>
+            </Button>
           ) : phase === 'available' && !selfUpdate ? (
             // iOS：只能跳出去，由系统渠道安装
-            <button type='button' className='m-btn m-sm' onClick={openReleasePage}>
+            <Button size='touch-sm' variant='default' type='button' className='m-btn m-sm' onClick={openReleasePage}>
               {t('去下载')}
-            </button>
+            </Button>
           ) : phase === 'available' ? (
-            <button type='button' className='m-btn m-sm' disabled={busy} onClick={() => void download()}>
+            <Button size='touch-sm' variant='default' type='button' className='m-btn m-sm' disabled={busy} onClick={() => void download()}>
               {t('立即更新')}
-            </button>
+            </Button>
           ) : (
-            <button
+            <Button size='touch-sm' variant='outline'
               type='button'
               className='m-btn m-ghost m-sm'
               disabled={busy}
               onClick={() => void runCheck()}
             >
               {phase === 'checking' ? t('检查中…') : t('检查更新')}
-            </button>
+            </Button>
           )}
         </div>
 
@@ -353,47 +350,26 @@ export function AppUpdatePanel() {
             <Icon name='refresh' />
           </span>
           <div className='m-grow'>
-            <div className='m-t1'>{t('自动检查更新')}</div>
+            <div className='m-t1'>{t('允许本机自动检查')}</div>
             <div className='m-t2'>
               {interval > 0
                 ? t('与电脑端一致：每 {n} 分钟', { n: Math.round(interval / 60_000) })
-                : t('电脑端已关闭「软件版本检查」，此处只做手动检查')}
+                : t('网关已关闭自动检查，此处只做手动检查')}
             </div>
           </div>
-          <button
-            type='button'
-            role='switch'
-            aria-checked={auto}
-            aria-label={t('自动检查更新')}
-            onClick={toggleAuto}
-            style={{
-              width: 44,
-              height: 26,
-              borderRadius: 999,
-              border: auto ? '0' : '1px solid var(--m-line-strong)',
-              background: auto ? 'var(--m-ok)' : 'var(--m-surface-3)',
-              position: 'relative',
-              padding: 0,
-              flex: 'none',
-              transition: 'background .18s, border-color .18s',
-            }}
-          >
-            <span
-              style={{
-                position: 'absolute',
-                top: 3,
-                left: auto ? 21 : 3,
-                width: 20,
-                height: 20,
-                borderRadius: '50%',
-                background: '#fff',
-                boxShadow: '0 1px 3px rgba(0,0,0,.25)',
-                transition: 'left .18s cubic-bezier(.3,.9,.4,1)',
-              }}
-            />
-          </button>
+          <UiSwitch size='touch' variant='success' checked={auto} aria-label={t('允许本机自动检查')}  onCheckedChange={() => toggleAuto()} />
         </div>
-      </div>
+        <AppUpdateSettings onChanged={channelsChanged => {
+          if (channelsChanged) channelRevision.current += 1
+          if (channelsChanged && phaseRef.current !== 'downloading' && phaseRef.current !== 'downloaded') {
+            setInfo(null)
+            setPhase('idle')
+            setError('')
+          }
+          setSettingsRevision(revision => revision + 1)
+        }} />
+        <GithubAccessSettingsPanel />
+      </Card>
     </div>
   )
 }

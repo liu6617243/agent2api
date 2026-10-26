@@ -49,25 +49,9 @@ use crate::server::ServerState;
 /// 网关先拒（上游会自己表达能收多大），见 `gateway_router` 里的 disable。
 pub const MAX_BODY_SIZE: usize = 32 * 1024 * 1024;
 
-/// CORS 允许的方法，照抄 Node 版 sendCORS，**只多一项 PUT**。
-///
-/// ── 为什么补 PUT ────────────────────────────────────────────
-/// AI 助手页为流式对话直接 fetch 网关（见 ui-islands 的 assistant-state.ts），
-/// 而桌面形态下页面来自 Tauri 自定义协议、网关在 `127.0.0.1:{port}`：跨源。
-/// 保存助手设置走 PUT + JSON 体，跨源必触发预检 —— 这份表里没有 PUT 时浏览器
-/// 直接判 CORS 失败，请求**根本到不了服务端**（表现是「连接网关失败…
-/// Failed to fetch」，与鉴权无关，日志里什么都看不到）。Node 版原表不带 PUT
-/// 是因为那时面板只被同源页面使用，跨源预检从来不在路径上。
-///
-/// 补上它不放开任何东西：预检只声明「允许发这个方法的跨源请求」，准入仍由
-/// `require_api_key` 判；且 `Allow-Origin: *` 下浏览器不会替跨源请求带 cookie，
-/// 凭证只能显式放进请求头（助手页正是这么做的，见 bridge 的 directCredentials）。
-///
-/// 注意：这里**仍不含 PATCH** —— Node 版就是这样，虽然账号批量修改等接口
-/// 在服务端支持 PATCH，但预检响应里没声明。不做「顺手修复」：
-/// PATCH 只被两条不跨源的通道用（壳的进程内 HTTP 客户端、网页端 shim 同源
-/// fetch），没有实际需要，浏览器端若有需求应由后续切片对照 Node 版行为一起评估。
-const CORS_METHODS: &str = "GET, POST, PUT, OPTIONS, DELETE";
+/// 原生手机端与网关跨源，账号、Key、插件设置和定时任务会发 PATCH。
+/// 预检只声明可用方法，实际请求仍由管理面鉴权；跨源凭证显式放在请求头中。
+const CORS_METHODS: &str = "GET, POST, PUT, PATCH, OPTIONS, DELETE";
 /// CORS 允许的请求头。
 ///
 /// ── 为什么不是「逐字照抄 Node 版」了 ──────────────────────────
@@ -324,6 +308,13 @@ pub fn panel_router(state: ServerState) -> Router {
             get(api::routing_api::get_routing).put(api::routing_api::put_routing),
         )
         .route("/api/routing/queue", get(api::routing_api::get_routing_queue))
+        .route("/api/routing/workspace", get(api::routing_workspace::get_workspace))
+        .route("/api/routing/profile", axum::routing::put(api::routing_workspace::put_profile))
+        .route("/api/routing/sticky", get(api::routing_workspace::get_sticky))
+        .route("/api/routing/sticky/clear", post(api::routing_workspace::clear_sticky))
+        .route("/api/routing/replays", get(api::routing_workspace::get_replays))
+        .route("/api/routing/trace", get(api::routing_trace::get_trace))
+        .route("/api/routing/trace/request", get(api::routing_trace::get_trace_request))
         // ── 调试模式（设置页「通用 → 调试模式」）──
         // GET/PUT 开关；traffic 是按 id 取原始报文的详情端点（列表接口不返回
         // 报文，见 debug_api 的模块头）。挂 protected：报文含上游 URL 与请求体。
@@ -580,6 +571,9 @@ pub fn panel_router(state: ServerState) -> Router {
             get(api::assistant::get_config).put(api::assistant::put_config),
         )
         .route("/api/assistant/chat", post(api::assistant::chat))
+        .route("/api/assistant/images/generations", post(api::assistant_images::generations))
+        .route("/api/assistant/images/edits", post(api::assistant_images::edits))
+        .route("/api/assistant/images/files/{id}", get(api::assistant_images::download))
         // 历史会话（左边那列对话）：列表 / 读 / 存 / 删 / 清空。存的是用户与
         // 助手聊过的正文，敏感度与设置同级，一起挂 protected。
         // `GET|DELETE /api/assistant/sessions` 是同一条路由的两个方法（清空走
@@ -652,17 +646,13 @@ pub fn panel_router(state: ServerState) -> Router {
         // 「安装」同样能 spawn 任意二进制，敏感度与 /api/plugins/install 同级。
         .route("/api/plugins/release", get(api::plugins::release))
         .route("/api/plugins/install-from-release", post(api::plugins::install_from_release))
-        // ── 出站指纹脱敏开关 ──
-        // 与 /api/debug 同形的单开关端点（GET 读 / PUT 写），挂 protected：
-        // 它决定出站请求体要不要剥离审核指纹，敏感度与调试模式同级。
-        // 改造前的 /api/desensitize* 八条端点（词表增删改 / 作用角色 / 作用提供商 /
-        // 命中统计 / 远程同步）随词表方案整体删除，只剩这一个开关。
+        // 出站词表与提供商范围修改请求正文，必须沿用管理面鉴权。
         .route(
             "/api/sanitize",
             get(api::sanitize::get_sanitize).put(api::sanitize::put_sanitize),
         )
         // ── 开发者角色兼容开关 ──
-        // 与 /api/sanitize 同形的单开关端点（GET 读 / PUT 写），挂 protected：
+        // 与 /api/debug 同形的单开关端点（GET 读 / PUT 写），挂 protected：
         // 它决定出站请求里 developer 角色消息要不要归一成 system（改的是发给
         // 上游的请求体，敏感度与那两者同级）。转换实施点见
         // `core::upstream::payload` 的 send_body 角色归一层。
@@ -680,7 +670,7 @@ pub fn panel_router(state: ServerState) -> Router {
             get(api::cline_headers::get_cline_headers).put(api::cline_headers::put_cline_headers),
         )
         // ── 网关面跨域访问开关 ──
-        // 与 /api/sanitize 同形的单开关端点（GET 读 / PUT 写），挂 protected：
+        // 与 /api/debug 同形的单开关端点（GET 读 / PUT 写），挂 protected：
         // 它决定 `/v1/*` 要不要应答浏览器跨源请求（见 api::cors 的模块头）。
         // 敏感度高一级 —— 打开等于把「转发上游、消耗额度」的能力交给任何网页，
         // 所以默认关，且改动会写进事件日志。
@@ -710,7 +700,7 @@ pub fn panel_router(state: ServerState) -> Router {
             get(api::auto_continue::get_auto_continue).put(api::auto_continue::put_auto_continue),
         )
         // ── 机器人校验开关 ──
-        // 与 /api/sanitize 同形的单开关端点（GET 读 / PUT 写），挂 protected：
+        // 与 /api/debug 同形的单开关端点（GET 读 / PUT 写），挂 protected：
         // 它决定登录 / 注册是否要求 ALTCHA proof-of-work，敏感度同级。
         .route(
             "/api/captcha",
@@ -899,6 +889,7 @@ pub fn gateway_router(state: ServerState) -> Router {
 
     let open = Router::new()
         .route("/v1/models", get(api::chat::list_models))
+        .route("/v1/images/files/{id}", get(api::images::download))
         .with_state(state.clone());
     // 三条协议入口 + Anthropic 的 token 计数端点：都查 API Key。
     // 与 chat/completions 完全同构：都走同一套转发链路，差异只在出入口的
@@ -912,6 +903,8 @@ pub fn gateway_router(state: ServerState) -> Router {
         .route("/v1/responses", post(api::protocol::responses_endpoint))
         .route("/v1/messages", post(api::protocol::messages_endpoint))
         .route("/v1/messages/count_tokens", post(api::chat::count_tokens))
+        .route("/v1/images/generations", post(api::images::generations))
+        .route("/v1/images/edits", post(api::images::edits))
         .layer(middleware::from_fn(require_api_key))
         .with_state(state);
     health.merge(open.merge(guarded))
@@ -1242,6 +1235,10 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
         if crate::server::access::v1_fail_closed() && path.starts_with("/v1/") {
             return errors::v1_fail_closed_response();
         }
+        request.extensions_mut().insert(crate::server::request_stats::ApiKeyIdentity {
+            source: "none".to_string(),
+            ..Default::default()
+        });
         return next.run(request).await;
     }
 
@@ -1251,8 +1248,18 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
         .cloned();
     if let Some(matched) = matched {
         // 命中的那把 Key 的限制随请求带到 handler（见函数头）
-        if let Some(scope) = scope_for_key(&snapshot.raw(), &matched) {
-            crate::server::core::key_scope::attach(&mut request, scope);
+        if crate::server::config::parse::env_api_key_value().as_deref() == Some(matched.as_str()) {
+            request.extensions_mut().insert(crate::server::request_stats::ApiKeyIdentity {
+                source: "env".to_string(),
+                ..Default::default()
+            });
+        } else if let Some(entry) = crate::server::core::api_keys::entry_for_key_from(snapshot.raw(), &matched) {
+            request.extensions_mut().insert(crate::server::request_stats::ApiKeyIdentity {
+                id: entry.id.clone(), name: entry.name.clone(), source: "key".to_string(),
+            });
+            crate::server::core::key_scope::attach(
+                &mut request, crate::server::core::key_scope::KeyScope::from_entry(&entry),
+            );
         }
         return next.run(request).await;
     }

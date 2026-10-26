@@ -726,7 +726,6 @@ pub struct AnthropicStream {
     has_tool: bool,
     stop_reason: Option<String>,
     usage: Option<Value>,
-    input_tokens: i64,
 }
 
 impl AnthropicStream {
@@ -748,7 +747,6 @@ impl AnthropicStream {
             has_tool: false,
             stop_reason: None,
             usage: None,
-            input_tokens: 0,
         }
     }
 
@@ -793,19 +791,12 @@ impl AnthropicStream {
             "message_delta",
             json!({
                 "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
-                "usage": { "output_tokens": self.output_tokens() },
+                // Chat 的 usage 可能末尾才到；message_delta 允许补发累计输入与缓存用量。
+                "usage": usage_to_anthropic(self.usage.as_ref()),
             }),
         ));
         out.push(self.event("message_stop", json!({})));
         out
-    }
-
-    fn output_tokens(&self) -> i64 {
-        self.usage
-            .as_ref()
-            .and_then(|usage| usage.get("completion_tokens"))
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
     }
 
     fn consume(&mut self, chunk: &Value) -> Vec<bytes::Bytes> {
@@ -833,8 +824,6 @@ impl AnthropicStream {
             }
         }
         if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
-            // Anthropic 的 message_delta 只报 output_tokens，input 在 message_start
-            self.input_tokens = usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0);
             self.usage = Some(usage.clone());
         }
         let choice = chunk.pointer("/choices/0");
@@ -1011,6 +1000,8 @@ impl AnthropicStream {
             return Vec::new();
         }
         self.started = true;
+        let mut usage = usage_to_anthropic(self.usage.as_ref());
+        usage["output_tokens"] = json!(0);
         vec![self.event(
             "message_start",
             json!({
@@ -1022,7 +1013,7 @@ impl AnthropicStream {
                     "content": [],
                     "stop_reason": Value::Null,
                     "stop_sequence": Value::Null,
-                    "usage": { "input_tokens": self.input_tokens, "output_tokens": 0 },
+                    "usage": usage,
                 },
             }),
         )]

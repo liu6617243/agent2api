@@ -37,8 +37,9 @@
  */
 
 import * as React from 'react'
-import { Badge, Button, Input, Popover, PopoverContent, PopoverTrigger, Switch, cn } from '@ui'
+import { Badge, Button, Input, Popover, PopoverContent, PopoverTrigger, Switch, cn , Card, CardHeader, CardContent } from '@ui'
 import { t } from '../i18n'
+import { Empty } from '@ui'
 
 /* ─── 从经典脚本取模型 ─────────────────────── */
 
@@ -137,12 +138,12 @@ export function SidebarPane() {
   // 面板退化为一句话说明。不抛错、不白屏 —— 设置页其余分类照常可用。
   if (!api) {
     return (
-      <section className='panel'>
-        <div className='panel-head'><h2>{t('侧边栏菜单')}</h2></div>
-        <div className='panel-body'>
+      <Card render={<section />} className='panel'>
+        <CardHeader className='panel-head'><h2>{t('侧边栏菜单')}</h2></CardHeader>
+        <CardContent className='panel-body'>
           <div className='settings-state'>{t('侧边栏布局模块未加载（ui/sidebar-layout.js 应在 app.js 之前引入）。')}</div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
     )
   }
 
@@ -417,8 +418,8 @@ function SidebarPaneBody({ api }: { api: LayoutApi }) {
 
   return (
     <>
-      <section className='panel'>
-        <div className='panel-head'>
+      <Card render={<section />} className='panel'>
+        <CardHeader className='panel-head'>
           <h2>{t('侧边栏菜单')}</h2>
           <span
             className='tip-q'
@@ -427,9 +428,9 @@ function SidebarPaneBody({ api }: { api: LayoutApi }) {
           <div className='head-actions'>
             <Button variant='outline' size='sm' onClick={resetAll}>{t('恢复默认')}</Button>
           </div>
-        </div>
+        </CardHeader>
 
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <div className='settings-state'>
             {t('拖动左侧 ⠿ 调整顺序（菜单可以跨组拖）；拨开关控制显隐；点分组名可重命名；组头的 ＋ 把别的菜单移进来；眼睛按钮隐藏整组。改动即时生效并记住，左侧侧边栏就是结果。键盘也能排序：把手聚焦后按 Alt+↑ / ↓。')}
           </div>
@@ -476,14 +477,14 @@ function SidebarPaneBody({ api }: { api: LayoutApi }) {
                         }}
                       />
                     ) : (
-                      <button
+                      <Button size='default' variant='ghost'
                         type='button'
                         className='sc-group-title'
                         title={t('点击重命名')}
                         onClick={() => { setRenaming(group.id); setRenameDraft(group.label) }}
                       >
                         {api.groupLabel(group.label)}
-                      </button>
+                      </Button>
                     )}
 
                     <span className='sc-group-meta'>{t('{n} 项 · {shown} 显示', { n: group.items.length, shown })}</span>
@@ -495,7 +496,7 @@ function SidebarPaneBody({ api }: { api: LayoutApi }) {
                         group={group}
                         onPick={key => apply(api.moveItem(layout, key, layout.groups.findIndex(item => item.id === group.id), group.items.length))}
                       />
-                      <button
+                      <Button size='default' variant='ghost'
                         type='button'
                         className='sc-icon-btn'
                         title={locked
@@ -506,7 +507,7 @@ function SidebarPaneBody({ api }: { api: LayoutApi }) {
                         onClick={() => toggleGroup(group.id)}
                         dangerouslySetInnerHTML={{ __html: iconHtml(group.hidden ? 'eyeOff' : 'eye', 15) }}
                       />
-                      <button
+                      <Button size='default' variant='ghost'
                         type='button'
                         className='sc-text-btn'
                         disabled={layout.groups.length <= 1}
@@ -514,13 +515,13 @@ function SidebarPaneBody({ api }: { api: LayoutApi }) {
                         onClick={() => removeGroup(group.id)}
                       >
                         {t('删除')}
-                      </button>
+                      </Button>
                     </div>
                   </div>
 
                   <div className='sc-items'>
                     {group.items.length === 0 ? (
-                      <div className='sc-empty'>{t('空分组 · 点组头的 ＋ 把菜单移进来')}</div>
+                      <Empty className='sc-empty'>{t('空分组 · 点组头的 ＋ 把菜单移进来')}</Empty>
                     ) : group.items.map(key => {
                       const menu = api.menuOf(key)
                       if (!menu) return null
@@ -604,8 +605,8 @@ function SidebarPaneBody({ api }: { api: LayoutApi }) {
             })}
             {hiddenGroups ? t('（{n} 个整组隐藏）', { n: hiddenGroups }) : ''}
           </div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
     </>
   )
 }
@@ -632,7 +633,7 @@ function GroupPicker({ layout, api, group, onPick }: {
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
         render={
-          <button
+          <Button size='default' variant='ghost'
             type='button'
             className='sc-icon-btn'
             title={t('把菜单移入「{name}」', { name: group.label })}
@@ -657,7 +658,7 @@ function GroupPicker({ layout, api, group, onPick }: {
               if (!menu) return null
               const from = api.locate(layout, key)
               return (
-                <button
+                <Button size='default' variant='ghost'
                   key={key}
                   type='button'
                   className='flex h-7 w-full items-center gap-2 rounded-xs px-2 text-left text-[12.5px] text-foreground hover:bg-nav-hover'
@@ -669,7 +670,7 @@ function GroupPicker({ layout, api, group, onPick }: {
                   <span className='flex-none text-[10.5px] text-muted-foreground'>
                     {from ? api.groupLabel(layout.groups[from.gi].label) : ''}
                   </span>
-                </button>
+                </Button>
               )
             })}
           </div>

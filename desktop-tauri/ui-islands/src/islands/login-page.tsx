@@ -23,7 +23,7 @@
 import * as React from 'react'
 import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
-import { Button, Input, Label } from '@ui'
+import { Button, Card, Input, Label, Verification } from '@ui'
 import { t } from '../i18n'
 
 /** 挂载点 id：login.html 里唯一的岛容器 */
@@ -38,7 +38,26 @@ const HOST_ID = 'login-app'
  * 自家自定义元素去扩全局 JSX 命名空间会波及其他岛（也可能与并行迁移的文件撞车）。
  * 元素只认 id：领题端点、文案、事件都在组件内部，这里不传任何属性。
  */
-const captchaWidget = React.createElement('panel-captcha', { id: 'captcha' })
+type CaptchaElement = HTMLElement & { state?: 'idle' | 'verifying' | 'verified' | 'error'; start?(): Promise<void> }
+
+function CaptchaControl() {
+  const [state, setState] = React.useState<'idle' | 'verifying' | 'verified' | 'error'>('idle')
+  const ref = React.useRef<CaptchaElement | null>(null)
+  React.useEffect(() => {
+    const element = ref.current
+    if (!element) return
+    const sync = () => setState(element.getAttribute('state') as typeof state || 'idle')
+    const observer = new MutationObserver(sync)
+    observer.observe(element, { attributes: true, attributeFilter: ['state'] })
+    sync()
+    return () => observer.disconnect()
+  }, [])
+  return React.createElement('panel-captcha', { id: 'captcha', ref },
+    <Verification state={state} className='mx-auto mt-5' onClick={() => { void ref.current?.start?.() }}>
+      {state === 'verifying' ? t('验证中…') : state === 'verified' ? t('验证成功') : state === 'error' ? t('验证失败，请重试') : t('我不是机器人')}
+    </Verification>,
+  )
+}
 
 /**
  * 卡片外壳与其中的表单。
@@ -48,7 +67,7 @@ const captchaWidget = React.createElement('panel-captcha', { id: 'captcha' })
  */
 function LoginPage() {
   return (
-    <div className='w-[min(400px,100%)] rounded-lg border border-border bg-card p-[36px_34px_30px] shadow-3'>
+    <Card className='w-[min(400px,100%)] p-[36px_34px_30px] shadow-3'>
       {/* 品牌标与桌面端 / 面板侧栏同一造型（icons.js 的 brand 项），底色是品牌色常量而非主题令牌 */}
       <div className='mb-[26px] flex flex-col items-center gap-3 text-center'>
         <svg
@@ -83,7 +102,7 @@ function LoginPage() {
         </Label>
         <Input id='password' type='password' autoComplete='new-password' placeholder={t('至少 8 位')} />
         {/* 领题求解放后台跑 → 绿勾已验证（组件见 ui/panel-captcha.js） */}
-        {captchaWidget}
+        <CaptchaControl />
         {/* type='submit' 必须显式给：Base UI 的 useButton 会给原生 button 补一个
             type="button"，只有显式传入（合并时外部 props 优先）才盖得掉 */}
         <Button id='submit' type='submit' size='lg' className='w-full'>
@@ -95,7 +114,7 @@ function LoginPage() {
       <div className='mt-[22px] text-center text-[12px] text-muted-foreground'>
         {t('登录后可在「网关 Key」页为 API 客户端创建密钥')}
       </div>
-    </div>
+    </Card>
   )
 }
 

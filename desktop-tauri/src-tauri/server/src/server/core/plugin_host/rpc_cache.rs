@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use agent2api_provider_protocol as proto;
 use serde_json::Value;
 
-use crate::server::core::providers::{catalog_cache, workbuddy};
+use crate::server::core::providers::catalog_cache;
 use crate::server::logging;
 
 pub const SETTING_MODEL_CATALOG: &str = "modelCatalog";
@@ -26,19 +26,25 @@ fn scope(provider: &str) -> String {
     format!("plugin:{provider}")
 }
 
-fn restore(provider: &str) -> Option<proto::ModelList> {
-    let cached = catalog_cache::load(&scope(provider)).or_else(|| {
-        let legacy = match workbuddy::Region::from_provider_id(provider)? {
-            workbuddy::Region::Cn => catalog_cache::SCOPE_WORKBUDDY,
-            workbuddy::Region::Intl => catalog_cache::SCOPE_WORKBUDDY_INTL,
-        };
-        catalog_cache::load(legacy)
-    })?;
+fn from_cached(cached: catalog_cache::CachedCatalog) -> Option<proto::ModelList> {
     let models = valid_models(cached.models);
     (!models.is_empty()).then_some(proto::ModelList {
         models,
         meta: proto::CatalogMeta { remote: true, refreshed_at: cached.fetched_at },
     })
+}
+
+fn restore(provider: &str) -> Option<proto::ModelList> {
+    let key = scope(provider);
+    if let Some(list) = catalog_cache::load(&key).and_then(from_cached) {
+        return Some(list);
+    }
+    let list = catalog_cache::load_legacy(provider).and_then(from_cached)?;
+    // 写事务里再次检查新槽，避免与在线刷新竞争时覆盖它；旧槽保留供回退。
+    catalog_cache::save_migrated(&key, catalog_cache::CachedCatalog {
+        models: list.models,
+        fetched_at: list.meta.refreshed_at,
+    }).and_then(from_cached)
 }
 
 fn valid_models(models: Vec<Value>) -> Vec<Value> {
@@ -49,15 +55,19 @@ fn valid_models(models: Vec<Value>) -> Vec<Value> {
     }).collect()
 }
 
-pub fn set_defaults(provider: &str, models: Vec<Value>) {
+pub fn set_defaults(provider: &str, models: Vec<Value>) -> Option<(usize, i64)> {
     let restored = restore(provider);
-    if let Ok(mut map) = table().lock() {
-        let entry = map.entry(provider.to_string()).or_default();
-        if entry.remote.is_none() {
-            entry.remote = restored;
-        }
-        entry.fallback = valid_models(models);
-    }
+    let mut map = table().lock().ok()?;
+    let entry = map.entry(provider.to_string()).or_default();
+    let recovered = if entry.remote.is_none() {
+        let recovered = restored.as_ref().map(|list| (list.models.len(), list.meta.refreshed_at));
+        entry.remote = restored;
+        recovered
+    } else {
+        None
+    };
+    entry.fallback = valid_models(models);
+    recovered
 }
 
 pub fn set_remote(provider: &str, mut list: proto::ModelList) -> usize {

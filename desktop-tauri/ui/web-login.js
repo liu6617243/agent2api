@@ -8,9 +8,8 @@
    （applyLoginState 的注释解释了这点），两份实现迟早会在某一次改动后分叉，
    而分叉的表现是「关掉弹窗后按钮永远卡在禁用态」这种很难复现的故障。
 
-   依赖 app.js 的顶层全局（经典 script 的顶层声明在全局可见）：$ / toast / busy /
-   releaseBusy / refresh。脚本顺序见 index.html：必须排在 add-account.js 之前 ——
-   后者在加载期就要 create() 出 WorkBuddy 那一份（它的 DOM 在 index.html 里）。
+   依赖 app.js 的顶层全局（经典 script 的顶层声明在全局可见）：toast / busy /
+   releaseBusy。脚本在页面的 DOMContentLoaded 之前就位，表单挂载后建立控制器。
 
    与主进程的契约：同一时刻只允许一个登录流程（壳侧 start_login 会拒绝第二个），
    因此这里维护一份**全局**的 loginActive / loginProvider，而不是每个控制器各存一份；
@@ -44,9 +43,10 @@
    *   provider   本控制器对应的 provider id（与壳侧 start_login 的参数一致）
    *   buttonId / cancelId / hintId   三个 DOM id（各家的块用前缀区分）
    *   texts()    返回 { button, hint }：当前该显示的按钮文案与提示。
-   *              做成函数是因为 WorkBuddy 的文案随「打开方式」分段控件变化，
-   *              而那个值只有 add-account.js 知道（这里不去读别家的 DOM）。
-   *   busyText   等待中的按钮文案（前缀会自动加转圈）
+   *              WorkBuddy 的文案随打开方式变化，具体值由表单提供。
+   *   onStateChange(state)  React 表单接收等待态，不让引擎写入它的子节点。
+   *                        未提供时保留按 DOM id 同步的兼容路径。
+   *   busyText   等待中的按钮文案，转圈由表单中的 Spinner 渲染
    *   start()    真正发起登录，返回壳命令的结果（`{canceled:true}` 表示用户取消）
    *   onSuccess(result)  登录成功后的收尾（关弹窗、刷新列表、提示）
    */
@@ -55,60 +55,52 @@
     const cancelButton = () => $(config.cancelId);
     const hint = () => $(config.hintId);
 
-    const syncTexts = () => {
+    let starting = false;
+    const publish = state => {
+      if (config.onStateChange) {
+        config.onStateChange(state);
+        return;
+      }
       const button_ = button();
-      if (!button_) return;
-      const texts = config.texts ? config.texts() : { button: '', hint: '' };
-      if (texts.button) button_.textContent = texts.button;
+      if (button_) {
+        button_.disabled = state.disabled;
+        button_.textContent = state.label;
+      }
+      const cancel_ = cancelButton();
+      if (cancel_) cancel_.hidden = !state.waiting;
       const hint_ = hint();
-      if (hint_ && texts.hint) hint_.textContent = texts.hint;
+      if (hint_) hint_.textContent = state.hint;
     };
 
-    /** 把主进程状态落到本控制器的 DOM（等待中/别家在等待/空闲三种形态） */
+    /** 同一时刻只能有一家等待登录，其余入口同步禁用。 */
     const applyState = () => {
-      const button_ = button();
-      if (!button_) return;
-      const cancel_ = cancelButton();
-      if (loginActive && loginProvider === config.provider) {
-        button_.disabled = true;
-        button_.innerHTML = `<span class="spinner"></span>${config.busyText || wbI18n.t('等待登录完成…')}`;
-        // 取消按钮切 hidden 属性而不是行内 display：它是组件库的 Button（自带带
-        // !important 的 inline-flex 工具类），行内样式压不过它
-        if (cancel_) cancel_.hidden = false;
-        return;
-      }
-      if (cancel_) cancel_.hidden = true;
-      if (loginActive) {
-        // 别家在等待：主进程同一时刻只允许一个登录流程，本家的发起按钮必须禁用
-        button_.disabled = true;
-        const hint_ = hint();
-        if (hint_) {
-          hint_.textContent = wbI18n.t('正在等待{name}登录完成；完成或取消后才能发起新的登录', {
+      const texts = config.texts ? config.texts() : { button: '', hint: '' };
+      const waiting = starting || (loginActive && loginProvider === config.provider);
+      publish({
+        label: waiting ? (config.busyText || wbI18n.t('等待登录完成…')) : (texts.button || ''),
+        hint: loginActive && loginProvider !== config.provider
+          ? wbI18n.t('正在等待{name}登录完成；完成或取消后才能发起新的登录', {
             name: providerLabel(loginProvider),
-          });
-        }
-        return;
-      }
-      button_.disabled = false;
-      syncTexts();
+          })
+          : (texts.hint || ''),
+        disabled: waiting || loginActive,
+        waiting,
+      });
     };
 
     const controller = {
       provider: config.provider,
       /** 提示与按钮文案随本家的其它控件变化时调用（等待中不覆盖，见 applyState） */
       syncTexts: () => {
-        if (!loginActive) syncTexts();
+        if (!loginActive && !starting) applyState();
       },
       applyState,
       /** 发起登录；与 takeBusy 同一把锁（弹窗里的按钮互斥） */
       async start() {
         if (busy || loginActive) return;
         busy = true;
-        const button_ = button();
-        if (button_) {
-          button_.disabled = true;
-          button_.innerHTML = `<span class="spinner"></span>${config.busyText || wbI18n.t('等待网页登录…')}`;
-        }
+        starting = true;
+        applyState();
         try {
           const result = await config.start();
           if (result?.canceled) {
@@ -122,6 +114,7 @@
         } catch (error) {
           toast(wbI18n.t('登录失败：{message}', { message: error.message }), 'err');
         } finally {
+          starting = false;
           flowSettling = false;
           releaseBusy();
           // 以主进程状态为准复位按钮，避免这里与真实状态不一致
@@ -137,6 +130,10 @@
         const canceled = await cancelLogin();
         toast(canceled ? wbI18n.t('已取消登录等待') : wbI18n.t('登录已结束'));
         await syncShellState();
+      },
+      dispose() {
+        const index = controllers.indexOf(controller);
+        if (index >= 0) controllers.splice(index, 1);
       },
     };
     controllers.push(controller);

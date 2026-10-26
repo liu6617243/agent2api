@@ -37,6 +37,7 @@
 pub mod agents;
 pub mod accounts;
 pub mod accounts_batch;
+mod accounts_export;
 // `/api/accounts/usage` 的查询与结果组装（从 accounts.rs 拆出：余额能力从
 // 「只服务 workbuddy」扩到四家混查时新增，见该文件模块头）
 pub mod accounts_usage;
@@ -44,6 +45,8 @@ pub mod accounts_usage;
 // 设置读写与流式对话转发。工具定义与执行都在前端，后端不认识任何工具，
 // 见该文件模块头
 pub mod assistant;
+pub mod assistant_images;
+mod image_input;
 // 整库备份 / 恢复（设置页「整库备份 / 恢复」，SQL 文本形态；核心在
 // `db::backup`，替换语义与账号 JSON 导入的 merge 是两条独立通道）
 pub mod backup_api;
@@ -83,6 +86,7 @@ pub mod cors;
 // `core::custom_providers` 与 `core::account_store::custom_accounts`）
 pub mod custom_providers;
 pub mod debug_api;
+mod date_range;
 // 进行中行的断线兜底守卫（从 pipeline.rs 拆出：那边已近 1000 行，而它是
 // 「handler 被 axum 取消时补 408 终态」这一件事的完整封装，见该文件模块头）
 pub mod disconnect_guard;
@@ -90,6 +94,9 @@ pub mod health;
 // 「从其他工具导入」的扫描接口（当前来源：cc-switch；存储读取见
 // `core::import_ccswitch`）
 pub mod import_sources;
+pub mod images;
+mod image_assets;
+mod image_output;
 pub mod keys_api;
 /// 保活换行丢弃开关（`/api/keepalive-strip`）：与 `/api/sanitize`、`/api/debug`
 /// 同形的单开关端点，独立成文件而不是塞进 config_api —— 理由见该模块头。
@@ -127,6 +134,8 @@ pub mod retry_api;
 // 见该文件模块头
 pub mod role_compat;
 pub mod routing_api;
+pub mod routing_trace;
+pub mod routing_workspace;
 pub mod sanitize;
 pub mod scheduled_tasks;
 pub mod session;

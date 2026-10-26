@@ -125,12 +125,14 @@
 use axum::http::HeaderMap;
 use serde_json::Value;
 
+pub use super::retry::RetryDecision;
+
 use std::sync::Arc;
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::errors::GatewayError;
 
-use super::{catalog_cache, ProviderKind};
+use super::ProviderKind;
 
 /// 转发前对「账号 + 请求体」的完整构造计划（架构文档 §4.2 的 ChatRequestPlan）。
 ///
@@ -248,6 +250,8 @@ pub enum UpstreamResponse {
     /// 走翻译层的理由同上：账号轮换、限额冷却、退避重试、usage 记账与取消处理
     /// 全部留在编排层，只有字节形态在翻译器里变。
     AntigravityGemini,
+    /// Images 端点的 JSON 或 Gemini inlineData 输出，不走 Chat 翻译器。
+    Images(super::images::ImageResponseKind),
     /// 智谱清言的 **SSE 混合帧**：帧是 SSE（`data: {json}`）没错，但一轮回答里
     /// 混着两种语义 —— `part.status == "init"` 的帧给的是**本拍新增的一小段**，
     /// 带 finish 的帧给的是**整段全文快照**。而 OpenAI 要的是统一口径的 delta：
@@ -491,6 +495,28 @@ pub trait ProviderAdapter: Send + Sync {
         Box<dyn std::future::Future<Output = Result<ChatRequestPlan, GatewayError>> + Send + 'a>,
     > {
         Box::pin(async move { self.build_chat_request(account, body, client_headers) })
+    }
+
+    fn supports_image_generation(&self) -> bool {
+        false
+    }
+
+    fn supports_image_editing(&self) -> bool {
+        false
+    }
+
+    fn build_image_request_async<'a>(
+        &'a self,
+        _account: &'a Value,
+        _body: &'a Value,
+        _client_headers: &'a HeaderMap,
+        _operation: super::images::ImageOperation,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ChatRequestPlan, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            Err(GatewayError::with_status(501, "当前提供商插件尚未接入图片生成，请更新插件"))
+        })
     }
 
     /// 把「映射上绑的思考等级」翻译成本家上游认识的字段与取值（模块头扩展 10）。
@@ -803,7 +829,7 @@ pub trait ProviderAdapter: Send + Sync {
         self.ensure_access_token(store, account_id)
     }
 
-    /// 「可退避重试的错误」的建议（模块头扩展 1）；None = 不重试。
+    /// 「可退避重试的错误」的建议；None = 无专属建议，允许通用规则。
     ///
     /// `attempt` 是**已经重试过**的次数（0 表示首次失败、还没重试过）。
     ///
@@ -828,6 +854,25 @@ pub trait ProviderAdapter: Send + Sync {
         budget: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RetryAdvice>> + Send + 'a>> {
         Box::pin(async move { self.retry_advice(error_body, attempt, budget) })
+    }
+
+    /// 可选的重试决定；Stop 终止本次请求，Default 才允许通用兜底。
+    fn retry_decision_async<'a>(
+        &'a self,
+        _status: u16,
+        error_body: &'a Value,
+        attempt: usize,
+        budget: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RetryDecision> + Send + 'a>> {
+        Box::pin(async move {
+            match self.retry_advice_async(error_body, attempt, budget).await {
+                Some(advice) => RetryDecision::Retry {
+                    delay_ms: advice.delay_ms,
+                    reason: advice.reason,
+                },
+                None => RetryDecision::Default,
+            }
+        })
     }
 
     /// 哪些 `finish_reason` 表示**上游拒答**（HTTP 200 的假成功），默认空 = 不认。
@@ -1359,6 +1404,26 @@ pub trait ProviderAdapter: Send + Sync {
         })
     }
 
+    fn checkin_claim_with_options<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        _manual: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        self.checkin_claim(store, account_id)
+    }
+
+    fn plugin_account_view<'a>(
+        &'a self,
+        _secret: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async { Err(GatewayError::with_status(501, "不支持插件账号视图")) })
+    }
+
     /// 领取类活动（新手任务 / 限时套餐）。
     ///
     /// `claim` 是活动标识（各家自己命名；空串 = 一键领取全部可领项）。
@@ -1655,6 +1720,26 @@ impl ProviderAdapter for BuiltinAdapter {
         adapter_for(self.0).supports_chat()
     }
 
+    fn supports_image_generation(&self) -> bool {
+        adapter_for(self.0).supports_image_generation()
+    }
+
+    fn supports_image_editing(&self) -> bool {
+        adapter_for(self.0).supports_image_editing()
+    }
+
+    fn build_image_request_async<'a>(
+        &'a self,
+        account: &'a Value,
+        body: &'a Value,
+        client_headers: &'a HeaderMap,
+        operation: super::images::ImageOperation,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ChatRequestPlan, GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).build_image_request_async(account, body, client_headers, operation)
+    }
+
     fn supports_model_refresh(&self) -> bool {
         adapter_for(self.0).supports_model_refresh()
     }
@@ -1680,6 +1765,16 @@ impl ProviderAdapter for BuiltinAdapter {
         budget: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RetryAdvice>> + Send + 'a>> {
         adapter_for(self.0).retry_advice_async(error_body, attempt, budget)
+    }
+
+    fn retry_decision_async<'a>(
+        &'a self,
+        status: u16,
+        error_body: &'a Value,
+        attempt: usize,
+        budget: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RetryDecision> + Send + 'a>> {
+        adapter_for(self.0).retry_decision_async(status, error_body, attempt, budget)
     }
 
     fn stream_refusal_finishes(&self) -> &'static [&'static str] {
@@ -2184,23 +2279,9 @@ pub async fn refresh_implemented(store: &AccountStore) -> Vec<Value> {
     results
 }
 
-/// 启动时恢复各家的持久化清单缓存（`ServerState::bootstrap` 在库句柄就绪后
-/// 调用一次，见 `providers::catalog_cache` 的模块头）。
-///
-/// ── 为什么必须显式跑一次 ────────────────────────────────────
-/// 各家的目录句柄是 `OnceLock` **懒初始化**，而持久化缓存只能在首次初始化时
-/// 读回（那正是各家 `restored_state` / `restored_cache` 的位置）。若某个更早的
-/// 调用点先碰到了句柄（那时 `catalog_cache::install` 还没跑），句柄就固化在
-/// 「没有缓存」的空状态上，缓存再也读不回来 —— 症状恰恰是本切片要消灭的那个
-/// （重启后回落到内置清单）。这里显式预热一次，把「首次初始化」钉在库就绪之后。
-///
-/// 顺带补一次默认规则种子：缓存恢复的清单与远程刷新落地的是同一批 id，
-/// 种子该在它们第一次可见时就位（与 [`refresh_implemented`] 开头那几行同一件事，
-/// 只是启动这一刻还没有任何刷新跑过）。
+/// 缓存装入后的目录预热与规则种子。插件缓存由装配时的 `set_defaults` 恢复，
+/// 这里在库就绪及插件装配完成后均调用，保证恢复的模型默认规则已经就位。
 pub fn restore_cached_catalogs() {
-    // 逐家触发一次 `list_models`（workbuddy 的目录也在这条路上：它的适配器
-    // 直接读 `core::models::global_catalog()`）——返回值丢弃，这里要的只是
-    // 「让各家的句柄初始化一次」这个副作用
     for kind in implemented_kinds() {
         let _ = adapter_for(kind).list_models();
     }
@@ -2210,24 +2291,6 @@ pub fn restore_cached_catalogs() {
     // 启动这一刻手里是缓存恢复的清单（或内置兜底）：可见性种子要跟着就位，
     // 否则「重启后不可见模型又变成可用了」。
     seed_hidden_visibility_defaults();
-    // 留痕：哪些家的清单是从持久化缓存恢复的、各是什么时候拉的。没有这条
-    // 日志，「这次的清单是刚拉的还是上次的」在排障时只能靠翻数据库回答。
-    let restored = catalog_cache::cached_scopes();
-    if !restored.is_empty() {
-        let detail = restored
-            .iter()
-            .map(|(scope, at)| format!("{scope}（{}）", catalog_cache::age_text(*at)))
-            .collect::<Vec<_>>()
-            .join("、");
-        crate::server::logging::log(
-            "[Models]",
-            &format!(
-                "📦 已从缓存恢复 {} 份模型清单（{}）——各家的刷新会在拉到新清单后覆盖",
-                restored.len(),
-                detail
-            ),
-        );
-    }
 }
 
 /// **手动**刷新模型清单：只刷「支持刷新」的家，且强制绕过缓存。

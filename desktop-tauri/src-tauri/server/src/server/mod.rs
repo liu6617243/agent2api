@@ -52,7 +52,7 @@
 //!     proxies.rs    /api/proxies*（Clash 实时读取 + 出口连通性测试）
 //!     billing.rs    /api/usage、/api/checkin*、/api/activity/*（对照 server.mjs 871-911）
 //!     chat.rs       POST /v1/chat/completions、GET /v1/models（对话主链路）
-//!     sanitize.rs   /api/sanitize（出站指纹脱敏开关）
+//!     sanitize.rs   /api/sanitize（出站脱敏开关、词表与提供商范围）
 //!     auto_checkin.rs /api/auto-checkin*（定时签到设置 / 手动执行）
 //!     scheduled_tasks.rs /api/scheduled-tasks*（间隔型定时任务：开关 / 间隔 / 立即执行）
 //!     update.rs     /api/update/*（软件更新检查 / 下载 / 进度 / 取消）
@@ -83,7 +83,7 @@
 //!       mod.rs       管理器句柄 / 下载状态机 / 进度与取消
 //!       version.rs   版本比较、域名白名单、资产挑选、文件名安全化（纯函数）
 //!       client.rs    出网候选（直连 → Clash）与 GitHub 请求头
-//!     sanitize.rs  出站请求体指纹脱敏（硬编码规则集，纯函数）
+//!     sanitize.rs  出站请求体指纹脱敏（可配置规则，纯文本变换）
 //!     prompt.rs    网关自有系统提示词（透传 / 替换 / 追加三模式，纯函数）
 //!     degrade.rs   内容拦截降级状态机（撞审核误报后到次日 00:00 用中性提示词）
 //!     upstream/    对话转发：
@@ -101,8 +101,8 @@
 //!   - 账号与鉴权：`ServerState::store()` / `auth()` / `login()` 三个克隆句柄。
 //!   - 模型目录与转发：目录走 `core::providers::catalog`（每次读取时聚合各家
 //!     适配器的清单，没有本进程的目录对象）；转发走 `ServerState::upstream()`。
-//!   - 指纹脱敏：无句柄，转发层每次出站前读 `config::current().sanitize_fingerprints()`
-//!     决定要不要调 `core::sanitize::sanitize_body`（纯函数，无状态）。
+//!   - 指纹脱敏：转发层逐请求取 `config::current().sanitize_settings()`，
+//!     按提供商范围执行词表；规则已编译，变换过程无 IO。
 //!   - 系统提示词：同样无句柄，转发层逐请求取一次 `config::current().prompt_plan()`
 //!     交给 `core::prompt` 落到出站副本上；撞内容拦截时由转发层触发
 //!     `core::degrade`（进程级原子状态，无句柄）并就地换中性提示词重试一次。
@@ -364,6 +364,7 @@ impl ServerState {
         // AI 助手的对话会话（左边那列历史会话）：装句柄即可，写入发生在每轮
         // 回答之后（见 `core::assistant_sessions` 的模块头）。
         core::assistant_sessions::install(db.clone());
+        core::assistant_images::install(db.clone());
         // 定时签到的「签到范围」一次性补齐：把加入版本晚于配置里那一版的家补进
         // 每条条目的范围（用户的期望是 OfficeAce 果办 / CodeArts 默认开启）。
         // 放在这里是因为它要读写配置快照（`config::init` 已在上方就位），且必须早于
@@ -564,6 +565,7 @@ impl ServerState {
             let settings = config::retention_settings();
             Retention {
                 request_days: settings.request_days,
+                request_count: settings.request_count,
                 daily_days: settings.daily_days,
             }
         }));
@@ -603,6 +605,8 @@ impl ServerState {
             // 与 account_bootstrap 同一模式：待迁移旧数据没导入时跳过 ——
             // 跑了会把幂等标记打早，升级完成后由 `api::upgrade_api` 补调。
             request_stats.remap_model_dimension_once();
+            request_stats.backfill_source_dimensions();
+            request_stats.prune();
         }
 
         let state = Self {
@@ -635,16 +639,17 @@ impl ServerState {
         );
         logging::log("[Config]", &format!("默认模型: {}", snapshot.default_model()));
         logging::log("[Config]", &format!("计费语言: {}", snapshot.locale()));
-        // 出站指纹脱敏一行：开着时说明「出站会剥离审核指纹」，关着时点明后果
-        // （客户端 system 模板会原样发上游，可能被 400 code=11128 误拦）
+        let sanitize = snapshot.sanitize_settings();
         logging::log(
             "[Config]",
             &format!(
-                "出站指纹脱敏: {}",
-                if snapshot.sanitize_fingerprints() {
-                    "✅ 已启用（剥离上游审核黑名单指纹）"
+                "出站指纹脱敏: {} · {} 条启用规则 · 应用范围={}",
+                if sanitize.enabled { "✅ 已启用" } else { "❌ 已关闭" },
+                sanitize.rules.entries().iter().filter(|rule| rule.enabled).count(),
+                if sanitize.providers.is_empty() {
+                    "全部提供商".to_string()
                 } else {
-                    "❌ 已关闭（客户端 system 模板原样发送，可能被上游误拦）"
+                    sanitize.providers.join(", ")
                 },
             ),
         );

@@ -1,6 +1,8 @@
+import { InputGroup, InputGroupInput, InputGroupAddon, InputGroupButton } from '@ui'
 import { useMemo, useState } from 'react'
 import { PageHead, IconButton, Badge, Empty, ErrorNote, SkeletonList } from '../components/ui'
 import { ProviderLogo } from '../components/ProviderLogo'
+import { HiddenAccountsNotice } from '../components/HiddenAccountsNotice'
 import { Icon } from '../components/Icon'
 import { AccountSheet } from './AccountSheet'
 import {
@@ -24,6 +26,9 @@ import { providerLabel } from '../lib/providers'
 import { usePolling } from '../lib/usePolling'
 import { usePullToRefresh, PullIndicator } from '../components/PullToRefresh'
 import { t } from '../i18n'
+import { Button, Input, Card } from '@ui'
+import { Switch as UiSwitch } from '@ui'
+import { Toggle as UiToggle } from '@ui'
 
 /**
  * 账号。
@@ -152,10 +157,10 @@ export function AccountsPage() {
       const id = String(item.provider || 'unknown')
       if (seen.has(id)) return
       seen.add(id)
-      list.push({ id, label: providerLabel(id) })
+      list.push({ id, label: providerLabel(id, state.session?.accounts?.providers?.find(provider => provider.id === id)?.label) })
     })
     return list
-  }, [accounts])
+  }, [accounts, state.session?.accounts?.providers])
 
   const filtered = useMemo(() => {
     const keyword = query.trim().toLowerCase()
@@ -236,7 +241,7 @@ export function AccountsPage() {
         subtitle={t('{n} 个账号 · {e} 启用 · {l} 限流', { n: accounts.length, e: enabledCount, l: limitedCount })}
         actions={
           <>
-            <button
+            <Button size='icon-touch' variant='outline'
               type='button'
               className='m-icon-btn'
               aria-label={t('筛选')}
@@ -266,7 +271,7 @@ export function AccountsPage() {
                   {activeFilterCount(filters)}
                 </span>
               ) : null}
-            </button>
+            </Button>
             <IconButton
               name='refresh'
               label={t('刷新')}
@@ -280,71 +285,43 @@ export function AccountsPage() {
       />
 
       <div className='m-section' style={{ marginTop: 0 }}>
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            height: 38,
-            padding: '0 12px',
-            borderRadius: 11,
-            background: 'var(--m-surface)',
-            border: '1px solid var(--m-line)',
-            color: 'var(--m-text-3)',
-          }}
-        >
-          <Icon name='search' style={{ width: 16, height: 16, flex: 'none' }} />
-          <input
-            value={query}
-            onChange={event => setQuery(event.target.value)}
-            placeholder={t('搜索账号 / 邮箱 / 备注')}
-            style={{
-              flex: 1,
-              minWidth: 0,
-              border: 0,
-              outline: 'none',
-              background: 'transparent',
-              color: 'var(--m-text)',
-              fontSize: 16,
-            }}
-          />
-          {query ? (
-            <button type='button' onClick={() => setQuery('')} aria-label={t('清除')} style={{ display: 'flex', border: 0, background: 'none', color: 'var(--m-text-3)' }}>
-              <Icon name='close' style={{ width: 15, height: 15 }} />
-            </button>
-          ) : null}
-        </div>
+        <InputGroup>
+          <InputGroupInput value={query} onChange={event => setQuery(event.target.value)} placeholder={t('搜索账号 / 邮箱 / 备注')} />
+          <InputGroupAddon><Icon name='search' style={{ width: 16, height: 16 }} /></InputGroupAddon>
+          {query ? <InputGroupAddon align='inline-end'><InputGroupButton size='icon-xs' onClick={() => setQuery('')} aria-label={t('清除')}><Icon name='close' /></InputGroupButton></InputGroupAddon> : null}
+        </InputGroup>
       </div>
 
       {/* 生效中的条件用一条摘要显示：横排 chip 只留「全部」与当前选中的，
           避免四颗常驻 chip 与面板里的选项各说一套 */}
       <div className='m-chips' style={{ padding: '10px 16px 12px' }}>
-        <button
+        <UiToggle size='default' variant='outline'
           type='button'
-          className='m-chip'
-          data-on={activeFilterCount(filters) === 0}
+          className='m-chip rounded-pill'
+          pressed={activeFilterCount(filters) === 0}
           onClick={() => setFilters(DEFAULT_FILTERS)}
         >
           {t('全部')}
           <span className='m-n'>{accounts.length}</span>
-        </button>
+        </UiToggle>
         {activeFilterCount(filters) > 0 ? (
-          <button type='button' className='m-chip' data-on onClick={() => setFilterOpen(true)}>
+          <UiToggle size='default' variant='outline' type='button' className='m-chip rounded-pill' pressed onClick={() => setFilterOpen(true)}>
             <Icon name='filter' style={{ width: 13, height: 13 }} />
             {t('已筛选 {n} 项', { n: filtered.length })}
-          </button>
+          </UiToggle>
         ) : null}
       </div>
       </div>
 
       {/* 只有这一块跟着手指滚：筛选条常驻，换筛选不用先滑回顶部 */}
       <div className='m-body'>
-      {error ? <ErrorNote text={error} /> : null}
+      {error || state.sessionError ? <ErrorNote text={error || state.sessionError} /> : null}
+      <HiddenAccountsNotice hidden={state.session?.accounts?.hiddenAccounts} />
       {!state.session && state.loading ? <SkeletonList rows={4} height={72} /> : null}
 
-      {state.session && !groups.length ? (
+      {state.session && !groups.length && (!state.session.accounts?.hiddenAccounts?.total || activeFilterCount(filters) > 0 || query) ? (
         <div className='m-section'>
-          <div className='m-card'>
+          <Card className='m-card'>
             <Empty
               text={
                 query
@@ -354,7 +331,7 @@ export function AccountsPage() {
                     : t('还没有账号，去桌面端添加')
               }
             />
-          </div>
+          </Card>
         </div>
       ) : null}
 
@@ -366,14 +343,14 @@ export function AccountsPage() {
             <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '0 3px 8px' }}>
               <ProviderLogo id={group.provider} />
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 13, fontWeight: 600 }}>{providerLabel(group.provider)}</div>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>{providerLabel(group.provider, state.session?.accounts?.providers?.find(provider => provider.id === group.provider)?.label)}</div>
                 <div style={{ fontSize: 11.5, color: 'var(--m-text-3)', marginTop: 2 }}>
                   {t('{n} 个账号 · 启用 {e}', { n: group.list.length, e: enabled })}
                   {limited ? t(' · 限流 {n}', { n: limited }) : ''}
                 </div>
               </div>
             </div>
-            <div className='m-card'>
+            <Card className='m-card'>
               {group.list.map((account, index) => (
                 <AccountRow
                   key={account.id}
@@ -385,7 +362,7 @@ export function AccountsPage() {
                   busy={busy}
                 />
               ))}
-            </div>
+            </Card>
           </div>
         )
       })}
@@ -473,7 +450,7 @@ function AccountRow({
         opacity: account.enabled ? 1 : 0.62,
       }}
     >
-      <button
+      <Button size='default' variant='ghost'
         type='button'
         onClick={onOpen}
         style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 11, background: 'none', border: 0, padding: 0, textAlign: 'left' }}
@@ -516,7 +493,7 @@ function AccountRow({
             ) : null}
           </div>
         </div>
-      </button>
+      </Button>
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 5, flex: 'none' }}>
         <SwitchSmall checked={Boolean(account.enabled)} onChange={onToggle} disabled={busy} label={accountName(account)} />
         <span style={{ fontSize: 10.5, color: 'var(--m-text-3)' }}>
@@ -540,38 +517,6 @@ function SwitchSmall({
   label: string
 }) {
   return (
-    <button
-      type='button'
-      role='switch'
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      style={{
-        width: 40,
-        height: 24,
-        borderRadius: 999,
-        border: checked ? '0' : '1px solid var(--m-line-strong)',
-        background: checked ? 'var(--m-ok)' : 'var(--m-surface-3)',
-        position: 'relative',
-        transition: 'background .18s, border-color .18s',
-        padding: 0,
-        flex: 'none',
-      }}
-    >
-      <span
-        style={{
-          position: 'absolute',
-          top: checked ? 2 : 2,
-          left: checked ? 18 : 2,
-          width: 20,
-          height: 20,
-          borderRadius: '50%',
-          background: '#fff',
-          boxShadow: '0 1px 3px rgba(0,0,0,.25)',
-          transition: 'left .18s cubic-bezier(.3,.9,.4,1)',
-        }}
-      />
-    </button>
+    <UiSwitch size='touch' variant='success' checked={checked} aria-label={label} disabled={disabled} onCheckedChange={onChange} />
   )
 }

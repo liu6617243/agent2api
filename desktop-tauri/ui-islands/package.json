@@ -12,7 +12,8 @@
   "dependencies": {
     "@base-ui/react": "^1.8.0",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "react-dom": "^19.2.0",
+    "recharts": "3.10.1"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",

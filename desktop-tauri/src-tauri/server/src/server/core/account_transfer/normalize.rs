@@ -60,7 +60,8 @@ fn positive_number_of(value: Option<&Value>) -> Option<Value> {
 
 /// 该键是否参与导入（内部字段与运行时标记不参与）
 fn importable_key(key: &str) -> bool {
-    !key.starts_with('_') && !LOCAL_OWNED_KEYS.iter().any(|owned| *owned == key)
+    !key.starts_with('_') && key != "format" && key != "customProviders"
+        && !LOCAL_OWNED_KEYS.iter().any(|owned| *owned == key)
 }
 
 /// 归一一条导入记录。

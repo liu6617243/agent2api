@@ -41,17 +41,26 @@ fn advertised_names(
 /// 否则某家关闭的映射会借另一家的同名上游重新出现在列表中。
 fn public_builtin_items(active: &[(String, Vec<Value>)]) -> Vec<(String, Value)> {
     let rules = model_rules::current();
-    let mut claimed = HashSet::new();
-    let mut result = Vec::new();
+    let mut claimed = std::collections::HashMap::<String, usize>::new();
+    let mut result: Vec<(String, Value)> = Vec::new();
     for (provider, manifest) in active {
         let names = advertised_names(&rules, provider, manifest);
         for name in names {
             let Some(wire) = builtin_target(&rules, provider, manifest, &name) else { continue };
-            if !claimed.insert(name.to_lowercase()) {
-                continue;
-            }
             let Some(upstream) = manifest.iter().find(|item| model_id(item) == wire.model) else { continue };
             let mut item = list_item(upstream, provider);
+            if let Some(index) = claimed.get(&name.to_lowercase()).copied() {
+                let existing = &mut result[index].1;
+                if item.get("supports_image_editing").and_then(Value::as_bool) == Some(true)
+                    && existing.get("kind").and_then(Value::as_str) == Some("image")
+                {
+                    existing["supports_image_editing"] = Value::Bool(true);
+                    existing["supports_images"] = Value::Bool(true);
+                    existing["input_modalities"] = json!(["text", "image"]);
+                }
+                continue;
+            }
+            claimed.insert(name.to_lowercase(), result.len());
             if let Some(object) = item.as_object_mut() {
                 object.insert("id".to_string(), Value::String(name.clone()));
                 if !name.eq_ignore_ascii_case(&wire.model) {
@@ -200,6 +209,11 @@ fn push_managed_model(
         "provider": provider, "providerLabel": super::super::label_of(provider),
         "source": source, "enabled": enabled, "aliases": aliases,
         "capabilities": capability::effective(&item),
+        "kind": if super::super::images::model_is_image(&item) { json!("image") }
+            else { item.get("kind").cloned().unwrap_or(json!("chat")) },
+        "output_modalities": item.get("output_modalities"),
+        "supports_image_generation": super::super::images::model_is_image(&item),
+        "supports_image_editing": super::super::images::provider_model_supports_editing(provider, &item),
         "capOverrides": cap_overrides,
         // 每个能力键的**来源**（`upstream` / `modelsdev` / `user`，见
         // `core::model_meta` 的模块头）。管理页据它把「上游实测」「社区
@@ -228,6 +242,7 @@ fn push_managed_model(
         // 缺失（`null`）= 这家没有可见性判据（当前是除上面四家之外的所有
         // provider）。界面据此显示 `—`，**不**把它当成「可见」或「不可见」：
         // 「这家没这个信息」和「这家说它不可见」是两件事。
+        "upstreamStatus": item.get("upstreamStatus"),
         "visibility": item.get("visibility").cloned().unwrap_or(Value::Null),
     }));
 }
@@ -247,6 +262,7 @@ pub fn manage_view(store: &AccountStore) -> Value {
     let rules = model_rules::current();
     let mut models = Vec::new();
     let mut mappings = Vec::new();
+    let mut providers = Vec::new();
     let mut attached = HashSet::new();
     // `(provider, id 小写)` 的出口去重（修复 #177 的兜底一层）。
     //
@@ -259,6 +275,15 @@ pub fn manage_view(store: &AccountStore) -> Value {
         manifest.sort_by_key(|item| !rules.default_enabled(&provider, &model_id(item)));
         let (remote, refreshed_at) = refresh_meta_for_provider(&provider);
         let source = if remote { "remote" } else { "builtin" };
+        let count = manifest.iter().map(model_id).filter(|id| !id.is_empty())
+            .map(|id| id.to_lowercase()).collect::<HashSet<_>>().len();
+        providers.push(json!({
+            "provider": provider,
+            "providerLabel": super::super::label_of(&provider),
+            "count": count,
+            "source": if count == 0 { "none" } else { source },
+            "refreshedAt": refreshed_at,
+        }));
         for item in manifest {
             push_managed_model(
                 &rules, &mut models, &mut mappings, &mut attached, &mut claimed,
@@ -282,6 +307,7 @@ pub fn manage_view(store: &AccountStore) -> Value {
     json!({
         "models": models,
         "mappings": mappings,
+        "providers": providers,
         "reasoningLevels": model_rules::REASONING_LEVELS,
         // models.dev 元数据的当前状态（`builtin` / `cache` / `network` + 生成
         // 时刻 + 条数）。它服务的是「这份档位/能力是什么时候的数据」这个问题 ——

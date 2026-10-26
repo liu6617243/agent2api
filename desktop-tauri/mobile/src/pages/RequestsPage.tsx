@@ -1,15 +1,18 @@
-import { useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { PageIntro, IconButton, Empty, ErrorNote, SkeletonList } from '../components/ui'
 import { ProviderLogo } from '../components/ProviderLogo'
 import { Icon } from '../components/Icon'
-import { Sheet, SheetContent, SheetHeader, SheetBody, SheetTitle, SheetFooter } from '@ui'
-import { store } from '../state/store'
+import { Alert, Sheet, SheetContent, SheetHeader, SheetBody, SheetTitle, SheetFooter, Button, Card, SegmentedControl } from '@ui'
+import { store, useStore } from '../state/store'
 import { fetchRequests, type RequestPage, type RequestRow } from '../api/gateway'
 import { ellipsisMiddle, formatClock, formatDuration, formatInt } from '../lib/format'
 import { providerLabel } from '../lib/providers'
 import { usePolling } from '../lib/usePolling'
 import { usePullToRefresh, PullIndicator } from '../components/PullToRefresh'
 import { t } from '../i18n'
+import { MetricGrid, MetricCard } from '@ui'
+import { DateRangeFilter } from '../components/DateRangeFilter'
+import { dateRangeQuery, readCustomRange, saveCustomRange, validCustomRange, type CustomDates, type DateRange } from '../../../ui-shared/date-range'
 
 /**
  * 请求日志。
@@ -27,35 +30,76 @@ import { t } from '../i18n'
 type Filter = 'all' | 'error' | 'retry' | 'running'
 
 const PAGE_SIZE = 20
+const CUSTOM_RANGE_KEY = 'agent2api-mobile-requests-custom-range'
+const EMPTY_SOURCE_QUERY: Record<string, string> = {}
 
 export function RequestsPage() {
+  const { route } = useStore()
+  const sourceQuery = route.params || EMPTY_SOURCE_QUERY
+  const routeDates = validCustomRange({ start: sourceQuery.startDate, end: sourceQuery.endDate })
+  const [range, setRange] = useState<DateRange>(routeDates ? 'custom' : 'all')
+  const [dates, setDates] = useState<CustomDates>(() => routeDates || readCustomRange(CUSTOM_RANGE_KEY))
   const [filter, setFilter] = useState<Filter>('all')
   const [page, setPage] = useState<RequestPage | null>(null)
   const [extra, setExtra] = useState<RequestRow[]>([])
   const [error, setError] = useState('')
   const [detail, setDetail] = useState<RequestRow | null>(null)
   const [loadingMore, setLoadingMore] = useState(false)
+  const routeParamsRef = useRef(route.params)
+  const queryKeyRef = useRef('')
+  const seqRef = useRef(0)
+
+  useEffect(() => {
+    if (routeParamsRef.current === route.params) return
+    routeParamsRef.current = route.params
+    const custom = validCustomRange({ start: sourceQuery.startDate, end: sourceQuery.endDate })
+    setRange(custom ? 'custom' : 'all')
+    setDates(custom || readCustomRange(CUSTOM_RANGE_KEY))
+    setExtra([])
+  }, [route.params, sourceQuery])
 
   // 当前筛选对应的服务端 status 参数：失败与在途都走服务端筛选，
   // 这样「加载更早」翻页时不会混进其它状态的记录；「有重试」后端没有对应参数，仍靠客户端过滤。
   const statusParam: 'ok' | 'error' | 'running' | undefined =
     filter === 'error' ? 'error' : filter === 'running' ? 'running' : undefined
 
-  const load = async () => {
+  const requestQuery = {
+    ...sourceQuery,
+    startDate: undefined as string | undefined,
+    endDate: undefined as string | undefined,
+    ...dateRangeQuery(range, dates),
+    completedOnly: filter === 'running' ? undefined : sourceQuery.completedOnly,
+    status: statusParam,
+  }
+  const queryKey = JSON.stringify({ ...requestQuery, filter })
+  queryKeyRef.current = queryKey
+  const queryRef = useRef(requestQuery)
+  queryRef.current = requestQuery
+
+  const load = useCallback(async () => {
+    const seq = ++seqRef.current
+    const requested = queryKeyRef.current
     try {
-      const next = await fetchRequests({
-        limit: PAGE_SIZE,
-        status: statusParam,
-      })
+      const next = await fetchRequests({ ...queryRef.current, limit: PAGE_SIZE })
+      if (seq !== seqRef.current || requested !== queryKeyRef.current) return
       setPage(next)
       setExtra([])
       setError('')
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure))
+      if (seq === seqRef.current && requested === queryKeyRef.current) {
+        setError(failure instanceof Error ? failure.message : String(failure))
+      }
     }
-  }
+  }, [])
 
-  usePolling(load, 30_000, [filter])
+  useEffect(() => {
+    ++seqRef.current
+    setPage(null)
+    setExtra([])
+    void load()
+    return () => { ++seqRef.current }
+  }, [queryKey, load])
+  usePolling(load, 30_000)
 
   const pull = usePullToRefresh({ onRefresh: load })
 
@@ -67,11 +111,15 @@ export function RequestsPage() {
   })
 
   const loadMore = async () => {
+    if (loadingMore) return
+    const requested = queryKeyRef.current
+    const seq = seqRef.current
     setLoadingMore(true)
     try {
       // offset 用已加载的原始条数：服务端分页按未过滤的行算，
       // 「有重试 / 在途」这类客户端二次过滤不影响翻页基准
-      const next = await fetchRequests({ offset: rows.length, limit: PAGE_SIZE, status: statusParam })
+      const next = await fetchRequests({ ...queryRef.current, offset: rows.length, limit: PAGE_SIZE })
+      if (seq !== seqRef.current || requested !== queryKeyRef.current) return
       setExtra(prev => [...prev, ...(next.entries || [])])
     } catch (failure) {
       store.toast(failure instanceof Error ? failure.message : String(failure), 'err')
@@ -92,55 +140,33 @@ export function RequestsPage() {
         />
 
       <div className='m-section' style={{ marginTop: 0 }}>
-        <div
-          style={{
-            display: 'flex',
-            gap: 2,
-            padding: 3,
-            borderRadius: 11,
-            background: 'var(--m-surface-3)',
-          }}
-        >
-          {(
-            [
-              { value: 'all', label: t('全部') },
-              { value: 'error', label: t('失败') },
-              { value: 'retry', label: t('有重试') },
-              { value: 'running', label: running ? t('在途 {n}', { n: running }) : t('在途') },
-            ] as Array<{ value: Filter; label: string }>
-          ).map(item => (
-            <button
-              key={item.value}
-              type='button'
-              onClick={() => setFilter(item.value)}
-              style={{
-                flex: 1,
-                height: 30,
-                borderRadius: 8,
-                border: 0,
-                fontSize: 12.5,
-                background: filter === item.value ? 'var(--m-surface)' : 'transparent',
-                color: filter === item.value ? 'var(--m-text)' : 'var(--m-text-2)',
-                fontWeight: filter === item.value ? 600 : 400,
-                boxShadow: filter === item.value ? 'var(--m-shadow-1)' : 'none',
-              }}
-            >
-              {item.label}
-            </button>
-          ))}
-        </div>
+        <SegmentedControl value={filter} className='w-full' aria-label={t('请求筛选')}
+          options={[
+            { value: 'all', label: t('全部') },
+            { value: 'error', label: t('失败') },
+            { value: 'retry', label: t('有重试') },
+            { value: 'running', label: running ? t('在途 {n}', { n: running }) : t('在途') },
+          ]} onValueChange={value => setFilter(value as Filter)} />
       </div>
+      <DateRangeFilter range={range} dates={dates} onRangeChange={setRange} label={t('请求日志时间范围')}
+        onDatesChange={next => { setDates(next); saveCustomRange(CUSTOM_RANGE_KEY, next) }} />
       </div>
 
       <div className='m-body'>
+      {Object.keys(sourceQuery).length ? <div className='m-section text-xs text-muted-foreground'>
+        {requestQuery.startDate && requestQuery.endDate ? `${requestQuery.startDate} ～ ${requestQuery.endDate}` : t('全部')}
+        {sourceQuery.client !== undefined ? ` · ${sourceQuery.client || t('未记录客户端')}` : ''}
+        {sourceQuery.apiKey ? ` · ${t('API Key')} ${sourceQuery.apiKey}` : ''}
+        <Button variant='ghost' size='sm' onClick={() => store.push('requests')}>{t('清除筛选')}</Button>
+      </div> : null}
       {error ? <ErrorNote text={error} /> : null}
       {!page ? <SkeletonList rows={4} height={104} /> : null}
 
       {page && !filtered.length ? (
         <div className='m-section'>
-          <div className='m-card'>
+          <Card className='m-card'>
             <Empty text={filter === 'all' ? t('暂无请求日志') : t('当前筛选下没有记录')} />
-          </div>
+          </Card>
         </div>
       ) : null}
 
@@ -152,9 +178,9 @@ export function RequestsPage() {
 
       {page && rows.length < matched ? (
         <div className='m-section'>
-          <button type='button' className='m-btn m-ghost' disabled={loadingMore} onClick={() => void loadMore()}>
+          <Button size='touch' variant='outline' type='button' className='m-btn m-ghost w-full' disabled={loadingMore} onClick={() => void loadMore()}>
             {loadingMore ? t('加载中…') : t('加载更早的请求')}
-          </button>
+          </Button>
         </div>
       ) : null}
 
@@ -165,12 +191,19 @@ export function RequestsPage() {
   )
 }
 
+function requestKeyName(row: RequestRow): string {
+  if (row.apiKeySource === 'key') return row.apiKeyName || row.apiKeyId || t('未命名')
+  if (row.apiKeySource === 'env') return t('环境变量 Key')
+  if (row.apiKeySource === 'none') return t('免鉴权调用')
+  return t('历史未记录 Key')
+}
+
 function RequestCard({ row, onClick }: { row: RequestRow; onClick: () => void }) {
   const status = Number(row.status) || 0
   const tone = !status ? 'warn' : status >= 200 && status < 400 ? 'ok' : 'bad'
   const note = buildNote(row)
   return (
-    <button
+    <Button size='default' variant='ghost'
       type='button'
       onClick={onClick}
       style={{
@@ -237,6 +270,9 @@ function RequestCard({ row, onClick }: { row: RequestRow; onClick: () => void })
         ) : null}
       </div>
 
+      <div className='mt-1 text-xs text-muted-foreground truncate'>
+        {row.client === 'other' ? t('其它') : row.client || t('未记录客户端')} · {requestKeyName(row)}
+      </div>
       {note ? (
         <div
           style={{
@@ -258,7 +294,7 @@ function RequestCard({ row, onClick }: { row: RequestRow; onClick: () => void })
           {note.text}
         </div>
       ) : null}
-    </button>
+    </Button>
   )
 }
 
@@ -299,8 +335,8 @@ function RequestSheet({ row, onClose }: { row: RequestRow | null; onClose: () =>
         <SheetBody>
           {row ? (
             <>
-              <div className='m-kv'>
-                <div className='m-kv-cell'>
+              <MetricGrid className='m-kv'>
+                <MetricCard className='m-kv-cell'>
                   <div className='k'>{t('状态')}</div>
                   <div
                     className='v'
@@ -315,22 +351,24 @@ function RequestSheet({ row, onClose }: { row: RequestRow | null; onClose: () =>
                   >
                     {row.status || t('在途')}
                   </div>
-                </div>
-                <div className='m-kv-cell'>
+                </MetricCard>
+                <MetricCard className='m-kv-cell'>
                   <div className='k'>{t('用时')}</div>
                   <div className='v'>{formatDuration(row.durationMs)}</div>
-                </div>
-                <div className='m-kv-cell'>
+                </MetricCard>
+                <MetricCard className='m-kv-cell'>
                   <div className='k'>{t('输入 Token')}</div>
                   <div className='v'>{formatInt(Number(row.promptTokens) || 0)}</div>
-                </div>
-                <div className='m-kv-cell'>
+                </MetricCard>
+                <MetricCard className='m-kv-cell'>
                   <div className='k'>{t('输出 Token')}</div>
                   <div className='v'>{formatInt(Number(row.completionTokens) || 0)}</div>
-                </div>
-              </div>
+                </MetricCard>
+              </MetricGrid>
 
               <div className='m-rows'>
+                <div className='m-row'><span className='m-k'>{t('客户端')}</span><span className='m-v'>{row.client || t('未记录客户端')}</span></div>
+                <div className='m-row'><span className='m-k'>{t('API Key')}</span><span className='m-v'>{requestKeyName(row)}</span></div>
                 <div className='m-row'>
                   <span className='m-k'>{t('模型')}</span>
                   <span className='m-v m-mono' style={{ fontSize: 11 }}>
@@ -398,14 +436,14 @@ function RequestSheet({ row, onClose }: { row: RequestRow | null; onClose: () =>
                 </>
               ) : null}
 
-              {row.error ? <div className='m-error'>{row.error}</div> : null}
+              {row.error ? <Alert variant='destructive'>{row.error}</Alert> : null}
             </>
           ) : null}
         </SheetBody>
         <SheetFooter>
-          <button type='button' className='m-btn m-ghost' onClick={onClose}>
+          <Button size='touch' variant='outline' type='button' className='m-btn m-ghost w-full' onClick={onClose}>
             {t('关闭')}
-          </button>
+          </Button>
         </SheetFooter>
       </SheetContent>
     </Sheet>

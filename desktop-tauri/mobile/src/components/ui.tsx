@@ -1,6 +1,7 @@
 import { Icon, type IconName } from './Icon'
 import { t } from '../i18n'
 import { store } from '../state/store'
+import { Alert, Badge as UiBadge, BadgeDot, Button, Empty as UiEmpty, PageHeader, PageTitle, PageDescription, Skeleton, Card } from '@ui'
 
 /** 通用页头（一级页）：大标题 + 副标题 + 右侧动作 */
 export function PageHead({
@@ -13,13 +14,13 @@ export function PageHead({
   actions?: React.ReactNode
 }) {
   return (
-    <div className='m-head'>
+    <PageHeader className='m-head'>
       <div style={{ minWidth: 0 }}>
-        <h1>{title}</h1>
-        {subtitle ? <p className='m-sub'>{subtitle}</p> : null}
+        <PageTitle className='text-[26px]'>{title}</PageTitle>
+        {subtitle ? <PageDescription className='m-sub'>{subtitle}</PageDescription> : null}
       </div>
       {actions ? <div className='m-head-actions'>{actions}</div> : null}
-    </div>
+    </PageHeader>
   )
 }
 
@@ -67,7 +68,7 @@ export function IconButton({
   primary?: boolean
 }) {
   return (
-    <button
+    <Button size='icon-touch' variant='outline'
       type='button'
       className={primary ? 'm-icon-btn m-primary' : 'm-icon-btn'}
       aria-label={label}
@@ -75,7 +76,7 @@ export function IconButton({
       onClick={onClick}
     >
       <Icon name={name} />
-    </button>
+    </Button>
   )
 }
 
@@ -91,9 +92,9 @@ export function SectionHead({
     <div className='m-section-head'>
       <h2>{title}</h2>
       {action ? (
-        <button type='button' className='m-link' onClick={action.onClick}>
+        <Button size='sm' variant='link' type='button' className='m-link px-0' onClick={action.onClick}>
           {action.label}
-        </button>
+        </Button>
       ) : null}
     </div>
   )
@@ -109,22 +110,20 @@ export function Badge({
   dot?: boolean
   children: React.ReactNode
 }) {
-  return (
-    <span className={`m-badge m-badge-${tone}`}>
-      {dot ? <i /> : null}
-      {children}
-    </span>
-  )
+  const variants = { ok: 'success', warn: 'warning', bad: 'destructive', mute: 'secondary', brand: 'brand' } as const
+  return <UiBadge variant={variants[tone]} shape='tag'>
+    {dot ? <BadgeDot /> : null}{children}
+  </UiBadge>
 }
 
 /** 空态 */
 export function Empty({ text }: { text: string }) {
-  return <div className='m-empty'>{text}</div>
+  return <UiEmpty className='m-empty'>{text}</UiEmpty>
 }
 
 /** 错误条（页内，不弹窗） */
 export function ErrorNote({ text }: { text: string }) {
-  return <div className='m-error'>{text}</div>
+  return <Alert variant='destructive' className='mx-4'>{text}</Alert>
 }
 
 /** 加载骨架：给列表页首屏用，避免「空白 → 突然出现内容」的跳动 */
@@ -132,7 +131,7 @@ export function SkeletonList({ rows = 4, height = 64 }: { rows?: number; height?
   return (
     <div className='m-section'>
       {Array.from({ length: rows }).map((_, index) => (
-        <div
+        <Skeleton
           key={index}
           className='m-skeleton'
           style={{ height, marginTop: index ? 8 : 0 }}
@@ -181,7 +180,7 @@ export function StatCard({
   tone?: 'up' | 'ok'
 }) {
   return (
-    <div className='m-card m-card-pad' style={{ padding: '12px 13px' }}>
+    <Card className='m-card m-card-pad' style={{ padding: '12px 13px' }}>
       <div style={{ fontSize: 11.5, color: 'var(--m-text-3)' }}>{label}</div>
       <div
         style={{
@@ -205,6 +204,6 @@ export function StatCard({
           {sub}
         </div>
       ) : null}
-    </div>
+    </Card>
   )
 }

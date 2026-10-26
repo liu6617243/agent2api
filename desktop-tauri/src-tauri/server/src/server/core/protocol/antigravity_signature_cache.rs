@@ -5,15 +5,11 @@
 //! 文案「Function call is missing a thought_signature in functionCall parts」）；
 //! 带一个伪造的同样 400（「Corrupted thought signature」—— 签名本体被校验，
 //! 「发明默认签名」的路走不通）。
-//! ⚠️ 这里说的是 **functionCall** 那一侧（issue #291 的实测结论，本模块的
-//! 存在理由）。另外两处别混进来：
-//!   · Google 官方文档确实给了两个「跳过校验」的哨兵值
-//!     （`skip_thought_signature_validator` / `context_engineering_is_the_way_to_go`），
-//!     但本仓**只**把它用在 Claude 的思考块占位上
-//!     （`antigravity_outbound::SKIP_SIGNATURE_SENTINEL`）—— functionCall 这侧
-//!     有真签名可用时没有理由拿哨兵顶；
-//!   · Claude 的历史轮思考块是**另一条**校验（要求「以思考块开头」），
-//!     与这里按 call id 缓存的是两回事，见 `ensure_claude_thinking_leading`。
+//! ── 插件调用 ────────────────────────────────────────────────
+//! 响应翻译与出站回填在网关进程使用同一份缓存。读取按会话 + 调用 id
+//! 精确匹配，避免不同客户端重复使用 call_1 时串签名；没有缓存时保留插件
+//! 补入的官方哨兵。客户端回传的真实签名永远不被覆盖。
+//!
 //! 网关把签名放在 `tool_calls[].extra_content.google.thought_signature`
 //! （Google 自家 OpenAI 兼容端点的字段位置）随响应带出 —— 但那是非标字段，
 //! 多数 OpenAI 兼容客户端下一轮会把它丢掉，于是「模型调工具 → 客户端回传
@@ -29,7 +25,7 @@
 //!     签名仍最优先（那是最忠实的一份），缓存只是客户端没带时的回填。
 //!
 //! ── 两档键 ──────────────────────────────────────────────────
-//!   1. `call_id → signature`（主键）：上游给 functionCall 的 id，OpenAI 形态
+//!   1. `sessionId + call_id → signature`（主键）：上游给 functionCall 的 id，OpenAI 形态
 //!      的客户端必须原样引用（`tool_calls[].id` / `tool_call_id` 要配对），
 //!      回放历史里就在手上 —— 绝大多数客户端命中这一档；
 //!   2. `sessionId + 函数名 → signature`（兜底）：个别框架会重排 / 重生成 id，
@@ -77,12 +73,12 @@ const CALL_PREFIX: &str = "c|";
 /// 键前缀：会话 + 函数名档
 const SESSION_PREFIX: &str = "s|";
 
-/// 记一个「call id → 签名」（响应侧：tool_call 带签名下发时调用）。
-pub fn remember_call(call_id: &str, signature: &str) {
-    if call_id.is_empty() || signature.is_empty() {
+/// 记一个「会话 + call id → 签名」（响应侧：tool_call 带签名下发时调用）。
+pub fn remember_call(session: &str, call_id: &str, signature: &str) {
+    if session.is_empty() || call_id.is_empty() || signature.is_empty() {
         return;
     }
-    insert(format!("{CALL_PREFIX}{call_id}"), signature.to_string());
+    insert(format!("{CALL_PREFIX}{session}|{call_id}"), signature.to_string());
 }
 
 /// 记一个「会话 + 函数名 → 签名」（响应侧兜底档；会话键拿不到时不记，
@@ -94,12 +90,12 @@ pub fn remember_for_session(session: &str, name: &str, signature: &str) {
     insert(format!("{SESSION_PREFIX}{session}|{name}"), signature.to_string());
 }
 
-/// 按 call id 取回签名（请求侧回填的主键档）。
-pub fn lookup_call(call_id: &str) -> Option<String> {
-    if call_id.is_empty() {
+/// 按会话与 call id 取回签名（请求侧回填的主键档）。
+pub fn lookup_call(session: &str, call_id: &str) -> Option<String> {
+    if session.is_empty() || call_id.is_empty() {
         return None;
     }
-    lookup(&format!("{CALL_PREFIX}{call_id}"))
+    lookup(&format!("{CALL_PREFIX}{session}|{call_id}"))
 }
 
 /// 按「会话 + 函数名」取回签名（请求侧回填的兜底档）。

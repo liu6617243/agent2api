@@ -1,5 +1,6 @@
 import { Icon } from './Icon'
 import { t } from '../i18n'
+import { Button, PageHeader } from '@ui'
 
 /**
  * 二级页顶部返回栏。
@@ -19,12 +20,12 @@ export function NavBar({
   actions?: React.ReactNode
 }) {
   return (
-    <div className='m-navbar'>
-      <button type='button' className='m-icon-btn' onClick={onBack} aria-label={t('返回')}>
+    <PageHeader className='m-navbar'>
+      <Button size='icon-touch' variant='outline' type='button' className='m-icon-btn' onClick={onBack} aria-label={t('返回')}>
         <Icon name='back' />
-      </button>
+      </Button>
       <span className='m-navbar-title'>{title}</span>
       <span className='m-navbar-slot'>{actions}</span>
-    </div>
+    </PageHeader>
   )
 }

@@ -67,6 +67,7 @@ pub mod catalog;
 /// 远程模型清单的**持久化缓存**（各家的清单在进程重启后由它读回，见模块头）。
 /// 不进身份体系：它是各家的共用基础设施，只按 scope 字符串存取 JSON。
 pub mod catalog_cache;
+mod catalog_legacy;
 pub mod catalog_refresh;
 pub mod cline;
 pub mod content_block;
@@ -75,6 +76,7 @@ pub mod content_block;
 /// 网关对它的转发是通用 OpenAI 兼容路径 —— 这条路**不针对任何特定上游**，
 /// 用户填什么就打什么，没有内置的伪装知识。
 pub mod custom;
+pub mod images;
 pub mod loomy;
 /// MonkeyCode 的两个站点：`monkeycode/` 里只剩**地区身份**
 /// （`monkeycode` / `monkeycode-intl` 是两家 provider）与展示名。
@@ -98,6 +100,7 @@ pub mod missing_plugin;
 pub mod qoder;
 pub mod refresh_flight;
 pub mod router;
+pub mod retry;
 pub mod workbuddy;
 pub mod zcode;
 
@@ -542,6 +545,7 @@ where
                 "id": detail.id,
                 "label": detail.label,
                 "count": count(detail.id),
+                "category": crate::server::core::plugin_host::provider_category(detail.id),
             })
         })
         .collect();
@@ -561,6 +565,7 @@ where
             "id": id,
             "label": adapter.label(),
             "count": count(&id),
+            "category": crate::server::core::plugin_host::provider_category(&id),
         }));
     }
     // `account_providers` 在两类来源之外只剩「插件已卸载的残留家」——

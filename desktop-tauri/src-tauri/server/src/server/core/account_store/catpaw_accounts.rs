@@ -206,12 +206,13 @@ impl AccountStore {
                 }
             }
             match self.plugin_update_secret(id, &secret, &next_secret) {
-                Ok(_) => {
+                Ok(true) => {
                     return Ok(vec![match next {
                         Some(_) => "余额查询凭证已更新".to_string(),
                         None => "余额查询凭证已清除".to_string(),
                     }])
                 }
+                Ok(false) => return Err(AccountStoreError::new("账号凭证已变化，请刷新后重试", 409)),
                 Err(message) => return Err(AccountStoreError::new(message, 500)),
             }
         }

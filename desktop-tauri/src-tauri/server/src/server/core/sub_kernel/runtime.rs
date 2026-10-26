@@ -507,17 +507,12 @@ fn alias_of_key(key: &str) -> String {
 
 /// 本次该给哪些节点开监听器的节点键集合（`<订阅id>::<节点名>`）。
 ///
-/// = **账号引用中的池条目**（`proxy_pool::listener_node_keys`，禁用中的条目
-/// 不算）。专用端口只服务「真正在用」的节点 —— 测试走统一测试口（见
-/// `select_test_node`），不再需要为它开端口；曾经还有「被测试钉住」这半个
-/// 来源，统一测试口上线后随 pinned 机制一起退役了。
-///
-/// 账号存储未接线 / 不可用 / 读失败时**只**给空引用集合（不整体返回空）：
-/// 与 `proxy_pool` 的「解析失败按空表处理」同一取向。
+/// 账号与服务线路引用的合集，禁用条目不算；测试走统一测试口，不占专用端口。
+/// 账号存储未接线时仍保留全局服务线路的引用。
 fn listener_node_keys() -> HashSet<String> {
-    let pool_ids = crate::server::core::sub_kernel::account_store()
-        .map(|store| store.referenced_pool_ids())
-        .unwrap_or_default();
+    let pool_ids = crate::server::core::proxy_pool::usage::referenced_pool_ids(
+        crate::server::core::sub_kernel::account_store(),
+    );
     let borrowed: HashSet<&str> = pool_ids.iter().map(String::as_str).collect();
     crate::server::core::proxy_pool::listener_node_keys(&borrowed)
 }

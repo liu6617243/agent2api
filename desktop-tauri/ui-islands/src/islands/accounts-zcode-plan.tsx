@@ -1,7 +1,7 @@
 /** ZCode 套餐通道选择与验证码令牌池状态。 */
 
 import * as React from 'react'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@ui'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Field, FieldLabel } from '@ui'
 import { t } from '../i18n'
 import { errorMessage, shared, type AccountsBridge } from './accounts-shared'
 import { zcodePlanLabel, ZCODE_PLAN_CODING, ZCODE_PLAN_START } from './accounts-domain'
@@ -61,8 +61,8 @@ export function PlanChannelField({
     return () => { alive = false; window.clearInterval(timer) }
   }, [plan])
   return (
-    <div className='field-row mt-2.5'>
-      <label htmlFor='account-plan-channel'>{t('使用套餐')}</label>
+    <Field orientation='horizontal' className='field-row mt-2.5'>
+      <FieldLabel htmlFor='account-plan-channel'>{t('使用套餐')}</FieldLabel>
       <Select value={plan} onValueChange={value => onChange(String(value))}>
         <SelectTrigger id='account-plan-channel' className='min-w-[220px]'>
           <SelectValue>{zcodePlanLabel(plan)}</SelectValue>
@@ -87,6 +87,6 @@ export function PlanChannelField({
           {poolStatus(pool, mint)}
         </span>
       ) : null}
-    </div>
+    </Field>
   )
 }

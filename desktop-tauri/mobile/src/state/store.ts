@@ -14,29 +14,22 @@ import * as React from 'react'
  * 都宝贵，只在页面可见时刷新。
  */
 
-import { apiCall } from '../api/client'
 import { fetchSession, type SessionPayload, type Account } from '../api/gateway'
 // 插件申报的账号行参数（有效期键 / 标识键 / 余额能力）：随会话一起下发，
 // 收到即归一（见 providerFacts 的模块头）
 import { adoptProviderFacts } from '../lib/providerFacts'
-// 插件申报的页面（签到中心这类）：菜单键 `plugin:<pack>:<page>`，与桌面端同一拼法
-import { isPluginKey, pluginPagesOf, type PluginPage } from '../lib/pluginPages'
+import { normalizeRoute, routeFromHash, type Route } from '../lib/routes'
+export type { Route } from '../lib/routes'
 import {
   activeServer,
   isPackaged,
   listServers,
   removeServer,
   saveServer,
+  serverIdentity,
   setActiveServer,
   type ServerEntry,
 } from '../lib/servers'
-
-export type Route = {
-  /** 一级页 id（home/report/accounts/assistant/more）或二级页 id */
-  screen: string
-  /** 二级页参数（如账号 id） */
-  params?: Record<string, string>
-}
 
 export type ThemeMode = 'system' | 'light' | 'dark'
 
@@ -50,7 +43,7 @@ type AppState = {
   sessionError: string
   loading: boolean
   theme: ThemeMode
-  toast: { text: string; tone: 'ok' | 'err' } | null
+  toast: { text: string; tone: 'ok' | 'err' | 'warn' } | null
   /**
    * 需要用户补凭证时置位，界面弹对应层：
    *   · `login` —— 管理员会话过期，弹登录表单
@@ -63,43 +56,11 @@ type AppState = {
   server: ServerEntry | null
   /** 打包形态（APK）才需要服务器配置页与登录页 */
   packaged: boolean
-  /**
-   * 插件申报的页面（`GET /api/plugins` 的 `packs[].ui[]`）。
-   *
-   * 与桌面端的 `dynamicMenus` 对应：手机端没有可增删的侧边栏，这些页面直接
-   * 进「更多」的宫格。空数组 = 没装带页面的插件，宫格里那一组不出现。
-   */
-  pluginPages: PluginPage[]
+  /** 地址或服务器变化时递增，用于销毁上一台网关的页内缓存。 */
+  serverRevision: number
 }
 
 const THEME_KEY = 'workbuddy-desktop-theme'
-
-/**
- * 已知页面 id 的白名单（与 `App.tsx` 的 SCREENS 同一份取值）。
- *
- * store 不 import 页面层（那会把整棵组件树拖进路由模块，也绕出循环依赖），
- * 所以这里单独列一份。**新增页面时两处都要加** —— 漏了只会让「手改 hash
- * 直达」失效，不影响应用内跳转。
- *
- * `checkin` / `checkin-records` 不在这里：签到中心已搬进插件包，它的菜单键
- * 是运行期的 `plugin:<pack>:checkin`（见 `knownScreen` 的前缀放行）。
- */
-const KNOWN_SCREENS = new Set([
-  'home', 'report', 'accounts', 'assistant', 'more',
-  'models', 'keys', 'proxies', 'tasks',
-  'requests', 'logs', 'settings', 'docs', 'agent', 'servers',
-])
-
-/**
- * hash 里的页面 id 认不认。
- *
- * 插件页面的键带冒号（`plugin:<pack>:<page>`），不能进上面那个 Set —— 它随
- * 装的插件而变。这里按前缀放行，具体存不存在由页面层查 `pluginPages`
- * （查不到就显示「这个页面没了」，不会渲染空白屏）。
- */
-function knownScreen(screen: string): boolean {
-  return KNOWN_SCREENS.has(screen) || isPluginKey(screen)
-}
 
 function readTheme(): ThemeMode {
   try {
@@ -118,12 +79,7 @@ function readTheme(): ThemeMode {
  * 先渲染首页再跳到目标页，手机上是一次可见的闪动。
  */
 function readInitialRoute(): Route {
-  const raw = location.hash.replace(/^#/, '').trim()
-  if (!raw) return { screen: 'home' }
-  // 插件页面的键本身带冒号，不含 `/`；先整体认一次，再走「屏幕/参数」的拆法
-  const [screen, id] = raw.split('/')
-  if (!screen || !knownScreen(screen)) return { screen: 'home' }
-  return { screen, params: id ? { id } : undefined }
+  return routeFromHash(location.hash)
 }
 
 /** 应用主题到 <html data-theme>：与桌面端同一套属性名，tokens 才能跟着切 */
@@ -155,7 +111,7 @@ class Store {
     servers: listServers(),
     server: activeServer(),
     packaged: isPackaged(),
-    pluginPages: [],
+    serverRevision: 0,
   }
 
   private listeners = new Set<Listener>()
@@ -202,8 +158,9 @@ class Store {
 
   /** 切一级页：清空二级栈 */
   go(screen: string): void {
-    if (this.state.route.screen === screen && this.state.stack.length === 0) return
-    this.patch({ route: { screen }, stack: [] })
+    const route = normalizeRoute(screen)
+    if (this.state.route.screen === route.screen && this.state.stack.length === 0) return
+    this.patch({ route, stack: [] })
     // 切 Tab 不是「往下钻」：之前的二级页历史一并作废（浏览器历史里那些
     // 条目不回收 —— 它们只会让「返回」多绕一圈，用户感知不到）
     this.historyDepth = 0
@@ -219,7 +176,7 @@ class Store {
   push(screen: string, params?: Record<string, string>): void {
     this.patch({
       stack: [...this.state.stack, this.state.route],
-      route: { screen, params },
+      route: normalizeRoute(screen, params),
     })
     this.historyDepth += 1
     this.syncHash(false)
@@ -315,7 +272,8 @@ class Store {
    */
   private syncHash(replace: boolean): void {
     const { route } = this.state
-    const id = route.params?.id ? `${route.screen}/${route.params.id}` : route.screen
+    const param = route.screen === 'checkin' ? route.params?.tab : route.params?.id
+    const id = param ? `${route.screen}/${param}` : route.screen
     try {
       if (replace) history.replaceState(null, '', `#${id}`)
       else history.pushState(null, '', `#${id}`)
@@ -331,40 +289,28 @@ class Store {
    * 而不是渲染一个空白屏。
    */
   restoreFromHash(): void {
-    const raw = location.hash.replace(/^#/, '').trim()
-    if (!raw) {
-      if (this.state.route.screen !== 'home') this.patch({ route: { screen: 'home' }, stack: [] })
-      return
-    }
-    const [screen, id] = raw.split('/')
-    if (!screen || screen === this.state.route.screen) return
-    // 未知页面回落首页：手改 hash（或旧版本留下的 #xxx）不该渲染出空白屏。
-    // 这里不 import SCREENS —— store 不该依赖页面层，用白名单即可，与
-    // App.tsx 的路由表同一份取值（新增二级页时两处都要加）。
-    if (!knownScreen(screen)) {
-      this.patch({ route: { screen: 'home' }, stack: [] })
-      return
-    }
-    this.patch({ route: { screen, params: id ? { id } : undefined }, stack: [] })
+    const route = routeFromHash(location.hash)
+    if (JSON.stringify(route) !== JSON.stringify(this.state.route)) this.patch({ route, stack: [] })
+    this.syncHash(true)
   }
 
   /* ── 会话 ── */
 
   async refresh(force = false): Promise<void> {
+    if (this.state.packaged && !this.state.server) return
     if (this.state.loading && !force) return
     this.inflight?.abort()
     const controller = new AbortController()
+    const identity = serverIdentity()
     this.inflight = controller
     this.patch({ loading: true })
     try {
       const session = await fetchSession(controller.signal)
-      // 插件申报的账号行参数（有效期键 / 标识键 / 余额能力）随会话一起下发。
-      // 在这里收下：它是 `/api/session` 的一部分，每次刷新都会换一份新对象，
-      // 而读它的地方（列表行、详情页）不经过 React 状态 —— 见 providerFacts。
-      adoptProviderFacts((session as { accountFeatures?: unknown }).accountFeatures)
+      if (controller.signal.aborted || serverIdentity() !== identity) return
+      adoptProviderFacts(session.accountFeatures)
       this.patch({ session, sessionError: '', loading: false, authLost: null })
     } catch (error) {
-      if (controller.signal.aborted) return
+      if (controller.signal.aborted || serverIdentity() !== identity) return
       const message = error instanceof Error ? error.message : String(error)
       this.patch({ sessionError: message, loading: false })
     }
@@ -375,28 +321,6 @@ class Store {
     return this.state.session?.accounts?.accounts || []
   }
 
-  /**
-   * 拉一次插件页面清单（`GET /api/plugins`）。
-   *
-   * 与会话分开拉：插件清单只在**装 / 卸 / 停用插件**后才变，跟会话的 20 秒
-   * 轮询不是一回事。调用点：应用启动、从插件管理页回来、切服务器。
-   * 失败保持原清单不变（一次网络抖动不该让宫格里的入口消失）。
-   */
-  async refreshPluginPages(): Promise<void> {
-    if (this.state.packaged && !this.state.server) return
-    try {
-      const payload = await apiCall<unknown>('/api/plugins')
-      this.patch({ pluginPages: pluginPagesOf(payload) })
-    } catch {
-      /* 拉不到就沿用上一次的清单 */
-    }
-  }
-
-  /** 按菜单键找插件页面（App 的路由分派用） */
-  pluginPage(key: string): PluginPage | undefined {
-    return this.state.pluginPages.find(page => page.key === key)
-  }
-
   /* ── 服务器（仅 APK） ── */
 
   /** 重新从 localStorage 读一遍列表（增删改之后调用） */
@@ -404,45 +328,51 @@ class Store {
     this.patch({ servers: listServers(), server: activeServer() })
   }
 
+  private resetServerData(): void {
+    this.inflight?.abort()
+    this.inflight = null
+    adoptProviderFacts(null)
+    this.patch({
+      session: null, sessionError: '', authLost: null, loading: false, toast: null,
+      serverRevision: this.state.serverRevision + 1,
+    })
+    void this.refresh(true)
+  }
+
   /** 新增一台服务器并切过去；返回它的 id */
   addServer(input: { name?: string; base: string }): string {
+    const previous = serverIdentity()
     const entry = saveServer(input)
     setActiveServer(entry.id)
     this.reloadServers()
-    // 换服务器 = 换一份会话，先把旧快照清掉，避免界面上短暂显示上一台的账号
-    this.patch({ session: null, sessionError: '', authLost: null })
+    if (serverIdentity() !== previous) this.resetServerData()
     return entry.id
   }
 
   /** 修改已有服务器（改地址 / 改名） */
   updateServer(id: string, input: { name?: string; base: string }): void {
+    const previous = serverIdentity()
     saveServer({ id, ...input })
     this.reloadServers()
-    // 地址变了，原来那份会话对不上新网关，重新拉
-    if (this.state.server?.id === id) this.patch({ session: null, sessionError: '' })
+    if (serverIdentity() !== previous) this.resetServerData()
   }
 
   deleteServer(id: string): void {
+    const previous = serverIdentity()
     removeServer(id)
     this.reloadServers()
-    this.patch({ session: null, sessionError: '', authLost: null })
+    if (serverIdentity() !== previous) this.resetServerData()
   }
 
-  /** 切到另一台服务器：清掉旧快照，界面随后自行 refresh */
   switchServer(id: string): void {
-    if (this.state.server?.id === id) return
+    if (this.state.server?.id === id || !this.state.servers.some(server => server.id === id)) return
     setActiveServer(id)
     this.reloadServers()
-    this.patch({
-      session: null,
-      sessionError: '',
-      authLost: null,
-      stack: [],
-      route: { screen: 'home' },
-      // 插件清单是**这台网关**的事实：换了服务器还留着上一台的页面键，
-      // 宫格里会点进一个不存在的地址
-      pluginPages: [],
-    })
+    this.patch({ stack: [], route: { screen: 'home' } })
+    this.historyDepth = 0
+    this.selfBackPending = 0
+    this.syncHash(true)
+    this.resetServerData()
   }
 
   /* ── 主题 ── */
@@ -469,7 +399,7 @@ class Store {
 
   /* ── 提示 ── */
 
-  toast(text: string, tone: 'ok' | 'err' = 'ok'): void {
+  toast(text: string, tone: 'ok' | 'err' | 'warn' = 'ok'): void {
     if (this.toastTimer !== null) window.clearTimeout(this.toastTimer)
     this.patch({ toast: { text, tone } })
     this.toastTimer = window.setTimeout(() => this.patch({ toast: null }), 2000)

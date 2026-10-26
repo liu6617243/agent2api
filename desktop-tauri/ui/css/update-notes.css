@@ -174,18 +174,6 @@
 
 /* 日期紧跟链接之后（链接已经吃了 auto，这里不再 auto，否则会平分空档） */
 .rel-head-link + .rel-date { margin-left: 0; }
-
-/* ─── 「加入交流群」弹窗 ──────────────────────────────
-   四张卡片（QQ 群 ×2、Telegram、Discord）：左边品牌标、右边主副标题。
-   卡片是原生 <button>（QQ，点击复制）/ <a>（外链，点击打开）。
-
-   **这里不能换成组件库 Button**：Button 的 ghost 变体自带 `border-transparent
-   bg-transparent`，会把卡片描边与底色整条压掉（两张卡粘成一片、与 <a> 卡对不齐）。
-   改用原生元素后还要压掉 components.css 里那两条全局规则：
-     · `button { height: 30px }` —— 卡片高度得由两行内容决定；
-     · `button:hover:not(:disabled) { background: var(--control-hover) }` —— 特异性
-       0,2,1，比 `.qq-card:hover`（0,2,0）高，不显式压过的话悬停会冒出灰底。
-   下面统一用 `button.qq-card…` 形态把特异性提到 0,3,1，正好盖住那一条。 */
 .qq-intro {
   margin: 0;
   color: var(--text-3);
@@ -250,7 +238,7 @@ button.qq-card:focus-visible { box-shadow: var(--ring); }
 }
 
 /* 图形是品牌色填充，反白靠 filter 会把描边也一起吃掉；改为给 path 直接上白色 */
-.qq-card-logo svg path { fill: #fff !important; }
+.qq-card-logo svg path { fill: #fff; }
 
 /* 品牌底：与 icons.js 里三枚 path 的 fill 取同一组 hex */
 .qq-card-logo[data-brand='qq'] { background: #1EBAFC; }

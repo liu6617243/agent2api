@@ -1,31 +1,9 @@
-//! 软件更新 —— GitHub Release 检测与安装包下载（对照 workbuddy-update.mjs）。
-//!
-//! ── 为什么检测/下载在后端而不是 Tauri 壳 ────────────────────
-//! 壳侧 reqwest 为省掉 TLS 依赖关掉了默认特性（只能访问本机网关的明文 HTTP），
-//! 发不出 GitHub 的 HTTPS 请求。因此这里负责联网，壳只做两件事：
-//! 把「当前版本」传进来比较、把下载好的安装包跑起来。
-//!
-//! ── 出口策略：直连优先，失败后借 Clash 混合端口兜一次 ────────
-//! 国内访问 GitHub 常需代理，但用户不一定给账号配了代理 ——
-//! 直连能通就别打扰，通不了再借 Clash 的混合端口重试。候选顺序与
-//! Node 版 `resolveEgressCandidates` 一致：`[直连, Clash 混合端口?]`。
-//! **只有网络层失败才切出口**：HTTP 状态码类错误直接交给调用方判断，
-//! 否则 404（仓库没有 Release）会被误当成「需要换代理」而白试一轮。
-//!
-//! ── 文件分工 ────────────────────────────────────────────────
-//!   mod.rs          句柄、下载状态机、进度/取消、check 的响应组装（本文件）
-//!   version.rs      版本比较、域名白名单、资产挑选、文件名安全化（纯函数）
-//!   client.rs       出网候选解析、GitHub 请求头、带出口重试的 fetch
-//!   selfupdate.rs   容器内自更新（原地替换二进制与 ui 目录、回滚、重启钩子）
-//!
-//! ── 与 Node 版的一处结构性差异：下载任务的所有权 ─────────────
-//! Node 用一个模块级 `task` 变量（同一时刻只允许一个下载）；Rust 侧同一份状态
-//! 放句柄内部的 `Mutex<Task>`，**下载字节数与进度也在同一把锁里更新**。
-//! 硬约束「持锁不做网络请求、不 await」因此落在：读响应流时按 chunk 加锁更新
-//! 计数 → 放锁 → 写文件。写文件是同步 IO，在 tokio 的工作线程上执行
-//! （reqwest 的 bytes_stream 本身就是 async，每条 chunk 的落盘量很小）。
+//! 软件更新：共享 GitHub 访问策略、版本检查与经过校验的安装包下载。
 
 mod check;
+mod download;
+pub(crate) mod source;
+mod integrity;
 // 更新源索引：从索引仓库的 `app.json` 读「构建产物放在哪个仓库」。
 // 与插件商店共用信任根仓库、两个文件（见模块头）。
 mod index;
@@ -43,19 +21,18 @@ mod version;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
-use crate::server::logging;
+use crate::server::{config, logging};
 
 pub use version::{
     api_base, assert_downloadable, compare_versions, custom_api_base, desktop_shell,
-    installer_kind, pick_android_apk, pick_asset_by_name, pick_installer, safe_file_name,
+    installer_kind, is_prerelease_version, pick_android_apk, pick_asset_by_name, pick_installer, safe_file_name,
     server_bundle_name, set_desktop_shell, UpdateError, DEFAULT_REPO, GITHUB_API,
-    MAX_INSTALLER_BYTES,
+    MAX_INSTALLER_BYTES, SOURCE_REPO,
 };
+pub use integrity::download_plan;
 /// 「更新设置」弹窗的 GitHub 令牌接口（api::update 走这两条；加解密本体
 /// 只在 token 模块内部，见它的模块头）
 pub use token::{set_token, status_json};
@@ -193,6 +170,11 @@ impl UpdateManager {
         self.lock().repository.clone()
     }
 
+    pub fn reset_source_preference(&self) {
+        source::clear_preferences();
+        self.lock().index_checked_at = 0;
+    }
+
     /// 解析本次检查要用的仓库，必要时先读一次索引。
     ///
     /// ── 优先级 ──────────────────────────────────────────────────
@@ -267,6 +249,12 @@ impl UpdateManager {
                 guard.pending_restart,
             )
         };
+        let channels = config::update_channels();
+        let latest = latest.filter(|release| {
+            let prerelease = release["prerelease"] == true
+                || version::is_prerelease_version(release["tag"].as_str().unwrap_or(""));
+            channels.accepts(prerelease)
+        });
         let latest_tag = latest
             .as_ref()
             .and_then(|value| value.get("tag"))
@@ -345,7 +333,12 @@ impl UpdateManager {
             // 已应用、只差重启：界面据此把按钮换成「立即重启」，
             // 而不是再给一次注定 400 的「下载并更新」
             "pendingRestart": pending_restart,
+            // 安装包所在的仓库（构建账号下），只用于「更新从哪来」的说明。
+            // 界面的作者行 / Star 入口**不要**用它 —— 见下一行。
             "repository": repository,
+            // 项目源码仓库：界面上的「关于作者」「收藏项目」由它拼链接。
+            // 构建账号只是借来跑 Actions 的，主页上没有代码，不能拿来当项目地址。
+            "sourceRepository": SOURCE_REPO,
             "downloadSupported": asset.is_some(),
             // 安装包形态（"nsis" / "dmg"）：界面据此决定文案 ——
             // Windows 要提示 UAC 提权、macOS 是挂载磁盘映像后手动拖进应用程序
@@ -353,289 +346,6 @@ impl UpdateManager {
             "downloadDir": download_dir.to_string_lossy(),
             "task": task.map(|task| task.to_json()).unwrap_or(Value::Null),
         })
-    }
-
-    // ─── 下载 ───────────────────────────────────────────────
-
-    /// 下载进度（前端轮询）；没有任务时为 null（对应 Node 的 taskSummary）
-    pub fn get_progress(&self) -> Value {
-        self.lock()
-            .task
-            .clone()
-            .map(|task| task.to_json())
-            .unwrap_or(Value::Null)
-    }
-
-    /// 取消进行中的下载并清理半截文件（对应 cancelDownload）。
-    /// 没有进行中的任务时返回 `{canceled:false}`。
-    pub fn cancel_download(&self) -> Value {
-        let (cancelable, flag) = {
-            let mut guard = self.lock();
-            let Some(task) = guard.task.as_mut() else {
-                return json!({ "canceled": false });
-            };
-            if !task.active {
-                return json!({ "canceled": false });
-            }
-            task.canceled = true;
-            (true, guard.cancel_flag.clone())
-        };
-        if cancelable {
-            if let Some(flag) = flag {
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        json!({ "canceled": true })
-    }
-
-    /// 启动安装包下载（对应 startDownload）。
-    ///
-    /// 同一时刻只跑一个：已有进行中的任务时**直接返回它的快照**，
-    /// 避免用户连点导致多个 200MB 的安装包同时落盘。
-    /// 后台跑真正的下载（接口立刻返回，进度由前端轮询）。
-    pub fn start_download(&self, url: &str, name: &str) -> Result<Value, UpdateError> {
-        // ① 已有进行中的任务 → 直接复用（**在校验 URL 之前**，与 Node 的判定顺序一致）
-        if let Some(task) = self.lock().task.clone().filter(|task| task.active) {
-            return Ok(task.to_json());
-        }
-
-        let target = assert_downloadable(url)?;
-        let fallback_name = target
-            .path_segments()
-            .and_then(|mut segments| segments.next_back())
-            .unwrap_or("")
-            .to_string();
-        let filename = safe_file_name(if name.is_empty() { &fallback_name } else { name });
-        let download_dir = self.download_dir();
-        if let Err(error) = std::fs::create_dir_all(&download_dir) {
-            return Err(UpdateError::new(format!("创建下载目录失败: {error}")));
-        }
-        let file_path = download_dir.join(&filename);
-
-        // 同版本重复下载时直接覆盖，不留一堆历史安装包。
-        // 删除失败（文件被占用）不在这里报错 —— 让后面的写入自己报，
-        // 与 Node 的 `try { rmSync } catch { /* 让写入自己报错 */ }` 一致
-        let _ = std::fs::remove_file(&file_path);
-
-        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let snapshot = {
-            let mut guard = self.lock();
-            let task = Task {
-                active: true,
-                done: false,
-                canceled: false,
-                error: None,
-                filename: filename.clone(),
-                path: Some(file_path.to_string_lossy().to_string()),
-                received: 0,
-                total: 0,
-            };
-            guard.task = Some(task.clone());
-            guard.cancel_flag = Some(cancel_flag.clone());
-            task.to_json()
-        };
-
-        let service = self.clone();
-        crate::spawn_task(async move {
-            service.run_download(target, file_path, cancel_flag).await;
-        });
-        Ok(snapshot)
-    }
-
-    /// 真正的下载（对应 runDownload）。
-    ///
-    /// 与 Node 相同的收尾约定：无论成功、失败还是取消，都清掉半截文件
-    /// （留着会被误当成可运行的安装包）、把 path 置 null、active 置 false；
-    /// 取消是**正常路径**（记「下载已取消」日志，不写 error）。
-    async fn run_download(
-        &self,
-        target: url::Url,
-        file_path: PathBuf,
-        cancel_flag: Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        let outcome = self.download_stream(&target, &file_path, &cancel_flag).await;
-        let canceled = cancel_flag.load(std::sync::atomic::Ordering::SeqCst);
-        let succeeded = matches!(&outcome, Ok(_)) && !canceled;
-
-        // 清理半截文件：**只有失败与取消才删**（Node 的 catch 分支才 rmSync）。
-        // 成功路径绝不能删 —— 那会把刚下好的安装包一起带走。
-        if !succeeded {
-            let _ = std::fs::remove_file(&file_path);
-        }
-
-        {
-            let mut guard = self.lock();
-            let Some(task) = guard.task.as_mut() else {
-                return;
-            };
-            task.active = false;
-            // 按引用匹配：下面还要用 outcome 打日志，不能让这里把它 move 走
-            match &outcome {
-                Ok(size) if !canceled => {
-                    task.done = true;
-                    task.received = *size;
-                    task.total = *size;
-                    task.path = Some(file_path.to_string_lossy().to_string());
-                    task.error = None;
-                }
-                // 取消与失败：path 置 null（留着的半成品会被误当成可运行的安装包）
-                Ok(_) => {
-                    task.path = None;
-                    task.error = None;
-                }
-                Err(error) => {
-                    task.path = None;
-                    if canceled {
-                        // 取消导致的读取中断不算错误（Node 同）
-                        task.error = None;
-                    } else {
-                        task.error = Some(error.message.clone());
-                    }
-                }
-            }
-        }
-        // 日志与控制台输出放在锁外（避免持锁做 IO）
-        if canceled {
-            logging::log("[Update]", "下载已取消");
-            return;
-        }
-        match outcome {
-            Ok(size) => logging::log(
-                "[Update]",
-                &format!(
-                    "✅ 安装包已就绪: {}（{:.1} MB）",
-                    file_path.display(),
-                    size as f64 / 1024.0 / 1024.0
-                ),
-            ),
-            Err(error) => logging::log("[Update]", &format!("❌ {}", error.message)),
-        }
-    }
-
-    /// 流式下载主体：返回落盘字节数。`Err` 是失败原因（取消由调用方读标志区分）。
-    ///
-    /// ── 为什么用 `tokio::select!` 而不是只在 chunk 之间查标志 ────
-    /// Node 版把 AbortController 的 signal 挂在整个 fetch 上，取消会**立刻**
-    /// 中断「建连 / 等响应头」阶段。若这里只在 `while let Some(chunk)` 里查标志，
-    /// 那么卡在等响应头时（GitHub 慢、连接挂着）取消要等到第一块数据才生效 ——
-    /// 实测就是「cancel 返回 200，但进度长时间停在 active:true」。
-    /// select! 让「等到下一块数据」与「等到取消请求」赛跑，取消即时生效。
-    async fn download_stream(
-        &self,
-        target: &url::Url,
-        file_path: &PathBuf,
-        cancel_flag: &Arc<std::sync::atomic::AtomicBool>,
-    ) -> Result<u64, UpdateError> {
-        let headers = vec![
-            ("User-Agent".to_string(), USER_AGENT.to_string()),
-            ("Accept".to_string(), "application/octet-stream".to_string()),
-        ];
-        // 建连 + 等响应头阶段也要能被取消（reason 见函数注释）
-        let response = tokio::select! {
-            result = client::fetch_with_egress(target.as_str(), &headers, None) => {
-                result?
-            }
-            _ = wait_cancel(cancel_flag) => return Ok(0),
-        };
-        if !response.status().is_success() {
-            return Err(UpdateError::new(format!(
-                "下载失败：GitHub 返回 HTTP {}",
-                response.status().as_u16()
-            )));
-        }
-        let declared = response.content_length().unwrap_or(0);
-        if declared > MAX_INSTALLER_BYTES {
-            return Err(UpdateError::new(format!(
-                "安装包体积异常（{} MB），已中止",
-                declared / 1024 / 1024
-            )));
-        }
-        {
-            let mut guard = self.lock();
-            if let Some(task) = guard.task.as_mut() {
-                task.total = declared;
-            }
-        }
-        logging::log(
-            "[Update]",
-            &format!(
-                "开始下载 {}{}",
-                file_path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-                if declared > 0 {
-                    format!("（{:.1} MB）", declared as f64 / 1024.0 / 1024.0)
-                } else {
-                    String::new()
-                }
-            ),
-        );
-
-        // 落盘：先写临时后缀再原子改名？Node 是**直接写目标文件** ——
-        // 保持一致：失败/取消路径都会把文件删掉，不会留下可被误执行的文件。
-        let mut file = tokio::fs::File::create(file_path)
-            .await
-            .map_err(|error| UpdateError::new(format!("创建下载文件失败: {error}")))?;
-        let mut stream = response.bytes_stream();
-        let mut received: u64 = 0;
-        loop {
-            // 「等下一块数据」与「等到取消」赛跑：body 数据块之间的间隔可能很长
-            // （GitHub 限速、连接僵住），只在 chunk 到达后查标志会让取消失效
-            let chunk = tokio::select! {
-                item = stream.next() => item,
-                _ = wait_cancel(cancel_flag) => {
-                    // 取消：返回 Ok(已收字节数)，由调用方按 canceled 标志走正常收尾
-                    return Ok(received);
-                }
-            };
-            let Some(chunk) = chunk else {
-                break;
-            };
-            let chunk = chunk.map_err(|error| {
-                if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                    // 主动取消会让 reqwest 报「body 读取中断」，这不是失败
-                    UpdateError::new("下载已取消")
-                } else {
-                    UpdateError::new(format!(
-                        "下载中断: {}",
-                        crate::server::core::egress::describe_error_detail(&error)
-                    ))
-                }
-            })?;
-            received += chunk.len() as u64;
-            if received > MAX_INSTALLER_BYTES {
-                return Err(UpdateError::new("安装包超过体积上限，已中止"));
-            }
-            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-                .await
-                .map_err(|error| UpdateError::new(format!("写入安装包失败: {error}")))?;
-            // 进度在锁内更新（只加两个数字），随即放锁继续读流
-            let mut guard = self.lock();
-            if let Some(task) = guard.task.as_mut() {
-                task.received = received;
-                // 未声明 content-length 时用已收字节估算总量，保证进度条不是死的
-                if task.total == 0 {
-                    task.total = received;
-                }
-            }
-        }
-        tokio::io::AsyncWriteExt::flush(&mut file)
-            .await
-            .map_err(|error| UpdateError::new(format!("写入安装包失败: {error}")))?;
-        drop(file);
-
-        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(received);
-        }
-        // 磁盘写入完成后再核一次大小，避免「进度 100% 但文件不完整」
-        let size = std::fs::metadata(file_path).map(|meta| meta.len()).unwrap_or(0);
-        if declared > 0 && size != declared {
-            return Err(UpdateError::new(format!(
-                "安装包不完整（期望 {declared} 字节，实际 {size} 字节）"
-            )));
-        }
-        Ok(size)
     }
 
     // ─── 容器内更新（Docker / Linux headless）────────────────────
@@ -699,7 +409,7 @@ impl UpdateManager {
                 "本次发布没有提供容器内更新包，请在宿主机执行 docker compose pull && docker compose up -d 升级",
             ));
         }
-        if checksum_url.is_empty() {
+        if checksum_url.is_empty() && !source::is_resource(&bundle_url) {
             return Err(UpdateError::with_status(
                 400,
                 "本次发布没有提供校验文件（.sha256），已放弃安装",
@@ -709,7 +419,11 @@ impl UpdateManager {
         if !archive.is_file() {
             return Err(UpdateError::with_status(400, "更新包尚未下载，请先点击「下载并更新」"));
         }
-        let expected = selfupdate::fetch_checksum(&checksum_url).await?;
+        let expected = match integrity::trusted_digest(&bundle_url).await {
+            Some((hash, _)) => hash,
+            None if !checksum_url.is_empty() => selfupdate::fetch_checksum(&checksum_url).await?,
+            None => return Err(UpdateError::new("未取得官方校验值，已放弃安装")),
+        };
         let actual = selfupdate::file_sha256(&archive)?;
         if expected != actual {
             logging::log(
@@ -780,23 +494,6 @@ impl UpdateManager {
             ));
         }
         Ok(json!({ "restarting": true }))
-    }
-}
-
-/// 等到「取消」被请求（轮询标志，20ms 一次）。
-///
-/// 为什么不用 `tokio::sync::Notify` / oneshot：取消标志的写入方是
-/// `cancel_download`（持锁的同步函数），它已经有原子标志可读；再引入一条
-/// 通知通道就要在锁里多维护一个可选发送端，还要处理「发送端正好被替换」
-/// 的竞态。20ms 轮询的代价是每 20ms 一次原子读，可以忽略，换来的是
-/// 与 Node 的 AbortController 同等量级的响应速度（用户点「取消」到
-/// 实际中断，肉眼无差别）。
-async fn wait_cancel(flag: &Arc<std::sync::atomic::AtomicBool>) {
-    loop {
-        if flag.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 

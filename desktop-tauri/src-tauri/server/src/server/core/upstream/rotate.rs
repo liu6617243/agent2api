@@ -131,7 +131,14 @@ pub(super) async fn select_target_account(
     pinned: Option<&str>,
     conv_key: &str,
 ) -> Result<RouteTarget, GatewayError> {
-    let accounts = accounts_in_providers(service, providers, pinned);
+    let accounts = scoped_accounts(service, providers, keys.request_model(), pinned);
+    if accounts.is_empty() && pinned.is_none()
+        && config::routing_profiles().effective(keys.request_model()).is_some()
+    {
+        return Err(GatewayError::with_status(
+            503, "当前模型路由没有参与转发的账号，请在路由页检查提供商与账号范围",
+        ));
+    }
     // 这些家都没有账号记录 → 用第一家的默认登录态（环境变量旁路等）
     if accounts.is_empty() {
         return Ok(RouteTarget {
@@ -147,7 +154,7 @@ pub(super) async fn select_target_account(
 
     // 限制器软跳过的候选先剔除（余额不足 / Token 限额，见 `filter_limiter_blocked`），
     // 三级选择共用
-    let (candidates, balance_blocked_ids) = filter_limiter_blocked(&accounts, pinned);
+    let (candidates, balance_blocked_ids) = filter_limiter_blocked(&accounts, keys, pinned);
 
     // 在途计数快照取一次（锁是纳秒级的内存操作，见 connections.rs）：
     // 第一级与第二级共用同一份，两级看到的「谁在忙」是同一时刻的事实。
@@ -158,7 +165,7 @@ pub(super) async fn select_target_account(
     // 的计时由它维持。
     let settings = config::routing_settings();
     let ttl = routing::sticky_ttl_ms(settings.sticky);
-    let snap = service.route.snapshot(conv_key, now, ttl);
+    let snap = service.route.snapshot_for_model(conv_key, keys.request_model(), now, ttl);
     // 轮转游标只在「本请求的第一次选路」前进：429 顺延的后续选路沿用同一
     // 起点往后走，否则一条请求会连跳好几位。粘性命中的轮次不前进 —— 会话
     // 一直粘着同一个账号时，轮转的「下一棒」留给新会话。
@@ -195,8 +202,12 @@ pub(super) async fn select_target_account(
         provider_cursors: provider_cursors.as_ref(),
         sticky_account: snap.sticky_hit.as_deref(),
     };
-    let plan = routing::plan_route(&candidates, keys, &counts, tried_ids, now, &meta);
-    let decision = decision_json(&plan, &settings, now);
+    let plan = routing::plan_route(&accounts, keys, &counts, tried_ids, now, &meta);
+    let mut decision = decision_json(&plan, &settings, now);
+    decision["scope"] = Value::String(config::routing_profiles().scope(keys.request_model()).to_string());
+    if !conv_key.is_empty() && ttl > 0 {
+        decision["stickyId"] = Value::String(super::route_sticky::entry_id(conv_key, keys.request_model()));
+    }
     let mut excluded: Vec<String> = tried_ids.to_vec();
     for entry in &plan.ordered {
         if let Some(picked_session) = service.store.get_session_by_id(&entry.id) {
@@ -304,6 +315,12 @@ pub(super) async fn select_target_account(
             }
         }
     }
+    if config::routing_profiles().effective(keys.request_model()).is_some() {
+        return Err(GatewayError::with_status(
+            503, "当前模型路由中的账号都没有可用凭证，请在路由页检查账号状态",
+        ));
+    }
+    decision["picked"] = Value::String(String::new());
     Ok(RouteTarget {
         provider: providers.first().copied().unwrap_or_default().to_string(),
         account_id: None,
@@ -355,24 +372,31 @@ pub(super) fn accounts_in_providers(
     providers: &[&str],
     pinned: Option<&str>,
 ) -> Vec<Value> {
-    let snapshot = service.store.list_accounts();
-    let accounts: Vec<Value> = routing::accounts_of(&snapshot)
+    let snapshot = service.store.list_visible_accounts();
+    routing::accounts_of(&snapshot)
         .into_iter()
         .filter(|account| providers.contains(&provider_of(account)))
         .filter(|account| match pinned {
             Some(id) => routing::account_id(account) == Some(id),
             None => true,
         })
-        .collect();
-    let routable: Vec<Value> = accounts
-        .iter()
+        .collect()
+}
+
+fn scoped_accounts(
+    service: &UpstreamService,
+    providers: &[&str],
+    model: &str,
+    pinned: Option<&str>,
+) -> Vec<Value> {
+    let accounts = accounts_in_providers(service, providers, pinned);
+    let accounts = if pinned.is_some() { accounts } else {
+        crate::server::core::routing_scope::apply_accounts(&accounts, model)
+    };
+    let routable: Vec<Value> = accounts.iter()
         .filter(|account| !readiness::gated(provider_of(account)))
-        .cloned()
-        .collect();
-    if routable.is_empty() {
-        return accounts;
-    }
-    routable
+        .cloned().collect();
+    if routable.is_empty() { accounts } else { routable }
 }
 
 /// 组装选路结果；代理解析失败时把提示**带进选路结果**（本次回退直连）。
@@ -408,6 +432,12 @@ pub(super) fn with_proxy_notice(
             None
         }
     };
+    let decision = decision.map(|mut decision| {
+        if let Some(object) = decision.as_object_mut() {
+            object.insert("picked".to_string(), Value::String(account_id.clone()));
+        }
+        decision
+    });
     RouteTarget {
         provider: provider_of(&account).to_string(),
         account_id: Some(account_id),
@@ -513,7 +543,7 @@ pub(super) fn earliest_limit_reset_at(
     keys: &routing::CooldownKeys<'_>,
 ) -> i64 {
     let now = logging::now_ms();
-    let accounts: Vec<Value> = accounts_in_providers(service, providers, None)
+    let accounts: Vec<Value> = scoped_accounts(service, providers, keys.request_model(), None)
         .into_iter()
         .filter(|account| !matches!(account.get("enabled"), Some(Value::Bool(false))))
         .collect();
@@ -601,6 +631,12 @@ pub(super) fn connection_counts(service: &UpstreamService) -> HashMap<String, us
     service.connections().snapshot().into_iter().collect()
 }
 
+pub(super) fn allows_route_skip(service: &UpstreamService, account_id: &str) -> bool {
+    let accounts = routing::accounts_of(&service.store.list_accounts());
+    !accounts.iter().find(|account| routing::account_id(account) == Some(account_id))
+        .is_some_and(|account| account.get("allowRouteSkip") == Some(&Value::Bool(false)))
+}
+
 /// 下一个可用账号（全局队列，限定在 `providers` 各家的账号里，跳过已尝试的）。
 ///
 /// `keys` 见 [`select_target_account`]：冷却按各家真名判定。
@@ -619,10 +655,13 @@ pub(super) fn pick_next_account(
     tried_ids: &[String],
     pinned: Option<&str>,
 ) -> Option<Value> {
-    let accounts = accounts_in_providers(service, providers, pinned);
+    if tried_ids.last().is_some_and(|last| !allows_route_skip(service, last)) {
+        return None;
+    }
+    let accounts = scoped_accounts(service, providers, keys.request_model(), pinned);
     // 换号顺延与第一级选路同一份候选剔除：被限制器拦下的账号不会在 429 之后
     // 被当作「下一个」重新塞进来
-    let (candidates, balance_blocked_ids) = filter_limiter_blocked(&accounts, pinned);
+    let (candidates, balance_blocked_ids) = filter_limiter_blocked(&accounts, keys, pinned);
     let counts = connection_counts(service);
     let now = logging::now_ms();
     let settings = config::routing_settings();
@@ -670,6 +709,8 @@ fn decision_json(
         "picked": plan.ordered.first().map(|entry| entry.id.clone()).unwrap_or_default(),
         "ordered": plan.ordered.iter().take(12).map(entry_json).collect::<Vec<_>>(),
         "blocked": plan.blocked.iter().take(12).map(entry_json).collect::<Vec<_>>(),
+        "orderedTotal": plan.ordered.len(),
+        "blockedTotal": plan.blocked.len(),
     })
 }
 
@@ -691,20 +732,20 @@ fn decision_json(
 /// 用后者分辨 503 的原因（限制器拦截 vs 全禁用）。
 fn filter_limiter_blocked(
     accounts: &[Value],
+    keys: &routing::CooldownKeys<'_>,
     pinned: Option<&str>,
 ) -> (Vec<Value>, std::collections::HashSet<String>) {
     if pinned.is_some() {
         return (accounts.to_vec(), Default::default());
     }
-    let facts = crate::server::core::usage_records::balance_facts();
-    let token_facts = crate::server::core::limiter::token_facts();
+    let facts = crate::server::core::limiter::sources::facts();
+    let counts = crate::server::core::limiter::counter::facts();
     let now = logging::now_ms();
     let blocked_ids: std::collections::HashSet<String> = accounts
         .iter()
-        .filter(|account| {
-            crate::server::core::usage_records::balance_blocked(account, &facts)
-                || crate::server::core::limiter::token_skip_blocked(account, &token_facts, now)
-        })
+        .filter(|account| crate::server::core::limiter::evaluate::blocked(
+            account, &keys.for_account(account), &facts, &counts, now,
+        ))
         .filter_map(|account| routing::account_id(account).map(str::to_string))
         .collect();
     if blocked_ids.is_empty() {

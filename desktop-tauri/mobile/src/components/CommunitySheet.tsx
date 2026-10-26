@@ -1,4 +1,4 @@
-import { Sheet, SheetContent, SheetHeader, SheetBody, SheetTitle, SheetFooter } from '@ui'
+import { Sheet, SheetContent, SheetHeader, SheetBody, SheetTitle, SheetFooter , Button } from '@ui'
 import { Icon } from './Icon'
 import { Badge, copyWithToast } from './ui'
 import { COMMUNITY_LINKS, QQ_GROUPS, openExternal } from '../lib/community'
@@ -8,7 +8,7 @@ import { t } from '../i18n'
  * 「社区与支持」面板（设置页底部那一行点开）。
  *
  * ── 为什么是抽屉而不是二级页 ──────────────────────────────────
- * 里面只有四张卡（两个 QQ 群 + Telegram + Discord），没有需要记住的状态、
+ * 里面只有五张卡（三个 QQ 群 + Telegram + Discord），没有需要记住的状态、
  * 也没有下一步。做成二级页会多一层返回栏、多一条浏览器历史，用户点完就退。
  *
  * ── QQ 卡片是「复制群号」，另两张是「打开链接」───────────────
@@ -38,10 +38,10 @@ export function CommunitySheet({
           </p>
 
           {QQ_GROUPS.map((group, index) => (
-            <button
+            <Button size='default' variant='ghost'
               key={group.no}
               type='button'
-              className='m-row'
+              className='m-row h-auto min-h-[52px] w-full justify-start rounded-none border-0 px-3.5 py-3 text-left'
               onClick={() => void copyWithToast(group.no, t('QQ 群号'))}
               style={{
                 borderRadius: 'var(--m-r-md)',
@@ -58,14 +58,14 @@ export function CommunitySheet({
               </span>
               <div className='m-grow'>
                 <div className='m-t1' style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  {index === 0 ? t('QQ 群 1') : t('QQ 群 2')}
+                  {index === 0 ? t('QQ 群 1') : index === 1 ? t('QQ 群 2') : t('QQ 群 3')}
                   <span className='m-mono' style={{ fontSize: 11.5, color: 'var(--m-text-3)' }}>
                     {group.no}
                   </span>
                 </div>
                 <div className='m-t2'>
                   {group.nearlyFull
-                    ? t('即将满员，请优先加群 2')
+                    ? t('即将满员，请优先加群 3')
                     : t('点击复制群号')}
                 </div>
               </div>
@@ -76,14 +76,14 @@ export function CommunitySheet({
                   <Icon name='copy' style={{ width: 16, height: 16 }} />
                 </span>
               )}
-            </button>
+            </Button>
           ))}
 
           {COMMUNITY_LINKS.map(link => (
-            <button
+            <Button size='default' variant='ghost'
               key={link.id}
               type='button'
-              className='m-row'
+              className='m-row h-auto min-h-[52px] w-full justify-start rounded-none border-0 px-3.5 py-3 text-left'
               onClick={() => openExternal(link.url)}
               style={{
                 borderRadius: 'var(--m-r-md)',
@@ -109,7 +109,7 @@ export function CommunitySheet({
               <span className='m-chev'>
                 <Icon name='link' />
               </span>
-            </button>
+            </Button>
           ))}
 
           <p style={{ margin: '2px 0 0', fontSize: 11.5, lineHeight: 1.7, color: 'var(--m-text-3)' }}>
@@ -117,9 +117,9 @@ export function CommunitySheet({
           </p>
         </SheetBody>
         <SheetFooter>
-          <button type='button' className='m-btn m-ghost' style={{ flex: 1 }} onClick={onClose}>
+          <Button size='touch' variant='outline' type='button' className='m-btn m-ghost w-full' style={{ flex: 1 }} onClick={onClose}>
             {t('关闭')}
-          </button>
+          </Button>
         </SheetFooter>
       </SheetContent>
     </Sheet>

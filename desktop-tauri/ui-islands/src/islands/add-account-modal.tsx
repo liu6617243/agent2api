@@ -34,7 +34,7 @@ import * as React from 'react'
 import { createRoot } from 'react-dom/client'
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogSection, DialogTitle } from '@ui'
 
-import { existingCustomOfPreset, shared, type CustomProviderRecord, type SharedWindow } from './add-account-bridge'
+import { shared, type CustomProviderRecord, type SharedWindow } from './add-account-bridge'
 import {
   BUILTIN_CONFIGS,
   CUSTOM_PROVIDER,
@@ -160,9 +160,11 @@ function AddAccountModal({
     : t(shared().wbProviders?.labelOf?.(state.provider) || state.provider)
   // 标题写在表单弹窗的头部：列表弹窗的标题始终是「添加账号」，不跟着步骤变
   const heading = isCustom
-    ? (state.providerHint || state.presetKey
+    ? (state.providerHint
       ? t('登录 / 添加 {name} 账号', { name: customLabel || t('自定义提供商') })
-      : t('新建自定义提供商'))
+      : state.presetKey
+        ? t('使用 {name} 模板新建提供商', { name: customLabel })
+        : t('新建自定义提供商'))
     : t('登录 / 添加 {name} 账号', { name: providerLabel })
 
   /** 第 1 步点一张卡：三种特殊取值分别落到自定义块的哪种模式（见 pickProvider 的旧注释） */
@@ -173,18 +175,11 @@ function AddAccountModal({
       setState(prev => ({ ...prev, ...entry, provider: CUSTOM_PROVIDER, providerHint: '', presetKey: '' }))
     } else if (id.startsWith(PRESET_CARD_PREFIX)) {
       const presetKey = id.slice(PRESET_CARD_PREFIX.length)
-      // 模板卡分两种落法（判重口径与卡片文案共用 bridge 的 existingCustomOfPreset）：
-      //   · 这家还没建过 —— 空 providerHint，落到「新建」模式（模板预填名称 / 协议 /
-      //     Base URL），提交即建家 + 首个账号；
-      //   · 已建过同名家 —— 带上那家的 id，落到「加入已有」模式并预选它，点几次
-      //     模板卡就能加几个账号（同一家多把 key 轮换），不会建出重名的第二家。
-      // presetKey 照带：`CustomFootActions` 在新建提交时要用它取 quirks。
-      const built = existingCustomOfPreset(shared().wbPresetProviders?.presetOf?.(presetKey))
       setState(prev => ({
         ...prev,
         ...entry,
         provider: CUSTOM_PROVIDER,
-        providerHint: built?.id || '',
+        providerHint: '',
         presetKey,
       }))
     } else if (customList().some(item => item.id === id)) {
@@ -291,7 +286,7 @@ function AddAccountModal({
                 仍在各自段落里，因此只有自定义块在场时才渲染这条 */}
             {isCustom ? (
               <DialogFooter>
-                <CustomFootActions mode={customMode} presetKey={state.presetKey} />
+                <CustomFootActions mode={customMode} presetKey={state.presetKey} providerId={state.providerHint} />
               </DialogFooter>
             ) : null}
           </DialogContent>

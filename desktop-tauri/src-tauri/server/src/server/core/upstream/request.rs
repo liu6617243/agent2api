@@ -76,7 +76,7 @@ pub struct TransportRequest {
 
 /// 归一化后的上游错误：`{code, message}`
 ///
-/// `message` 的兜底是响应文本的前 500 个字符（Node 的 `text.slice(0, 500)`）。
+/// 非调试请求的 `message` 兜底取响应前 500 个字符，调试请求保留完整文本。
 /// 适配器的 `classify_error` 收的就是本结构的 JSON 形态（`to_value`）——
 /// 于是「上游错误怎么读」与「这条错误属于哪一档」彻底分开：
 /// 前者是本文件（协议层），后者是适配器（provider 层）。
@@ -113,7 +113,11 @@ pub async fn read_upstream_error(
         capture.push(text.as_bytes());
     }
     let mut code = None;
-    let mut message: String = text.chars().take(500).collect();
+    let mut message = if capture.is_some() {
+        text.clone()
+    } else {
+        text.chars().take(500).collect()
+    };
     if let Ok(payload) = serde_json::from_str::<Value>(&text) {
         code = payload.get("code").and_then(Value::as_i64);
         // Node: `payload?.message || payload?.msg || payload?.error?.message || message`
@@ -196,13 +200,15 @@ pub async fn send_chat_request(
                     egress::describe_error_detail(&error)
                 )
             };
-            Err(UpstreamRequestError { message, reason })
+            let safe_to_retry = error.is_connect() || error.is_builder();
+            Err(UpstreamRequestError { message, reason, safe_to_retry })
         }
         Err(_elapsed) => {
             let seconds = headers_budget.as_secs();
             Err(UpstreamRequestError {
                 reason: format!("等待响应超时({seconds}秒)"),
                 message: format!("等待响应超时({seconds}秒，出口 {via})"),
+                safe_to_retry: false,
             })
         }
     }
@@ -216,6 +222,8 @@ pub struct UpstreamRequestError {
     /// 「连接中超时(N秒)」/「等待响应超时(N秒)」/「上游连接失败」。
     /// `message` 是最终失败的详细文案（带出口说明），这里是它的简短形态。
     pub reason: String,
+    /// 只有请求尚未写出（建连或构造失败）才允许非幂等的生图自动重试。
+    pub safe_to_retry: bool,
 }
 
 impl UpstreamRequestError {

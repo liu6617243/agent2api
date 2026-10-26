@@ -171,7 +171,7 @@ bash scripts/release.sh vX.Y.Z
 | 工作流（跑在构建仓库） | 产出 | 说明 |
 |---|---|---|
 | `release.yml` | 桌面端三平台安装包 + 两个服务端包 + Android APK + iOS IPA | 七个 job：`macos-x64`（dmg）/ `macos-arm64` / `windows-x64`（NSIS exe）/ `linux`（deb + AppImage + 服务端 tar.gz，双架构 matrix）/ `windows-server`（无 GUI 的 zip）/ `android`（APK）/ `ios`（IPA，跑在 `macos-26`）。macOS / iOS 与 Linux 桌面端的产物**只能在各自平台上构建**，无法从 Windows 交叉编译。五个平台的插件包产物**自动发到构建仓库的 Release**（`publish` job） |
-| `docker.yml` | GHCR `ghcr.io/aimod-cc/Agent2API:<版本>` + Docker Hub `aimodcc/agent2api:<版本>`，均 amd64 / arm64 双架构 | 手动 `workflow_dispatch` 且不填 ref 时只出 `:dev` 测试 tag，不碰正式 tag；beta tag（版本号带 `-`）只出 `<版本>`，**不移动 `:latest`** |
+| `docker.yml` | Docker Hub `aimodcc/agent2api:<版本>`，amd64 / arm64 双架构 | 正式版发布 `<版本>` + `:latest`；beta 预发布发布 `<版本>` + 滚动 `:beta`，**不移动 `:latest`**；手动 `workflow_dispatch` 且不填 ref 时只出 `:dev`，不移动 `:beta` 或 `:latest` |
 
 **源码仓库的 `build.yml` 只做派发，`docker.yml` 已整体删除** —— 镜像构建现在只在构建仓库里跑（源码仓库保留那份只会让人误以为它还在工作）。
 
@@ -220,7 +220,7 @@ bash scripts/release.sh vX.Y.Z
 
 默认开（`MIRROR_TO_SOURCE=0` 可关）。产物在构建仓库，但用户与贡献者习惯看源码仓库的 Releases 页 —— 那里空着会让人以为「这个版本没发」。
 
-镜像的正文末尾会附一行指向构建仓库的链接，因为**更新检查只读构建仓库**（`DEFAULT_REPO` 与索引 `app.repo`），源码仓库那份纯属展示。
+镜像的正文与构建仓库那份**逐字相同**（同一个更新日志），不追加任何说明行 —— 两个 Release 的内容应当一致。**不要**在镜像正文里加「同一份发布，也是应用更新检查读取的那一份：…」这类指向构建仓库的句子，用户明确不要这一段；更新检查读哪个仓库由 `DEFAULT_REPO` 与索引 `app.repo` 决定，不需要在正文里解释。
 
 ⚠️ **Release 必须出现在构建仓库**。桌面端更新检查（`core::update::version` 的 `DEFAULT_REPO`）与索引里的 `app.repo` 都指向那里；只发在源码仓库的症状是「Release 建出来了，但所有人都显示已是最新」——不报错，最难查。
 
@@ -262,7 +262,7 @@ bash scripts/release.sh v3.1.0-beta.1
 2. **Release 漏标 pre-release**：标记就是开关的分界线 —— 正式通道走 GitHub 的 `/releases/latest`，它排除预发布，只有开了开关的人从 `/releases` 列表里看到 beta。**漏标 = beta 被所有正式版用户当成正式更新收到。** `scripts/release.sh` 已按「tag 里带 `-`」自动标记，重跑收尾时也会把标记纠正回来，走脚本就不用操心。
 3. **tag 打在 `main` 上**：beta 是集成分支，beta 版要的是它的快照。打在 `main` 上要么不含 beta 分支的新改动（白测一场），要么等于把还没发布的改动提前推进 `main`。
 
-docker 的 `:latest` 不会被 beta tag 移动（`.github/workflows/docker.yml`），镜像仍出 `3.1.0-beta.1` 那个版本 tag，想尝鲜的按版本号拉。
+构建仓库 `.github/workflows/docker.yml` 发布 beta 时同时产出完整版本标签（如 `3.3.0-beta.3`）与滚动 `:beta`，**不移动 `:latest`**。Docker 用户用 `aimodcc/agent2api:beta` 跟随 beta，或用完整版本号固定版本；手动 dev 构建不会移动 `:beta`。
 
 后续常见三件事：
 
@@ -276,7 +276,7 @@ docker 的 `:latest` 不会被 beta tag 移动（`.github/workflows/docker.yml`�
 
 - [ ] **构建仓库的 run 全绿**：`gh run list --repo Agent2Builder/agent2api-releases --limit 4` —— 应看到 `Release` 与 `docker` 两个 run，前者七个 job 全绿（含 `publish`）；
 - [ ] GitHub Release（在构建仓库）：`gh release view vX.Y.Z --repo Agent2Builder/agent2api-releases` —— 正文日志齐全，桌面端附件都在：Windows `Agent2API_<版本>_x64-setup.exe`、macOS `Agent2API_<版本>_universal.dmg`、Linux `Agent2API_<版本>_amd64.deb` 与 `Agent2API_<版本>_amd64.AppImage`（另有两个 `agent2api-server-linux-*.tar.gz` + `.sha256`，那是容器内更新包，见第 5 节）；
-- [ ] **镜像到源码仓库**：`gh release view vX.Y.Z --repo aimod-cc/Agent2API` —— 附件数与构建仓库一致（默认 10 个：4 个桌面端 + 3 个服务端包 ×2 带校验 + 无手机端）；正文末尾有指向构建仓库的链接；
+- [ ] **镜像到源码仓库**：`gh release view vX.Y.Z --repo aimod-cc/Agent2API` —— 附件数与构建仓库一致（默认 10 个：4 个桌面端 + 3 个服务端包 ×2 带校验 + 无手机端）；正文与构建仓库那份逐字相同，**不带**指向构建仓库的附加说明；
 - [ ] **手机端包不在 Release 里**（当前策略）：`INCLUDE_MOBILE` 默认 0，APK / IPA 只留在构建 run 的 artifact 里。要恢复发布时加 `INCLUDE_MOBILE=1`，并同步恢复安装文档里的手机端段落；
 - [ ] **插件包**（同一次发版里，构建仓库的 `release.yml` 若也编了插件包）：Release 里应有 `agent2api-providers-<版本>-<target>.zip` 五个平台各一份，且 `pack.json` 里带 `signature`；
 - [ ] Linux 桌面端：装 deb（或 `chmod +x` 后跑 AppImage）能启动，且面板「设置 → 软件更新」能检查到版本、给出对应包型的安装入口（deb → 系统安装器，AppImage → 换文件）；
@@ -286,7 +286,7 @@ docker 的 `:latest` 不会被 beta tag 移动（`.github/workflows/docker.yml`�
 - [ ] **更新检查真的能查到**（这条最容易漏）：`gh release view vX.Y.Z --repo Agent2Builder/agent2api-releases` 有内容，且索引仓库的 `app.json` 里 `app.repo` 指向同一个仓库。两者对不上时，用户面板会显示「已是最新」；
 - [ ] 安装包「关于」页版本号与 tag 一致；
 - [ ] 安装文档对得上实际产物：`docs/install.md` 与 5 份译文的产物名、端口、命令、环境变量跟这次 Release 一致（README 里那几张速查表同理）；
-- [ ] beta 版多一条：Release 显示 **Prerelease**，且 Docker Hub 上 `latest` 没有跟着动。
+- [ ] beta 版多一条：Release 显示 **Prerelease**；Docker Hub 上完整版本标签与 `beta` 的镜像 digest 一致，包含 amd64 / arm64，且 `latest` 没有跟着动。
 
 ## 8. 已知坑与排查
 

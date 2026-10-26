@@ -1,12 +1,11 @@
 import * as React from 'react'
-import { Badge, Button, Progress, Switch } from '@ui'
+import { Badge, Button, Progress, Switch, Label, Card as UiCard } from '@ui'
 import { formatSize, formatTime, platformLabel, pluginDescription, pluginName } from './plugins-shared'
-import type { HostState, PackProvider, PackSummary, PluginOperation, PluginUpdate, StorePlugin } from './plugins-types'
+import type { HostState, PackSummary, PluginOperation, PluginUpdate, StorePlugin } from './plugins-types'
 import { t } from '../i18n'
 
 function Card({ children, installed }: { children: React.ReactNode; installed?: boolean }) {
-  return <article className={'flex flex-col overflow-hidden rounded-lg border bg-surface shadow-1 '
-    + (installed ? 'border-success/40' : 'border-border')}>{children}</article>
+  return <UiCard render={<article />} className={'flex flex-col ' + (installed ? 'border-success/40' : '')}>{children}</UiCard>
 }
 
 function CardHead({ id, name, version, icon, children }: {
@@ -17,8 +16,8 @@ function CardHead({ id, name, version, icon, children }: {
     <div className='grid size-11 shrink-0 place-items-center overflow-hidden rounded-xl bg-primary-soft text-[19px] font-bold text-primary-fg'>
       {icon ? <img src={icon} alt='' className='size-full object-cover' /> : title.slice(0, 1)}
     </div>
-    <div className='min-w-0 flex-1'>
-      <h3 className='mb-1 flex flex-wrap items-center gap-2 text-[14px] font-semibold leading-snug'>
+    <div className='min-w-0 flex flex-1 flex-col gap-1.5'>
+      <h3 className='flex flex-wrap items-center gap-2 text-[14px] font-semibold leading-snug'>
         {title}{version ? <span className='text-[11.5px] font-normal tabular-nums text-muted-foreground'>v{version}</span> : null}
       </h3>
       <div className='flex flex-wrap gap-1.5'>{children}</div>
@@ -74,7 +73,7 @@ export function StorePluginCard({ item, target, operation, disabled, onInstall, 
   </Card>
 }
 
-export function InstalledPluginCard({ pack, store, host, update, operation, disabled, onEnabled, onProvider, onRemove, onUpdate, onNotes }: {
+export function InstalledPluginCard({ pack, store, host, update, operation, disabled, onEnabled, onSettings, onRemove, onUpdate, onNotes }: {
   pack: PackSummary
   store?: StorePlugin
   host: HostState
@@ -82,12 +81,13 @@ export function InstalledPluginCard({ pack, store, host, update, operation, disa
   operation?: PluginOperation
   disabled: boolean
   onEnabled: (enabled: boolean) => void
-  onProvider: (provider: PackProvider, enabled: boolean) => void
+  onSettings: () => void
   onRemove: () => void
   onUpdate: () => void
   onNotes: () => void
 }) {
   const blocked = update?.error === true
+  const packHost = pack.host === undefined ? host : pack.host
   return <Card installed>
     <CardHead id={pack.id} name={store?.name || pack.name} version={pack.version} icon={pack.icon || store?.icon}>
       <Badge variant={pack.enabled ? 'default' : 'secondary'}>{pack.enabled ? t('已启用') : t('已停用')}</Badge>
@@ -103,7 +103,7 @@ export function InstalledPluginCard({ pack, store, host, update, operation, disa
       {t('{count} 家提供商 · 安装于 {time}', { count: String(pack.providers.length), time: formatTime(pack.installedAt) })}
     </p>
     <div className='flex flex-wrap gap-3 px-4 pt-3 text-[11px] text-muted-foreground'>
-      <span>{host?.running ? t('运行中') : t('未运行')}</span>
+      <span>{packHost?.running ? t('运行中') : t('未运行')}</span>
       <span>{t('已加载')} {t('{count} 家', { count: String(pack.providers.filter(provider => provider.loaded).length) })}</span>
     </div>
     {!pack.entryPresent ? <p className='px-4 pt-2 text-[12px] text-destructive'>
@@ -119,11 +119,13 @@ export function InstalledPluginCard({ pack, store, host, update, operation, disa
     </div> : null}
     {update?.error ? <p className='px-4 pt-2 text-[12px] text-destructive'>{update.reason}</p> : null}
     {operation?.error ? <p className='px-4 pt-2 text-[12px] text-destructive'>{operation.error}</p> : null}
+    {packHost?.lastError ? <p className='px-4 pt-2 text-[12px] text-destructive'>{packHost.lastError}</p> : null}
     {operation?.hostError ? <p className='px-4 pt-2 text-[12px] text-warning'>{operation.hostError}</p> : null}
     {operation?.active ? <OperationProgress operation={operation} /> : <div className='mt-auto flex flex-wrap items-center gap-2 px-4 pb-4 pt-3.5'>
-      <label className='flex items-center gap-1.5 text-[12px] text-subtle'>
+      <Label className='flex items-center gap-1.5 text-[12px] text-subtle'>
         {t('启用')}<Switch checked={pack.enabled} disabled={disabled} onCheckedChange={value => onEnabled(value === true)} />
-      </label>
+      </Label>
+      <Button variant='outline' size='sm' onClick={onSettings} aria-haspopup='dialog'>{t('设置')}</Button>
       <Button variant='outline' size='sm' disabled={disabled} onClick={onRemove}>{t('卸载')}</Button>
       <span className='flex-1' />
       {update?.available ? <Button size='sm' disabled={disabled || blocked} onClick={onUpdate}>
@@ -132,19 +134,5 @@ export function InstalledPluginCard({ pack, store, host, update, operation, disa
         {update?.checked ? update.reason || t('已是最新') : t('尚未检查更新')}
       </span>}
     </div>}
-    <details className='border-t border-hairline'>
-      <summary className='cursor-pointer select-none px-4 py-2 text-[12px] text-subtle'>
-        {t('这个包提供的提供商（可单独停用某一家）')}
-      </summary>
-      <div className='grid gap-1 px-3 pb-3 sm:grid-cols-2'>
-        {pack.providers.map(provider => <label key={provider.id} className='flex items-center gap-2 rounded px-1.5 py-1 text-[12.5px]'>
-          <Switch checked={provider.enabled} disabled={disabled || !pack.enabled}
-            onCheckedChange={value => onProvider(provider, value === true)} />
-          <span className='min-w-0 truncate'>{provider.label}</span>
-          <code className='text-[11px] text-muted-foreground'>{provider.id}</code>
-          {provider.enabled && !provider.loaded ? <Badge variant='secondary'>{t('未加载')}</Badge> : null}
-        </label>)}
-      </div>
-    </details>
   </Card>
 }

@@ -4,6 +4,7 @@ import { usePwa } from '../lib/usePwa'
 import { useStore } from '../state/store'
 import { applyUpdate } from '../lib/pwa'
 import { t } from '../i18n'
+import { Alert, Button } from '@ui'
 
 /**
  * PWA 状态条。
@@ -31,16 +32,16 @@ export function PwaNotice() {
   return (
     <>
       {pwa.offline ? (
-        <div className='m-notice-top' role='status'>
+        <Alert variant='warning' className='m-notice-top rounded-none border-x-0 border-t-0' role='status'>
           <Icon name='alert' />
           <span>{t('已离线 · 显示的是缓存内容')}</span>
-        </div>
+        </Alert>
       ) : null}
 
       {showUpdate ? (
-        <div className='m-notice-update' role='status'>
+        <Alert className='m-notice-update' role='status'>
           <span className='m-notice-text'>{t('有新版本，重启后生效')}</span>
-          <button
+          <Button size='touch-sm' variant='default'
             type='button'
             className='m-btn m-sm'
             disabled={busy}
@@ -50,11 +51,11 @@ export function PwaNotice() {
             }}
           >
             {busy ? t('重启中…') : t('重启更新')}
-          </button>
-          <button type='button' className='m-notice-later' onClick={() => setSnoozed(true)}>
+          </Button>
+          <Button size='default' variant='ghost' type='button' className='m-notice-later' onClick={() => setSnoozed(true)}>
             {t('稍后')}
-          </button>
-        </div>
+          </Button>
+        </Alert>
       ) : null}
     </>
   )

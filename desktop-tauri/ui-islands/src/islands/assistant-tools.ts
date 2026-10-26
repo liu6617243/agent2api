@@ -5,8 +5,8 @@
  * 每只工具做的都是界面本来就会做的事（模型启停、映射、能力位、顺序、余额、
  * 模型测试），而这些动作在**桥**上已有现成入口（`window.workbuddyDesktop`
  * 的同名方法，桌面壳与 headless 面板各有一份实现）。工具放在这里 = 加一只工具
- * 不用动 Rust；执行走既有桥 = 与界面按钮走同一条链（校验、提示、刷新口径一致）。
- * 后端只负责把 `tools` 原样转给上游、把 `tool_calls` 原样流回来（见
+ * 不用加 Rust 业务接口；执行走既有桥 = 与界面按钮走同一条链。
+ * 后端校验工具 ID 与权限后转给上游、把 `tool_calls` 原样流回来（见
  * `api::assistant` 模块头）。
  *
  * ── 三类工具（决定确认流程）──────────────────────────────────
@@ -23,6 +23,13 @@
 
 import { t } from '../i18n'
 import { modelOptionsFrom, type ModelOption } from './assistant-models'
+import { ASSISTANT_READ_META, ASSISTANT_READ_TOOLS } from './assistant-read-tools'
+import { ASSISTANT_ACCOUNT_TOOLS } from './assistant-account-tools'
+import { createBalanceTool } from '../../../ui-shared/assistant-read-balance'
+import { ASSISTANT_IMAGE_TOOLS, ASSISTANT_IMAGE_META } from './assistant-image-tools'
+import type { ImageAsset, ImageToolContext } from '../../../ui-shared/assistant-image-tools'
+import { checkToolSignal, runToolBatch } from '../../../ui-shared/assistant-tool-execution'
+import { safeText } from '../../../ui-shared/assistant-read-data'
 
 export type { ModelOption } from './assistant-models'
 
@@ -30,6 +37,7 @@ export type { ModelOption } from './assistant-models'
 export type ToolResult = {
   text: string
   summary: string
+  images?: ImageAsset[]
 }
 
 /** 确认卡上的计划（改动类工具在用户确认前渲染它） */
@@ -51,7 +59,7 @@ export type AssistantTool = {
   params: Record<string, unknown>
   /** 改动类 / 消耗类：渲染确认卡（只读工具不实现） */
   plan?: (args: Record<string, unknown>) => ToolPlan
-  run: (args: Record<string, unknown>) => Promise<ToolResult>
+  run: (args: Record<string, unknown>, context?: ImageToolContext) => Promise<ToolResult>
 }
 
 /* ─── 桥（只声明用到的那些方法，缺失时按「这条链在当前形态不可用」处理）── */
@@ -65,9 +73,10 @@ type Bridge = {
   removeModelMapping?: (alias: string, target: string, provider: string) => Promise<unknown>
   setModelCapabilities?: (provider: string, id: string, capabilities: Record<string, unknown>) => Promise<unknown>
   testModel?: (payload: Record<string, unknown>) => Promise<unknown>
-  updateAccount?: (id: string, patch: Record<string, unknown>) => Promise<unknown>
-  reorderAccounts?: (queue: string[]) => Promise<unknown>
+  terminateStatsRequest?: (id: string) => Promise<unknown>
   getAllBalances?: (id?: string) => Promise<unknown>
+  getAccounts?: () => Promise<unknown>
+  getBalancesSnapshot?: () => Promise<unknown>
 }
 
 function bridge(): Bridge {
@@ -110,6 +119,9 @@ type ModelRow = {
   providerLabel?: unknown
   enabled?: unknown
   aliases?: unknown
+  kind?: unknown
+  supports_image_generation?: unknown
+  supports_image_editing?: unknown
   /** 生效能力位（`/api/models/manage` 的 capabilities，见 core::providers::catalog::view） */
   capabilities?: unknown
 }
@@ -121,14 +133,6 @@ type MappingRow = {
   enabled?: unknown
   isDefault?: unknown
   dangling?: unknown
-}
-type AccountRow = {
-  id?: unknown
-  provider?: unknown
-  name?: unknown
-  nickname?: unknown
-  priority?: unknown
-  enabled?: unknown
 }
 
 /**
@@ -268,9 +272,12 @@ function customView(id: string): ManageViewLike | null {
  * 用户自建的全部上游，且 `set_model_*` 系列拿不到自定义家的启用状态。
  */
 async function readModels(): Promise<{ models: ModelRow[]; mappings: MappingRow[] }> {
-  const data = (await bridge().getModelManage?.()) as ManageViewLike | undefined
-  const models: ModelRow[] = Array.isArray(data?.models) ? data.models.slice() : []
-  const mappings: MappingRow[] = Array.isArray(data?.mappings) ? data.mappings.slice() : []
+  const read = bridge().getModelManage
+  if (!read) throw new Error(t('当前客户端缺少读取接口：{name}', { name: 'getModelManage' }))
+  const data = await read() as ManageViewLike | undefined
+  if (!Array.isArray(data?.models) || !Array.isArray(data?.mappings)) throw new Error(t('读取模型清单失败'))
+  const models: ModelRow[] = data.models.slice()
+  const mappings: MappingRow[] = data.mappings.slice()
   // 自定义家逐个适配后追加。目录缓存缺失（面板形态未注入 / 还没拉到）时
   // 只是少这一块 —— 内置家那部分照常可用，不因此整条工具失败。
   const known = new Set(models.map(row => `${str(row.provider)}\u0001${str(row.id)}`.toLowerCase()))
@@ -290,51 +297,12 @@ async function readModels(): Promise<{ models: ModelRow[]; mappings: MappingRow[
   return { models, mappings }
 }
 
-/**
- * 账号清单（`/api/session` 的 `accounts` 是**对象**：`{currentAccountId,
- * currentAccountIds, accounts: [...], providers: [...]}`，数组在第二层）。
- *
- * 这里同时接受数组形态：`bridge.rs` 与 `web_shim.rs` 的 `getState` 都返回
- * `/api/session` 的 `data`，形状没变过；容忍两种只为了「将来某天有人把它拍平」
- * 时这条链不会静默退化成空表（空表的表现是「没有找到账号」，极难排查）。
- */
-async function readAccounts(): Promise<AccountRow[]> {
-  const state = (await bridge().getState?.()) as
-    | { accounts?: AccountRow[] | { accounts?: AccountRow[] } }
-    | undefined
-  const holder = state?.accounts
-  const rows = Array.isArray(holder) ? holder : Array.isArray(holder?.accounts) ? holder.accounts : []
-  // 全局队列 = priority 升序（后端 priority 0 起、越小越靠前）
-  return rows
-    .slice()
-    .sort((a, b) => Number(a.priority ?? 0) - Number(b.priority ?? 0))
-}
-
 /** 模型行的可读标识（模型名一律带提供商，免得同名映射下说不清是哪一条） */
 function modelLabel(row: ModelRow): string {
   const provider = str(row.providerLabel) || str(row.provider)
   return provider ? `${provider} / ${str(row.id)}` : str(row.id)
 }
-function accountLabel(row: AccountRow): string {
-  return str(row.name) || str(row.nickname) || str(row.id) || t('未命名账号')
-}
-
-/** 账号点名：id 精确 > 名字精确 > 名字子串（唯一命中才算），命中多条时说清是哪些 */
-function findAccount(accounts: AccountRow[], ref: string): AccountRow {
-  const needle = ref.trim()
-  if (!needle) throw new Error(t('没给账号名'))
-  const byId = accounts.find(row => str(row.id) === needle)
-  if (byId) return byId
-  const exact = accounts.filter(row => accountLabel(row) === needle)
-  if (exact.length === 1) return exact[0]
-  const fuzzy = accounts.filter(row => accountLabel(row).includes(needle))
-  if (fuzzy.length === 1) return fuzzy[0]
-  const candidates = (exact.length ? exact : fuzzy).map(accountLabel).slice(0, 6)
-  if (!candidates.length) throw new Error(t('没有找到账号「{name}」', { name: needle }))
-  throw new Error(t('「{name}」匹配到多个账号：{list}，请用完整账号名重试', { name: needle, list: candidates.join('、') }))
-}
-
-/* ─── 九只工具 ─────────────────────────────────────────────── */
+/* ─── 模型工具与余额查询 ───────────────────────────────────── */
 
 /** 分页的默认页大小与上限（`list_models` 用；上限防一次把上下文打爆） */
 const PAGE_DEFAULT = 100
@@ -418,6 +386,9 @@ const listModels: AssistantTool = {
         providerLabel: str(row.providerLabel) || str(row.provider),
         id: str(row.id),
         enabled: row.enabled === true,
+        kind: str(row.kind) || 'chat',
+        supports_image_generation: row.supports_image_generation === true,
+        supports_image_editing: row.supports_image_editing === true,
         aliases: Array.isArray(row.aliases) ? row.aliases.map(item => str(item)) : [],
       })), offset, limit)
       payload.models = { ...page.meta, items: page.items }
@@ -452,33 +423,23 @@ const listModels: AssistantTool = {
   },
 }
 
-/** 2 · 查询账号余额（只读） */
-const listAccountBalance: AssistantTool = {
-  id: 'list_account_balance',
-  label: t('查询账号余额'),
-  kind: 'read',
-  desc: '查询各账号的余额 / 剩余额度（会向各上游发起真实的余额查询）。回答「还剩多少」「哪个账号快用完了」这类问题之前先调用它。',
-  params: {
-    type: 'object',
-    properties: {
-      account: { type: 'string', description: '只查某个账号（账号名或 id）；不填 = 全部账号' },
-    },
+const listAccountBalance: AssistantTool = createBalanceTool({
+  accounts: async () => {
+    const read = bridge().getAccounts
+    if (!read) throw new Error(t('当前客户端缺少读取接口：{name}', { name: 'getAccounts' }))
+    return read()
   },
-  run: async args => {
-    const ref = str(args.account, 128)
-    // 点名某个账号时先把它解析成 id（余额接口按 id 查）
-    const id = ref ? str(findAccount(await readAccounts(), ref).id) : ''
-    const data = (await bridge().getAllBalances?.(id || undefined)) as unknown
-    const results = Array.isArray((data as { results?: unknown[] })?.results)
-      ? ((data as { results: unknown[] }).results)
-      : data
-    const rows = Array.isArray(results) ? results : []
-    return {
-      text: JSON.stringify({ accounts: rows.slice(0, 60) }).slice(0, 12000),
-      summary: t('{n} 个账号', { n: rows.length }),
-    }
+  usageSnapshot: async () => {
+    const read = bridge().getBalancesSnapshot
+    if (!read) throw new Error(t('当前客户端缺少读取接口：{name}', { name: 'getBalancesSnapshot' }))
+    return read()
   },
-}
+  refreshBalance: async id => {
+    const query = bridge().getAllBalances
+    if (!query) throw new Error(t('当前客户端缺少读取接口：{name}', { name: 'getAllBalances' }))
+    return query(id)
+  },
+}, t)
 
 /** 3 · 启用 / 禁用模型（改动） */
 const setModelEnabled: AssistantTool = {
@@ -520,28 +481,23 @@ const setModelEnabled: AssistantTool = {
       note: t('改动立即生效；禁用后指向它的请求会落到下一个候选。'),
     }
   },
-  run: async args => {
+  run: async (args, context) => {
     const api = bridge()
-    const items = list(args.items)
-    const done: string[] = []
-    for (const item of items) {
+    const result = await runToolBatch(list(args.items), context, async item => {
       const provider = str(item.provider)
       const id = str(item.id)
       const enabled = bool(item.enabled)
       if (!provider || !id || enabled === undefined) throw new Error(t('参数不完整（需要 provider / id / enabled）'))
       if (isCustomProvider(provider)) {
-        // 自定义家的启停存在提供商记录的 models[] 里（整表替换接口），与内置家
-        // 的 modelRules 是两套存储 —— 见 models-custom-source 的文件头。
-        // `alias == target` 的「默认绑定」在那边就是模型自己的 enabled 字段。
         await customBinding(provider, id, id, { enabled })
-        done.push(`${enabled ? '启用' : '禁用'} ${provider}/${id}`)
-        continue
+      } else {
+        if (!api.setModelState) throw new Error(t('当前客户端缺少读取接口：{name}', { name: 'setModelState' }))
+        await api.setModelState({ provider, id, enabled })
       }
-      await api.setModelState?.({ provider, id, enabled })
-      done.push(`${enabled ? '启用' : '禁用'} ${provider}/${id}`)
-    }
+      return `${enabled ? '启用' : '禁用'} ${provider}/${id}`
+    }, t)
     refreshApp()
-    return { text: JSON.stringify({ ok: true, changed: done }), summary: t('已修改 {n} 个模型', { n: done.length }) }
+    return result
   },
 }
 
@@ -594,37 +550,28 @@ const setModelMapping: AssistantTool = {
       note: t('只改映射名，不动上游模型 ID；映射立即生效（新对话即可用）。'),
     }
   },
-  run: async args => {
+  run: async (args, context) => {
     const api = bridge()
-    const items = list(args.items)
-    const done: string[] = []
-    for (const item of items) {
+    const result = await runToolBatch(list(args.items), context, async item => {
       const provider = str(item.provider)
       const id = str(item.id)
       const alias = str(item.alias, 128)
-      if (!provider || !id || !alias) throw new Error(t('参数不完整（需要 provider / id / alias）'))
+      const action = str(item.action)
+      if (!provider || !id || !alias || !['add', 'remove'].includes(action)) throw new Error(t('参数不完整（需要 provider / id / alias / action）'))
       if (isCustomProvider(provider)) {
-        // 自定义家的映射是提供商记录里的 mappings 数组：新增 = 加一条，
-        // 删除 = 摘掉那条（默认绑定 alias == target 不可删，与内置家同口径）。
-        if (str(item.action) === 'remove') {
-          await customWriter().removeMapping(provider, alias, id)
-          done.push(`删除 ${alias} → ${provider}/${id}`)
-        } else {
-          await customBinding(provider, alias, id, { enabled: true })
-          done.push(`新增 ${alias} → ${provider}/${id}`)
-        }
-        continue
-      }
-      if (str(item.action) === 'remove') {
-        await api.removeModelMapping?.(alias, id, provider)
-        done.push(`删除 ${alias} → ${provider}/${id}`)
+        if (action === 'remove') await customWriter().removeMapping(provider, alias, id)
+        else await customBinding(provider, alias, id, { enabled: true })
+      } else if (action === 'remove') {
+        if (!api.removeModelMapping) throw new Error(t('当前客户端缺少读取接口：{name}', { name: 'removeModelMapping' }))
+        await api.removeModelMapping(alias, id, provider)
       } else {
-        await api.addModelMapping?.(alias, id, provider)
-        done.push(`新增 ${alias} → ${provider}/${id}`)
+        if (!api.addModelMapping) throw new Error(t('当前客户端缺少读取接口：{name}', { name: 'addModelMapping' }))
+        await api.addModelMapping(alias, id, provider)
       }
-    }
+      return `${action === 'remove' ? '删除' : '新增'} ${alias} → ${provider}/${id}`
+    }, t)
     refreshApp()
-    return { text: JSON.stringify({ ok: true, changed: done }), summary: t('已改动 {n} 条映射', { n: done.length }) }
+    return result
   },
 }
 
@@ -680,7 +627,8 @@ const setModelCapability: AssistantTool = {
       note: t('能力位决定下游看到的声明（能不能贴图、能塞多少上下文），不改上游的真实行为。'),
     }
   },
-  run: async args => {
+  run: async (args, context) => {
+    checkToolSignal(context)
     const provider = str(args.provider)
     const id = str(args.id)
     const raw = (args.capabilities && typeof args.capabilities === 'object' ? args.capabilities : {}) as Record<string, unknown>
@@ -706,7 +654,9 @@ const setModelCapability: AssistantTool = {
       // `api::model_manage::set_capabilities` 的说明）。
       await customWriter().setCapabilities(provider, id, caps as Record<string, number | boolean | null>)
     } else {
-      await bridge().setModelCapabilities?.(provider, id, caps)
+      const write = bridge().setModelCapabilities
+      if (!write) throw new Error(t('当前客户端缺少读取接口：{name}', { name: 'setModelCapabilities' }))
+      await write(provider, id, caps)
     }
     refreshApp()
     return { text: JSON.stringify({ ok: true, provider, id, capabilities: caps }), summary: t('已修改 {n} 项能力', { n: Object.keys(caps).length }) }
@@ -739,186 +689,51 @@ const testModel: AssistantTool = {
     },
     note: t('这是真实的上游请求，与生产走同一条链路（会记账，报表排除）。'),
   }),
-  run: async args => {
-    const payload: Record<string, unknown> = { provider: str(args.provider), model: str(args.id) }
+  run: async (args, context) => {
+    checkToolSignal(context)
+    const api = bridge()
+    if (!api.testModel) throw new Error(t('当前客户端缺少读取接口：{name}', { name: 'testModel' }))
+    const testId = crypto.randomUUID()
+    const payload: Record<string, unknown> = { provider: str(args.provider), model: str(args.id), test_id: testId }
     const prompt = str(args.prompt, 4000)
     if (prompt) payload.prompt = prompt
-    const result = (await bridge().testModel?.(payload)) as Record<string, unknown> | undefined
+    const cancel = () => { void api.terminateStatsRequest?.(testId).catch(() => {}) }
+    context?.signal?.addEventListener('abort', cancel, { once: true })
+    let result: Record<string, unknown> | undefined
+    try {
+      result = await api.testModel(payload) as Record<string, unknown> | undefined
+    } finally {
+      context?.signal?.removeEventListener('abort', cancel)
+    }
     const status = String(result?.status ?? '')
     const ok = result?.success === true
     const slim = {
       ok,
       status,
-      error: result?.error ?? null,
-      reply: String(result?.reply ?? '').slice(0, 1500),
+      error: result?.error ? safeText(result.error, 3000) : null,
+      reply: safeText(result?.reply, 1500),
       duration_ms: result?.duration_ms ?? null,
       ttfb_ms: result?.ttfb_ms ?? null,
       account: result?.account_name ?? null,
     }
     return {
-      text: JSON.stringify(slim).slice(0, 6000),
+      text: JSON.stringify(slim),
       summary: ok ? t('连通 · {ms}ms', { ms: String(slim.duration_ms ?? '') }) : t('失败 · {status}', { status: status || '—' }),
     }
   },
 }
 
-/** 7 · 调整提供商顺位（改动）—— 整组移动：这一家的全部账号在全局队列里的位置 */
-const setProviderOrder: AssistantTool = {
-  id: 'set_provider_order',
-  label: t('调整提供商顺位'),
-  kind: 'write',
-  desc: '调整某个提供商在账号全局队列里的**整组顺位**（第几组），决定路由时先试哪一家。这一家的所有账号会作为一整块移动。位置从 1 开始数。',
-  params: {
-    type: 'object',
-    properties: {
-      provider: { type: 'string', description: '提供商 id' },
-      position: { type: 'number', description: '目标组顺位（1 = 最前）' },
-    },
-    required: ['provider', 'position'],
-  },
-  plan: args => ({
-    lead: t('将把「{provider}」整组移到第 {position} 顺位：', {
-      provider: str(args.provider) || t('（未指定）'),
-      position: String(num(args.position) ?? '?'),
-    }),
-    note: t('队列是一次性整表提交（后端按新顺序重编优先级），移动会连带调整其它组的相对次序。'),
-  }),
-  run: async args => {
-    const provider = str(args.provider).toLowerCase()
-    const position = num(args.position)
-    if (!provider || position === undefined) throw new Error(t('参数不完整（需要 provider / position）'))
-    const accounts = await readAccounts()
-    // 按家分组（保持组内原有相对顺序 —— 组内顺位是用户自己排的，不该被这步打乱）
-    const groups: Array<{ provider: string; ids: string[] }> = []
-    for (const row of accounts) {
-      const id = str(row.id)
-      const key = str(row.provider).toLowerCase()
-      if (!id) continue
-      const last = groups[groups.length - 1]
-      if (last && last.provider === key) last.ids.push(id)
-      else groups.push({ provider: key, ids: [id] })
-    }
-    const from = groups.findIndex(group => group.provider === provider)
-    if (from < 0) throw new Error(t('没有找到提供商「{provider}」的账号', { provider }))
-    const to = Math.max(0, Math.min(groups.length - 1, Math.round(position) - 1))
-    const [moved] = groups.splice(from, 1)
-    groups.splice(to, 0, moved)
-    await bridge().reorderAccounts?.(groups.flatMap(group => group.ids))
-    refreshApp()
-    return {
-      text: JSON.stringify({ ok: true, provider, from: from + 1, to: to + 1, moved: moved.ids.length }),
-      summary: t('已移到第 {n} 顺位', { n: to + 1 }),
-    }
-  },
-}
-
-/** 8 · 调整账号优先级（改动） */
-const setAccountOrder: AssistantTool = {
-  id: 'set_account_order',
-  label: t('调整账号优先级'),
-  kind: 'write',
-  desc: '把某个账号移动到账号全局队列的第 N 顺位（1 = 最前）。位置决定主备与切换顺序：越靠前越先被使用。',
-  params: {
-    type: 'object',
-    properties: {
-      account: { type: 'string', description: '账号名或账号 id' },
-      position: { type: 'number', description: '目标顺位（1 = 最前）' },
-    },
-    required: ['account', 'position'],
-  },
-  plan: args => ({
-    lead: t('将把账号「{account}」移到第 {position} 顺位：', {
-      account: str(args.account) || t('（未指定）'),
-      position: String(num(args.position) ?? '?'),
-    }),
-    note: t('队列是一次性整表提交；位置越靠前，路由时越先被选中。'),
-  }),
-  run: async args => {
-    const ref = str(args.account, 128)
-    const position = num(args.position)
-    if (!ref || position === undefined) throw new Error(t('参数不完整（需要 account / position）'))
-    const accounts = await readAccounts()
-    const target = findAccount(accounts, ref)
-    const id = str(target.id)
-    const ids = accounts.map(row => str(row.id)).filter(Boolean)
-    const from = ids.indexOf(id)
-    if (from < 0) throw new Error(t('账号不在当前队列里'))
-    ids.splice(from, 1)
-    const to = Math.max(0, Math.min(ids.length, Math.round(position) - 1))
-    ids.splice(to, 0, id)
-    await bridge().reorderAccounts?.(ids)
-    refreshApp()
-    return {
-      text: JSON.stringify({ ok: true, account: accountLabel(target), from: from + 1, to: to + 1 }),
-      summary: t('已移到第 {n} 顺位', { n: to + 1 }),
-    }
-  },
-}
-
-/** 9 · 启用 / 禁用账号（高危） */
-const setAccountEnabled: AssistantTool = {
-  id: 'set_account_enabled',
-  label: t('启用 / 禁用账号'),
-  kind: 'write',
-  desc: '开启或关闭某几个账号的转发资格。禁用只是把它移出队列（余额仍可查），但**如果某条线路只剩它**，禁用会直接断供。一次可以改多个。',
-  params: {
-    type: 'object',
-    properties: {
-      items: {
-        type: 'array',
-        description: '要改的账号列表',
-        items: {
-          type: 'object',
-          properties: {
-            account: { type: 'string', description: '账号名或账号 id' },
-            enabled: { type: 'boolean', description: 'true = 启用，false = 禁用' },
-          },
-          required: ['account', 'enabled'],
-        },
-      },
-    },
-    required: ['items'],
-  },
-  plan: args => {
-    const items = list(args.items)
-    const disabling = items.filter(item => bool(item.enabled) === false).length
-    return {
-      lead: t('将修改 {n} 个账号的启用状态（其中禁用 {k} 个）：', { n: items.length, k: disabling }),
-      table: {
-        head: [t('账号'), t('改成')],
-        rows: items.map(item => [str(item.account), bool(item.enabled) === false ? t('禁用') : t('启用')]),
-      },
-      note: t('禁用会把账号移出转发队列；若这条线路没有别的可用账号，请求会直接失败。'),
-    }
-  },
-  run: async args => {
-    const api = bridge()
-    const items = list(args.items)
-    const accounts = await readAccounts()
-    const done: string[] = []
-    for (const item of items) {
-      const enabled = bool(item.enabled)
-      if (enabled === undefined) throw new Error(t('参数不完整（需要 account / enabled）'))
-      const target = findAccount(accounts, str(item.account, 128))
-      await api.updateAccount?.(str(target.id), { enabled })
-      done.push(`${enabled ? '启用' : '禁用'} ${accountLabel(target)}`)
-    }
-    refreshApp()
-    return { text: JSON.stringify({ ok: true, changed: done }), summary: t('已修改 {n} 个账号', { n: done.length }) }
-  },
-}
-
 /** 全部工具（顺序 = 设置页清单顺序：只读在前，改动在后，高危最后） */
 export const ASSISTANT_TOOLS: AssistantTool[] = [
+  ...ASSISTANT_READ_TOOLS,
   listModels,
   listAccountBalance,
   setModelEnabled,
   setModelMapping,
   setModelCapability,
   testModel,
-  setProviderOrder,
-  setAccountOrder,
-  setAccountEnabled,
+  ...ASSISTANT_IMAGE_TOOLS,
+  ...ASSISTANT_ACCOUNT_TOOLS,
 ]
 
 export function toolById(id: string): AssistantTool | undefined {
@@ -937,6 +752,8 @@ export function toolsPayload(enabled: Record<string, boolean>): Array<Record<str
  *  文案在这里就用 `t()` 包好（定义时求值）：页面直接取 `meta.label` 即可，
  *  不会再出现「把变量喂给 t()」那种扫描器提不到键的写法。 */
 export const TOOL_META: Array<{ id: string; label: string; desc: string; tag?: 'danger' | 'cost' }> = [
+  ...ASSISTANT_READ_META,
+  ...ASSISTANT_IMAGE_META,
   { id: 'list_models', label: t('获取模型列表'), desc: t('读各提供商的模型清单、映射名与启用状态。') },
   { id: 'list_account_balance', label: t('查询账号余额'), desc: t('读各账号的额度 / 剩余用量。') },
   { id: 'set_model_enabled', label: t('启用 / 禁用模型'), desc: t('开关模型的对外可用性，不改其它属性。') },
@@ -960,6 +777,5 @@ export async function loadModelOptions(): Promise<ModelOption[]> {
   if (!readState) throw new Error(t('读取模型清单失败'))
   const state = await readState() as { models?: unknown } | null | undefined
   if (!Array.isArray(state?.models)) throw new Error(t('读取模型清单失败'))
-  const managed = await readModels().catch(() => ({ models: [], mappings: [] }))
-  return modelOptionsFrom(state.models, managed.models, managed.mappings)
+  return modelOptionsFrom(state.models)
 }

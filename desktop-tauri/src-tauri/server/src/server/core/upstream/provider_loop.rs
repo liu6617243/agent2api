@@ -81,7 +81,7 @@ use crate::server::config;
 use crate::server::core::custom_providers;
 use crate::server::core::protocol::strip_internal_fields;
 use crate::server::core::providers::adapter::{
-    adapter_for, ProviderAdapter, RetryAdvice, UpstreamErrorClass,
+    adapter_for, ProviderAdapter, RetryAdvice, RetryDecision, UpstreamErrorClass,
 };
 use crate::server::core::providers::custom::forward as custom_forward;
 use crate::server::core::providers::readiness;
@@ -118,6 +118,8 @@ struct OutboundFailure {
     /// 收的就是 `error.message`（`上游返回 429: {上游原文}`），
     /// accounts.json 里落的那段文案因此逐字不变。
     error: GatewayError,
+    /// 插件明确终止本次请求；不再刷新凭证、降级提示词或换账号。
+    stop: bool,
 }
 
 /// **原地重发**的退避预算（见 `send_with_retry` 的说明）。
@@ -421,8 +423,19 @@ pub(super) async fn forward_with_providers(
         ctx.key_scope
             .map(crate::server::core::key_scope::KeyScope::allowed_provider_ids)
             .unwrap_or_default()
+    } else if let Some(operation) = ctx.images {
+        crate::server::core::routing_scope::providers_for(
+            &model, &crate::server::core::providers::images::operation_providers(&model, operation),
+        )
     } else {
         route_for_forward(&model)
+    };
+    let candidates: Vec<_> = if ctx.images.is_some() {
+        candidates
+    } else {
+        candidates.into_iter().filter(|provider| {
+            !crate::server::core::providers::images::provider_model_is_image(provider, &model)
+        }).collect()
     };
     if crate::server::core::providers::catalog::providers_for_model(&model).is_empty() {
         logging::verbose(
@@ -445,6 +458,12 @@ pub(super) async fn forward_with_providers(
                 ),
             )
             .with_code("model_not_found"));
+        }
+        if config::routing_profiles().effective(&model).is_some() {
+            return Err(GatewayError::with_status(
+                503,
+                format!("模型 {model} 的路由中没有启用的提供商，请在路由页调整参与范围"),
+            ));
         }
         return Err(GatewayError::new("没有可用的提供商，无法转发"));
     }
@@ -555,6 +574,8 @@ async fn attempt_queue(
     // 只用这一个键 —— 429 顺延的后续选路查的是同一个会话，粘住的账号失败后
     // 同样顺延（粘性不等于无条件）。
     let conv_key = super::route_state::RouteState::conversation_key(ctx.client_headers, &ctx.body);
+    let sticky_generation = service.route.sticky_generation();
+    let sticky_source = super::route_state::RouteState::conversation_source(ctx.client_headers, &ctx.body);
     let mut tried_ids: Vec<String> = Vec::new();
     // ── 两份独立的预算（见 config::RetrySettings）─────────────────────
     //   - `budget`：同一个账号上还能**原地重发**几次。整份请求共用一份，
@@ -645,7 +666,17 @@ async fn attempt_queue(
             let custom_provider_id = target.provider.clone();
             let custom_account_id = target.account_id.clone();
             match attempt_custom(service, ctx, target, slot, connections, degraded).await {
-                Ok(outcome) => return Ok(outcome),
+                Ok(outcome) => {
+                    if let Some(account_id) = custom_account_id.as_deref() {
+                        service.route.sticky_bind(
+                            &conv_key, &model, account_id, sticky_source, logging::now_ms(),
+                            config::routing_settings().sticky.ttl_ms().unwrap_or(0), sticky_generation,
+                        );
+                        service.route.backoff_clear(account_id);
+                        service.route.sink_clear(account_id);
+                    }
+                    return Ok(outcome);
+                },
                 Err(error) => {
                     // 手动终止优先（与无状态路径同一判定与理由）：不把已受理的
                     // 终止当成「这一轮失败」去顺延下一个账号
@@ -779,7 +810,17 @@ async fn attempt_queue(
             )
             .await
             {
-                Ok(outcome) => return Ok(outcome),
+                Ok(outcome) => {
+                    if let Some(account_id) = stateful_account_id.as_deref() {
+                        service.route.sticky_bind(
+                            &conv_key, &model, account_id, sticky_source, logging::now_ms(),
+                            config::routing_settings().sticky.ttl_ms().unwrap_or(0), sticky_generation,
+                        );
+                        service.route.backoff_clear(account_id);
+                        service.route.sink_clear(account_id);
+                    }
+                    return Ok(outcome);
+                },
                 Err(error) => {
                     // 手动终止优先（与无状态 / 自定义两条路径同一判定与理由）：
                     // 会话式这一轮已经结束，但用户要的是终止 —— 不把它当成
@@ -939,6 +980,7 @@ async fn attempt_queue(
             target.account_id.as_deref().unwrap_or(""),
             &session,
         );
+        ctx.telemetry.note_quota_channel(target.account.as_ref());
         ctx.telemetry.note_attempt(
             target.account_id.as_deref(),
             &attempt_account,
@@ -1025,6 +1067,8 @@ async fn attempt_queue(
             // 随发送体一起取（发送体换了，真名也随之重算），成功时随返回值交给
             // 循环外（`cap_cleared` 要读它）—— 所以它是 break 的第二个元素。
             let wire_model = send.wire_model.clone();
+            ctx.telemetry.note_upstream_model(&wire_model);
+            ctx.telemetry.note_upstream_reasoning(send.wire_reasoning.clone());
             // 构造请求计划**可能失败**（适配器自己的校验，例如小浣熊账号缺
             // accessToken → 401）。这里显式处理而不是用 `?` 直接抛出：
             // 上面的 `note_attempt_started` 已经为这一轮起了头，直接返回会让
@@ -1034,7 +1078,12 @@ async fn attempt_queue(
             // 在此也成立（那是本字段的全部前提，见模块头）。
             // 走异步伴生方法：内置家直接转调同步实现（零成本），插件家走 RPC。
             // 见 `ProviderAdapter::build_chat_request_async` 的说明。
-            let plan = match adapter.build_chat_request_async(&session, body, ctx.client_headers).await {
+            let planned = if let Some(operation) = ctx.images {
+                adapter.build_image_request_async(&session, body, ctx.client_headers, operation).await
+            } else {
+                adapter.build_chat_request_async(&session, body, ctx.client_headers).await
+            };
+            let plan = match planned {
                 Ok(plan) => plan,
                 Err(error) => {
                     ctx.telemetry.finish_last_attempt(
@@ -1140,6 +1189,10 @@ async fn attempt_queue(
                 capture.as_deref(),
                 ctx.telemetry,
                 degraded,
+                match plan.response {
+                    crate::server::core::providers::adapter::UpstreamResponse::Images(kind) => Some(kind),
+                    _ => None,
+                },
             )
             .await
             {
@@ -1168,13 +1221,33 @@ async fn attempt_queue(
                         }
                         service.route.backoff_clear(account_id);
                         service.route.sink_clear(account_id);
+                        // 这次转发成功 = 账号的登录态**此刻确实可用**：清掉可能
+                        // 存在的「需要重新登录」标记（用户可能已经在别处重新登录
+                        // 过，或者之前那次 401 是上游抖动）。
+                        //
+                        // 为什么在成功出口清、而不是等重新登录流程清：无续期家
+                        // （Loomy）没有「刷新成功」这个信号可用，一次成功的真实
+                        // 转发就是最强的反证。不清的后果是账号被永久钉在
+                        // 「需要重新登录」上，用户明明已经重新登录、账号也能用，
+                        // 界面却一直红着。
+                        if service.store.needs_relogin(account_id) {
+                            service.store.set_needs_relogin(account_id, None);
+                            logging::log(
+                                "[Upstream]",
+                                &format!("账号 {account_id} 转发成功，已清除「需要重新登录」标记"),
+                            );
+                        }
                     }
                     if let (Some(_ttl), true, Some(account_id)) = (
                         route_settings.sticky.ttl_ms(),
                         !conv_key.is_empty(),
                         target.account_id.as_deref(),
                     ) {
-                        service.route.sticky_bind(&conv_key, account_id, logging::now_ms());
+                        service.route.sticky_bind(
+                            &conv_key, &model, account_id, sticky_source,
+                            logging::now_ms(), route_settings.sticky.ttl_ms().unwrap_or(0),
+                            sticky_generation,
+                        );
                     }
                     // Antigravity 的会话键随信封带出（签名缓存兜底档的写入键，
                     // issue #291）：只有本家的信封有 `request.sessionId`，其余
@@ -1206,6 +1279,13 @@ async fn attempt_queue(
                         );
                         return Err(cancellation::cancelled_error());
                     }
+                    if failure.stop {
+                        ctx.telemetry.finish_last_attempt(
+                            Some(i64::from(failure.error.status_code)),
+                            Some(&failure.error.message),
+                        );
+                        return Err(failure.error);
+                    }
                     // ── 指定错误码直接换号 ──────────────────────────────
                     // 用户点名的状态码（默认 402）不做「同一账号再看一眼」：
                     // 原地重发已在 `send_with_retry` 的第二道闸挡住，这里的
@@ -1232,7 +1312,14 @@ async fn attempt_queue(
                     // 重试成功时这一轮的结局就是成功。`degraded` 置位后不再重复
                     // 触发，一次请求最多补救一次。
                     let attempt_prompt = ctx.prompt.for_provider(provider_id);
+                    if ctx.images.is_some() && matches!(failure.class, UpstreamErrorClass::ContentBlocked { .. }) {
+                        ctx.telemetry.finish_last_attempt(
+                            Some(i64::from(failure.error.status_code)), Some(&failure.error.message),
+                        );
+                        return Err(failure.error);
+                    }
                     if matches!(failure.class, UpstreamErrorClass::ContentBlocked { .. })
+                        && !ctx.preserve_system_prompt
                         && !named_switch
                         && !degraded
                         && attempt_prompt.mode.degradable()
@@ -1320,6 +1407,44 @@ async fn attempt_queue(
                             );
                         }
                     }
+                    // ── 动作 2b：凭证**真的失效** → 给账号落「需要重新登录」 ──
+                    //
+                    // ── 判据为什么是「刷新没救回来」而不是「收到 401」──────
+                    // 401 本身不代表登录态已死：有续期的家靠刷新就能自愈（上面
+                    // 动作 2 已经试过）。只有**没有续期手段**的家（Loomy 这类，
+                    // `supports_refresh() == false`）在 401 / 业务码 020002 时才是
+                    // 真的没救 —— 它们连 `refresh_access_token` 都没实现，动作 2
+                    // 那一支根本不会执行，于是错误只能原样透传给客户端。
+                    // 对这类家，收到 `TokenExpired` 就是「上游明确说这个 session
+                    // 不认了」，这正是唯一可靠、可验证的失效判据（比起按登录时刻
+                    // 估一个到期时间，它不会误杀仍然可用的账号）。
+                    //
+                    // 为什么标在**这一层**而不是插件里：`classify` 只有 status 与
+                    // body，拿不到账号 id；而账号库是网关的事实。标记落在记录上，
+                    // 界面读 `needsRelogin`（`store_view::public_account` 统一注入），
+                    // 凭证维护也会跳过它，不再白打上游。
+                    if matches!(failure.class, UpstreamErrorClass::TokenExpired { .. })
+                        && !adapter.supports_refresh()
+                    {
+                        if let Some(account_id) = target.account_id.clone() {
+                            // 只在该账号尚未被标记时写一次：401 会随每次请求重复
+                            // 出现，每轮都写一遍等于把账号表当日志写。`set_needs_relogin`
+                            // 本身是幂等的，这里的判据只是省掉重复的写盘。
+                            if !service.store.needs_relogin(&account_id) {
+                                service.store.set_needs_relogin(
+                                    &account_id,
+                                    Some("上游拒绝了这个登录态（会话已失效）"),
+                                );
+                                logging::log(
+                                    "[Upstream]",
+                                    &format!(
+                                        "账号 {account_id} 的登录态已被上游注销（该家无续期手段），\
+                                         已标记为「需要重新登录」"
+                                    ),
+                                );
+                            }
+                        }
+                    }
                     // ── 这一轮的结局已定（不会再重发同一个账号）→ 记明细 ────
                     // 位置在动作 1 / 动作 3 之前：那两段会 `continue 'accounts`
                     // （开下一轮、追加新明细）或 `return Err`（整体收尾），
@@ -1370,6 +1495,15 @@ async fn attempt_queue(
                             let limit_label = limit_model_label(&model, &wire_model);
                             let from_label =
                                 account_label(target.account.as_ref(), &account_id, &session);
+                            if !rotate::allows_route_skip(service, &account_id) {
+                                rotate::report_limit_event(
+                                    "warn",
+                                    &format!("账号「{from_label}」对模型 {limit_label} 已限额，已关闭失败换号"),
+                                    Some(&from_label), None, &wire_model, *upstream_code,
+                                    *status as i32, limit_at, None, provider_id,
+                                );
+                                return Err(failure.error);
+                            }
                             match rotate::pick_next_account(
                                 service,
                                 provider_ids,
@@ -1570,6 +1704,13 @@ async fn attempt_queue(
                 logging::now_ms() - started_at
             ),
         );
+
+        let response = match response {
+            super::images::ImageResponse::Complete(body) => {
+                return Ok(ForwardOutcome::Completion { body });
+            }
+            super::images::ImageResponse::Live(response) => response,
+        };
 
         // ── 调试模式：响应头到手（必须在 consume response 之前）──────────
         // 状态码与响应头在这里定稿；响应体由后续的流 / 聚合函数逐段补进同一个
@@ -1826,7 +1967,7 @@ async fn attempt_queue(
                 // 外层 `if` 已排除它，这一支只为 match 的穷尽性存在，**不可能
                 // 走到**。真走到说明分派被改坏了：报内部错误而不是 panic
                 // （release 是 `panic=abort`，一处 panic 带走整个网关）。
-                UpstreamResponse::Chat => {
+                UpstreamResponse::Chat | UpstreamResponse::Images(_) => {
                     return Err(GatewayError::with_status(
                         500,
                         "内部错误：Chat 协议不该进入上游响应翻译分派",
@@ -2042,6 +2183,7 @@ async fn attempt_custom(
         target.account_id.as_deref().unwrap_or(""),
         &Value::Null,
     );
+    ctx.telemetry.note_quota_channel(target.account.as_ref());
     ctx.telemetry
         .note_attempt(target.account_id.as_deref(), &attempt_account, &provider_id);
     ctx.telemetry
@@ -2265,6 +2407,7 @@ async fn attempt_stateful(
         target.account_id.as_deref().unwrap_or(""),
         &Value::Null,
     );
+    ctx.telemetry.note_quota_channel(target.account.as_ref());
     ctx.telemetry
         .note_attempt(target.account_id.as_deref(), &attempt_account, provider_id);
     // 尝试明细的起头：与 note_attempt 配对（同上一条注释的说明）。
@@ -2272,6 +2415,8 @@ async fn attempt_stateful(
     // 所以一轮就是一条明细，链路至多一项（`provider_loop` 的 `'accounts` 循环
     // 仍可能在外层顺延到下一个账号，那会走本函数第二次调用）。
     ctx.telemetry.note_attempt_started(provider_id, &attempt_account);
+    ctx.telemetry.note_upstream_model(wire_model);
+    ctx.telemetry.note_upstream_reasoning(send.wire_reasoning.clone());
     if let Some(notice) = target.proxy_notice.as_deref() {
         ctx.telemetry.note_attempt_notice(notice);
     }
@@ -2491,6 +2636,7 @@ fn cancelled_failure() -> OutboundFailure {
             upstream_code: None,
         },
         error: cancellation::cancelled_error(),
+        stop: true,
     }
 }
 
@@ -2511,6 +2657,7 @@ async fn send_or_cancel(
         _ = token.cancelled() => Err(super::request::UpstreamRequestError {
             message: cancellation::MANUAL_TERMINATED.to_string(),
             reason: cancellation::MANUAL_TERMINATED.to_string(),
+            safe_to_retry: false,
         }),
     }
 }
@@ -2565,9 +2712,10 @@ async fn send_with_retry(
     transport: &TransportRequest,
     budget: &mut RetryBudget,
     capture: Option<&crate::server::core::debug_traffic::TrafficCapture>,
-    telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
+    telemetry: &std::sync::Arc<crate::server::core::upstream::usage::RequestTelemetry>,
     degraded: bool,
-) -> Result<reqwest::Response, OutboundFailure> {
+    images: Option<crate::server::core::providers::images::ImageResponseKind>,
+) -> Result<super::images::ImageResponse, OutboundFailure> {
     loop {
         // 手动终止：发送前先看令牌（退避睡眠 / 上一轮失败之后回到这里）。
         // 出口是 `cancelled_failure`，但调用方（attempt_queue）在分类动作之前
@@ -2582,11 +2730,27 @@ async fn send_with_retry(
         // 「重试中」，而它其实已经在等上游出字了。
         telemetry.note_phase(LogPhase::Waiting);
         let response = match send_or_cancel(transport, telemetry).await {
-            Ok(response) => response,
+            Ok(response) => {
+                telemetry.note_attempt_response();
+                response
+            }
             Err(error) => {
                 // 手动终止：不把它当传输失败去退避重发（原因不是链路抖动）
                 if telemetry.is_cancelled() {
                     return Err(cancelled_failure());
+                }
+                if images.is_some() && !error.safe_to_retry {
+                    telemetry.note_attempt_notice("生图请求可能已发送，未自动重发，以免重复消耗额度");
+                    let gateway = super::images::output_error(format!(
+                        "{}；上游可能已消耗生图额度，未自动重试", error.message,
+                    ));
+                    return Err(OutboundFailure {
+                        class: UpstreamErrorClass::Fatal {
+                            status: 502, message: gateway.message.clone(), upstream_code: None,
+                        },
+                        error: gateway,
+                        stop: true,
+                    });
                 }
                 // 传输层失败（DNS/代理/连接）：按设置退避重发，吸收链路抖动；
                 // 次数用完才收敛成 502，与改造前的兜底一致
@@ -2609,11 +2773,46 @@ async fn send_with_retry(
                         upstream_code: None,
                     },
                     error: gateway,
+                    stop: false,
                 });
             }
         };
+        if let Some(kind) = images.filter(|_| response.status().is_success()) {
+            match super::images::collect(response, kind, telemetry).await {
+                Ok(body) => return Ok(super::images::ImageResponse::Complete(body)),
+                Err(failure) => {
+                    let message = failure.body.get("message").and_then(Value::as_str).unwrap_or("图片生成失败");
+                    let class = if failure.body.get("code").and_then(Value::as_str) == Some("content_policy_violation") {
+                        UpstreamErrorClass::ContentBlocked {
+                            status: 400, message: message.to_string(), upstream_code: None,
+                        }
+                    } else {
+                        adapter.classify_error_async(failure.status, &failure.body).await
+                    };
+                    let error = match &class {
+                        UpstreamErrorClass::QuotaLimited { status, message, upstream_code, .. }
+                        | UpstreamErrorClass::ContentBlocked { status, message, upstream_code }
+                        | UpstreamErrorClass::Fatal { status, message, upstream_code } => {
+                            GatewayError::with_status(i32::from(*status).max(400), message.clone())
+                                .with_optional_code(*upstream_code)
+                        }
+                        UpstreamErrorClass::TokenExpired { message } => GatewayError::with_status(401, message.clone()),
+                    };
+                    let stop = failure.status >= 500
+                        && matches!(class, UpstreamErrorClass::Fatal { .. });
+                    if stop {
+                        telemetry.note_attempt_notice("生图结果不确定，未自动重发，以免重复消耗额度");
+                    }
+                    return Err(OutboundFailure {
+                        class,
+                        error: if error.message.is_empty() { super::images::output_error(message) } else { error },
+                        stop,
+                    });
+                }
+            }
+        }
         if !adapter.is_error_response(response.status().as_u16(), response.headers()) {
-            return Ok(response);
+            return Ok(super::images::ImageResponse::Live(response));
         }
         let status = response.status().as_u16();
         // 错误响应体的读取同样受「非流式响应超时」管（对应 OmniProxy
@@ -2632,6 +2831,20 @@ async fn send_with_retry(
         };
         let body = detail.to_value();
         let class = adapter.classify_error_async(status, &body).await;
+        let decision = adapter
+            .retry_decision_async(status, &body, budget.used(), budget.total)
+            .await;
+        let uncertain_image = images.is_some()
+            && matches!(class, UpstreamErrorClass::Fatal { .. })
+            && (status >= 500 || matches!(status, 408 | 409 | 425));
+        let stop = uncertain_image || matches!(&decision, RetryDecision::Stop { .. });
+        if uncertain_image {
+            telemetry.note_attempt_notice("图片请求结果不确定，未自动重发，以免重复消耗额度");
+        }
+        if let RetryDecision::Stop { reason } = &decision {
+            telemetry.note_attempt_notice(reason);
+            logging::console_line("[Upstream]", reason);
+        }
         // 退避重试：provider 专属判定优先，没声明时对瞬时状态码统一兜底
         //
         // ── 内容拦截为什么在 `!degraded` 时跳过这一整层 ──────────────
@@ -2648,19 +2861,17 @@ async fn send_with_retry(
         // 上，直接换下一个账号继续试（见 `direct_switch_status` 与动作 3），
         // 换满仍失败才把错误给客户端。两处合起来才是「这个码直接换号」的
         // 完整语义。
-        let advice = if !degraded && matches!(class, UpstreamErrorClass::ContentBlocked { .. }) {
-            None
-        } else if direct_switch_status(i64::from(status)) {
+        let advice = if stop
+            || (!degraded && matches!(class, UpstreamErrorClass::ContentBlocked { .. }))
+            || direct_switch_status(i64::from(status))
+        {
             None
         } else {
-            // 走异步伴生方法：内置家直接转调同步实现（零成本），插件家走 RPC。
-            match adapter
-                .retry_advice_async(&body, budget.used(), budget.total)
-                .await
-            {
-                Some(advice) => Some(advice),
-                None => transient_retry_advice(status, budget.remaining)
+            match decision {
+                RetryDecision::Retry { delay_ms, reason } => Some(RetryAdvice { delay_ms, reason }),
+                RetryDecision::Default => transient_retry_advice(status, budget.remaining)
                     .or_else(|| fallback_retry_advice(&class, budget.remaining, status)),
+                RetryDecision::Stop { .. } => None,
             }
         };
         if let Some(advice) = advice {
@@ -2701,7 +2912,11 @@ async fn send_with_retry(
                     .with_optional_code(detail.code)
             }
         };
-        return Err(OutboundFailure { class, error });
+        let error = if uncertain_image {
+            GatewayError::with_status(error.status_code, format!("{}；图片请求可能已消耗额度，未自动重试", error.message))
+                .with_optional_code(error.upstream_code)
+        } else { error };
+        return Err(OutboundFailure { class, error, stop });
     }
 }
 

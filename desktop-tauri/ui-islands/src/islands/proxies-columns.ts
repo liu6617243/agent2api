@@ -43,17 +43,7 @@ export const PROXY_COLUMNS: readonly ProxyColumn[] = [
   { key: 'act', label: t('操作'), align: 'right' },
 ]
 
-/**
- * 各列的**默认宽度类**（写在 `<col>` 上，没拖过的列走它）。
- *
- * 是普通 CSS 类而不是 Tailwind 工具类，位置在 css/page-gateway.css 的
- * `.proxies-table .p-*`：组件库的 Tailwind 是 `!important` 导出的，工具类的
- * `width: 196px !important` 会压住列宽层写下的 inline 宽度 —— 拖完一松手列宽
- * 就弹回原值。其余三张表的默认列宽（`.c-*` / `.k-*`）也是同一口径。
- *
- * 节点列**不给宽度**：它是全表唯一内容长度不可控的列（名字 + 协议 + 引用数），
- * 该吃掉剩余宽度；连通性列给 28% —— 失败原因有两行（结论 + 上游错误原文）。
- */
+
 export const COL_CLASS: Record<string, string> = {
   pick: 'p-pick',
   name: '',

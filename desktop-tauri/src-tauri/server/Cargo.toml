@@ -1,6 +1,6 @@
 [package]
 name = "agent2api-server"
-version = "3.3.0-beta.3"
+version = "3.3.0-beta.4"
 description = "Agent2API 网关本体 — AI 路由网关与 Agent 客户端接管（桌面端与 headless 服务器共用）"
 authors = ["Agent2API"]
 edition = "2021"
@@ -73,7 +73,7 @@ agent2api-provider-protocol = { git = "https://github.com/ProvidersPlugin/Agent2
 # 依赖树里（image 拉的），声明出来直接复用；tar 解析手写（几十行，见 risk.rs）
 flate2 = "1"
 url = "2"
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 # 出站请求：rustls（纯 Rust，不依赖系统 openssl）+ socks5 出网代理。
 # `system-proxy` 打开 hyper-util 的系统代理匹配器（Windows / macOS 系统设置 +
 # 环境变量）：只有「跟随系统代理」那条出口（`egress::client_for_system_proxy`，
@@ -95,9 +95,10 @@ sha2 = "0.10"
 sha1 = "0.10"
 # 「从其他工具导入」：解析 cc-switch 里 Codex 供应商的 config.toml 字符串
 # （提取激活 model_provider 的 base_url，见 core/import_ccswitch.rs）
-# preserve_order：Agent 页写回 Codex 的 config.toml 时要保住用户原有的键序，
-# 否则每写一次就把整份文件重排一遍（注释仍会丢，写前有备份可回退）
 toml = { version = "0.9", features = ["preserve_order"] }
+# 客户端配置必须保留未修改部分的注释与排版。
+toml_edit = "=0.25.13"
+jsonc-parser = { version = "=0.33.1", features = ["cst", "serde_json"] }
 # ALTCHA 机器人校验的 challenge 签名（HMAC-SHA256，见 server/altcha.rs）
 hmac = "0.12"
 chrono = "0.4"

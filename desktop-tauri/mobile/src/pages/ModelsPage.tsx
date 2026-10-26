@@ -1,3 +1,4 @@
+import { InputGroup, InputGroupInput, InputGroupAddon, InputGroupButton } from '@ui'
 import { useMemo, useState } from 'react'
 import { PageIntro, IconButton, Badge, Empty, ErrorNote, SkeletonList } from '../components/ui'
 import { ProviderLogo } from '../components/ProviderLogo'
@@ -7,6 +8,10 @@ import { store } from '../state/store'
 import { fetchManage, refreshModels, setModelEnabled, type ManageModel } from '../api/gateway'
 import { usePolling } from '../lib/usePolling'
 import { t } from '../i18n'
+import { Input, Card, Button } from '@ui'
+import { Switch as UiSwitch } from '@ui'
+import { Badge as UiBadge } from '@ui'
+import { Toggle as UiToggle } from '@ui'
 
 /**
  * 模型管理。
@@ -108,35 +113,11 @@ export function ModelsPage() {
         />
 
       <div className='m-section' style={{ marginTop: 0 }}>
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            height: 38,
-            padding: '0 12px',
-            borderRadius: 11,
-            background: 'var(--m-surface)',
-            border: '1px solid var(--m-line)',
-            color: 'var(--m-text-3)',
-          }}
-        >
-          <Icon name='search' style={{ width: 16, height: 16, flex: 'none' }} />
-          <input
-            value={query}
-            onChange={event => setQuery(event.target.value)}
-            placeholder={t('搜索模型 ID / 提供商')}
-            style={{
-              flex: 1,
-              minWidth: 0,
-              border: 0,
-              outline: 'none',
-              background: 'transparent',
-              color: 'var(--m-text)',
-              fontSize: 16,
-            }}
-          />
-        </div>
+        <InputGroup>
+          <InputGroupInput value={query} onChange={event => setQuery(event.target.value)} placeholder={t('搜索模型 ID / 提供商')} />
+          <InputGroupAddon><Icon name='search' style={{ width: 16, height: 16 }} /></InputGroupAddon>
+
+        </InputGroup>
       </div>
 
       <div className='m-chips' style={{ padding: '10px 16px 12px' }}>
@@ -152,9 +133,9 @@ export function ModelsPage() {
 
       {models && !groups.length ? (
         <div className='m-section'>
-          <div className='m-card'>
+          <Card className='m-card'>
             <Empty text={t('没有匹配的模型')} />
-          </div>
+          </Card>
         </div>
       ) : null}
 
@@ -162,7 +143,7 @@ export function ModelsPage() {
         const isCollapsed = collapsed.has(group.provider)
         return (
           <div key={group.provider} className='m-section' style={{ marginTop: 12 }}>
-            <button
+            <Button size='default' variant='ghost'
               type='button'
               onClick={() => {
                 const next = new Set(collapsed)
@@ -194,9 +175,9 @@ export function ModelsPage() {
                   transition: 'transform .16s',
                 }}
               />
-            </button>
+            </Button>
             {isCollapsed ? null : (
-              <div className='m-card'>
+              <Card className='m-card'>
                 {group.list.map(model => {
                   const key = `${model.provider}:${model.id}`
                   const hidden = model.visibility === 'hidden'
@@ -221,22 +202,30 @@ export function ModelsPage() {
                           {model.id}
                         </div>
                         <div style={{ display: 'flex', gap: 6, marginTop: 4, fontSize: 10.5, color: 'var(--m-text-3)', flexWrap: 'wrap' }}>
-                          {caps.context ? <span className='m-pill'>{caps.context}</span> : null}
-                          <span className='m-pill'>{sourceLabel(model.source)}</span>
+                          {model.kind === 'image' ? <UiBadge variant='secondary' shape='tag' className='m-pill'>{t('图片生成')}</UiBadge> : null}
+                          {model.supports_image_editing ? <UiBadge variant='secondary' shape='tag' className='m-pill'>{t('图片编辑')}</UiBadge> : null}
+                          {model.upstreamStatus === 'undeployed' ? (
+                            <UiBadge variant='warning' shape='tag'
+                              title={t('上游目录列出了这个模型，但推理端尚未识别；保留在清单中，后续探测成功后自动清除标记')}>
+                              {t('上游未部署')}
+                            </UiBadge>
+                          ) : null}
+                          {caps.context ? <UiBadge variant='secondary' shape='tag' className='m-pill'>{caps.context}</UiBadge> : null}
+                          <UiBadge variant='secondary' shape='tag' className='m-pill'>{sourceLabel(model.source)}</UiBadge>
                           {model.aliases?.length ? (
-                            <span className='m-pill' style={{ color: 'var(--m-primary)' }}>
+                            <UiBadge variant='secondary' shape='tag' className='m-pill' style={{ color: 'var(--m-primary)' }}>
                               {t('{n} 个映射', { n: model.aliases.length })}
-                            </span>
+                            </UiBadge>
                           ) : null}
                           {hidden ? (
-                            <span className='m-pill' style={{ color: 'var(--m-warn)' }}>
+                            <UiBadge variant='secondary' shape='tag' className='m-pill' style={{ color: 'var(--m-warn)' }}>
                               {t('不展示')}
-                            </span>
+                            </UiBadge>
                           ) : null}
                           {caps.reasoning ? (
-                            <span className='m-pill' style={{ color: 'var(--m-primary)' }}>
+                            <UiBadge variant='secondary' shape='tag' className='m-pill' style={{ color: 'var(--m-primary)' }}>
                               {t('思考')}
-                            </span>
+                            </UiBadge>
                           ) : null}
                         </div>
                       </div>
@@ -249,16 +238,16 @@ export function ModelsPage() {
                     </div>
                   )
                 })}
-              </div>
+              </Card>
             )}
           </div>
         )
       })}
 
       <div className='m-section' style={{ paddingBottom: 8 }}>
-        <div className='m-card m-card-pad' style={{ fontSize: 11.5, color: 'var(--m-text-3)', lineHeight: 1.7 }}>
+        <Card className='m-card m-card-pad' style={{ fontSize: 11.5, color: 'var(--m-text-3)', lineHeight: 1.7 }}>
           {t('映射、思考等级、上下文窗口与工具调用能力在桌面端「模型管理」里改；手机端只做启停。')}
-        </div>
+        </Card>
       </div>
       </div>
     </div>
@@ -267,10 +256,10 @@ export function ModelsPage() {
 
 function Chip({ label, count, on, onClick }: { label: string; count: number; on: boolean; onClick: () => void }) {
   return (
-    <button type='button' className='m-chip' data-on={on} onClick={onClick}>
+    <UiToggle size='default' variant='outline' type='button' className='m-chip rounded-pill' pressed={on} onClick={onClick}>
       {label}
       <span className='m-n'>{count}</span>
-    </button>
+    </UiToggle>
   )
 }
 
@@ -286,40 +275,7 @@ function SwitchSmall({
   label: string
 }) {
   return (
-    <button
-      type='button'
-      role='switch'
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      style={{
-        width: 40,
-        height: 24,
-        borderRadius: 999,
-        border: checked ? '0' : '1px solid var(--m-line-strong)',
-        background: checked ? 'var(--m-ok)' : 'var(--m-surface-3)',
-        position: 'relative',
-        transition: 'background .18s',
-        padding: 0,
-        flex: 'none',
-        opacity: disabled ? 0.5 : 1,
-      }}
-    >
-      <span
-        style={{
-          position: 'absolute',
-          top: 2,
-          left: checked ? 18 : 2,
-          width: 20,
-          height: 20,
-          borderRadius: '50%',
-          background: '#fff',
-          boxShadow: '0 1px 3px rgba(0,0,0,.25)',
-          transition: 'left .18s cubic-bezier(.3,.9,.4,1)',
-        }}
-      />
-    </button>
+    <UiSwitch size='touch' variant='success' checked={checked} aria-label={label} disabled={disabled} onCheckedChange={onChange} />
   )
 }
 

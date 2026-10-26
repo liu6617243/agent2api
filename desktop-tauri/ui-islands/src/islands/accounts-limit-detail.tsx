@@ -31,7 +31,7 @@
  */
 
 import * as React from 'react'
-import { Button, Popover, PopoverContent, PopoverTrigger } from '@ui'
+import { Button, Meter, Popover, PopoverContent, PopoverTrigger } from '@ui'
 import { t } from '../i18n'
 import { activeLimits, formatResetText, RESET_UNKNOWN } from './accounts-domain'
 import type { AccountRecord } from './accounts-shared'
@@ -147,7 +147,7 @@ export function LimitDetailButton({ accountName, rows, count, soonest, onClear }
     <>
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger
-          render={<button type='button' className='usage-toggle warn'
+          render={<Button size='default' variant='ghost' type='button' className='usage-toggle warn'
             title={t('点击查看各模型的限流明细')} aria-label={t('限流明细')} />}
         >
           <span className='val'>{t('{n} 个模型', { n: count })}</span>
@@ -156,10 +156,7 @@ export function LimitDetailButton({ accountName, rows, count, soonest, onClear }
         {/* `align='center'`：与「积分明细」同一处置（理由见 accounts-credit-detail
             的同名参数）—— 这两列的按钮都靠右，'end' 会把弹层甩到表格右外侧。 */}
         <PopoverContent align='center' sideOffset={6} className='w-[320px]' initialFocus={initialFocus}>
-          {/* ⚠️ 这一层 div 是**滚动容器本身**，不是装饰：组件库给 PopoverContent 编出的
-              `overflow-hidden` / `max-h-[min(70vh,560px)]` 都带 `!important`，把
-              max-height / overflow-y 写在弹层自己身上会被压掉。与 .usage-pop-credit
-              同一处置，见 page-accounts-table.css 里那两处说明。 */}
+
           <div className='usage-pop-limit' ref={attachBox} tabIndex={-1}>
             {accountName ? <div className='usage-pop-sub'>{accountName}</div> : null}
             <div className='usage-pop-group'>{t('限流明细')}</div>
@@ -178,10 +175,8 @@ export function LimitDetailButton({ accountName, rows, count, soonest, onClear }
                     onClick={() => onClear(row.model)}>{t('清除')}</Button>
                 </div>
                 {row.progress !== null ? (
-                  <span className='lp-pop-track'>
-                    <i style={{ width: `${row.progress}%` }}
-                      aria-label={t('冷却进度 {percent}%', { percent: Math.round(row.progress) })} />
-                  </span>
+                  <Meter value={row.progress} variant='muted' className='mt-1.5' trackClassName='h-[3px]'
+                    aria-label={t('冷却进度 {percent}%', { percent: Math.round(row.progress) })} />
                 ) : null}
               </div>
             ))}

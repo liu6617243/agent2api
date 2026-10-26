@@ -84,9 +84,9 @@ pub(crate) fn managed_manifests(store: &AccountStore) -> Vec<(String, Vec<Value>
     all_provider_ids()
         .into_iter()
         .filter(|provider| provider_available(store, provider))
-        .filter_map(|provider| {
+        .map(|provider| {
             let manifest = manifest_for_provider(&provider);
-            (!manifest.is_empty()).then_some((provider, manifest))
+            (provider, manifest)
         })
         .collect()
 }

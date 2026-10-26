@@ -41,8 +41,11 @@
 //!
 //! 子模块：identity.rs 身份判定与 id 分配；normalize.rs 字段归一。
 
+mod export;
 mod identity;
 mod normalize;
+
+pub use export::{export_account_files, ExportSelection, ACCOUNT_FILE_FORMAT};
 
 use serde_json::{json, Map, Value};
 
@@ -67,8 +70,8 @@ pub const EXPORT_VERSION: i64 = 2;
 
 /// 单条导入的处理结果
 enum ImportOutcome {
-    Updated,
-    Added,
+    Updated(String),
+    Added(String),
     Skipped(String),
 }
 
@@ -84,6 +87,7 @@ struct ImportStats {
     skipped: usize,
     failures: Vec<Value>,
     skipped_items: Vec<Value>,
+    imported_ids: Vec<String>,
 }
 
 /// 单条账号记录 → 导出形态：原样输出全部业务字段，剔除 rateLimits（本机运行时
@@ -188,8 +192,14 @@ pub fn import_accounts(store: &AccountStore, payload: &Value) -> Result<Value, A
                 &mut catpaw_invalidations,
             );
             match outcome {
-                Ok(ImportOutcome::Updated) => stats.updated += 1,
-                Ok(ImportOutcome::Added) => stats.added += 1,
+                Ok(ImportOutcome::Updated(id)) => {
+                    stats.updated += 1;
+                    stats.imported_ids.push(id);
+                }
+                Ok(ImportOutcome::Added(id)) => {
+                    stats.added += 1;
+                    stats.imported_ids.push(id);
+                }
                 Ok(ImportOutcome::Skipped(reason)) => {
                     let id = error_id_of(item);
                     stats.skipped += 1;
@@ -236,6 +246,7 @@ pub fn import_accounts(store: &AccountStore, payload: &Value) -> Result<Value, A
             "skipped": stats.skipped,
             "failed": failed,
             "errors": errors,
+            "importedIds": stats.imported_ids,
             "customProviders": {
                 "added": providers_added,
                 "updated": providers_updated,
@@ -344,12 +355,14 @@ fn import_one_item(
         .unwrap_or("")
         .trim()
         .to_string();
-    let has_any_credential = CREDENTIAL_KEYS.iter().any(|key| {
-        object
-            .get(*key)
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-    });
+    let plugin_secret = object.get("pluginSecret").filter(|value| !value.is_null());
+    let has_any_credential = plugin_secret.is_some()
+        || CREDENTIAL_KEYS.iter().any(|key| {
+            object
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        });
     // 自定义账号的 apiKey 可空（`noAuth` 形态），不强制要求凭证
     if !is_custom_provider && !has_any_credential {
         return Err("缺少凭证（accessToken / refreshToken / apiKey / modelAppKey 等均为空）"
@@ -425,7 +438,7 @@ fn import_one_item(
             // 凭证被更新：该账号的 CatPaw 会话映射必须在锁外作废
             catpaw_invalidations.push(state.accounts[index].id().to_string());
         }
-        return Ok(ImportOutcome::Updated);
+        return Ok(ImportOutcome::Updated(state.accounts[index].id().to_string()));
     }
 
     // ── 新增 ──
@@ -485,6 +498,6 @@ fn import_one_item(
     }
     state.accounts.push(saved);
     // id 记入占用集合：同批后续记录不会分到同一个 id
-    taken_ids.push(new_id);
-    Ok(ImportOutcome::Added)
+    taken_ids.push(new_id.clone());
+    Ok(ImportOutcome::Added(new_id))
 }

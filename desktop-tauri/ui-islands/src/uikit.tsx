@@ -32,7 +32,8 @@ import { flushSync } from 'react-dom'
 import {
   Badge, Button, Checkbox, Input, Label, Progress, SegmentedControl, Spinner, Switch,
   Select, SelectTrigger, SelectValue, SelectContent, SelectItem,
-  SelectGroup, SelectLabel, SelectSeparator,
+  SelectGroup, SelectLabel, SelectSeparator, Card, CardHeader, CardContent, CardFooter,
+  Collapsible, CollapsibleTrigger, CollapsibleContent, HtmlContent, Toaster, toastManager,
 } from '@ui'
 
 declare global {
@@ -58,6 +59,16 @@ declare global {
       SegmentedControl: typeof SegmentedControl
       Spinner: typeof Spinner
       Switch: typeof Switch
+      Card: typeof Card
+      CardHeader: typeof CardHeader
+      CardContent: typeof CardContent
+      CardFooter: typeof CardFooter
+      Collapsible: typeof Collapsible
+      CollapsibleTrigger: typeof CollapsibleTrigger
+      CollapsibleContent: typeof CollapsibleContent
+      HtmlContent: typeof HtmlContent
+      Toaster: typeof Toaster
+      toastManager: typeof toastManager
       /** Select 是一组（Root / Trigger / Value / Content / Item …），
        *  只给 Root 用不了 —— 调用方必须能拼出完整的组合 */
       Select: {
@@ -87,6 +98,8 @@ window.wbUiKit = {
   SegmentedControl,
   Spinner,
   Switch,
+  Card, CardHeader, CardContent, CardFooter, Collapsible, CollapsibleTrigger, CollapsibleContent,
+  HtmlContent, Toaster, toastManager,
   Select: {
     Root: Select,
     Trigger: SelectTrigger,

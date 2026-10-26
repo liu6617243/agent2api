@@ -14,6 +14,7 @@ pub mod balance;
 /// 七种方案的上游响应解析（纯函数；与 `balance` 的请求链路分开，
 /// 便于对照移植来源逐字段读）
 pub mod balance_parse;
+mod quota;
 pub mod emulation;
 pub mod forward;
 /// 商汤日日新的账号密码登录（OAuth2 + PKCE 换控制台 JWT），只服务余额查询

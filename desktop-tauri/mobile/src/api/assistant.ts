@@ -19,12 +19,14 @@
  * （同一只工具的参数会被拆成多片，不能逐片当独立调用）。
  */
 
-import { ApiError, authHeaders, refreshPanelAuth, refreshPanelAuthIfExpiring, resolveUrl } from '../api/client'
+import { ApiError, apiCall, authHeaders, refreshPanelAuth, refreshPanelAuthIfExpiring, resolveUrl } from '../api/client'
+import type { ImageAsset } from '../../../ui-shared/assistant-image-tools'
+import { readAssistantStream, type ChatEvent, type ToolCall } from '../../../ui-shared/assistant-stream'
+import { t } from '../i18n'
+import { serverIdentity } from '../lib/servers'
+export type { ChatEvent, ToolCall } from '../../../ui-shared/assistant-stream'
 
 export type ChatRole = 'user' | 'assistant' | 'tool'
-
-/** 一次工具调用（聚合后的完整形态） */
-export type ToolCall = { id: string; name: string; arguments: string }
 
 export type ChatMessage = {
   role: ChatRole
@@ -33,33 +35,22 @@ export type ChatMessage = {
   toolCalls?: ToolCall[]
   /** role = 'tool' 时对应哪一次调用 */
   toolCallId?: string
+  images?: string[] | ImageAsset[]
 }
-
-export type ChatEvent =
-  | { type: 'delta'; text: string }
-  | { type: 'toolCalls'; calls: ToolCall[] }
-  | { type: 'done'; finishReason: string }
 
 /** 助手配置（只读用得到的几项） */
 export type AssistantConfig = {
   model?: string | null
   reasoning?: string | null
+  mode?: 'confirm' | 'full'
   /** 工具勾选表：tool id → 是否勾选（后端已把缺省值展开） */
   tools?: Record<string, boolean>
 }
 
 export async function fetchAssistantConfig(): Promise<AssistantConfig> {
-  const response = await fetch(resolveUrl('/api/assistant/config'), {
-    headers: authHeaders(),
-  })
-  const payload = await response.json().catch(() => null)
-  if (!response.ok || payload?.success === false) {
-    throw new ApiError(
-      String(payload?.error?.message || payload?.error || `HTTP ${response.status}`),
-      response.status,
-    )
-  }
-  return (payload?.data?.config || {}) as AssistantConfig
+  const payload = await apiCall<{ config?: AssistantConfig }>('/api/assistant/config')
+  if (!payload.config) throw new Error(t('配置响应不完整'))
+  return payload.config
 }
 
 /**
@@ -87,13 +78,17 @@ export async function streamAssistantChat(options: {
   // （见 config::AssistantConfig::system_prompt），空数组与不发不是一回事
   if (options.tools && options.tools.length) body.tools = options.tools
 
-  const send = async (): Promise<Response> =>
-    fetch(resolveUrl('/api/assistant/chat'), {
+  const identity = serverIdentity()
+  const target = resolveUrl('/api/assistant/chat')
+  const send = async (): Promise<Response> => {
+    if (serverIdentity() !== identity) throw new DOMException('服务器已切换', 'AbortError')
+    return fetch(target, {
       method: 'POST',
       headers: { ...authHeaders(), 'Content-Type': 'application/json', Accept: 'text/event-stream' },
       body: JSON.stringify(body),
       signal: options.signal,
     })
+  }
 
   // 到期前先换令牌：这条不走 apiCall，不补这一步就会在 access 过期那一刻
   // 产生一条 401（见 client.ts 的 refreshPanelAuthIfExpiring）
@@ -113,95 +108,17 @@ export async function streamAssistantChat(options: {
     } catch {
       /* 非 JSON 错误体：原样用文本 */
     }
-    if (response.status === 404) {
-      throw new ApiError(
-        `这一版网关还没有 AI 助手接口（HTTP 404），请升级网关后重试。${message}`,
-        404,
-      )
+    if (response.status === 404 && message === 'Not found: POST /api/assistant/chat') {
+      throw new ApiError(t('这一版网关还没有 AI 助手接口（HTTP 404），请升级网关后重试。'), 404)
     }
     throw new ApiError(message || `HTTP ${response.status}`, response.status)
   }
 
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-  let finished = false
-  /** 正文累积 + 工具调用按 index 聚合（参数会被拆成多片） */
-  const calls = new Map<number, ToolCall>()
-  let finishReason = ''
-
-  /** 处理一帧；返回 true 表示收到 [DONE] */
-  const handleFrame = (frame: string): boolean => {
-    for (const rawLine of frame.split('\n')) {
-      const line = rawLine.trimEnd()
-      if (!line.startsWith('data:')) continue
-      const payload = line.slice(5).trim()
-      if (!payload) continue
-      if (payload === '[DONE]') return true
-      let chunk: Record<string, unknown>
-      try {
-        chunk = JSON.parse(payload) as Record<string, unknown>
-      } catch {
-        continue
-      }
-      const choice = Array.isArray(chunk.choices)
-        ? (chunk.choices[0] as Record<string, unknown> | undefined)
-        : undefined
-      const delta = (choice?.delta || {}) as Record<string, unknown>
-      // 思考型模型的 reasoning_content 不进正文：手机上只显示最终回答，
-      // 把思考过程混进气泡会让长回答读起来像两段话
-      const content = typeof delta.content === 'string' ? delta.content : ''
-      if (content) options.onEvent({ type: 'delta', text: content })
-
-      if (Array.isArray(delta.tool_calls)) {
-        for (const raw of delta.tool_calls as Array<Record<string, unknown>>) {
-          const index = Number(raw.index ?? 0)
-          const slot = calls.get(index) || { id: '', name: '', arguments: '' }
-          if (typeof raw.id === 'string' && raw.id) slot.id = raw.id
-          const fn = (raw.function || {}) as Record<string, unknown>
-          if (typeof fn.name === 'string' && fn.name) slot.name = fn.name
-          if (typeof fn.arguments === 'string') slot.arguments += fn.arguments
-          calls.set(index, slot)
-        }
-      }
-      if (typeof choice?.finish_reason === 'string') finishReason = choice.finish_reason
-    }
-    return false
-  }
-
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      let index = buffer.indexOf('\n\n')
-      while (index >= 0) {
-        const frame = buffer.slice(0, index)
-        buffer = buffer.slice(index + 2)
-        if (handleFrame(frame)) {
-          finished = true
-          // 收到 [DONE]：剩下的字节不必再读
-          await reader.cancel().catch(() => {})
-          index = -1
-          break
-        }
-        index = buffer.indexOf('\n\n')
-      }
-      if (finished) break
-    }
-    // 尾帧没有空行收尾时也要处理（部分上游不发最后的 \n\n）
-    if (!finished && buffer.trim()) handleFrame(buffer)
-    // 聚合好的工具调用一次性交出去（正文已逐段给过）
-    const done = [...calls.entries()].sort((a, b) => a[0] - b[0]).map(([, call]) => call)
-    if (done.length) options.onEvent({ type: 'toolCalls', calls: done })
-    options.onEvent({ type: 'done', finishReason })
-  } finally {
-    try {
-      reader.releaseLock()
-    } catch {
-      /* 已取消 */
-    }
-  }
+  await readAssistantStream(response, {
+    onEvent: options.onEvent,
+    signal: options.signal,
+    incompleteMessage: t('模型响应未完整结束，请重试；未执行其中的工具调用。'),
+  })
 }
 
 /**
@@ -226,5 +143,15 @@ function wireMessage(message: ChatMessage): Record<string, unknown> {
     }
     return wire
   }
-  return { role: 'user', content: message.content }
+  const images = (message.images || []).filter((image): image is string => typeof image === 'string')
+  if (!images.length) return { role: 'user', content: message.content }
+  return { role: 'user', content: [
+    { type: 'text', text: message.content },
+    ...images.map(url => ({ type: 'image_url', image_url: { url } })),
+  ] }
+}
+
+export function saveAssistantSession(id: string, messages: ChatMessage[], model?: string | null): Promise<unknown> {
+  const title = messages.find(message => message.role === 'user')?.content.slice(0, 40) || ''
+  return apiCall('/api/assistant/sessions', { method: 'POST', body: { id, title, messages, model: model || null } })
 }

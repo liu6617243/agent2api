@@ -53,12 +53,9 @@
     // 简体没有词典目录（查不到即显示简体原文）；其余语言注入 manifest + 各域文件。
     if (locale === 'zh-Hans') return;
     document.write('<script src="i18n/manifest.js"><\/script>');
-    var domains = window.__WB_I18N_DOMAINS || [];
-    for (var d = 0; d < domains.length; d++) {
-      document.write('<script src="i18n/' + locale + '/' + domains[d] + '.js"><\/script>');
-    }
   })();
 </script>
+<script src="i18n.js"></script>
 
 <script>
   // 主题引导：在首帧之前把 data-theme 定下来，避免浅色闪一下再切深色。

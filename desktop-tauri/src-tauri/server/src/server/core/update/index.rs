@@ -53,10 +53,7 @@ const INDEX_TIMEOUT_MS: u64 = 20_000;
 pub async fn resolve_app_repo() -> String {
     match fetch_repo().await {
         Some(repo) => {
-            logging::verbose(
-                "[Update]",
-                &format!("更新源索引指向 {repo}"),
-            );
+            logging::verbose("[Update]", &format!("更新源索引指向 {repo}"));
             repo
         }
         None => DEFAULT_REPO.to_string(),
@@ -69,20 +66,20 @@ pub async fn resolve_app_repo() -> String {
 /// 不校验仓库是否**存在** —— 那要多打一次 API，而「地址写错」的后果与
 /// 「索引读不到」相同（检查更新时 404 按「无更新」处理，不是错误）。
 async fn fetch_repo() -> Option<String> {
-    let response = client::fetch_public(
-        &index_url(),
-        // raw.githubusercontent.com 不需要 Accept: application/vnd.github+json，
-        // 但也不需要别的头；空切片即可（与插件索引同）
-        &[],
-        Some(INDEX_TIMEOUT_MS),
-    )
+    let response = client::fetch_json(&index_url(), &[], INDEX_TIMEOUT_MS, |value| {
+        value
+            .get("app")
+            .and_then(|app| app.get("repo"))
+            .and_then(Value::as_str)
+            .is_some_and(is_repo_slug)
+    })
     .await
     .ok()?;
-    if !response.status().is_success() {
+    if !response.status.is_success() {
         return None;
     }
-    let text = response.text().await.ok()?;
-    let parsed: Value = serde_json::from_str(&text).ok()?;
+    let from_official = response.official;
+    let parsed = response.value;
     let repo = parsed
         .get("app")
         .and_then(|app| app.get("repo"))
@@ -94,6 +91,25 @@ async fn fetch_repo() -> Option<String> {
             &format!("更新源索引里的 app.repo 不是 owner/repo 形式：{repo}"),
         );
         return None;
+    }
+    let trusted_key = "updateIndexTrustedRepo";
+    if from_official {
+        let _ = crate::server::core::task_state::store_value(
+            trusted_key,
+            Value::String(repo.to_string()),
+        );
+    } else if repo != DEFAULT_REPO {
+        let trusted = crate::server::core::task_state::read(trusted_key)
+            .ok()
+            .and_then(|state| state.value)
+            .and_then(|value| value.as_str().map(str::to_string));
+        if trusted.as_deref() != Some(repo) {
+            logging::verbose(
+                "[Update]",
+                "加速索引提出未经官方确认的更新仓库，保留可信仓库",
+            );
+            return trusted;
+        }
     }
     Some(repo.to_string())
 }

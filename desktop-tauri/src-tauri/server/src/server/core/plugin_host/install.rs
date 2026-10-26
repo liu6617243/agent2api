@@ -627,6 +627,7 @@ mod tests {
             }],
             entry: BTreeMap::from([("x86_64-pc-windows-msvc".to_string(), "bin/x.exe".to_string())]),
             icons: None,
+            ui: Vec::new(),
             homepage: None,
             signature: None,
         }
@@ -743,10 +744,10 @@ mod tests {
     #[test]
     fn payload_covers_binary_and_target() {
         let m = manifest(1);
-        let left = proto::signing_payload(&m, "x86_64-pc-windows-msvc", "aaaa");
-        let right = proto::signing_payload(&m, "x86_64-pc-windows-msvc", "bbbb");
+        let left = proto::signing_payload(&m, "x86_64-pc-windows-msvc", "aaaa", &[]);
+        let right = proto::signing_payload(&m, "x86_64-pc-windows-msvc", "bbbb", &[]);
         assert_ne!(left, right, "二进制摘要变了，载荷必须变");
-        let other_target = proto::signing_payload(&m, "aarch64-apple-darwin", "aaaa");
+        let other_target = proto::signing_payload(&m, "aarch64-apple-darwin", "aaaa", &[]);
         assert_ne!(left, other_target, "平台变了，载荷必须变");
         assert!(left.starts_with("agent2api-pack-v1\n"));
         assert!(left.contains("binary=aaaa"));
@@ -769,7 +770,7 @@ mod tests {
         let dir = staged_dir("roundtrip", b"the-real-binary");
         let binary_hash = sha256_file(&dir.join("bin/x.exe")).expect("算摘要");
         let mut m = manifest(1);
-        let payload = proto::signing_payload(&m, target, &binary_hash);
+        let payload = proto::signing_payload(&m, target, &binary_hash, &[]);
         let signature = signing.sign(payload.as_bytes());
         m.signature = Some(proto::PackSignature {
             algorithm: "ed25519".into(),
@@ -790,7 +791,7 @@ mod tests {
         ));
 
         // 换一份内容（模拟包被改过）→ 必须验不过
-        let tampered = proto::signing_payload(&m, target, "0000");
+        let tampered = proto::signing_payload(&m, target, "0000", &[]);
         assert!(!verify_ed25519(
             &hex_to_32(&public_hex).expect("公钥十六进制"),
             tampered.as_bytes(),

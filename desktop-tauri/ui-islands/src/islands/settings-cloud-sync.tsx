@@ -17,9 +17,14 @@ import {
   SelectTrigger,
   SelectValue,
   Switch,
-} from '@ui'
+  Card, CardHeader, CardContent } from '@ui'
 import { errorMessage, shared, toast } from './settings-model'
 import { t } from '../i18n'
+import { Alert } from '@ui'
+import {
+  emptyForm, formFromView, formatDateText, formatTime, payloadOf, PROVIDER_S3, PROVIDER_WEBDAV,
+  S3_PRESETS, WEBDAV_PRESETS, type CloudSyncView, type Form, type RemoteInfo,
+} from './settings-cloud-sync-model'
 
 /**
  * 设置 → 数据 → 云同步（对标 cc-switch 的 WebDAV / S3 同步区块）。
@@ -46,215 +51,6 @@ import { t } from '../i18n'
  * 备份」写清楚。
  */
 
-/* ─── 桥返回的形状（与 api::cloud_sync 的 JSON 一一对应） ───── */
-
-type SyncStatus = {
-  lastSyncAt?: number
-  lastAction?: string
-  lastSnapshotId?: string
-  lastLocalHash?: string
-  lastKeyFingerprint?: string
-  lastError?: string
-  lastErrorSource?: string
-}
-
-type CloudSyncView = {
-  provider: string
-  webdav: { baseUrl: string; username: string; hasPassword: boolean }
-  s3: {
-    region: string
-    bucket: string
-    accessKeyId: string
-    endpoint: string
-    hasSecretKey: boolean
-  }
-  hasSyncPassword: boolean
-  enabled: boolean
-  autoSync: boolean
-  remoteRoot: string
-  profile: string
-  status: SyncStatus
-  remotePath: string
-  keyFingerprint: string | null
-}
-
-type RemoteInfo = {
-  empty?: boolean
-  remotePath?: string
-  format?: string
-  version?: number
-  appVersion?: string
-  schemaVersion?: number
-  deviceName?: string
-  createdAt?: string
-  snapshotId?: string
-  artifacts?: string[]
-  compatible?: boolean
-  incompatibleReason?: string
-  keyFingerprint?: string | null
-  localKeyFingerprint?: string | null
-  keyRequired?: boolean
-  hasKeyArtifact?: boolean
-}
-
-type Form = {
-  provider: string
-  webdavBaseUrl: string
-  webdavUsername: string
-  webdavPassword: string
-  s3Region: string
-  s3Bucket: string
-  s3AccessKeyId: string
-  s3SecretAccessKey: string
-  s3Endpoint: string
-  syncPassword: string
-  enabled: boolean
-  autoSync: boolean
-  remoteRoot: string
-  profile: string
-}
-
-const PROVIDER_WEBDAV = 'webdav'
-const PROVIDER_S3 = 's3'
-
-/** WebDAV 服务商预设：选中只填地址占位与提示，不改用户已输入的内容 */
-const WEBDAV_PRESETS = [
-  {
-    id: 'jianguoyun',
-    label: t('坚果云'),
-    baseUrl: 'https://dav.jianguoyun.com/dav/',
-    hint: t('坚果云需使用「第三方应用密码」（账户信息 → 安全选项里生成），地址必须是 /dav/ 下的目录。'),
-  },
-  {
-    id: 'nextcloud',
-    label: t('Nextcloud'),
-    baseUrl: 'https://your-server/remote.php/dav/files/USERNAME/',
-    hint: t('把地址里的 your-server 与 USERNAME 换成你自己的；目录不存在时会自动创建。'),
-  },
-  {
-    id: 'synology',
-    label: t('群晖 NAS'),
-    baseUrl: 'http://your-nas-ip:5005/',
-    hint: t('群晖需在「控制面板 → 应用程序门户 → WebDAV」里启用服务，端口默认 5005（HTTP）/ 5006（HTTPS）。'),
-  },
-  { id: 'custom', label: t('自定义'), baseUrl: '', hint: '' },
-] as const
-
-/** S3 预设：只影响提示与 Region 占位符（Endpooint 由用户填） */
-const S3_PRESETS = [
-  {
-    id: 'aws',
-    label: 'Amazon S3',
-    regionPlaceholder: 'us-east-1',
-    hint: t('Endpoint 留空即走 AWS 官方地址；Region 必须与桶所在区域一致。'),
-  },
-  {
-    id: 'r2',
-    label: 'Cloudflare R2',
-    regionPlaceholder: 'auto',
-    hint: t('Endpoint 填 https://<账户ID>.r2.cloudflarestorage.com，Region 固定填 auto。'),
-  },
-  {
-    id: 'minio',
-    label: 'MinIO',
-    regionPlaceholder: 'us-east-1',
-    hint: t('Endpoint 形如 http://192.168.1.10:9000（自建通常用 http）；Region 一般填 us-east-1。'),
-  },
-  {
-    id: 'oss',
-    label: t('阿里云 OSS'),
-    regionPlaceholder: 'cn-hangzhou',
-    hint: t('Endpoint 填 https://oss-cn-hangzhou.aliyuncs.com，Region 填 cn-hangzhou（按实际地域改）。'),
-  },
-  {
-    id: 'cos',
-    label: t('腾讯云 COS'),
-    regionPlaceholder: 'ap-guangzhou',
-    hint: t('Endpoint 填 https://cos.ap-guangzhou.myqcloud.com，Region 填 ap-guangzhou（按实际地域改）。'),
-  },
-  {
-    id: 'obs',
-    label: t('华为云 OBS'),
-    regionPlaceholder: 'cn-north-4',
-    hint: t('Endpoint 填 https://obs.cn-north-4.myhuaweicloud.com，Region 填 cn-north-4（按实际地域改）。'),
-  },
-  { id: 'custom', label: t('自定义'), regionPlaceholder: 'us-east-1', hint: '' },
-] as const
-
-function formatTime(ms?: number): string {
-  if (!ms) return ''
-  try {
-    return new Date(ms).toLocaleString()
-  } catch {
-    return String(ms)
-  }
-}
-
-function formatDateText(raw?: string): string {
-  if (!raw) return '—'
-  const parsed = new Date(raw)
-  return Number.isNaN(parsed.getTime()) ? raw : parsed.toLocaleString()
-}
-
-function emptyForm(): Form {
-  return {
-    provider: PROVIDER_WEBDAV,
-    webdavBaseUrl: '',
-    webdavUsername: '',
-    webdavPassword: '',
-    s3Region: '',
-    s3Bucket: '',
-    s3AccessKeyId: '',
-    s3SecretAccessKey: '',
-    s3Endpoint: '',
-    syncPassword: '',
-    enabled: false,
-    autoSync: false,
-    remoteRoot: 'agent2api-sync',
-    profile: 'default',
-  }
-}
-
-function formFromView(view: CloudSyncView): Form {
-  return {
-    provider: view.provider === PROVIDER_S3 ? PROVIDER_S3 : PROVIDER_WEBDAV,
-    webdavBaseUrl: view.webdav.baseUrl,
-    webdavUsername: view.webdav.username,
-    // 密码不回显：留空 = 沿用后端已保存的那份
-    webdavPassword: '',
-    s3Region: view.s3.region,
-    s3Bucket: view.s3.bucket,
-    s3AccessKeyId: view.s3.accessKeyId,
-    s3Endpoint: view.s3.endpoint,
-    s3SecretAccessKey: '',
-    syncPassword: '',
-    enabled: view.enabled,
-    autoSync: view.autoSync,
-    remoteRoot: view.remoteRoot,
-    profile: view.profile,
-  }
-}
-
-/** 保存 / 测试共用的请求体（字段名与 `api::cloud_sync::parse_save_input` 对齐） */
-function payloadOf(form: Form): Record<string, unknown> {
-  return {
-    provider: form.provider,
-    webdavBaseUrl: form.webdavBaseUrl,
-    webdavUsername: form.webdavUsername,
-    webdavPassword: form.webdavPassword,
-    s3Region: form.s3Region,
-    s3Bucket: form.s3Bucket,
-    s3AccessKeyId: form.s3AccessKeyId,
-    s3SecretAccessKey: form.s3SecretAccessKey,
-    s3Endpoint: form.s3Endpoint,
-    syncPassword: form.syncPassword,
-    enabled: form.enabled,
-    autoSync: form.autoSync,
-    remoteRoot: form.remoteRoot,
-    profile: form.profile,
-  }
-}
-
 type Busy = 'load' | 'test' | 'save' | 'upload' | 'download' | 'remote' | 'key' | null
 type DialogKind = 'upload' | 'download' | 'key' | null
 
@@ -264,7 +60,12 @@ export function CloudSyncPanel() {
   const [form, setForm] = React.useState<Form>(emptyForm)
   const [dirty, setDirty] = React.useState(false)
   const [busy, setBusy] = React.useState<Busy>('load')
-  const [loadFailed, setLoadFailed] = React.useState(false)
+  const [loadError, setLoadError] = React.useState('')
+  const loadingRef = React.useRef<Promise<void> | null>(null)
+  const busyRef = React.useRef(busy)
+  busyRef.current = busy
+  const dirtyRef = React.useRef(dirty)
+  dirtyRef.current = dirty
   const [remote, setRemote] = React.useState<RemoteInfo | null>(null)
   const [dialog, setDialog] = React.useState<DialogKind>(null)
   const [keyPassword, setKeyPassword] = React.useState('')
@@ -274,41 +75,54 @@ export function CloudSyncPanel() {
   const s3Preset = S3_PRESETS.find(item => item.id !== 'custom' && item.label === 'Cloudflare R2' && form.s3Region === 'auto') ?? S3_PRESETS[0]
 
   /** 取一次设置并铺进表单（保留用户正在编辑的密码输入） */
-  const load = React.useCallback(async (keepPassword = false) => {
-    if (!bridge?.getCloudSync) {
-      setLoadFailed(true)
-      setBusy(null)
-      return
-    }
-    setBusy(current => current ?? 'load')
-    try {
-      const data = (await bridge.getCloudSync()) as CloudSyncView | null | undefined
-      if (!data) {
-        setLoadFailed(true)
-        return
-      }
-      setLoadFailed(false)
-      setView(data)
-      setForm(current => {
-        const next = formFromView(data)
-        if (keepPassword) {
-          next.webdavPassword = current.webdavPassword
-          next.s3SecretAccessKey = current.s3SecretAccessKey
-          next.syncPassword = current.syncPassword
+  const load = React.useCallback((keepPassword = false, silent = false): Promise<void> => {
+    if (loadingRef.current) return loadingRef.current
+    const reading = (async () => {
+      setBusy(current => current ?? 'load')
+      try {
+        const api = shared().workbuddyDesktop
+        if (!api?.getCloudSync) throw new Error(t('后端桥不可用'))
+        const data = (await api.getCloudSync()) as CloudSyncView | null | undefined
+        if (!data || !data.webdav || !data.s3) throw new Error(t('配置响应不完整'))
+        setLoadError('')
+        setView(data)
+        if (!silent || !dirtyRef.current) {
+          setForm(current => {
+            const next = formFromView(data)
+            if (keepPassword) {
+              next.webdavPassword = current.webdavPassword
+              next.s3SecretAccessKey = current.s3SecretAccessKey
+              next.syncPassword = current.syncPassword
+            }
+            return next
+          })
+          setDirty(false)
         }
-        return next
-      })
-      setDirty(false)
-    } catch (error) {
-      setLoadFailed(true)
-      toast(t('读取云同步设置失败：{message}', { message: errorMessage(error) }), 'err')
-    } finally {
-      setBusy(null)
-    }
-  }, [bridge])
+      } catch (error) {
+        const message = errorMessage(error)
+        setLoadError(message)
+        if (!silent) toast(t('读取云同步设置失败：{message}', { message }), 'err')
+      } finally {
+        setBusy(null)
+      }
+    })()
+    loadingRef.current = reading
+    void reading.finally(() => { if (loadingRef.current === reading) loadingRef.current = null })
+    return reading
+  }, [])
 
   React.useEffect(() => {
-    void load()
+    const reload = () => {
+      if (busyRef.current !== null && busyRef.current !== 'load') return
+      void load(true, true)
+    }
+    reload()
+    window.addEventListener('wb:settings-load', reload)
+    const unsubscribe = shared().workbuddyDesktop?.onBackendReady?.(reload)
+    return () => {
+      window.removeEventListener('wb:settings-load', reload)
+      if (typeof unsubscribe === 'function') unsubscribe()
+    }
   }, [load])
 
   const patch = (changes: Partial<Form>) => {
@@ -478,8 +292,8 @@ export function CloudSyncPanel() {
 
   return (
     <>
-      <section className='panel'>
-        <div className='panel-head'>
+      <Card render={<section />} className='panel'>
+        <CardHeader className='panel-head'>
           <h2>{t('云同步')}</h2>
           <span
             className='tip-q'
@@ -487,23 +301,25 @@ export function CloudSyncPanel() {
               '把账号、网关配置、自定义提供商、Agent 配置、代理池 / 订阅、签到与余额记录同步到 WebDAV 或 S3 兼容存储，换台机器后一键取回。事件日志、请求明细、调试报文与面板登录态不在同步范围内（它们是本机的运行痕迹）。上传的账号凭证仍是加密形态，解密用的账号密钥由「同步密码」单独加密后一并上传 —— 同步密码不会保存到云端，换机下载时需要重新输入。'
             )}
           ></span>
-          <Badge variant={loadFailed ? 'destructive' : view?.enabled ? 'success' : 'outline'}>
-            {loadFailed ? t('不可用') : view?.enabled ? t('已启用') : t('未启用')}
+          <Badge variant={loadError ? 'destructive' : view?.enabled ? 'success' : 'outline'}>
+            {!view && busy === 'load' ? t('正在加载…') : loadError ? t('不可用') : view?.enabled ? t('已启用') : t('未启用')}
           </Badge>
           <div className='head-actions'>
             <Button variant='outline' disabled={disabled} onClick={() => void load(true)}>
               {t('刷新')}
             </Button>
           </div>
-        </div>
-        <div className='panel-body'>
-          {loadFailed ? (
-            <div className='hint'>{t('未能读取云同步设置，请稍后重试。')}</div>
+        </CardHeader>
+        <CardContent className='panel-body'>
+          {loadError ? (
+            <div className='hint' role='status'>
+              {t('未能读取云同步设置，请稍后重试。')}<br />{loadError}
+            </div>
           ) : (
             <>
               <div className='retention-list'>
                 <div className='retention-row'>
-                  <label>{t('服务商')}</label>
+                  <Label>{t('服务商')}</Label>
                   <div className='routing-row'>
                     <SegmentedControl
                       options={[
@@ -521,7 +337,7 @@ export function CloudSyncPanel() {
                 {isWebDav ? (
                   <>
                     <div className='retention-row'>
-                      <label>{t('预设')}</label>
+                      <Label>{t('预设')}</Label>
                       <div className='routing-row'>
                         <Select
                           value={webdavPreset?.id || 'custom'}
@@ -545,7 +361,7 @@ export function CloudSyncPanel() {
                       </div>
                     </div>
                     <div className='retention-row'>
-                      <label htmlFor='cloud-webdav-url'>{t('服务器地址')}</label>
+                      <Label htmlFor='cloud-webdav-url'>{t('服务器地址')}</Label>
                       <Input
                         id='cloud-webdav-url'
                         value={form.webdavBaseUrl}
@@ -555,7 +371,7 @@ export function CloudSyncPanel() {
                       />
                     </div>
                     <div className='retention-row'>
-                      <label htmlFor='cloud-webdav-user'>{t('用户名')}</label>
+                      <Label htmlFor='cloud-webdav-user'>{t('用户名')}</Label>
                       <Input
                         id='cloud-webdav-user'
                         value={form.webdavUsername}
@@ -565,7 +381,7 @@ export function CloudSyncPanel() {
                       />
                     </div>
                     <div className='retention-row'>
-                      <label htmlFor='cloud-webdav-password'>{t('密码')}</label>
+                      <Label htmlFor='cloud-webdav-password'>{t('密码')}</Label>
                       <Input
                         id='cloud-webdav-password'
                         type='password'
@@ -581,7 +397,7 @@ export function CloudSyncPanel() {
                 ) : (
                   <>
                     <div className='retention-row'>
-                      <label>{t('预设')}</label>
+                      <Label>{t('预设')}</Label>
                       <div className='routing-row'>
                         <Select
                           value={s3Preset.id}
@@ -605,7 +421,7 @@ export function CloudSyncPanel() {
                       </div>
                     </div>
                     <div className='retention-row'>
-                      <label htmlFor='cloud-s3-region'>{t('区域（Region）')}</label>
+                      <Label htmlFor='cloud-s3-region'>{t('区域（Region）')}</Label>
                       <Input
                         id='cloud-s3-region'
                         value={form.s3Region}
@@ -615,7 +431,7 @@ export function CloudSyncPanel() {
                       />
                     </div>
                     <div className='retention-row'>
-                      <label htmlFor='cloud-s3-bucket'>{t('存储桶（Bucket）')}</label>
+                      <Label htmlFor='cloud-s3-bucket'>{t('存储桶（Bucket）')}</Label>
                       <Input
                         id='cloud-s3-bucket'
                         value={form.s3Bucket}
@@ -624,7 +440,7 @@ export function CloudSyncPanel() {
                       />
                     </div>
                     <div className='retention-row'>
-                      <label htmlFor='cloud-s3-key'>{t('Access Key ID')}</label>
+                      <Label htmlFor='cloud-s3-key'>{t('Access Key ID')}</Label>
                       <Input
                         id='cloud-s3-key'
                         value={form.s3AccessKeyId}
@@ -634,7 +450,7 @@ export function CloudSyncPanel() {
                       />
                     </div>
                     <div className='retention-row'>
-                      <label htmlFor='cloud-s3-secret'>{t('Secret Access Key')}</label>
+                      <Label htmlFor='cloud-s3-secret'>{t('Secret Access Key')}</Label>
                       <Input
                         id='cloud-s3-secret'
                         type='password'
@@ -646,7 +462,7 @@ export function CloudSyncPanel() {
                       />
                     </div>
                     <div className='retention-row'>
-                      <label htmlFor='cloud-s3-endpoint'>{t('Endpoint')}</label>
+                      <Label htmlFor='cloud-s3-endpoint'>{t('Endpoint')}</Label>
                       <Input
                         id='cloud-s3-endpoint'
                         value={form.s3Endpoint}
@@ -660,7 +476,7 @@ export function CloudSyncPanel() {
                 )}
 
                 <div className='retention-row'>
-                  <label htmlFor='cloud-remote-root'>{t('远程根目录')}</label>
+                  <Label htmlFor='cloud-remote-root'>{t('远程根目录')}</Label>
                   <Input
                     id='cloud-remote-root'
                     value={form.remoteRoot}
@@ -670,7 +486,7 @@ export function CloudSyncPanel() {
                   />
                 </div>
                 <div className='retention-row'>
-                  <label htmlFor='cloud-profile'>{t('档案')}</label>
+                  <Label htmlFor='cloud-profile'>{t('档案')}</Label>
                   <Input
                     id='cloud-profile'
                     value={form.profile}
@@ -680,7 +496,7 @@ export function CloudSyncPanel() {
                   />
                 </div>
                 <div className='retention-row'>
-                  <label htmlFor='cloud-sync-password'>{t('同步密码')}</label>
+                  <Label htmlFor='cloud-sync-password'>{t('同步密码')}</Label>
                   <Input
                     id='cloud-sync-password'
                     type='password'
@@ -697,7 +513,7 @@ export function CloudSyncPanel() {
                   </div>
                 </div>
                 <div className='retention-row'>
-                  <label htmlFor='cloud-auto-sync'>{t('自动同步')}</label>
+                  <Label htmlFor='cloud-auto-sync'>{t('自动同步')}</Label>
                   <Switch
                     id='cloud-auto-sync'
                     checked={form.autoSync}
@@ -709,7 +525,7 @@ export function CloudSyncPanel() {
                   </div>
                 </div>
                 <div className='retention-row'>
-                  <label htmlFor='cloud-enabled'>{t('启用云同步')}</label>
+                  <Label htmlFor='cloud-enabled'>{t('启用云同步')}</Label>
                   <Switch
                     id='cloud-enabled'
                     checked={form.enabled}
@@ -759,25 +575,25 @@ export function CloudSyncPanel() {
               </div>
 
               {showAutoError ? (
-                <div className='danger-zone' id='cloud-sync-auto-error'>
+                <Alert variant='destructive' className='danger-zone' id='cloud-sync-auto-error'>
                   <strong>{t('自动同步上次失败')}</strong>
                   <br />
                   {status.lastError}
                   <br />
                   {t('改动仍保存在本机，修复网络或凭据后下一次改动会自动重试，也可以手动点「上传到云端」。')}
-                </div>
+                </Alert>
               ) : null}
 
-              <div className='danger-zone'>
+              <Alert variant='destructive' className='danger-zone'>
                 <strong>{t('上传内容含加密后的账号凭证与网关配置')}</strong>
                 {t(
                   '，以及代理池 / 订阅里可能存在的代理凭据。请使用只有你能访问的私有存储；账号密钥由同步密码单独加密，泄露存储本身不等于泄露账号。'
                 )}
-              </div>
+              </Alert>
             </>
           )}
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
       {/* ─── 上传确认 ─── */}
       <Dialog open={dialog === 'upload'} onOpenChange={next => { if (!next) setDialog(null) }}>
@@ -795,14 +611,14 @@ export function CloudSyncPanel() {
               {t('目标路径：{path}', { path: view?.remotePath || '' })}
             </div>
             {remote ? (
-              <div className='danger-zone mt-3'>
+              <Alert variant='destructive' className='danger-zone mt-3'>
                 <strong>{t('远端已有一份快照，将被覆盖')}</strong>
                 <br />
                 {t('来自 {device}，生成于 {time}', {
                   device: remote.deviceName || t('未知设备'),
                   time: formatDateText(remote.createdAt),
                 })}
-              </div>
+              </Alert>
             ) : (
               <div className='hint mt-3'>{t('远端该路径下还没有快照，本次是首次上传。')}</div>
             )}
@@ -823,11 +639,11 @@ export function CloudSyncPanel() {
             <DialogTitle>{t('从云端恢复')}</DialogTitle>
           </DialogHeader>
           <DialogBody>
-            <div className='danger-zone'>
+            <Alert variant='destructive' className='danger-zone'>
               {t('本机的账号、网关配置、Agent 配置、代理池 / 订阅、签到与余额记录将被远端快照')}
               <strong>{t('整体替换')}</strong>
               {t('。事件日志、请求明细、调试报文与面板登录态保持不变。替换前会自动把当前业务数据备份到配置目录的 backups/ 下。')}
-            </div>
+            </Alert>
             <div className='mt-3 text-[12.5px]'>
               <div>{t('来源设备：{device}', { device: remote?.deviceName || t('未知设备') })}</div>
               <div>{t('生成时间：{time}', { time: formatDateText(remote?.createdAt) })}</div>

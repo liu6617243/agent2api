@@ -15,12 +15,14 @@
 use serde_json::{Map, Value};
 
 use crate::server::core::account_store::state::StoredAccount;
+use crate::server::core::account_store::store_util::js_truthy;
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::proxies::{describe_account_proxy, resolve_account_proxy, ProxyResolution};
 use crate::server::logging;
 
-/// 凭证键（不透明 JSON，网关不解析）。
+/// 凭证键（不透明 JSON；公开出口只读取白名单标量派生字段）。
 const SECRET_KEY: &str = "pluginSecret";
-/// 公开视图键（给界面看，网关不解析）。
+/// 插件公开视图键（提供商专属展示字段）。
 const PUBLIC_KEY: &str = "pluginPublic";
 /// 台账键的前缀：`pluginLedger.<kind>`。
 const LEDGER_PREFIX: &str = "pluginLedger.";
@@ -32,7 +34,7 @@ const LEDGER_PREFIX: &str = "pluginLedger.";
 /// 它的凭证只能「摊平整条记录」。骨架键混进去会让插件的 `store::record` 看到
 /// 一堆它不认识的键（`priority` / `enabled` / `addedAt`…），更糟的是写回时
 /// 它们会被当成 secret 的一部分参与「比较再写」，永远比不相等。
-const SKELETON_KEYS: [&str; 9] = [
+const SKELETON_KEYS: &[&str] = &[
     "id",
     "provider",
     "name",
@@ -42,6 +44,18 @@ const SKELETON_KEYS: [&str; 9] = [
     "addedAt",
     "updatedAt",
     "rateLimits",
+    "limiterGroups",
+    "limiters",
+    "lowBalance",
+    "checkinAt",
+    "streakDays",
+    "claimAt",
+    "claimPlanId",
+    "claimPlans",
+    "needsRelogin",
+    "needsReloginReason",
+    "nameCustom",
+    "usageQuery",
 ];
 
 /// 把一条**内置家**记录的凭证字段摊成插件认的 secret 形态。
@@ -61,7 +75,7 @@ const SKELETON_KEYS: [&str; 9] = [
 fn flatten_builtin_secret(record: &StoredAccount) -> Value {
     let mut secret = Map::new();
     for (key, value) in record.fields() {
-        if SKELETON_KEYS.contains(&key.as_str()) {
+        if SKELETON_KEYS.contains(&key.as_str()) || key.starts_with(LEDGER_PREFIX) {
             continue;
         }
         secret.insert(key.clone(), value.clone());
@@ -82,10 +96,18 @@ const MIRROR_KEYS: [&str; 3] = ["accessToken", "refreshToken", "expiresAt"];
 
 /// 这条记录的插件 secret（`pluginSecret` 优先，否则摊平内置字段）。
 fn secret_of(record: &StoredAccount) -> Value {
-    match record.get(SECRET_KEY) {
+    let mut secret = match record.get(SECRET_KEY) {
         Some(value) if !value.is_null() => value.clone(),
         _ => flatten_builtin_secret(record),
+    };
+    let key = crate::server::core::providers::zcode::PLAN_FIELD;
+    if super::is_zcode_family(&record.provider()) {
+        if let Some(plan) = record.get(key).and_then(Value::as_str)
+            .and_then(crate::server::core::providers::zcode::normalize_plan) {
+            if let Some(fields) = secret.as_object_mut() { fields.insert(key.to_string(), Value::String(plan.to_string())); }
+        }
     }
+    secret
 }
 
 /// 进程级账号存储句柄（bootstrap 时 install 一次）。
@@ -110,7 +132,7 @@ pub fn shared() -> Option<AccountStore> {
 }
 
 impl AccountStore {
-    /// 读一条插件账号（`{id, provider, secret, public}`）。
+    /// 读一条插件账号（`{id, provider, secret, public, proxy}`）。
     ///
     /// ── 两种记录形态都读（迁移过渡期）───────────────────────────
     ///   1. **插件写的记录**：凭证在 `pluginSecret` 里，原样还回去；
@@ -127,12 +149,63 @@ impl AccountStore {
         let guard = self.guard();
         let record = self.record_by_id(&guard, id)?;
         let secret = secret_of(&record);
-        let public = record.get(PUBLIC_KEY).cloned().unwrap_or(Value::Null);
+        let public = self.public_account(&record);
+        let config = record
+            .get("proxy")
+            .or_else(|| secret.get("proxy"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        // 出口不能并进 secret：代理池更新不应让凭证的比较再写失效。
+        drop(guard);
+        let config = config
+            .get("config")
+            .filter(|value| value.is_object())
+            .unwrap_or(&config);
+        let source = config.get("source").and_then(Value::as_str).unwrap_or("");
+        let proxy = if source == "direct" {
+            serde_json::json!({ "state": "unset" })
+        } else if !matches!(source, "pool" | "rotate" | "clash" | "system")
+            && ["url", "proxy", "address", "server"]
+                .into_iter()
+                .any(|key| {
+                    config
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+                })
+        {
+            serde_json::json!({ "state": "static", "config": config })
+        } else {
+            match resolve_account_proxy(Some(config)) {
+                Some(ProxyResolution::Resolved(proxy)) if proxy.host.trim().is_empty() => {
+                    serde_json::json!({ "state": "failed", "message": "代理配置缺少主机地址" })
+                }
+                Some(ProxyResolution::Resolved(proxy)) if proxy.port.is_none() => {
+                    serde_json::json!({ "state": "failed", "message": "代理端口必须是 1-65535 的整数" })
+                }
+                Some(ProxyResolution::Resolved(proxy)) => serde_json::json!({
+                    "state": "resolved",
+                    "proxy": agent2api_provider_protocol::WireProxy {
+                        protocol: proxy.protocol,
+                        host: proxy.host,
+                        port: proxy.port,
+                        username: proxy.username,
+                        password: proxy.password,
+                    },
+                }),
+                Some(ProxyResolution::Failed(message)) => serde_json::json!({
+                    "state": "failed",
+                    "message": message,
+                }),
+                None => serde_json::json!({ "state": "unset" }),
+            }
+        };
         Some(serde_json::json!({
             "id": record.id(),
             "provider": record.provider(),
             "secret": secret,
             "public": public,
+            "proxy": proxy,
         }))
     }
 
@@ -192,6 +265,16 @@ impl AccountStore {
         expect: &Value,
         secret: &Value,
     ) -> Result<bool, String> {
+        self.plugin_update_account(id, expect, secret, None)
+    }
+
+    pub fn plugin_update_account(
+        &self,
+        id: &str,
+        expect: &Value,
+        secret: &Value,
+        public: Option<&Value>,
+    ) -> Result<bool, String> {
         let guard = self.guard();
         let Some(mut record) = self.record_by_id(&guard, id) else {
             return Err(format!("账号 {id} 不存在"));
@@ -201,6 +284,9 @@ impl AccountStore {
             return Ok(false);
         }
         record.set(SECRET_KEY, secret.clone());
+        if let Some(public) = public.filter(|value| value.is_object()) {
+            record.set(PUBLIC_KEY, public.clone());
+        }
         // 镜像（只对顶层已存在的键）：卸载插件后内置实现仍拿得到新令牌
         for key in MIRROR_KEYS {
             let existed = record.get(key).is_some();
@@ -210,6 +296,11 @@ impl AccountStore {
             if let Some(value) = secret.get(key) {
                 record.set(key, value.clone());
             }
+        }
+        if let Some(mut public) = record.get(PUBLIC_KEY).and_then(Value::as_object).cloned() {
+            super::plugin_public::credential_fields(&record, &mut public);
+            public.retain(|key, _| !super::plugin_public::is_private_field(key));
+            record.set(PUBLIC_KEY, Value::Object(public));
         }
         record.set_updated_at(logging::now_ms());
         self.with_conn(&guard, |conn| {
@@ -226,7 +317,21 @@ impl AccountStore {
             return Value::Null;
         };
         let key = format!("{LEDGER_PREFIX}{kind}");
-        record.get(&key).cloned().unwrap_or(Value::Null)
+        // 显式 null 表示插件已清除记忆，不能回落到其他台账或存量字段。
+        record
+            .get(&key)
+            .or_else(|| match kind {
+                "onboarding" => record
+                    .get("pluginLedger.onboardingSettled")
+                    .or_else(|| record.get("onboardingSettled")),
+                "onboardingSettled" => record
+                    .get("pluginLedger.onboarding")
+                    .or_else(|| record.get(kind)),
+                "onboardingGrants" => record.get(kind),
+                _ => None,
+            })
+            .cloned()
+            .unwrap_or(Value::Null)
     }
 
     /// 写插件台账。
@@ -237,6 +342,15 @@ impl AccountStore {
         };
         let key = format!("{LEDGER_PREFIX}{kind}");
         record.set(&key, value.clone());
+        // 两种名称指向同一份结清记忆，写入和清除必须同步。
+        let alias = match kind {
+            "onboarding" => Some("onboardingSettled"),
+            "onboardingSettled" => Some("onboarding"),
+            _ => None,
+        };
+        if let Some(alias) = alias {
+            record.set(&format!("{LEDGER_PREFIX}{alias}"), value.clone());
+        }
         record.set_updated_at(logging::now_ms());
         self.with_conn(&guard, |conn| {
             crate::server::core::account_store::sql::update_in_place(conn, &record)
@@ -259,8 +373,17 @@ impl AccountStore {
     ) -> Result<Value, String> {
         let guard = self.guard();
         if let Some(mut record) = self.record_by_id(&guard, id) {
+            let zcode_plan = super::is_zcode_family(&record.provider()).then(|| record.zcode_plan());
             record.set(SECRET_KEY, secret.clone());
             record.set(PUBLIC_KEY, public.clone());
+            if let Some(plan) = zcode_plan.filter(|plan| !plan.trim().is_empty()) { record.set_zcode_plan(&plan); }
+            // 重新登录成功 = 拿到了一份新的凭证，「需要重新登录」标记必须跟着
+            // 消失 —— 否则用户明明刚登录过，账号页还红着写「需要重新登录」。
+            // 这个标记是**凭证级**的事实（会话被上游注销），换了一份凭证就不再
+            // 成立；清它的位置只有这里（登录落库）与转发成功出口
+            // （`upstream::provider_loop`，见那里的说明）。
+            record.remove("needsRelogin");
+            record.remove("needsReloginReason");
             record.set_updated_at(logging::now_ms());
             self.with_conn(&guard, |conn| {
                 crate::server::core::account_store::sql::update_in_place(conn, &record)
@@ -287,28 +410,43 @@ impl AccountStore {
 
     /// 插件家的公开形态。
     ///
-    /// ── 为什么是「插件给什么就是什么」────────────────────────────
-    /// 各家内置 provider 的公开字段集由网关定义（`to_*_public_account`），
-    /// 因为网关知道那些家的账号有什么。插件家的账号有什么只有插件知道，
-    /// 所以网关只提供一层**骨架**（id / provider / name / 时间戳）加上插件
-    /// 自己写的 `pluginPublic`，其余一律不猜。
+    /// 提供商专属展示字段来自 `pluginPublic`；身份、运营属性和用户备注由
+    /// 网关记录决定。凭证派生标量按白名单取最新值，兼容旧插件与缺失快照。
     ///
     /// ── 凭证绝不下发 ────────────────────────────────────────────
     /// `pluginSecret` 一个字节都不进这里。这是账号列表接口，前端与局域网内
     /// 的浏览器都能读到它。
     pub(crate) fn to_plugin_public_account(&self, record: &StoredAccount) -> Value {
         let mut public = Map::new();
-        for key in ["id", "provider", "name", "source", "addedAt", "updatedAt", "priority"] {
-            public.insert(key.to_string(), record.get(key).cloned().unwrap_or(Value::Null));
-        }
-        public.insert("enabled".to_string(), Value::Bool(record.enabled()));
-        public.insert("hasRefreshToken".to_string(), Value::Bool(false));
+        public.insert("name".to_string(), record.get("name").cloned().unwrap_or(Value::Null));
         public.insert("tokenTail".to_string(), Value::Null);
-        // 插件自己的展示字段（uid / 邮箱 / 余额……）：原样并进来。撞键时
-        // 插件赢 —— 它比网关更清楚自己那条账号该显示什么。
+        // 插件拥有提供商专属展示字段；用户备注以账号顶层记录为准。
         if let Some(Value::Object(extra)) = record.get(PUBLIC_KEY) {
             for (key, value) in extra {
-                public.insert(key.clone(), value.clone());
+                if !super::plugin_public::is_private_field(key) {
+                    public.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        super::plugin_public::credential_fields(record, &mut public);
+        // 身份、启用状态与队列元数据归网关，不能被插件展示字段覆盖。
+        public.insert("id".to_string(), Value::String(record.id().to_string()));
+        public.insert("provider".to_string(), Value::String(record.provider()));
+        public.insert("source".to_string(), record.get("source").cloned().unwrap_or(Value::Null));
+        public.insert("nameCustom".to_string(), Value::Bool(record.get("nameCustom").map(js_truthy).unwrap_or(false)));
+        public.insert("enabled".to_string(), Value::Bool(record.enabled()));
+        public.insert("priority".to_string(), Value::from(record.priority()));
+        public.insert("addedAt".to_string(), Value::from(record.added_at()));
+        public.insert("updatedAt".to_string(), Value::from(record.updated_at()));
+        public.insert(
+            "rateLimits".to_string(),
+            record.get("rateLimits").cloned().unwrap_or_else(|| Value::Object(Map::new())),
+        );
+        public.insert("proxy".to_string(), describe_account_proxy(Some(&record.proxy())));
+        if record.get("nameCustom").map(js_truthy).unwrap_or(false) {
+            let name = record.name();
+            if !name.trim().is_empty() {
+                public.insert("name".to_string(), Value::String(name));
             }
         }
         Value::Object(public)

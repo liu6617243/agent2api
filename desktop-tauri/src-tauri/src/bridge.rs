@@ -328,6 +328,7 @@ const BRIDGE_JS: &str = r#"
     deleteKey: id => call('DELETE', '/api/keys/' + encodeURIComponent(id)),
 
     // ── 多账号 ──
+    getAccounts: () => call('GET', '/api/accounts'),
     // switchAccount 仅把账号移到全局队列第一位，不改变启用状态
     switchAccount: id => call('POST', '/api/accounts/current', { id }),
     refreshAccountToken: id => call('POST', '/api/accounts/refresh', id ? { id } : {}),
@@ -350,6 +351,13 @@ const BRIDGE_JS: &str = r#"
         model ? { model } : {}),
     // ── 账号路由（策略 / 粘性 / 退避 / 垫底 / 熔断 + 队列可见化）──
     getRoutingConfig: () => call('GET', '/api/routing'),
+    getRoutingWorkspace: model => call('GET', '/api/routing/workspace' + toQuery({ model })),
+    saveRoutingProfile: payload => call('PUT', '/api/routing/profile', payload || {}),
+    getRoutingSticky: model => call('GET', '/api/routing/sticky' + toQuery({ model })),
+    clearRoutingSticky: payload => call('POST', '/api/routing/sticky/clear', payload || {}),
+    getRoutingReplays: query => call('GET', '/api/routing/replays' + toQuery(query)),
+    getRoutingTrace: query => call('GET', '/api/routing/trace' + toQuery(query)),
+    getRoutingTraceRequest: query => call('GET', '/api/routing/trace/request' + toQuery(query)),
     setRoutingConfig: patch => call('PUT', '/api/routing', patch || {}),
     // 候选队列可见化（账号页「路由」面板的数据源）：model 缺省 = 不限模型的全局队列
     getRoutingQueue: model =>
@@ -366,6 +374,9 @@ const BRIDGE_JS: &str = r#"
           : {}),
         ...(payload && Object.prototype.hasOwnProperty.call(payload, 'usageQuery')
           ? { usageQuery: payload.usageQuery }
+          : {}),
+        ...(payload && Object.prototype.hasOwnProperty.call(payload, 'limiterGroups')
+          ? { limiterGroups: payload.limiterGroups }
           : {}),
         ...(payload && Object.prototype.hasOwnProperty.call(payload, 'limiters')
           ? { limiters: payload.limiters }
@@ -672,6 +683,8 @@ const BRIDGE_JS: &str = r#"
     // （检查与下载安装包都走它，后端出口候选的第一优先级）
     getUpdateProxy: () => call('GET', '/api/update/proxy'),
     setUpdateProxy: payload => call('POST', '/api/update/proxy', payload),
+    getGithubAccess: () => call('GET', '/api/update/github'),
+    setGithubAccess: payload => call('POST', '/api/update/github', payload),
     // 「软件更新」的 GitHub 令牌：读只报 {filled, origin}（后端永不回显本体），
     // 写传 {token: '…' | null}（null = 清除）。加密落库在后端做
     getUpdateToken: () => call('GET', '/api/update/token'),
@@ -681,6 +694,8 @@ const BRIDGE_JS: &str = r#"
     // 写响应带 saved（false = 本次运行已生效、重启会回到原通道）
     getUpdateBeta: () => call('GET', '/api/update/beta'),
     setUpdateBeta: payload => call('POST', '/api/update/beta', payload),
+    getUpdateChannels: () => call('GET', '/api/update/channels'),
+    setUpdateChannels: payload => call('POST', '/api/update/channels', payload),
     downloadUpdate: payload => invoke('download_update', {
       url: String((payload && payload.url) || ''),
       name: (payload && payload.name) ? String(payload.name) : null,
@@ -691,11 +706,11 @@ const BRIDGE_JS: &str = r#"
       invoke('run_installer', { path: String(path || ''), restart: restart !== false }),
     openReleasePage: url => invoke('open_release_page', { url: String(url || '') }),
 
-    // ── 出站指纹脱敏开关 ──
-    // 与 getDebug / saveDebug 同形：GET 读、PUT 写，响应体就是新状态。
+    // ── 出站指纹脱敏 ──
+    // 部分更新；保留布尔签名以兼容缓存中的旧界面。
     getSanitize: () => call('GET', '/api/sanitize'),
-    saveSanitize: enabled =>
-      call('PUT', '/api/sanitize', { sanitizeBlacklistFingerprints: enabled === true }),
+    saveSanitize: patch => call('PUT', '/api/sanitize',
+      typeof patch === 'boolean' ? { sanitizeBlacklistFingerprints: patch } : patch),
 
     // ── 开发者角色兼容开关 ──
     // 与 getSanitize / saveSanitize 同形：GET 读、PUT 写，响应体就是新状态。
@@ -800,17 +815,18 @@ const BRIDGE_JS: &str = r#"
     // 清空支持筛选条件（可选对象，与 getLogs 同一套键）：带条件 = 只删命中的，
     // 不传 = 全部清空（后端两种语义不同，见 logs_api::clear_logs）
     clearLogs: query => call('DELETE', '/api/logs' + toQuery(query)),
-    exportLogs: () => invoke('export_logs'),
+    exportLogs: query => invoke('export_logs', { query: typeof query === 'string' ? query : toQuery(query).replace(/^\?/, '') }),
 
     // ── 请求统计报表 / 数据保留 ──
     // range 只认 today / yesterday / 7 / 30 / month / all / custom，非法值由后端返回 400
     // （不在这里静默改口径：界面选了什么就该拿到什么，报错比默默换区间好排查）。
     // dates（`{start, end}`，`YYYY-MM-DD`）**只在 range=custom 时**给：
     // 后端对 custom 会强制要求这两个参数，其余档位带上反而是噪音
-    getStatsSummary: (range, dates) => call('GET', '/api/stats/summary' + toQuery({
+    getStatsSummary: (range, dates, options) => call('GET', '/api/stats/summary' + toQuery({
       range,
       startDate: dates && dates.start,
       endDate: dates && dates.end,
+      apiKey: options && options.apiKey,
     })),
     // 筛选条件是可选对象，复用上面 toQuery 的「空值跳过」语义：
     // 清空的输入框不该变成 `?model=` 这种永不命中的条件
@@ -892,12 +908,14 @@ const BRIDGE_JS: &str = r#"
     // { message, conflict, canEndOccupant }。事件只是「去查一次」的提醒，
     // 状态以 getBackendStatus 为准 —— 它可能在界面订阅之前就发出去了。
     onBackendError: callback => on('backend:error', callback),
+    onBackendReady: callback => on('backend:ready', callback),
 
     // ── 本壳特有：后端就绪状态与端口冲突处置（界面可选使用） ──
-    // 后端返回 { ready, port, portFromEnv, failure }：failure 为 null 表示
+    // 后端返回 { ready, phase, port, portFromEnv, failure }：failure 为 null 表示
     // 启动正常，非 null 时带 { message, conflict, canEndOccupant }，
     // 界面据此决定给不给「结束占用进程 / 更换端口」两个出口。
     getBackendStatus: () => invoke('backend_status'),
+    waitForBackend: () => invoke('wait_for_backend'),
     // 查 / 结束占用网关端口的进程（只动查到的那个 PID，不做无差别清理）
     getPortOccupant: () => invoke('port_occupant'),
     endPortOccupant: () => invoke('end_port_occupant'),
@@ -987,6 +1005,7 @@ const BRIDGE_JS: &str = r#"
     // 参数名 patch 必须与 Rust 侧 save_app_settings 的形参名一致
     saveAppSettings: patch => invoke('save_app_settings', { patch }),
     exportAccounts: () => invoke('export_accounts'),
+    exportAccountFiles: selection => invoke('export_account_files', { selection }),
     importAccounts: () => invoke('import_accounts'),
     // ── 整库备份 / 恢复（设置页「整库备份 / 恢复」）──
     // 文件由后端按壳选的路径直读直写（见 api/backup_api.rs），壳只负责

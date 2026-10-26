@@ -240,5 +240,13 @@
   "首次购买使用优惠码 AGENT2API25 享 75 折。": "Use o código AGENT2API25 para 25% de desconto na primeira compra.",
   "＋ 新增代理": "+ Adicionar proxy",
   "＋ 新增订阅": "+ Nova assinatura",
-  "，": "; "
+  "，": "; ",
+  "软件 / 插件更新": "Atualizações de software / plugins",
+  "内核下载": "Download do kernel",
+  "此代理用于{services}；删除后这些线路将不可用，不会自动回退直连。": "Este proxy é usado para {services}. Excluí-lo deixa essas rotas indisponíveis; elas não voltam automaticamente à conexão direta.",
+  "选中的代理用于{services}；删除后这些线路将不可用，不会自动回退直连。": "Os proxies selecionados são usados para {services}. Excluí-los deixa essas rotas indisponíveis; elas não voltam automaticamente à conexão direta.",
+  "代理内核未安装（下载内核后，被账号或服务线路引用的节点会自动开监听端口）": "O kernel do proxy não está instalado. Após baixá-lo, os nós referenciados por contas ou rotas de serviço recebem portas de escuta automaticamente.",
+  "已有账号或服务线路引用它，监听端口尚未就绪；请稍等，或检查内核状态": "Uma conta ou rota de serviço referencia este nó, mas a porta de escuta ainda não está pronta. Aguarde um momento ou verifique o estado do kernel.",
+  "还没有账号或服务线路使用它；在账号或更新设置中选中并保存后，内核会自动开端口": "Nenhuma conta ou rota de serviço usa este nó ainda. Selecione-o nas configurações de conta ou atualização e salve para o kernel abrir a porta automaticamente.",
+  "更新出网线路已保存，正在准备监听端口": "A rota de atualização foi salva; preparando a porta de escuta."
 }

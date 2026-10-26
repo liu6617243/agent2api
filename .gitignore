@@ -5,6 +5,7 @@ node_modules/
 desktop-tauri/node_modules/
 desktop-tauri/src-tauri/target/
 desktop-tauri/src-tauri/gen/schemas/
+desktop-tauri/target/
 
 # cargo 编译产物（src-tauri/.cargo/config.toml 把 target-dir 指到了项目根）
 /target/
@@ -14,6 +15,8 @@ desktop-tauri/src-tauri/gen/schemas/
 .verify/
 prototype/
 .codeartsdoer/
+# 排查模型目录时导出的临时快照
+.tmp_catalog.json
 # ZCode 的忽略配置文件本身（本机工具配置，不入库）
 .zcodeignore
 
@@ -73,5 +76,6 @@ desktop-tauri/mobile/android/keystore.properties
 desktop-tauri/mobile/ios/App/build/
 desktop-tauri/mobile/ios/DerivedData/
 
-# 提供商插件（临时开发目录；正式仓库另置，不得进入本仓库历史）
+# 提供商插件（独立仓库的本地开发目录，不得进入本仓库历史）
 /agent2api-providers/
+/plugin/

@@ -6,7 +6,8 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
-} from '@ui'
+  Item,
+  Button } from '@ui'
 import { COMMUNITY_LINKS, QQ_GROUPS, handleExternalClick, shared } from './update-shared'
 import { t } from '../i18n'
 
@@ -19,7 +20,7 @@ import { t } from '../i18n'
  * icons.js 那三枚）、右边主标题 + 副标题，整张卡可点。QQ 两张卡是「复制群号」
  * （群号本身就是要拿走的文本），另两张是「打开链接」（外链交给系统浏览器）。
  *
- * 群 1 的「即将满员」放在卡片右上角而不是标题旁：它是这张卡的**状态**，
+ * 群 1、群 2 的「即将满员」放在卡片右上角而不是标题旁：它是这张卡的**状态**，
  * 挂在标题上会把标题挤成两截，扫视时也看不出这是「整张卡」的属性。
  *
  * ── 为什么不再摆二维码 ────────────────────────────────────
@@ -46,19 +47,11 @@ export function QqGroupDialog({ open, onClose }: { open: boolean; onClose: () =>
           <p className='qq-intro'>{t('遇到问题或有使用心得，欢迎到群里交流。')}</p>
 
           <div className='qq-cards'>
-            {/* QQ 群：两张卡。群 1 挂「即将满员」，并把「优先加群 2」写进副标题 ——
-                提示要落在人真要动手的那张卡旁边，而不是只写在顶上那段话里。
-
-                **为什么用原生 <button> 而不是组件库 Button**：Button 的变体类带
-                `border-transparent bg-transparent`（ghost）且组件库工具类带 !important，
-                会把 .qq-card 的描边与底色整条压掉 —— 两张卡粘成一片、和下面两张
-                <a> 卡也对不齐（就是「样式崩了」那个样子）。这里要的是「一张可点的
-                卡片」而不是「一个按钮」，所以只借原生元素 + 自己的类。 */}
+            {/* 群 1、群 2 都提示优先加群 3，放在各卡片副标题旁。 */}
             {QQ_GROUPS.map((group, index) => (
-              <button
+              <Item render={<Button variant='outline' />} variant='outline'
                 key={group.no}
-                type='button'
-                className='qq-card'
+                className='qq-card h-auto whitespace-normal text-left'
                 data-copy={group.no}
                 title={t('复制群号 {group}', { group: group.no })}
               >
@@ -69,29 +62,26 @@ export function QqGroupDialog({ open, onClose }: { open: boolean; onClose: () =>
                 />
                 <span className='qq-card-body'>
                   <span className='qq-card-title'>
-                    {index === 0 ? t('QQ 群 1') : t('QQ 群 2')}
+                    {index === 0 ? t('QQ 群 1') : index === 1 ? t('QQ 群 2') : t('QQ 群 3')}
                     <code>{group.no}</code>
                   </span>
                   <span className='qq-card-sub'>
-                    {group.nearlyFull ? t('即将满员，请优先加群 2') : t('点击复制群号')}
+                    {group.nearlyFull ? t('即将满员，请优先加群 3') : t('点击复制群号')}
                   </span>
                 </span>
                 {group.nearlyFull ? (
                   <Badge shape='tag' variant='warning' className='qq-card-flag'>{t('即将满员')}</Badge>
                 ) : null}
-              </button>
+              </Item>
             ))}
 
             {/* Telegram / Discord：整张卡是外链。标签直接写字面量（不取 link 上的字段
                 再包一层）—— 扫描器只认字符串字面量首参，变量形式提不出键，会一直漏翻 */}
             {COMMUNITY_LINKS.map(link => (
-              <a
+              <Item render={<a href={link.url} target='_blank' rel='noopener' />} variant='outline'
                 key={link.id}
                 className='qq-card'
-                href={link.url}
                 data-external={link.url}
-                target='_blank'
-                rel='noopener'
                 title={t('在浏览器中打开')}
               >
                 <span
@@ -105,7 +95,7 @@ export function QqGroupDialog({ open, onClose }: { open: boolean; onClose: () =>
                   </span>
                   <span className='qq-card-sub'>{t('点击在浏览器中打开')}</span>
                 </span>
-              </a>
+              </Item>
             ))}
           </div>
 

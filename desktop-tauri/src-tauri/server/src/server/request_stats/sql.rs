@@ -68,10 +68,11 @@ use super::report::{normalize_status_filter, SummaryRow};
 /// （见 `db/schema.rs` 的 `V2_SCHEMA`）。它们必须排在**最后**：`decode_request`
 /// 按序号取值，而「加列」这件事只有在末尾才不牵动前面的序号 —— 中间插一列会让
 /// 所有后续字段的序号整体挪一位，那种改动在整个文件里看不出错，只会静默取错值。
-const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
+pub(super) const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
-     client_reasoning, upstream_reasoning, phase, phase_started_at, is_test, route, client";
+     client_reasoning, upstream_reasoning, phase, phase_started_at, is_test, route, client, \
+     api_key_id, api_key_name, api_key_source";
 
 /// 报表窄列查询的列顺序 —— **与 `db::schema` 的 `idx_requests_summary` 列序一致**
 /// （索引是 `ts, is_test` 前缀 + 这里的后 5 列），改任一侧都要回来对一眼。
@@ -105,7 +106,7 @@ const SUMMARY_COLUMNS: &str =
 ///
 /// 末尾两个 JSON 列走 [`decode_json_list`]：坏值退化成空表而不是让整条明细读不出来
 /// （理由见那个函数）。
-fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEntry> {
+pub(super) fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEntry> {
     let attempt_details: String = row.get(17)?;
     let sensitive_hits: String = row.get(18)?;
     Ok(RequestEntry {
@@ -150,7 +151,14 @@ fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEntry> {
             .unwrap_or(Value::Null),
         // 末列是 schema v12 加的（请求来源客户端）；旧行的 DEFAULT '' 原样
         // 读出 —— 空串 = 没有记录（前端显示占位符），与无 UA 的请求同一形态
-        client: row.get(25)?,
+        source: super::RequestSource {
+            client: row.get(25)?,
+            api_key: super::ApiKeyIdentity {
+                id: row.get(26)?,
+                name: row.get(27)?,
+                source: row.get(28)?,
+            },
+        },
     })
 }
 
@@ -225,6 +233,22 @@ impl FilterPlan {
         if let Some(want) = filter.provider.as_deref().filter(|text| !text.is_empty()) {
             fragments.push("provider = ?".to_string());
             binds.push(SqlValue::Text(want.to_string()));
+        }
+
+        if let Some(want) = filter.client.as_deref() {
+            fragments.push("client = ?".to_string());
+            binds.push(SqlValue::Text(want.to_string()));
+        }
+        if let Some(identity) = filter.api_key.as_deref().and_then(super::ApiKeyIdentity::from_filter) {
+            fragments.push("api_key_source = ? AND api_key_id = ?".to_string());
+            binds.push(SqlValue::Text(identity.source));
+            binds.push(SqlValue::Text(identity.id));
+        }
+        if filter.production_only {
+            fragments.push("is_test = 0".to_string());
+        }
+        if filter.completed_only {
+            fragments.push("status <> 0".to_string());
         }
 
         // ② 成功 / 失败 / 进行中：与 `RequestEntry::is_success` **逐字等价**的
@@ -390,6 +414,28 @@ fn select_distinct_ordered(
         out.push(row.get(0)?);
     }
     Ok(out)
+}
+
+pub(super) fn source_filter_options(conn: &Connection, max: usize) -> rusqlite::Result<Value> {
+    let clients = select_distinct_ordered(conn, "client", max)?;
+    let mut stmt = conn.prepare(
+        "SELECT api_key_id, api_key_source, \
+         (SELECT r.api_key_name FROM requests r WHERE r.api_key_id = requests.api_key_id \
+          AND r.api_key_source = requests.api_key_source AND r.api_key_name <> '' ORDER BY r.ts DESC, r.row_id DESC LIMIT 1) \
+         FROM requests GROUP BY api_key_source, api_key_id \
+         ORDER BY COUNT(*) DESC, api_key_source, api_key_id LIMIT ?1",
+    )?;
+    let keys = stmt.query_map(params![max as i64], |row| {
+        let identity = super::ApiKeyIdentity {
+            id: row.get(0)?, source: row.get(1)?, name: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+        };
+        Ok(serde_json::json!({ "value": identity.filter_value(), "label": super::source_report::key_label(&identity) }))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut clients: Vec<Value> = clients.into_iter().map(|client| serde_json::json!({
+        "value": client, "label": super::source_report::client_label(&client),
+    })).collect();
+    clients.push(serde_json::json!({ "value": "", "label": "未记录客户端" }));
+    Ok(serde_json::json!({ "clients": clients, "apiKeys": keys }))
 }
 
 /// 最早 / 最晚的明细时间戳（空表为 `None`）—— `stats()` 的 `firstTs` / `lastTs`。
@@ -603,7 +649,7 @@ pub(super) fn insert_started_request(
     model: &str,
     client_model: &str,
     client_reasoning: &str,
-    client: &str,
+    source: &super::RequestSource,
     is_test: bool,
 ) -> rusqlite::Result<bool> {
     let existing: i64 = conn.query_row(
@@ -622,9 +668,10 @@ pub(super) fn insert_started_request(
     // 进行中行也应带上 —— 等收尾再补会让列表里「客户端」列在转发期间空一格
     conn.execute(
         "INSERT INTO requests (id, ts, model, client_model, client_reasoning, status, \
-         phase, phase_started_at, is_test, client) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'connecting', ?2, ?6, ?7)",
-        params![id, ts, model, client_model, client_reasoning, is_test as i64, client],
+         phase, phase_started_at, is_test, client, api_key_id, api_key_name, api_key_source) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'connecting', ?2, ?6, ?7, ?8, ?9, ?10)",
+        params![id, ts, model, client_model, client_reasoning, is_test as i64,
+            source.client, source.api_key.id, source.api_key.name, source.api_key.source],
     )?;
     Ok(true)
 }
@@ -708,8 +755,8 @@ pub(super) fn update_running_progress(
     conn.execute(
         "UPDATE requests SET provider = ?2, account_id = ?3, account_name = ?4, \
          upstream_model = ?5, upstream_reasoning = ?6, attempts = ?7, first_response_ms = ?8, \
-         attempt_details = ?9, sensitive_hits = ?10, phase = ?11, phase_started_at = ?12 \
-         WHERE id = ?1 AND status = 0",
+         attempt_details = ?9, sensitive_hits = ?10, phase = ?11, phase_started_at = ?12, \
+         route = COALESCE(?13, route) WHERE id = ?1 AND status = 0",
         params![
             id,
             progress.provider,
@@ -723,6 +770,7 @@ pub(super) fn update_running_progress(
             encode_json_list(&progress.sensitive_hits),
             progress.phase,
             progress.phase_started_at,
+            progress.route.as_ref().map(Value::to_string),
         ],
     )
 }
@@ -755,7 +803,8 @@ pub(super) fn update_running_request(
          completion_tokens = ?12, total_tokens = ?13, cache_read_tokens = ?14, provider = ?15, \
          client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19, \
          client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL, \
-         is_test = ?22, route = ?23, client = ?24 \
+         is_test = ?22, route = ?23, client = ?24, \
+         api_key_id = ?25, api_key_name = ?26, api_key_source = ?27 \
          WHERE id = ?1 AND status = 0",
         params![
             entry.id,
@@ -785,8 +834,19 @@ pub(super) fn update_running_request(
             encode_optional_json(&entry.route),
             // 客户端同 is_test：首发已写过一次，收尾再写一次保证
             // 「有进行中行」与「直接插入」两条路径落库的值同源
-            entry.client,
+            entry.source.client,
+            entry.source.api_key.id,
+            entry.source.api_key.name,
+            entry.source.api_key.source,
         ],
+    )
+}
+
+pub(super) fn terminal_record_exists(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM requests WHERE id = ?1 AND status <> 0) \
+         AND NOT EXISTS(SELECT 1 FROM requests WHERE id = ?1 AND status = 0)",
+        params![id], |row| row.get(0),
     )
 }
 
@@ -803,9 +863,10 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
         "INSERT INTO requests (id, ts, model, account_id, account_name, status, duration_ms, \
          first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
          cache_read_tokens, provider, client_model, upstream_model, attempt_details, \
-         sensitive_hits, client_reasoning, upstream_reasoning, is_test, route, client) \
+         sensitive_hits, client_reasoning, upstream_reasoning, is_test, route, client, \
+         api_key_id, api_key_name, api_key_source) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
         params![
             entry.id,
             entry.ts,
@@ -830,7 +891,10 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
             entry.upstream_reasoning,
             entry.is_test as i64,
             encode_optional_json(&entry.route),
-            entry.client,
+            entry.source.client,
+            entry.source.api_key.id,
+            entry.source.api_key.name,
+            entry.source.api_key.source,
         ],
     )?;
     Ok(())
@@ -893,9 +957,9 @@ pub(super) fn delete_expired_requests(conn: &Connection, cutoff: i64) -> rusqlit
 // ─── 原始报文：request_raw ──────────────────────────────────
 
 /// 写一条原始正文（存在即覆盖；`id` 为空由调用方拦下）。
+/// 明细可能在记账后被数量上限淘汰，只为仍在库中的请求保存正文。
 ///
-/// `size` 是**两侧字节长度合计**（截断后的落库体积，与 debug_traffic 的
-/// size 口径同理：闸门守的是「这张表实际占多大」）。UPSERT 而不是先查后写：
+/// `size` 是完整请求体与响应体的字节长度合计。UPSERT 而不是先查后写：
 /// `id` 是主键，`ON CONFLICT` 一条语句完成「新建 / 覆盖」，同 id 重写
 /// （理论上不该发生，防手改库与重复请求）不会撞约束。
 pub(super) fn upsert_raw(
@@ -907,10 +971,10 @@ pub(super) fn upsert_raw(
     size: i64,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO request_raw (id, ts, request_body, response_body, size) \
-         VALUES (?1, ?2, ?3, ?4, ?5) \
+        "INSERT INTO request_raw (id, ts, request_body, response_body, size, truncated) \
+         SELECT ?1, ?2, ?3, ?4, ?5, 0 WHERE EXISTS (SELECT 1 FROM requests WHERE id = ?1) \
          ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, request_body = excluded.request_body, \
-         response_body = excluded.response_body, size = excluded.size",
+         response_body = excluded.response_body, size = excluded.size, truncated = 0",
         params![id, ts, request_body, response_body, size],
     )?;
     Ok(())
@@ -957,11 +1021,11 @@ pub(super) fn trim_raw_rows(conn: &Connection, overflow: usize) -> rusqlite::Res
 pub(super) fn select_raw(
     conn: &Connection,
     id: &str,
-) -> rusqlite::Result<Option<(String, String, String)>> {
-    let mut stmt = conn.prepare("SELECT id, request_body, response_body FROM request_raw WHERE id = ?1")?;
+) -> rusqlite::Result<Option<(String, String, String, bool)>> {
+    let mut stmt = conn.prepare("SELECT id, request_body, response_body, truncated FROM request_raw WHERE id = ?1")?;
     let mut rows = stmt.query(params![id])?;
     match rows.next()? {
-        Some(row) => Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?))),
+        Some(row) => Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))),
         None => Ok(None),
     }
 }

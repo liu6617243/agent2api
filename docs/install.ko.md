@@ -151,6 +151,8 @@ Linux 에서는 `/etc/agent2api/agent2api.env` 에, Windows 에서는 서비스 
 
 ## Docker
 
+이미지 태그: `latest`는 최신 정식 버전을, `beta`는 최신 beta 사전 출시 버전을 따릅니다. `3.3.0-beta.3` 같은 전체 버전 번호로 버전을 고정할 수도 있습니다. beta를 사용하려면 아래 명령이나 Compose 설정의 `aimodcc/agent2api:latest`를 `aimodcc/agent2api:beta`로 바꾸고, 업데이트할 때 `docker compose pull && docker compose up -d`를 실행하세요. beta 출시 시 `latest`는 변경되지 않으며, 수동 개발 빌드는 `dev`만 업데이트합니다.
+
 ```bash
 docker run -d --name agent2api --restart unless-stopped \
   -p 3065:3065 -v ./data:/data \

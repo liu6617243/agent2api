@@ -54,6 +54,7 @@ use crate::server::core::auto_checkin::{self};
 use crate::server::core::beijing;
 use crate::server::core::billing::checkin;
 use crate::server::core::checkin_history;
+use crate::server::core::providers::{kind_id, ProviderKind};
 use crate::server::http::ok_json;
 use crate::server::ServerState;
 
@@ -139,7 +140,13 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
         .get("accounts")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|account| {
+            account.get("provider").and_then(Value::as_str) != Some(kind_id(ProviderKind::Chatglm))
+                || account.get("isGuest").and_then(Value::as_bool) != Some(true)
+        })
+        .collect();
 
     // ── 每日签到分组：提供商 ∈ **可用**清单 且 supports_checkin ──
     // 按注册顺序分桶（界面行序稳定）；范围外账号按「提供商 + 原因」聚合
@@ -267,7 +274,7 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
             // `settled` 是**一次性福利的结算记忆**（已结清才非空）：本地事实、
             // 零上游请求，界面据此直接渲染「已领取」并在进页面 / 签到后跳过
             // 自动查询，不必为一条早就领完的福利反复问上游。
-            "settled": super::onboarding::settled_view(state.store(), &id, &provider)
+            "settled": super::onboarding::settled_view(state.store(), &id)
                 .unwrap_or(Value::Null),
         }));
     }

@@ -30,24 +30,21 @@
 
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
-import { Button, cn } from '@ui'
+import { Alert, Button, Empty, NavList, NavItem, PageHeader, ResponsiveSheet, cn } from '@ui'
 import { t } from '../i18n'
 import {
   AssistantRequestError,
   DEFAULT_SYSTEM_PROMPT,
-  clearSessions,
-  deleteSession,
   gatewayBase,
   loadSession,
   loadSessions,
   parseToolArguments,
-  saveSession,
+  newSessionId,
   streamChat,
   toast,
   type AssistantConfig,
   type ChatMessage,
   type PermissionMode,
-  type SessionSummary,
   type ToolCall,
 } from './assistant-state'
 import {
@@ -60,40 +57,22 @@ import {
 import { selectedModel, unavailableModelMessage } from './assistant-models'
 import { useAssistantModels } from './assistant-model-state'
 import { useAssistantConfig } from './assistant-config-state'
-import {
-  MAX_IMAGES,
-  MAX_IMAGE_BYTES,
-  AssistantComposer,
-} from './assistant-composer'
-import { prepareImage } from './assistant-images'
+import { titleFrom, useAssistantSessions } from './assistant-session-state'
+import { AssistantComposer } from './assistant-composer'
+import { useAssistantAttachments } from './assistant-attachments'
 import { MessageList, type UiMessage } from './assistant-messages'
 import { AssistantSettingsDrawer } from './assistant-settings-drawer'
 import { PlusIcon } from './assistant-icons'
+import { imageContext, type ImageAsset } from '../../../ui-shared/assistant-image-tools'
 
 /** 一轮对话里最多允许的「上游调用 → 工具 → 上游调用」循环次数 */
 const MAX_ROUNDS = 12
-
-/** 侧边栏标题：取第一条用户消息的前若干字（没聊过时给占位） */
-const TITLE_MAX_CHARS = 40
-function titleFrom(messages: ChatMessage[]): string {
-  const first = messages.find(message => message.role === 'user')
-  const text = first && first.role === 'user' ? first.content.trim().replace(/\s+/g, ' ') : ''
-  if (!text) return ''
-  return text.length > TITLE_MAX_CHARS ? `${text.slice(0, TITLE_MAX_CHARS)}…` : text
-}
-
-/** 新会话 id（与后端 `core::assistant_sessions` 的「id 由前端生成」配套） */
-function newSessionId(): string {
-  const cryptoApi = (window as unknown as { crypto?: Crypto }).crypto
-  if (cryptoApi?.randomUUID) return cryptoApi.randomUUID()
-  return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
-}
 
 /** 挂起的工具链：确认卡点完之后从 `index` 继续跑 */
 type Suspended = {
   calls: ToolCall[]
   index: number
-  collected: Array<{ toolCallId: string; content: string }>
+  collected: Array<{ toolCallId: string; content: string; images?: ImageAsset[] }>
   cardIndex: number
 }
 
@@ -106,9 +85,7 @@ function AssistantPage() {
   const [busy, setBusy] = React.useState(false)
   const [awaiting, setAwaiting] = React.useState(false)
   const [draft, setDraft] = React.useState('')
-  const [images, setImages] = React.useState<string[]>([])
   /** 历史会话列表（侧边栏）与当前打开的那一条 */
-  const [sessions, setSessions] = React.useState<SessionSummary[]>([])
   const [activeId, setActiveId] = React.useState<string>('')
   /** 侧边栏在窄屏下是否展开（宽屏常驻，见 CSS 的 .asst-layout） */
   const [sidebarOpen, setSidebarOpen] = React.useState(false)
@@ -116,12 +93,6 @@ function AssistantPage() {
   const [settingsOpen, setSettingsOpen] = React.useState(false)
 
   const uiRef = React.useRef<UiMessage[]>([])
-  /** 已选图片的最新值（`addFiles` 要按当前张数算还剩几个名额，而回调用
-   *  useCallback([]) 固定住，读不到闭包里的 state） */
-  const imagesRef = React.useRef<string[]>([])
-  imagesRef.current = images
-  /** 正在读取中的张数（读文件是异步的：不占名额就会「连点两次 + 选满 12 张」） */
-  const pendingRef = React.useRef(0)
   const wireRef = React.useRef<ChatMessage[]>([])
   const suspendedRef = React.useRef<Suspended | null>(null)
   const controllerRef = React.useRef<AbortController | null>(null)
@@ -129,10 +100,15 @@ function AssistantPage() {
   const loadedRef = React.useRef(false)
   /** 当前会话 id（`uiRef` 那串消息归属哪一条；新建时换一个） */
   const activeIdRef = React.useRef<string>('')
+  const { images, setImages, addFiles, reading: readingImages } = useAssistantAttachments(activeIdRef)
   /** 会话标题（用户没改过就一直取第一条用户消息，见 `titleFrom`） */
   const titleRef = React.useRef<string>('')
-  /** 保存的串行化：每轮回答结束都存一次，但两次保存不该并发（后到的会覆盖先到的） */
-  const savingRef = React.useRef<Promise<void>>(Promise.resolve())
+  const { sessions, setSessions, persist, remove: removeSavedSession, clear: clearSavedSessions } = useAssistantSessions({
+    config: configRef, messages: wireRef, activeId: activeIdRef, title: titleRef,
+  })
+  const stoppedRef = React.useRef(false)
+  const historyBusyRef = React.useRef(false)
+  const [historyBusy, setHistoryBusy] = React.useState(false)
   /**
    * `loop` 的稳定引用（**别删**）。
    *
@@ -154,71 +130,6 @@ function AssistantPage() {
 
   const syncUI = React.useCallback(() => { setUi(uiRef.current.slice()) }, [])
 
-  /**
-   * 把当前会话落库（新建或覆盖）。
-   *
-   * ── 为什么每次回答完都存、而不是只在切走时存 ────────────────
-   * 「切走时存」在崩溃 / 关窗口 / 切页时都会丢最后一轮 —— 而那正是用户最想
-   * 留下的东西。每次回答完存一次的代价是一条本地 HTTP + 一次 upsert，可以忽略。
-   *
-   * ── 为什么要串行 ────────────────────────────────────────────
-   * 一轮对话里 `loop` 可能被调多次（工具回灌后继续），每次结束都会触发保存。
-   * 并发写同一条会话时，后到的请求**不保证**先落库 —— 那会让「刚存的最新版」
-   * 被「稍早的旧版」覆盖。这里用一条 promise 链把保存排成队。
-   *
-   * ── 为什么保存后不无条件把这条挪到最上面（`bump`）────────────
-   * 切换会话前也会先 `persist()` 一次（见 `openSession`），而那时内容其实没变
-   * —— 如果保存成功就 `[saved, ...rest]`，用户每点一条历史，那条就被顶到列表
-   * 第一位，列表顺序随着浏览行为不停抖动。所以这里默认**原地更新**，只有调用方
-   * 明确表示「这条有新内容」时才置顶（`bump`）。后端仍按 `updated_at` 倒序返回
-   * （见 `assistant_sessions.rs`），重进页面时顺序才以真实活跃度为据。
-   */
-  const persist = React.useCallback((bump = true): Promise<void> => {
-    const id = activeIdRef.current
-    if (!id) return Promise.resolve()
-    const messages = wireRef.current
-    if (!messages.length) return Promise.resolve()
-    const title = titleRef.current || titleFrom(messages)
-    const payload = {
-      id,
-      title,
-      messages,
-      model: configRef.current?.model ?? null,
-      reasoning: configRef.current?.reasoning ?? null,
-    }
-    savingRef.current = savingRef.current
-      .catch(() => { /* 上一次的失败不该阻断这一次 */ })
-      .then(async () => {
-        try {
-          const saved = await saveSession(payload)
-          // ── 只有「保存的仍是当前会话」才回写 titleRef ──────────────
-          // 点「新对话」/ 切会话时是先 `void persist(...)` 再 `resetToBlank`，
-          // 两者都不等待：保存请求飞在路上的那几百毫秒里，`titleRef` 已经被
-          // 新会话清空、`activeIdRef` 也换成了新 id。此时无条件
-          // `titleRef.current = saved.title` 会把**旧会话的标题**写回新会话，
-          // 症状正是「记录清空了、左上角标题还在，要再点一次新对话才消失」
-          // （第二次因为 wireRef 已空，persist 直接 return，不写 ref）。
-          // 列表本身照常更新：那条会话确实存下来了，与当前在看哪条无关。
-          if (activeIdRef.current === id) titleRef.current = saved.title
-          setSessions(prev => {
-            const index = prev.findIndex(item => item.id === saved.id)
-            // 新会话（列表里还没有）：只能加，且加在最前面 —— 它刚被创建
-            if (index < 0) return [saved, ...prev]
-            // 已有会话：原地替换那一条。顺序保持不动，除非调用方要求置顶。
-            if (!bump) {
-              const next = prev.slice()
-              next[index] = saved
-              return next
-            }
-            const rest = prev.filter(item => item.id !== saved.id)
-            return [saved, ...rest]
-          })
-        } catch (error) {
-          toast(t('这条会话没能存进历史：{message}', { message: errorText(error) }), 'err')
-        }
-      })
-    return savingRef.current
-  }, [configRef])
   /** `persist` 的稳定引用（`loop` 的 deps 里放它会陷入循环，见 loopRef 的说明） */
   const persistRef = React.useRef(persist)
   persistRef.current = persist
@@ -282,11 +193,37 @@ function AssistantPage() {
     : currentModel && !currentOption ? unavailableModelMessage(currentModel) : ''
   const mode: PermissionMode = config?.mode ?? 'confirm'
 
+  const runTool = React.useCallback(async (tool: NonNullable<ReturnType<typeof toolById>>, args: Record<string, unknown>, collected: Suspended['collected']): Promise<ToolResult> => {
+    const controller = new AbortController()
+    controllerRef.current = controller
+    const session = activeIdRef.current
+    try {
+      if (tool.id === 'generate_images' || tool.id === 'edit_images') await persistRef.current(true, collected)
+      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError')
+      const references = imageContext([...wireRef.current, ...collected.map(item => ({ role: 'tool', images: item.images }))])
+      const result = await tool.run(args, { session, images: references, confirmed: true, signal: controller.signal })
+      if (activeIdRef.current !== session) throw new DOMException('Aborted', 'AbortError')
+      return result
+    } finally {
+      if (controllerRef.current === controller) controllerRef.current = null
+    }
+  }, [])
+
   /* ─── agent loop ───────────────────────────────────────── */
 
   /** 处理一批 tool_calls（从 `index` 起；confirm 模式遇到改动类会挂起） */
   const pump = React.useCallback(async (calls: ToolCall[], index: number, collected: Suspended['collected']) => {
+    setBusy(true)
+    const session = activeIdRef.current
     for (let i = index; i < calls.length; i += 1) {
+      if (activeIdRef.current !== session) return
+      if (stoppedRef.current) {
+        for (const call of calls.slice(i)) {
+          uiRef.current.push({ kind: 'tool', call, state: 'cancelled' })
+          collected.push({ toolCallId: call.id, content: '用户已停止，未执行这次操作。' })
+        }
+        break
+      }
       const call = calls[i]
       const tool = toolById(call.name)
       const args = parseToolArguments(call.arguments)
@@ -299,14 +236,31 @@ function AssistantPage() {
         syncUI()
         continue
       }
-      if (tool.kind === 'read') {
+      if (configRef.current?.tools?.[tool.id] !== true) {
+        const message = t('工具「{name}」未获授权，未执行。', { name: tool.label })
+        uiRef.current.push({ kind: 'tool', call, state: 'failed', error: message })
+        collected.push({ toolCallId: call.id, content: message })
+        syncUI()
+        continue
+      }
+      const refreshingBalance = tool.id === 'list_account_balance' && args.refresh === true
+      if (tool.kind === 'read' && !refreshingBalance) {
         const cardIndex = uiRef.current.push({ kind: 'tool', call, state: 'running' }) - 1
         syncUI()
         try {
-          const result = await tool.run(args)
-          uiRef.current[cardIndex] = { kind: 'tool', call, state: 'done', summary: result.summary, detail: result.text }
-          collected.push({ toolCallId: call.id, content: result.text })
+          const result = await runTool(tool, args, collected)
+          uiRef.current[cardIndex] = { kind: 'tool', call, state: 'done', summary: result.summary, detail: result.text, images: result.images }
+          collected.push({ toolCallId: call.id, content: result.text, images: result.images })
+          if (result.images?.length) void persistRef.current(true, collected)
         } catch (error) {
+          if (error instanceof DOMException && error.name === 'AbortError') {
+            if (activeIdRef.current !== session) return
+            stoppedRef.current = true
+            uiRef.current[cardIndex] = { kind: 'tool', call, state: 'cancelled' }
+            collected.push({ toolCallId: call.id, content: '用户已停止，未继续执行这次操作。' })
+            syncUI()
+            continue
+          }
           const message = errorText(error)
           uiRef.current[cardIndex] = { kind: 'tool', call, state: 'failed', error: message }
           collected.push({ toolCallId: call.id, content: `工具执行失败：${message}` })
@@ -316,7 +270,10 @@ function AssistantPage() {
       }
 
       // 改动 / 消耗类：看权限模式决定「先问」还是「直接做」
-      const plan = tool.plan?.(args) || { lead: t('将执行 {label}。', { label: tool.label }) }
+      const plan = tool.plan?.(args) || {
+        lead: t('将执行 {label}。', { label: tool.label }),
+        ...(refreshingBalance ? { note: t('实时余额查询会请求上游，并可能触发已配置的自动禁用规则。') } : {}),
+      }
       const auto = (configRef.current?.mode ?? 'confirm') === 'full'
       if (!auto) {
         const cardIndex = uiRef.current.push({ kind: 'tool', call, state: 'confirm', plan }) - 1
@@ -330,13 +287,22 @@ function AssistantPage() {
       const cardIndex = uiRef.current.push({ kind: 'tool', call, state: 'running', plan, auto: true }) - 1
       syncUI()
       try {
-        const result = await tool.run(args)
+        const result = await runTool(tool, args, collected)
         uiRef.current[cardIndex] = {
           kind: 'tool', call, state: 'done', auto: true,
-          summary: result.summary, detail: result.text,
+          summary: result.summary, detail: result.text, images: result.images,
         }
-        collected.push({ toolCallId: call.id, content: result.text })
+        collected.push({ toolCallId: call.id, content: result.text, images: result.images })
+        if (result.images?.length) void persistRef.current(true, collected)
       } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          if (activeIdRef.current !== session) return
+          stoppedRef.current = true
+          uiRef.current[cardIndex] = { kind: 'tool', call, state: 'cancelled' }
+          collected.push({ toolCallId: call.id, content: '用户已停止，未继续执行这次操作。' })
+          syncUI()
+          continue
+        }
         const message = errorText(error)
         uiRef.current[cardIndex] = { kind: 'tool', call, state: 'failed', auto: true, error: message }
         collected.push({ toolCallId: call.id, content: `工具执行失败：${message}` })
@@ -345,14 +311,19 @@ function AssistantPage() {
     }
     // 一批处理完：回灌工具结果，进入下一轮（经 ref 拿最新的 loop，见它的说明）
     for (const item of collected) {
-      wireRef.current.push({ role: 'tool', toolCallId: item.toolCallId, content: item.content })
+      wireRef.current.push({ role: 'tool', toolCallId: item.toolCallId, content: item.content, images: item.images })
     }
+    syncUI()
+    await persistRef.current()
+    if (stoppedRef.current) { setBusy(false); return }
     await loopRef.current?.()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   /** 开一轮上游调用（流式收 delta / tool_calls） */
   const loop = React.useCallback(async () => {
+    if (stoppedRef.current) { setBusy(false); return }
+    const session = activeIdRef.current
     if (roundRef.current >= MAX_ROUNDS) {
       uiRef.current.push({
         kind: 'notice',
@@ -360,6 +331,7 @@ function AssistantPage() {
         bad: true,
       })
       syncUI()
+      setBusy(false)
       return
     }
     roundRef.current += 1
@@ -378,6 +350,7 @@ function AssistantPage() {
         reasoning: configRef.current?.reasoning ?? null,
         signal: controller.signal,
         onEvent: event => {
+          if (activeIdRef.current !== session) return
           if (event.type === 'delta') {
             const current = uiRef.current[botIndex]
             if (current && current.kind === 'bot') {
@@ -389,6 +362,7 @@ function AssistantPage() {
         },
       })
     } catch (error) {
+      if (activeIdRef.current !== session) return
       failed = true
       if (error instanceof AssistantRequestError && error.code === 'model_not_found') {
         void refreshModels().catch(() => {})
@@ -397,7 +371,11 @@ function AssistantPage() {
       const current = uiRef.current[botIndex]
       const partial = current && current.kind === 'bot' ? current.text : ''
       if (!partial) uiRef.current.splice(botIndex, 1)
-      else uiRef.current[botIndex] = { kind: 'bot', text: partial }
+      else {
+        uiRef.current[botIndex] = { kind: 'bot', text: partial }
+        wireRef.current.push({ role: 'assistant', content: partial })
+      }
+      void persistRef.current()
       const aborted = controller.signal.aborted
       uiRef.current.push({
         kind: 'notice',
@@ -406,8 +384,9 @@ function AssistantPage() {
       })
       syncUI()
     } finally {
-      controllerRef.current = null
+      if (controllerRef.current === controller) controllerRef.current = null
     }
+    if (activeIdRef.current !== session) return
     if (failed) {
       setBusy(false)
       return
@@ -438,6 +417,7 @@ function AssistantPage() {
 
   /** 确认卡上的一次决策：执行或取消，然后继续跑剩下的调用 */
   const resolveConfirm = React.useCallback(async (run: boolean) => {
+    const session = activeIdRef.current
     const suspended = suspendedRef.current
     if (!suspended) return
     suspendedRef.current = null
@@ -454,10 +434,21 @@ function AssistantPage() {
       setBusy(true)
       syncUI()
       try {
-        const result: ToolResult = await tool.run(args)
-        uiRef.current[suspended.cardIndex] = { kind: 'tool', call, state: 'done', summary: result.summary, detail: result.text }
-        suspended.collected.push({ toolCallId: call.id, content: result.text })
+        if (configRef.current?.tools?.[tool.id] !== true) throw new Error(t('工具「{name}」未获授权，未执行。', { name: tool.label }))
+        const result: ToolResult = await runTool(tool, args, suspended.collected)
+        uiRef.current[suspended.cardIndex] = { kind: 'tool', call, state: 'done', summary: result.summary, detail: result.text, images: result.images }
+        suspended.collected.push({ toolCallId: call.id, content: result.text, images: result.images })
+        if (result.images?.length) void persistRef.current(true, suspended.collected)
       } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          if (activeIdRef.current !== session) return
+          stoppedRef.current = true
+          uiRef.current[suspended.cardIndex] = { kind: 'tool', call, state: 'cancelled' }
+          suspended.collected.push({ toolCallId: call.id, content: '用户已停止，未继续执行这次操作。' })
+          syncUI()
+          await pump(suspended.calls, suspended.index + 1, suspended.collected)
+          return
+        }
         const message = errorText(error)
         uiRef.current[suspended.cardIndex] = { kind: 'tool', call, state: 'failed', error: message }
         suspended.collected.push({ toolCallId: call.id, content: `工具执行失败：${message}` })
@@ -471,7 +462,7 @@ function AssistantPage() {
   /** 发送前校验当前模型，校验失败不追加历史也不清空草稿。 */
   const send = React.useCallback(async (text: string, attached: string[]) => {
     const value = text.trim()
-    if ((!value && attached.length === 0) || busy || awaiting || sendingRef.current) return
+    if ((!value && attached.length === 0) || busy || awaiting || readingImages || sendingRef.current || historyBusyRef.current) return
     const current = configRef.current
     if (!current?.model) {
       toast(current
@@ -501,6 +492,7 @@ function AssistantPage() {
         setActiveId(id)
       }
       roundRef.current = 0
+      stoppedRef.current = false
       uiRef.current.push({ kind: 'user', text: value, ...(attached.length ? { images: attached } : {}) })
       wireRef.current.push({ role: 'user', content: value, ...(attached.length ? { images: attached } : {}) })
       setDraft('')
@@ -521,7 +513,7 @@ function AssistantPage() {
         setBusy(false)
       }
     }
-  }, [awaiting, busy, loop, syncUI, refreshModels, configRef])
+  }, [awaiting, busy, readingImages, loop, syncUI, refreshModels, configRef])
 
   const stop = React.useCallback(() => {
     if (checkingModelRef.current) {
@@ -531,6 +523,7 @@ function AssistantPage() {
       setBusy(false)
       return
     }
+    stoppedRef.current = true
     controllerRef.current?.abort()
   }, [])
 
@@ -548,10 +541,12 @@ function AssistantPage() {
     setActiveId(id)
     setAwaiting(false)
     setBusy(false)
+    setImages([])
     syncUI()
-  }, [syncUI])
+  }, [syncUI, setImages])
 
   const newChat = React.useCallback(() => {
+    if (historyBusyRef.current || sendingRef.current) return
     // 与 openSession 同一理由：开新对话前保存旧的，但不算「有新内容」，
     // 不该把刚才那条顶到列表第一位。
     void persistRef.current(false)
@@ -566,22 +561,21 @@ function AssistantPage() {
    * 往**新会话**的数组里追加（同一个 ref）—— 结果是两条对话的内容混在一起。
    */
   const openSession = React.useCallback(async (id: string) => {
-    if (busy || awaiting) return
+    if (busy || awaiting || sendingRef.current || historyBusyRef.current) return
     if (id === activeIdRef.current) { setSidebarOpen(false); return }
-    // `false`：这里保存只是为了不丢掉正在看的那条，内容并没有新增 ——
-    // 置顶会让列表跟着「点了哪条」抖动（见 persist 的说明）。
-    await persistRef.current(false)
+    historyBusyRef.current = true
+    setHistoryBusy(true)
     try {
+      await persistRef.current(false)
       const detail = await loadSession(id)
       // 回放：只画有正文的消息。工具调用卡（`role:"tool"`）与「只带 tool_calls、
       // 正文为空」的 assistant 消息**不重建卡片** —— 那张卡的可执行状态在当时的
       // 会话里才有意义，历史里重建出来会让人以为还能再点一次。
-      uiRef.current = detail.messages
-        .filter(message => message.role !== 'tool')
-        .filter(message => message.role === 'user' || message.content.trim().length > 0)
-        .map(message => message.role === 'user'
-          ? { kind: 'user' as const, text: message.content, ...(message.images?.length ? { images: message.images } : {}) }
-          : { kind: 'bot' as const, text: message.content })
+      uiRef.current = detail.messages.flatMap((message): UiMessage[] => {
+        if (message.role === 'user') return [{ kind: 'user', text: message.content, images: message.images }]
+        if (message.role === 'tool') return message.images?.length ? [{ kind: 'images', images: message.images }] : []
+        return message.content.trim() ? [{ kind: 'bot', text: message.content }] : []
+      })
       wireRef.current = detail.messages
       activeIdRef.current = detail.id
       titleRef.current = detail.title
@@ -595,38 +589,49 @@ function AssistantPage() {
         const next: AssistantConfig = {
           ...config,
           model: detail.model ?? config.model,
-          reasoning: detail.reasoning ?? config.reasoning,
+          reasoning: detail.reasoning,
         }
         saveConfig(next)
         refreshModelOptions()
       }
     } catch (error) {
       toast(t('打开会话失败：{message}', { message: errorText(error) }), 'err')
+    } finally {
+      historyBusyRef.current = false
+      setHistoryBusy(false)
     }
     setSidebarOpen(false)
   }, [awaiting, busy, config, syncUI, saveConfig, refreshModelOptions])
 
   const removeSession = React.useCallback(async (id: string) => {
+    if (busy || awaiting || sendingRef.current || historyBusyRef.current) return
+    historyBusyRef.current = true
+    setHistoryBusy(true)
     try {
-      await deleteSession(id)
+      await removeSavedSession(id)
+      if (id === activeIdRef.current) resetToBlank(newSessionId())
     } catch (error) {
       toast(t('删除会话失败：{message}', { message: errorText(error) }), 'err')
-      return
+    } finally {
+      historyBusyRef.current = false
+      setHistoryBusy(false)
     }
-    setSessions(prev => prev.filter(item => item.id !== id))
-    if (id === activeIdRef.current) resetToBlank(newSessionId())
-  }, [resetToBlank])
+  }, [busy, awaiting, resetToBlank, removeSavedSession])
 
   const clearHistory = React.useCallback(async () => {
+    if (busy || awaiting || sendingRef.current || historyBusyRef.current) return
+    historyBusyRef.current = true
+    setHistoryBusy(true)
     try {
-      await clearSessions()
+      await clearSavedSessions()
+      resetToBlank(newSessionId())
     } catch (error) {
       toast(t('清空历史失败：{message}', { message: errorText(error) }), 'err')
-      return
+    } finally {
+      historyBusyRef.current = false
+      setHistoryBusy(false)
     }
-    setSessions([])
-    resetToBlank(newSessionId())
-  }, [resetToBlank])
+  }, [busy, awaiting, resetToBlank, clearSavedSessions])
 
   const pickModel = React.useCallback((name: string) => {
     if (!name) return
@@ -653,98 +658,45 @@ function AssistantPage() {
     )
   }, [config, saveConfig])
 
-  /**
-   * 追加图片：类型 / 张数 / 单张大小三道门槛，超了说清楚哪一条不过。
-   *
-   * 名额按 `imagesRef` 的当前值算，**不在 setState 的 updater 里做副作用**
-   * （读文件、再 setState）：updater 在严格模式下会被调两次，那样同一张图
-   * 会读两遍、也可能多塞一张。读完的结果统一走 `appendImage` 的 updater。
-   */
-  const addFiles = React.useCallback((files: FileList | File[]) => {
-    const list = Array.from(files)
-    const imagesOnly = list.filter(file => file.type.startsWith('image/'))
-    if (!imagesOnly.length) {
-      toast(t('只支持图片文件（PNG / JPG / WebP / GIF）。'), 'err')
-      return
-    }
-    const oversized = imagesOnly.find(file => file.size > MAX_IMAGE_BYTES)
-    if (oversized) {
-      toast(t('「{name}」超过 {n} MB，换一张小一点的。', {
-        name: oversized.name,
-        n: MAX_IMAGE_BYTES / 1024 / 1024,
-      }), 'err')
-      return
-    }
-    const room = MAX_IMAGES - imagesRef.current.length - pendingRef.current
-    if (room <= 0) {
-      toast(t('一次最多 {n} 张图片。', { n: MAX_IMAGES }), 'err')
-      return
-    }
-    const take = imagesOnly.slice(0, room)
-    if (take.length < imagesOnly.length) {
-      toast(t('一次最多 {n} 张图片，多出的没有添加。', { n: MAX_IMAGES }), 'warn')
-    }
-    pendingRef.current += take.length
-    for (const file of take) {
-      void prepareImage(file)
-        .then(url => {
-          if (url) setImages(current => (current.length >= MAX_IMAGES ? current : [...current, url]))
-        })
-        .catch(error => toast(t('读取图片失败：{message}', { message: errorText(error) }), 'err'))
-        .finally(() => { pendingRef.current = Math.max(0, pendingRef.current - 1) })
-    }
-  }, [])
-
-  /** 粘贴 / 拖入都走 addFiles（文件名不同也能加，内容相同的图不去重：
-   *  用户可能确实想发两张一样的做对比） */
-  const addFilesDedup = React.useCallback((files: FileList | File[]) => {
-    addFiles(files)
-  }, [addFiles])
-
   /* ─── 渲染 ─── */
 
   const activeTitle = titleRef.current || titleFrom(wireRef.current) || t('新对话')
   const empty = ui.length === 0
 
   return (
-    <div className={cn('asst-layout', sidebarOpen && 'side-open')}>
-      {/* 左边：历史会话（宽屏常驻、窄屏抽屉，见 CSS 的 .asst-side） */}
-      <aside className='asst-side'>
+    <div className='asst-layout'>
+      <ResponsiveSheet open={sidebarOpen} onOpenChange={setSidebarOpen} title={t('历史对话')}
+        breakpoint={900} side='left' inlineAs='aside' inlineClassName='asst-side'
+        contentClassName='w-[min(280px,86vw)]' bodyClassName='gap-0'>
         <div className='asst-side-head'>
-          <Button variant='default' size='sm' className='asst-new' onClick={newChat} disabled={busy || awaiting}>
+          <Button variant='default' size='sm' className='asst-new' onClick={newChat} disabled={busy || awaiting || historyBusy}>
             <PlusIcon size={14} /> {t('新对话')}
           </Button>
         </div>
-        <div className='asst-side-list'>
-          {sessions.length === 0 && <div className='asst-side-empty'>{t('还没有历史对话')}</div>}
+        <NavList className='asst-side-list'>
+          {sessions.length === 0 && <Empty className='asst-side-empty'>{t('还没有历史对话')}</Empty>}
           {sessions.map(item => (
-            <div key={item.id}
-              className={cn('asst-side-item', item.id === activeId && 'active')}
-              role='button'
-              tabIndex={0}
-              onClick={() => void openSession(item.id)}
-              onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') void openSession(item.id) }}>
-              <span className='title'>{item.title || t('未命名对话')}</span>
-              <button type='button' className='del' title={t('删除这条对话')}
-                aria-label={t('删除这条对话')}
-                onClick={event => { event.stopPropagation(); void removeSession(item.id) }}>✕</button>
+            <div key={item.id} className='asst-side-item relative pr-7'>
+              <NavItem active={item.id === activeId} className='h-auto px-2 py-1.5' onClick={() => void openSession(item.id)}>
+                <span className='title'>{item.title || t('未命名对话')}</span>
+              </NavItem>
+              <Button size='icon-2xs' variant='ghost' type='button' className='del absolute right-1 top-1.5' title={t('删除这条对话')}
+                aria-label={t('删除这条对话')} disabled={busy || awaiting || historyBusy} onClick={() => void removeSession(item.id)}>✕</Button>
             </div>
           ))}
-        </div>
+        </NavList>
         {sessions.length > 0 && (
           <div className='asst-side-foot'>
-            <button type='button' className='link' onClick={() => void clearHistory()}>{t('清空全部')}</button>
+            <Button size='default' variant='ghost' type='button' className='link' disabled={busy || awaiting || historyBusy} onClick={() => void clearHistory()}>{t('清空全部')}</Button>
           </div>
         )}
-      </aside>
-
-      {sidebarOpen && <div className='asst-side-mask' onClick={() => setSidebarOpen(false)} />}
+      </ResponsiveSheet>
 
       <div className='asst-main'>
         {/* 顶栏：会话标题 + 助手设置 */}
-        <div className='asst-top'>
-          <button type='button' className='asst-menu' title={t('历史对话')} aria-label={t('历史对话')}
-            onClick={() => setSidebarOpen(open => !open)}>☰</button>
+        <PageHeader className='asst-top'>
+          <Button size='default' variant='ghost' type='button' className='asst-menu' title={t('历史对话')} aria-label={t('历史对话')}
+            onClick={() => setSidebarOpen(open => !open)}>☰</Button>
           <span className='asst-title' title={activeTitle}>{activeTitle}</span>
           <span className='spacer' />
           <span className='asst-top-hint'>{t('走本地网关 · 消耗所选账号额度')}</span>
@@ -757,11 +709,11 @@ function AssistantPage() {
             </svg>
             {t('助手设置')}
           </Button>
-        </div>
+        </PageHeader>
 
         <div className='asst-scroll' ref={scrollRef}>
           {empty ? (
-            <div className='asst-empty'>
+            <Empty className='asst-empty'>
               <div className='asst-empty-logo'>
                 <svg viewBox='0 0 24 24' width='26' height='26' aria-hidden='true'>
                   <path fill='currentColor' d='M12 2.7l1.85 5.45 5.45 1.85-5.45 1.85L12 17.3l-1.85-5.45L4.7 10l5.45-1.85L12 2.7z' />
@@ -780,18 +732,18 @@ function AssistantPage() {
                   t('CodeArts 的账号余额还剩多少？'),
                   t('把重复的模型加上家名前缀区分开'),
                 ].map(text => (
-                  <button key={text} type='button' onClick={() => void send(text, [])}>“{text}”</button>
+                  <Button size='default' variant='ghost' key={text} type='button' onClick={() => void send(text, [])}>“{text}”</Button>
                 ))}
               </div>
               {config !== null && enabledCount === 0 && (
-                <div className='asst-empty-warn'>
+                <Alert variant='warning' className='asst-empty-warn'>
                   {t('当前一个工具都没勾选，助手只能纯聊天。点右上角「助手设置」勾上需要的工具。')}
-                </div>
+                </Alert>
               )}
               {loadingFailed && (
-                <div className='asst-empty-warn bad'>{status || t('助手设置读取失败，工具可能已过时。')}</div>
+                <Alert variant='destructive' className='asst-empty-warn'>{status || t('助手设置读取失败，工具可能已过时。')}</Alert>
               )}
-            </div>
+            </Empty>
           ) : (
             <div className='asst-flow'>
               <MessageList messages={ui} onConfirm={run => void resolveConfirm(run)} />
@@ -803,9 +755,10 @@ function AssistantPage() {
           draft={draft}
           onDraftChange={setDraft}
           images={images}
-          onAddFiles={addFilesDedup}
+          onAddFiles={addFiles}
           onRemoveImage={index => setImages(prev => prev.filter((_, i) => i !== index))}
           modelSupportsImages={modelSupportsImages}
+          imageToolsEnabled={toolEnabled.edit_images === true}
           modelAvailable={modelsReady && Boolean(currentOption)}
           modelsReady={modelsReady}
           modelsLoading={modelsLoading}
@@ -818,8 +771,8 @@ function AssistantPage() {
           onPickReasoning={pickReasoning}
           mode={mode}
           onModeChange={pickMode}
-          busy={busy}
-          awaiting={awaiting}
+          busy={busy || readingImages}
+          awaiting={awaiting || historyBusy}
           onSend={() => void send(draft, images)}
           onStop={stop}
         />

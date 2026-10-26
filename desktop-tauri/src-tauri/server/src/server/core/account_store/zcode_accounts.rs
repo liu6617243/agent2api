@@ -176,7 +176,13 @@ impl AccountStore {
         // 已经是这条通道（且记录里写着）时不写盘：保存设置时前端只在「真的改了」
         // 才带这个键，走到这里说明记录里本来就是目标值 —— 重写一次会让
         // `updatedAt` 无谓地跳动
-        if zcode::plan_of(&record.to_value()) == plan && !record.zcode_plan().trim().is_empty() {
+        let current = zcode::normalize_plan(&record.zcode_plan()).unwrap_or(zcode::PLAN_CODING);
+        let mirrored = ["pluginSecret", "pluginPublic"].iter().all(|field| {
+            record.get(field).and_then(Value::as_object)
+                .map(|fields| fields.get(zcode::PLAN_FIELD).and_then(Value::as_str) == Some(plan))
+                .unwrap_or(true)
+        });
+        if current == plan && record.get(zcode::PLAN_FIELD).and_then(Value::as_str) == Some(plan) && mirrored {
             return Ok(Vec::new());
         }
         record.set_zcode_plan(plan);

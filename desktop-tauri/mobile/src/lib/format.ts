@@ -92,14 +92,15 @@ export function isToday(ts: number | null | undefined): boolean {
   return beijingDayKey(ts) === beijingDayKey()
 }
 
-/** 取账号的展示名：备注名 → 昵称 → 邮箱 → id */
+/** 展示名优先采用网关快照，旧网关缺字段时回落原来的名字链。 */
 export function accountName(account: {
+  displayName?: string
   name?: string
   nickname?: string
   email?: string
   id?: string
 }): string {
-  return account.name || account.nickname || account.email || account.id || '未命名'
+  return account.displayName || account.name || account.nickname || account.email || account.id || '未命名'
 }
 
 /** 脱敏：保留首尾各 3 个字符，中间用 • 代替 */

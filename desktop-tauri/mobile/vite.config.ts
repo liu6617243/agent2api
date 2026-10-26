@@ -108,6 +108,9 @@ function apkBundle(): Plugin {
       if (fs.existsSync(i18nSrc)) {
         fs.cpSync(i18nSrc, i18nOut, { recursive: true })
       }
+      for (const name of ['i18n.js', 'aliyun-captcha.js']) {
+        fs.copyFileSync(path.join(source, name), path.join(root, name))
+      }
       // 提供商图标
       const providersSrc = path.join(source, 'assets', 'providers')
       const providersOut = path.join(root, 'assets', 'providers')

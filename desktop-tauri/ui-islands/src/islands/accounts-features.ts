@@ -47,7 +47,14 @@ export type ProviderFeatures = {
    *  displayNameOf（**未设备注**账号的主名口径，设过备注的以备注名为主）与
    *  models-fetch-modal 的 accountLabel（拉取模型的账号下拉） */
   emailAsName?: boolean
-  /** 有没有「领体验套餐」这个动作（只有 ZCode 两家） */
+  /**
+   * 有没有「领体验套餐」这个动作（只有 ZCode 两家）。
+   *
+   * 界面**不再消费这一位**：账号页那颗「领套餐」按钮已撤，入口统一在签到中心的
+   * 「活动福利」卡（判据是后端插件申报的 `plans` 位，见 `api::checkin_center`）。
+   * 留着它是协议字段的镜像（`AccountFeatures.claim`），排障时仍能看出这一家
+   * 是否申报了领取能力。
+   */
   claim?: boolean
   /**
    * 有没有「使用哪个套餐（上游通道）」这个设置（只有 ZCode 两家）。
@@ -180,9 +187,10 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   //   （每 N 小时 / 每周的剩余比例，见 providers::zcode::monitor）。
   //   两把凭证都没有时后端回可识别的「未配置」，余额列显示成中性提示而不是一片红，
   //   所以这颗按钮照样渲染。
-  // `claim: true` 就是那颗「领套餐」：2026-09-28 起那期（ZCode Trust Build）是
-  //   **每天一份新套餐**（plan_id 带日期段），领过之后按钮当天显示「今日已领」、
-  //   次日自动恢复 —— 见 `claimedToday`。
+  // `claim: true` 是协议里的领取能力位。账号页**已不再**用它出按钮（那颗「领套餐」
+  //   已撤，入口在签到中心「活动福利」卡）；这里照旧申报，保持与插件协议一致。
+  //   ZCode 的活动形态是每天一份新套餐（plan_id 带日期段），领过之后那一行显示
+  //   「今天已领 N 份」、次日自动恢复。
   // expiry 取 expiresAt 是给 add_zcode_account 的契约（落账号时要写访问令牌的过期时间）
   // `creditDetail: true` —— 逐额度桶一行（总量 / 已用 / 剩余，认得出归属时还带套餐名）；
   //   纯比例窗口（监控通道那条链）只有 `remainingPercent`、三个数全缺，整行跳过
@@ -219,11 +227,16 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // `usage: true` 对应 providers::loomy::balance —— 余额是**双账户**（永久积分 +
   //   每日赠送积分，读 `GET /api/v2/points/records` 的摘要字段），界面上两张卡都列。
   // `edition: false` —— 单一入口（手机验证码登录），没有国际版/地区概念。
-  // `expiry: ['expiresAt']` —— 落账号时按登录时刻 + 14 天估算（上游没有续期接口，
-  //   过期只能重新登录；这一列对它是「什么时候该重登」的提示）。
+  // `expiry: ['']`（**不登记 longLived**）—— 上游登录响应只有
+  //   `{session, userid, phone}`，**没有到期时刻**。以前按「登录时刻 + 14 天」
+  //   估算一个值填进 `expiresAt` 当有效期显示，结果账号用满两周就红着写
+  //   「已过期」，而上游照常放行（实测估算到期后仍能签到、能转发）。
+  //   现在不估算、也不展示：失效只认上游的 `020002` / `100002`，那时网关给账号
+  //   落 `needsRelogin`，界面显示「需要重新登录」。也不登记 `longLived` ——
+  //   session 确实会失效，只是失效时刻不可知。
   // `creditDetail: true` —— 双账户各一行（永久积分 / 每日赠送积分），后者标 `daily`
   //   → 界面写「每日重置」而不是到期（读到 0 也不折进「已用完」，明天回满）。
-  loomy: { usage: true, creditDetail: true, edition: false, identifier: ['userId'], expiry: ['expiresAt'] },
+  loomy: { usage: true, creditDetail: true, edition: false, identifier: ['userId'], expiry: [''] },
   // KukuAI（百度文库库库 AI）。各位各有出处：
   // `usage: true` —— 余额/积分查询（GET /bizapi/gfpro/getgfvipremain 的
   //   totalPoint，见后端 providers::kuku::balance）。

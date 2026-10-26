@@ -69,6 +69,7 @@ pub mod api_keys;
 pub mod auth;
 pub mod auth_http;
 pub mod assistant_sessions;
+pub mod assistant_images;
 pub mod auto_checkin;
 pub mod beijing;
 pub mod billing;
@@ -111,6 +112,7 @@ pub mod proxy_rotate;
 pub mod proxy_settings;
 pub mod proxies;
 pub mod routing;
+pub mod routing_scope;
 pub mod sanitize;
 pub mod scheduled_tasks;
 // 侧边栏布局（分组 / 顺序 / 显隐）的持久化：整份 JSON 存 kv 一个键。

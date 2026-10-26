@@ -84,6 +84,9 @@
   background: var(--rail-bg);
 }
 .agent-rail-scroll {
+  --ui-selection-bg: var(--surface);
+  --ui-selection-border: var(--border);
+  --ui-selection-shadow: var(--shadow-1);
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
@@ -122,17 +125,11 @@
   text-align: left;
   justify-content: flex-start;
 }
-.agent-client:hover:not(:disabled) { background: var(--nav-hover); border-color: transparent; }
-.agent-client.is-active,
-.agent-client.is-active:hover:not(:disabled) {
-  background: var(--surface);
-  border-color: var(--border);
-  box-shadow: var(--shadow-1);
-}
+.agent-client:hover:not(:disabled):not([data-active]) { background: var(--nav-hover); border-color: transparent; }
 /* 深色下 --surface 比 --rail-bg 暗：选中行换亮一档的 --surface-2 */
-:root[data-theme="dark"] .agent-client.is-active,
-:root[data-theme="dark"] .agent-client.is-active:hover:not(:disabled) {
-  background: var(--surface-2);
+:root[data-theme="dark"] .agent-rail-scroll { --ui-selection-bg: var(--surface-2); }
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] .agent-rail-scroll { --ui-selection-bg: var(--surface-2); }
 }
 .agent-client.is-missing { opacity: .52; }
 .agent-client-main { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
@@ -178,9 +175,6 @@
 /* 状态点：实心绿 = 走网关；空心 = 没走；虚线 = 未安装 */
 .agent-dot {
   flex: none;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
   background: transparent;
   border: 1px solid var(--border-strong);
 }
@@ -253,6 +247,7 @@
 }
 
 .agent-dhead { display: flex; align-items: flex-start; gap: 12px; }
+.agent-dhead-actions { display: flex; align-items: center; gap: 8px; flex: none; }
 .agent-dtitle { min-width: 0; flex: 1; }
 .agent-dtitle h3 {
   display: flex;
@@ -503,6 +498,25 @@
   background: var(--surface-inset);
   color: var(--text-2);
   font-size: 11.5px;
+}
+
+.agent-machine-note { margin: 10px 0 5px; font-size: 11.5px; color: var(--text-3); }
+.agent-resolved-path { display: block; padding: 8px 10px; border-radius: var(--r-sm); background: var(--surface-inset); overflow-wrap: anywhere; font-size: 11.5px; }
+.agent-evidence { margin: 8px 0 0; padding-left: 18px; color: var(--text-3); font-size: 11px; overflow-wrap: anywhere; }
+.agent-profile.agent-profile-v2 { grid-template-columns: minmax(0, 1fr); }
+.agent-profile-v2 .agent-profile-act { justify-content: flex-end; }
+.agent-profile-models { display: flex; gap: 5px 10px; flex-wrap: wrap; overflow-wrap: anywhere; }
+.agent-config-dialog { width: min(820px, calc(100vw - 48px)); }
+.agent-preview-file { min-width: 0; }
+.agent-line-sign { width: 16px; flex: none; user-select: none; }
+.agent-line.is-removed { background: var(--danger-soft); }
+.agent-line.is-removed .agent-line-text { color: var(--danger); }
+@media (max-width: 767px) {
+  .agent-dhead { flex-wrap: wrap; }
+  .agent-dhead-actions { margin-left: auto; }
+  .agent-toolbar { flex-wrap: wrap; }
+  .agent-config-dialog { width: calc(100vw - 24px); max-height: calc(100dvh - 24px); }
+  .agent-detail { padding: 12px; }
 }
 
 /* ─── 窄窗口：左栏收窄、表单标签折到上一行 ─── */

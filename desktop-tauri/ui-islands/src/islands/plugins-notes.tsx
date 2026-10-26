@@ -2,6 +2,7 @@ import * as React from 'react'
 import { Badge, Button, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@ui'
 import { handleExternalClick, markdownHtml, openExternal } from './update-shared'
 import { t } from '../i18n'
+import { HtmlContent } from '@ui'
 
 export type PluginNotes = {
   name: string
@@ -23,7 +24,7 @@ export function PluginNotesDialog({ value, onClose }: { value: PluginNotes | nul
           {value?.prerelease ? <Badge variant='warning'>{t('beta 版')}</Badge> : null}
         </div>
         <div className='max-h-[46vh] overflow-y-auto overscroll-contain pr-1.5' onClick={handleExternalClick}>
-          {html ? <div className='md-body' dangerouslySetInnerHTML={{ __html: html }} />
+          {html ? <HtmlContent className='md-body' html={html} />
             : notes ? <div className='whitespace-pre-wrap text-[12.5px] leading-relaxed text-subtle'>{notes}</div>
               : <p className='text-[12px] text-muted-foreground'>{t('这个版本没有填写发布说明。')}</p>}
         </div>

@@ -206,8 +206,8 @@
     return result;
   }
 
-  // 「这个账号有没有领取能力」的判据**不在这里** —— 它走账号页的能力表
-  // （accounts-domain.ts 的 `claim` 位 + 后端给的 `canClaim`，见 `supportsClaim`）。
+  // 「这个账号有没有领取能力」的判据**不在这里** —— 入口由签到中心的「活动福利」卡
+  // 给出（判据是后端插件申报的 `plans` 位，见 api::checkin_center）。
   // 本模块只负责「探测一次」与「领一份」。
   window.wbZcodeClaim = { preview, claim };
 })();

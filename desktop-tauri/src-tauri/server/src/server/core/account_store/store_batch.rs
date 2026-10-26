@@ -137,7 +137,19 @@ impl AccountStore {
             .get("limiterMode")
             .map(BatchLimiterMode::parse)
             .transpose()?;
-        let incoming_rules = if limiter_mode.is_some_and(BatchLimiterMode::needs_rules) {
+        let incoming_groups = patch_object.get("limiterGroups")
+            .map(limiter::normalize_groups).transpose().map_err(AccountStoreError::bad_request)?;
+        if let Some(groups) = &incoming_groups {
+            if groups.iter().any(|group| group.conditions.iter().any(|condition| {
+                !matches!(condition.source_id.as_str(), "" | "account" | "local")
+            })) {
+                return Err(AccountStoreError::bad_request("套餐实例不能跨账号复制，请使用通用条件"));
+            }
+            if groups.is_empty() && limiter_mode.is_some_and(BatchLimiterMode::needs_rules) {
+                return Err(AccountStoreError::bad_request("请至少添加一个条件组"));
+            }
+        }
+        let incoming_rules = if incoming_groups.is_none() && limiter_mode.is_some_and(BatchLimiterMode::needs_rules) {
             let value = patch_object
                 .get("limiters")
                 .filter(|value| value.is_array())
@@ -157,9 +169,11 @@ impl AccountStore {
             ));
         }
 
+        let group_needs_usage = incoming_groups.as_ref().is_some_and(|groups| groups.iter().any(|group|
+            group.conditions.iter().any(|condition| !matches!(condition.metric, limiter::types::Metric::Tokens | limiter::types::Metric::Requests))));
         let needs_usage = allowed.contains_key("usageQuery")
             || (limiter_mode.is_some_and(BatchLimiterMode::needs_rules)
-                && incoming_rules.iter().any(|rule| rule.kind == limiter::LimiterKind::Balance));
+                && (group_needs_usage || incoming_rules.iter().any(|rule| rule.kind == limiter::LimiterKind::Balance)));
         let _guard = self.guard();
         // 批量操作按语义要遍历**选中的那些账号**（逐条 apply_patch、逐条记
         // ok/failed），所以这里是「按需取那几条」而不是读全量：ids 里的每一项
@@ -183,7 +197,18 @@ impl AccountStore {
             };
             let name = record.name();
             let provider = record.provider();
-            let has_usage = !needs_usage || usage_query::supports_usage_provider(&provider);
+            // 访客账号与「这家没有余额查询」同一档（见 `usage_query::supports_usage`）：
+            // 它不参与余额查询，写一份查询设置进去只会得到一份永不生效的配置 ——
+            // 界面上还会因此多出「查询设置」段与自动查询的排期。
+            //
+            // 判据读**公开形态**：插件账号的 `isGuest` 在 `pluginPublic` 里，
+            // 直接 `record.get("isGuest")` 读不到（见 `plugin_accounts` 的说明）。
+            let guest = self
+                .public_account(&record)
+                .get("isGuest")
+                .and_then(Value::as_bool)
+                == Some(true);
+            let has_usage = !needs_usage || (!guest && usage_query::supports_usage_provider(&provider));
             let mut account_patch = allowed.clone();
             if !has_usage {
                 account_patch.remove("usageQuery");
@@ -191,7 +216,7 @@ impl AccountStore {
             if let Some(mode) = limiter_mode {
                 if mode.needs_rules()
                     && !has_usage
-                    && incoming_rules.iter().any(|rule| rule.kind == limiter::LimiterKind::Balance)
+                    && (group_needs_usage || incoming_rules.iter().any(|rule| rule.kind == limiter::LimiterKind::Balance))
                 {
                     skipped.push(json!({
                         "id": id, "name": name,
@@ -199,10 +224,22 @@ impl AccountStore {
                     }));
                     continue;
                 }
-                account_patch.insert(
-                    "limiters".to_string(),
-                    mode.apply(record.fields(), &incoming_rules),
-                );
+                if incoming_groups.is_some() || record.fields().contains_key("limiterGroups") && !mode.needs_rules() {
+                    let mut groups = limiter::effective_groups_in(record.fields());
+                    match mode {
+                        BatchLimiterMode::Append => for group in incoming_groups.iter().flatten() {
+                            if !groups.contains(group) { groups.push(group.clone()); }
+                        },
+                        BatchLimiterMode::Replace => groups = incoming_groups.clone().unwrap_or_default(),
+                        BatchLimiterMode::Enable | BatchLimiterMode::Disable => for group in &mut groups {
+                            group.enabled = matches!(mode, BatchLimiterMode::Enable);
+                        },
+                        BatchLimiterMode::Clear => groups.clear(),
+                    }
+                    account_patch.insert("limiterGroups".to_string(), limiter::types::json_of(&groups));
+                } else {
+                    account_patch.insert("limiters".to_string(), mode.apply(record.fields(), &incoming_rules));
+                }
             }
             if account_patch.is_empty() {
                 skipped.push(json!({
@@ -244,6 +281,7 @@ impl AccountStore {
         }
         // 写库完成后再动注册表（放锁，见 `disabled_catpaw` 的说明）
         drop(_guard);
+        if limiter_mode.is_some() { limiter::counter::invalidate(); }
         for (id, provider) in disabled_catpaw {
             self.invalidate_catpaw_sessions(&id, &provider);
         }

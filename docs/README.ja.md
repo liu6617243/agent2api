@@ -12,7 +12,7 @@
 [![stars](https://img.shields.io/github/stars/aimod-cc/Agent2API?style=flat&color=yellow)](https://github.com/aimod-cc/Agent2API/stargazers)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/aimod-cc/Agent2API/releases/latest)
 
-[✨ 主な機能](#-主な機能) • [💬 コミュニティとサポート](#-コミュニティとサポート) • [🧩 プラグイン拡張](#-プラグイン拡張) • [🚀 クイックスタート](#-クイックスタート) • [📦 インストールとデプロイ](./install.ja.md) • [📸 画面プレビュー](#-画面プレビュー) • [🔧 開発とビルド](#-開発とビルド) • [📜 使用に関する告知](#-使用に関する告知)
+[✨ 主な機能](#-主な機能) • [💬 コミュニティとサポート](#-コミュニティとサポート) • [🚀 クイックスタート](#-クイックスタート) • [📦 インストールとデプロイ](./install.ja.md) • [📸 画面プレビュー](#-画面プレビュー) • [🔧 開発とビルド](#-開発とビルド) • [📜 使用に関する告知](#-使用に関する告知)
 
 </div>
 
@@ -24,7 +24,7 @@ Agent2API は **AI ルーティングゲートウェイと Agent クライアン
 
 ## ✨ 主な機能
 
-- 🔌 **統一モデル API** — OpenAI Chat / Responses、Anthropic Messages と統一モデル一覧
+- 🔌 **統一モデル API** — OpenAI Chat / Responses / Images、Anthropic Messages と統一モデル一覧。Raccoon、Loomy、Antigravity が画像生成を提供し、Loomy と Antigravity は参照画像の編集にも対応。生成と編集は AI アシスタントのツールからも利用可能
 - 🧭 **AI ルーティング** — モデルマッピング、アカウント優先度、負荷分散、セッション固定、フェイルオーバー
 - 🤖 **Agent クライアント設定管理** — 複数の接続設定、既存設定のインポート、書き込みプレビュー、サービス切り替え
 - 🧩 **プラグイン拡張** — プロバイダー実装は本体に同梱せず個別にインストール・更新。ゲートウェイ単独でも利用可能
@@ -49,20 +49,11 @@ Agent2API は **AI ルーティングゲートウェイと Agent クライアン
 
 ## 💬 コミュニティとサポート
 
-- **QQ グループ**: Agent2API の交流グループ —— **グループ 1（`1127656296`）はまもなく満員のため、グループ 2（`1130894674`）への参加をお願いします**（QQ で番号を検索して参加できます）。
+- **QQ グループ**: Agent2API の交流グループ —— **グループ 1（`1127656296`）とグループ 2（`1130894674`）はまもなく満員のため、グループ 3（`1108276647`）にご参加ください**（QQ で番号を検索して参加できます）。
 - **Telegram グループ**: <https://t.me/+9gM8YPvgRL02NGRl>
 - **Discord サーバー**: <https://discord.gg/z9GzSJMWp>
 - **💖 支援**: Agent2API がお役に立ったら、[作者にコーヒーをおごる](./SPONSOR.md)のも歓迎です。支援は任意で、機能の解放などはありません。
 - **🤝 スポンサー / ビジネス**: スポンサーになりたい、またはここに製品を掲載したい場合は [541675139@qq.com](mailto:541675139@qq.com) までメールでご連絡ください。
-
-## 🧩 プラグイン拡張
-
-本体はルーティング、Agent クライアント設定、プラグイン管理を担当し、プロバイダー固有の実装は内蔵しません。「プラグイン」ページから **Provider Enhancement（提供商增强）** や互換プラグインを必要に応じてインストールしてください。
-
-- [プラグインのソースと対応機能](https://github.com/ProvidersPlugin/Agent2Providers)
-- [プラグイン索引](https://github.com/Agent2plugin/Agent2plugin)
-
-インストール、有効化、更新は本体とは独立しています。対応機能は各プラグインのマニフェストとリポジトリで確認できます。
 
 ## 🚀 クイックスタート
 
@@ -146,10 +137,6 @@ npm run build:icon         # アイコンのソース画像を生成（アイコ
 macOS の `.dmg` は **macOS 上でしかビルドできません**（`npm --prefix desktop-tauri run build -- --target universal-apple-darwin`）。Windows からのクロスコンパイルは不可のため、公式成果物は CI の `build` ワークフロー（`macos-latest` で 2 ターゲットを統合）が生成します。Linux デスクトップのパッケージは同じワークフローの `linux-desktop` job が生成し（deb + AppImage）、Docker イメージとコンテナ内更新に使うサーバーパッケージは `linux-server` job が生成します。後者は Dockerfile のコンパイル経路を再利用するため、パッケージ内の実行ファイルはイメージと同一ツールチェーンの成果物になります。
 
 ## 📜 使用に関する告知
-
-### プロジェクトの範囲
-
-AI ルーティングとローカル Agent クライアント設定管理を提供します。モデルサービスやクライアントの公式製品ではなく、その承認やスポンサーシップを意味しません。利用前にサービス規約、アカウント権限、プラグインの出所を確認してください。
 
 ### 認証情報とデータの安全性
 

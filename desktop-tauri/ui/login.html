@@ -66,60 +66,8 @@
        同一手法）—— 中间多一层 div 的话，卡片的 min(400px,100%) 会按那一层的收缩宽度
        计算，窄窗口下就偏了 */
     #login-app { display: contents; }
-    /* 机器人校验组件（ui/panel-captcha.js 定义的 <panel-captcha>）：浅色 DOM、
-       样式留在页面这一层，观感与迁移前的 altcha widget 一致 —— 一行居中、
-       圆角描边方框、左侧指示圈（求解中转圈 / 通过打勾 / 失败描红）。
-       组件只在开启校验时占位：校验关闭后它被隐藏，间距随 display:none 一起消失，
-       与按钮之间的间隔改由 #submit 自己的 margin-top 撑住（两侧各 20px）。 */
-    panel-captcha { display: block; margin: 20px 0 0; }
+    panel-captcha { display: flex; justify-content: center; }
     #submit { margin-top: 20px; }
-    panel-captcha .pc-box {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      width: fit-content;
-      max-width: 100%;
-      margin: 0 auto;
-      padding: 10px 14px;
-      border: 1px solid var(--ui-border);
-      border-radius: 8px;
-      background: var(--ui-card);
-      font-size: 13px;
-      cursor: pointer;
-      user-select: none;
-    }
-    panel-captcha .pc-box:hover { border-color: var(--ui-border-strong); }
-    panel-captcha .pc-indicator {
-      width: 18px;
-      height: 18px;
-      flex: none;
-      border: 2px solid var(--ui-border-strong);
-      border-radius: 4px;
-    }
-    panel-captcha[state='verifying'] .pc-indicator {
-      border-radius: 50%;
-      border-color: color-mix(in srgb, var(--ui-border-strong) 40%, transparent);
-      border-top-color: var(--ui-primary);
-      animation: pc-spin 0.7s linear infinite;
-    }
-    panel-captcha[state='verified'] .pc-indicator {
-      border-color: var(--ui-success);
-      background: var(--ui-success);
-    }
-    panel-captcha[state='verified'] .pc-indicator::after {
-      content: '';
-      display: block;
-      width: 5px;
-      height: 9px;
-      margin: 0 auto 2px;
-      border: solid var(--ui-success-foreground);
-      border-width: 0 2px 2px 0;
-      transform: rotate(45deg);
-    }
-    panel-captcha[state='verified'] .pc-label { color: var(--ui-success); }
-    panel-captcha[state='error'] .pc-indicator { border-color: var(--ui-destructive); }
-    panel-captcha[state='error'] .pc-label { color: var(--ui-destructive); }
-    @keyframes pc-spin { to { transform: rotate(360deg); } }
   </style>
   <!-- 多语言运行时（词典已在上面 head 的引导脚本里同步注入）：排在所有 css 之后，
        且早于 body 末尾的 islands/ui.js 与 panel-captcha.js。 -->

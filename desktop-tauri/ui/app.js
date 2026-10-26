@@ -5,7 +5,7 @@ const api = window.workbuddyDesktop;
 const $ = id => document.getElementById(id);
 /**
  * 是不是「网页端」形态（headless / Docker：面板由网关自己托管）。
- * 判定口径与 titlebar.js 一致 —— 桥接层注入的 platform 为 'web' 即网页端；
+ * 判定口径与组件库标题栏一致 —— 桥接层注入的 platform 为 'web' 即网页端；
  * 桥还没就绪时按桌面形态处理（保守：桌面才是自绘窗口按钮那一套）。
  */
 const isWebPanel = () => api?.platform === 'web';
@@ -26,12 +26,7 @@ function esc(value) {
 }
 
 function toast(message, type = 'ok') {
-  const element = $('toast');
-  element.textContent = message;
-  element.className = type;
-  element.style.display = 'block';
-  clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => { element.style.display = 'none'; }, 3500);
+  window.wbShell?.toast(message, type);
 }
 
 function formatTime(value) {
@@ -74,9 +69,7 @@ function applyTheme(mode) {
     if ((settledDark ? 'dark' : 'light') !== effective) applyTheme('system');
   })?.catch?.(() => { /* 命令失败时不做复核，界面保持本次结果 */ });
   localStorage.setItem('workbuddy-desktop-theme', mode);
-  document.querySelectorAll('#theme-switch button').forEach(item => {
-    item.classList.toggle('active', item.dataset.mode === mode);
-  });
+  window.wbShell?.theme(mode);
   // 通知其它控制面（设置页「显示 → 显示模式」那组档位）：主题有两个入口
   // （侧边栏三键与设置页），谁改了都要让另一处跟上 —— 事件单向广播，
   // 两边都不去读对方的状态。detail 是本函数最初收到的 mode 原值。
@@ -132,7 +125,7 @@ function applyZoom(percent) {
 // ─── 页面导航 ────────────────────────────────
 
 const PAGE_KEY = 'workbuddy-desktop-page';
-const PAGES = ['assistant', 'overview', 'accounts', 'checkin', 'gateway', 'agent', 'proxies', 'keys', 'docs', 'logs', 'tasks', 'requests', 'plugins', 'settings'];
+const PAGES = ['assistant', 'overview', 'accounts', 'checkin', 'routing', 'gateway', 'agent', 'proxies', 'keys', 'docs', 'logs', 'tasks', 'requests', 'plugins', 'settings'];
 /** 页签中文名：顶栏面包屑用。overview 的用户可见名是「报表」、gateway 的是「模型管理」
  *  （内部标识保持不变：localStorage 记忆、showPage 与 CSS 的 [data-page] 选择器都依赖它）
  *
@@ -142,8 +135,9 @@ const PAGE_LABELS = {
   overview: wbI18n.t('报表'),
   accounts: wbI18n.t('账号'),
   checkin: wbI18n.t('签到中心'),
+  routing: wbI18n.t('路由'),
   gateway: wbI18n.t('模型管理'),
-  agent: 'Agent',
+  agent: wbI18n.t('Agent 配置'),
   proxies: wbI18n.t('网络代理'),
   keys: wbI18n.t('网关 Key'),
   docs: wbI18n.t('文档'),
@@ -291,53 +285,16 @@ function readSidebarLayout() {
  * 图标不在这里注入：画完调 paintIcons()，它按 data-icon 从 icons.js 取图形。
  */
 function renderSidebar() {
-  const nav = $('nav');
   const api = sidebarApi();
-  if (!nav || !api) return;
-
-  const layout = api.readLayout();
-  const groups = api.renderGroups(layout);
-
-  // 一个菜单都不剩：留一句提示，否则侧边栏只剩品牌与底部，像加载失败
-  if (!groups.length) {
-    nav.innerHTML = `<div class="nav-empty" data-i18n="侧边栏没有显示任何菜单。到「设置 → 显示 → 侧边栏菜单」里打开需要的项。">${esc(wbI18n.t('侧边栏没有显示任何菜单。到「设置 → 显示 → 侧边栏菜单」里打开需要的项。'))}</div>`;
-    return;
-  }
-
-  const parts = [];
-  for (const group of groups) {
-    parts.push(`<div class="nav-group-label">${esc(api.groupLabel(group.label))}</div>`);
-    for (const menu of group.items) {
-      parts.push(navItemHtml(menu));
-    }
-  }
-  nav.innerHTML = parts.join('');
-  paintIcons();
-  // 选中态与角标跟着重画：showPage 只负责「当前页」，重画后它认得的节点已经换了
+  if (!api) return;
+  window.wbShell?.sidebar(api.renderGroups(api.readLayout()));
   markActiveNav();
   syncNavBadges();
 }
 
-/** 一颗导航项。角标只给三个菜单，id 必须与 app.js 里的取用点逐字一致 */
-function navItemHtml(menu) {
-  const label = esc(wbI18n.t(menu.label));
-  const badge = menu.key === 'requests'
-    ? '<span class="count" id="nav-count-requests" style="display:none">0</span>'
-    : menu.key === 'logs'
-      ? '<span class="count" id="nav-count-logs" style="display:none">0</span>'
-      : menu.key === 'settings'
-        ? `<span class="count" id="nav-count-update" style="display:none">${esc(wbI18n.t('新'))}</span>`
-        : '';
-  return `<button class="nav-item" data-page="${menu.key}" data-icon="${menu.icon}">`
-    + '<span class="ico"></span>'
-    + `<span class="label">${label}</span>${badge}</button>`;
-}
-
-/** 把选中态标到当前页那一项上（showPage 与 renderSidebar 共用） */
 function markActiveNav() {
-  document.querySelectorAll('.nav-item').forEach(item => {
-    item.classList.toggle('active', item.dataset.page === currentPage);
-  });
+  const label = pluginPages.get(currentPage)?.label || PAGE_LABELS[currentPage] || currentPage;
+  window.wbShell?.page(currentPage, label);
 }
 
 /**
@@ -412,7 +369,7 @@ function showPluginPage(key, { persist = true } = {}) {
   markActiveNav();
   const crumb = $('crumb-page');
   if (crumb) crumb.textContent = page.label;
-  { const t = document.getElementById('nav-toggle'); if (t) t.checked = false; }
+  window.wbShell?.closeNavigation();
   if (persist) localStorage.setItem(PAGE_KEY, key);
   window.wbColSettings?.close?.();
   // 整块换掉：上一页的 iframe 连同它的定时器一起消失
@@ -551,9 +508,8 @@ function showPage(name, { persist = true } = {}) {
   markActiveNav();
   const crumb = $('crumb-page');
   if (crumb) crumb.textContent = PAGE_LABELS[page] || page;
-  // 移动端：切页后收起侧边栏抽屉。#nav-toggle 是纯 CSS 开关（见 css/mobile.css），
-  // 点导航项只切页不 uncheck，抽屉会一直开着；桌面端该元素恒为 unchecked，这行无副作用。
-  { const t = document.getElementById('nav-toggle'); if (t) t.checked = false; }
+  // 切页后由组件库外壳收起移动侧边栏。
+  window.wbShell?.closeNavigation();
   if (persist) localStorage.setItem(PAGE_KEY, page);
   // 列的设置面板常驻 body（.panel 是 overflow:hidden，留在原处会被裁掉，
   // 见 table-col-settings.js），不随宿主页面的 display:none 一起消失 ——
@@ -601,6 +557,9 @@ function showPage(name, { persist = true } = {}) {
   // 账号页被加过 / 改过 / 删过（提供商记录与它的模型清单），而这一页的数据是
   // 自持的、不随主状态轮询更新。两件事（自定义目录 + 内置清单）都在面板里，
   // 这里只转发 —— 它自己保证「切页这次刷新一定落地」。
+  if (page === 'routing') {
+    void window.wbRoutingPanel?.load?.();
+  }
   if (page === 'gateway') {
     void window.wbModelsPanel?.refreshAll?.();
   }
@@ -646,76 +605,35 @@ function showPage(name, { persist = true } = {}) {
 
 /** 顶栏右侧状态区：随当前页给出该页最关心的两三个状态 */
 function renderTopbarStatus() {
-  const box = $('topbar-status');
-  if (!box) return;
   const session = state?.session || {};
   const accounts = state?.accounts?.accounts || [];
-  const enabled = accounts.filter(a => a.enabled !== false).length;
-  // 「可用」= 启用且凭证完整。`available` 就是后端选路用的那个键
-  // （account_store 的 public_account 写的），所以徽章与「转发时会不会用这个账号」
-  // 同一判据；缺该键的老数据按可用处理（宁可不误报「不可用」）。
-  const available = accounts.filter(a => a.enabled !== false && a.available !== false).length;
-  // accounts-model.js 在 app.js 之后加载，首屏这次调用可能早于它就绪，故用可选链。
-  // 计数用 isLimited（含「余额不足已跳过」档，与账号页「已限流」分段同一口径）；
-  // 契约上没有该成员时退回 isRateLimited（只数模型限流），宁少报不报错
+  const enabled = accounts.filter(account => account.enabled !== false).length;
+  const available = accounts.filter(account => account.enabled !== false && account.available !== false).length;
   const modelApi = window.wbAccountsModel;
   const isLimited = modelApi?.isLimited || modelApi?.isRateLimited;
-  const limited = isLimited ? accounts.filter(a => a.enabled !== false && isLimited(a)).length : 0;
-  // 「网关运行中」用的是**网关进程**的判据（壳侧 is_ready 探测，见 port-panel.js），
-  // 不是 upstreamConfigured（那个说的是有没有账号）。两者会独立变化：没账号不影响
-  // 网关监听，端口被占也不影响账号存在 —— 混用会让用户对着「未就绪」去查账号。
-  const gatewayUp = window.wbPortPanel?.isReady?.() === true;
-  const chip = (text, kind = '', optional = false) =>
-    `<span class="badge ${kind}${optional ? ' optional' : ''}"><span class="dot"></span>${esc(text)}</span>`;
-  const port = window.wbPortPanel?.portLabel?.() || '';
-  /** 直接复用某面板已渲染的徽标文案（词表 / 日志面板自持状态，这里不重复计算） */
+  const limited = isLimited ? accounts.filter(account => account.enabled !== false && isLimited(account)).length : 0;
+  const ready = window.wbPortPanel?.isReady?.() === true;
+  const port = window.wbPortPanel?.portLabel?.() || "";
+  const chip = (text, kind = "", optional = false) => ({ text, kind, optional, dot: true });
   const mirror = id => {
     const badge = $(id);
-    if (!badge || !badge.textContent || badge.textContent === '—') return '';
-    // 语义色优先读 data-tone：徽标可能已是组件库的 Badge，它的 className 是一串
-    // Tailwind 工具类（inline-flex / bg-*-soft …），按「className 去掉 badge」拆修饰
-    // 会拆出一串垃圾类名塞进顶栏。迁到组件库的面板都挂 data-tone（ok / warn / bad，
-    // 无修饰为空串）；还没迁的老徽标没有该属性，回落到原来的 className 拆法。
-    const kind = badge.dataset.tone ?? badge.className.replace('badge', '').trim();
-    return `<span class="badge ${kind}">${esc(badge.textContent)}</span>`;
+    return badge?.textContent && badge.textContent !== "—"
+      ? [{ text: badge.textContent, kind: badge.dataset.tone || "" }]
+      : [];
   };
-
+  const gateway = optional => chip(ready ? wbI18n.t("网关运行中") : wbI18n.t("未就绪"), ready ? "ok" : "bad", optional);
   const views = {
-    accounts: () => chip(wbI18n.t('{n} 个启用', { n: enabled }), enabled ? 'ok' : '')
-      + (limited ? chip(wbI18n.t('{n} 个已限流', { n: limited }), 'warn') : ''),
-    // 「监听 127.0.0.1」只在桌面模式成立：web 模式（Docker / 反代）下网关监听的是
-    // 容器内的 0.0.0.0，面板访问它走的是映射 / 代理后的地址 —— 那里照实说「网关运行中」
-    // 就好，后面的 port 徽标给的才是真正的地址。（文案复用已有的同一句话，不新增键）
-    gateway: () => (gatewayUp
-      ? chip(isWebPanel() ? wbI18n.t('网关运行中') : wbI18n.t('监听 127.0.0.1'), 'ok')
-      : chip(wbI18n.t('未就绪'), 'bad')) + chip(port, '', true),
-    keys: () => mirror('keys-status'),
-    // 文档页没有自己的徽标（它只有一组复制的地址），跟着网关的运行状态走 ——
-    // 地址在页面上的意义就是「现在能不能连」，网关没起来时那个状态最要紧
-    docs: () => (gatewayUp ? chip(wbI18n.t('网关运行中'), 'ok') : chip(wbI18n.t('未就绪'), 'bad')) + chip(port, '', true),
-    logs: () => mirror('logs-badge'),
-    requests: () => mirror('req-badge'),
-    // 定时任务页的徽标由 tasks-panel 自己渲染（「N / M 个已开启」），直接镜像
-    tasks: () => mirror('tasks-badge'),
-    // 签到中心在插件页的 iframe 里，它的徽标（自动签到开启状态）画在页面内部
-    // 的标签条上 —— 宿主这边没有可镜像的元素。跨源 iframe 也读不到它的 DOM，
-    // 所以顶栏不给这一页徽标（其它页照常）。
-    settings: () => (gatewayUp ? chip(wbI18n.t('网关运行中'), 'ok', true) : chip(wbI18n.t('未就绪'), 'bad', true))
-      + (enabled ? chip(wbI18n.t('{n} 个账号启用', { n: enabled })) : ''),
-    // 「已登录 / 未登录」说的是**旧式单账号登录态**（WorkBuddy 的 auth.json），
-    // 它与「能不能转发」在库模式下是两件事：没有 WorkBuddy 账号的多账号部署会
-    // 恒显黄色「未登录」，而路由、转发、签到一切正常（issue #178）。有可用账号时
-    // 报账号数；一个可用账号都没有才回落登录态 —— 那时「未登录」是准确的说法。
-    overview: () => (gatewayUp ? chip(wbI18n.t('网关运行中'), 'ok') : chip(wbI18n.t('未就绪'), 'bad'))
-      + (available
-        ? chip(wbI18n.t('{n} 个账号可用', { n: available }), 'ok')
-        : (session.loggedIn ? chip(wbI18n.t('已登录'), 'ok') : chip(wbI18n.t('未登录'), 'warn'))),
+    accounts: () => [chip(wbI18n.t("{n} 个启用", { n: enabled }), enabled ? "ok" : ""), ...(limited ? [chip(wbI18n.t("{n} 个已限流", { n: limited }), "warn")] : [])],
+    gateway: () => [chip(ready ? isWebPanel() ? wbI18n.t("网关运行中") : wbI18n.t("监听 127.0.0.1") : wbI18n.t("未就绪"), ready ? "ok" : "bad"), chip(port, "", true)],
+    keys: () => mirror("keys-status"),
+    docs: () => [gateway(), chip(port, "", true)],
+    logs: () => mirror("logs-badge"),
+    requests: () => mirror("req-badge"),
+    tasks: () => mirror("tasks-badge"),
+    settings: () => [gateway(true), ...(enabled ? [chip(wbI18n.t("{n} 个账号启用", { n: enabled }))] : [])],
+    overview: () => [gateway(), available ? chip(wbI18n.t("{n} 个账号可用", { n: available }), "ok") : chip(session.loggedIn ? wbI18n.t("已登录") : wbI18n.t("未登录"), session.loggedIn ? "ok" : "warn")],
   };
-
-  box.innerHTML = views[currentPage]?.() ?? views.overview();
-  // 加载失败的原因挂在这里（会话状态卡片删除后它没有别的落点）：此时下面各页面
-  // 显示的都是上一次的值，顶栏是唯一常驻可见的位置。成功一次即清空。
-  box.title = stateError ? wbI18n.t('加载失败：{error}', { error: stateError }) : '';
+  window.wbShell?.status(views[currentPage]?.() || views.overview(), stateError ? wbI18n.t("加载失败：{error}", { error: stateError }) : "");
 }
 
 // ─── 日志未读徽标（只提示 error） ─────────────
@@ -1232,9 +1150,6 @@ async function runAccountAction(action, id) {
 
 // ─── 事件绑定 ─────────────────────────────────
 
-document.querySelectorAll('#theme-switch button').forEach(button => {
-  button.addEventListener('click', () => applyTheme(button.dataset.mode));
-});
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   if ((localStorage.getItem('workbuddy-desktop-theme') || 'system') === 'system') applyTheme('system');
 });
@@ -1306,6 +1221,7 @@ window.wbApp = {
   // 侧边栏的插件页菜单按这份清单生成，不重拉就会「装完了菜单里还是没有」
   refreshPluginPages,
   renderTopbarStatus,
+  syncNavBadges,
   updateLogsBadge,
   syncLogsBadge,
   // 软件更新面板在每次检查结束后回调它，把「有新版本」翻译成导航上的提示
@@ -1324,36 +1240,8 @@ window.wbApp = {
 
 // ─── 初始化 ───────────────────────────────────
 
-// 导航：点击切换页面，记住上次所在页
-// （首帧渲染在文件上方、第一个桥调用之前 —— 见那里的说明）
-$('nav').addEventListener('click', event => {
-  const item = event.target.closest('.nav-item[data-page]');
-  if (item) showPage(item.dataset.page);
-});
+// 导航点击由组件库外壳处理，切页与页面记忆仍通过 wbApp.showPage。
 
-/**
- * 图标注入：index.html 里的 .ico 与 .brand-logo 只留空占位，图形从这里填。
- * 放在 JS 而不是写死在 HTML 里，是为了让图标的定义集中在一处
- * （icons.js），后续换图标只改一个文件，不必在 HTML 里翻找。
- *
- * 品牌标与应用图标（icons/icon.png）同一造型，所以它也跟着这里注入 ——
- * 哪天图标换了，改 icons.js 的 brand 项即可，不会出现「窗口图标换了、
- * 侧栏还停在旧图形」这种不一致。
- */
-function paintIcons() {
-  const icon = window.wbIcons?.icon;
-  if (!icon) return;
-  document.querySelectorAll('.nav-item[data-icon] .ico').forEach(slot => {
-    const name = slot.closest('.nav-item').dataset.icon;
-    // 插件页申报的图标名可能不在内置表里（第三方包，图标键由它自己定）：
-    // 落到 `plugins` 那颗通用图标上，别留一个空槽（空槽看起来像加载失败）
-    slot.innerHTML = icon(name, 17) || icon('plugins', 17);
-  });
-  document.querySelectorAll('.brand-logo').forEach(slot => {
-    slot.innerHTML = icon('brand', 32);
-  });
-}
-paintIcons();
 
 // ─── 端口状态与冲突处置 ───────────────────────
 //
@@ -1362,13 +1250,9 @@ paintIcons();
 // 一整套弹窗交互，留在本文件会让这里继续膨胀。本文件只负责在 render()
 // 里委托它重画，并在首屏主动问一次后端状态。
 
-// ─── 初始页恢复：必须等 islands bundle 注册完 ───────────────
-// app.js 在 index.html 里排在 islands/ui.js **之前**，而各页面的数据加载由
-// showPage 里「切到某页时拉一次」完成。若在这里同步恢复上次页面，此刻 ui.js
-// 还没执行、wbSettingsPanel 等岛方法都不存在，`?.` 会把这次加载静默吞掉 ——
-// 恢复页是「设置」时，启动设置就永远停在「检测中…」（局域网开关随之显示
-// 默认值，看着像没保存）。DOMContentLoaded 在全部同步脚本执行完才触发，
-// 借它把初始切换对齐到「岛已就绪」之后，与用户手动切页完全同行为。
+// ─── 初始页恢复：等待后续业务引擎也就绪 ─────────────────────
+// 外壳与页面岛已经同步注册；提供商、列设置及升级引擎仍在 app.js 之后加载。
+// 初始切页放在 DOMContentLoaded，避免业务加载时缺少这些依赖。
 //
 // 恢复前先过一道「这页还看得见吗」：用户可能在上次退出前把它（或它所在的分组）
 // 隐藏了。停在一个侧边栏里找不到入口的页面上，看起来就像页面丢了 —— 这时落到
@@ -1505,6 +1389,11 @@ function pollUpdateStatus() {
   const settle = () => { setTimeout(pollUpdateStatus, updatePollDelay); };
   if (document.hidden) { settle(); return; }
   void api.getUpdateStatus?.().then(info => {
+    if (info?.channelChanged) {
+      wbApp.updateUpdateBadge(info);
+      updatePollDelay = 5_000;
+      return;
+    }
     if (info && info.checked !== false) {
       // 有结果了（含「已是最新」）：回到常态节奏，徽标/弹窗由同一出口处理
       updatePollDelay = 60_000;

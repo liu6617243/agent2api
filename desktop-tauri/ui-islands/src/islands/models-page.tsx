@@ -1,86 +1,9 @@
-/**
- * Agent2API · 模型管理页（左栏提供商导航 + 模型表 + 三个弹窗）—— React 岛。
- *
- * 替换 ui/models-panel.js + ui/models-reasoning.js + ui/models-custom-source.js 三个文件。
- * 对外接口与原实现**完全一致**（见 models-panel-state.ts 末尾的 window.wbModelsPanel）：
- * app.js:142 refreshAll() / app.js:570 render() / table-columns.js:74 visibleColumns() /
- * models-fetch-modal.tsx:274 builtinProviders() 与 :646 providerRefreshedAt()。
- *
- * 本文件只放**视图层**（页面骨架 + 左栏 + 模型表 + 映射 / 添加模型两个弹窗 + 挂载）；
- * 数据层（快照 store / 取数 / 写入 / 对外契约）在 models-panel-state.ts —— 那个文件不是岛
- * （.ts，不被 glob 加载）；「模型能力」弹窗自带一个文件（model-capability-dialog.tsx，它只
- * 依赖数据层，不依赖本文件），操作列那颗「测试」的两层弹窗同样自带一个文件
- * （model-test-dialog.tsx：门禁判定 `testBlockReason` 与弹窗本体都在那边，本页只挂载）。
- *
- * ── 一个页面，两种数据源 ──────────────────────────────
- * 左栏（`.prov-rail`）是提供商导航：**内置提供商**一组（「全部」= 各家的聚合视图，各家是
- * 筛选视角）、**自定义提供商**一组（一家一项，一家一份清单）。选中谁，右栏就是谁家的模型表
- * —— 同一个表格骨架、同一批映射 chip 控件、同一套搜索与列设置。
- *
- * 两个数据源的差别只在取数与写入，渲染完全共用：
- *   · 内置家：`GET /api/models/manage`（`{models, mappings, reasoningLevels}`），写操作逐条
- *     即时生效（桥接的具名方法，都返回最新的同形数据，就地替换后重绘）；
- *   · 自定义家：目录缓存里该家记录的 models / mappings，由 models-custom-source.ts 适配成
- *     上面那个同形数据；写入是整表替换，于是体验与内置家一致 —— 点一下立即生效，没有保存
- *     按钮，也没有草稿态。
- * 本页自持内置家那份数据，不经过 app.js 的 state（那是 /api/session 的快照，轮询会整份覆盖）。
- *
- * ── 状态放模块级快照 + useSyncExternalStore（照 port-panel / update-panel）──
- * 对外契约方法（render / load / selectProvider / refreshAll）从 React 之外调用，且必须与
- * 界面共用同一份状态；组件内部的 useState 做不到这一点。所以状态是一份模块级快照，改动一律
- * 走 patch()（换新对象再通知订阅者），组件用 useSyncExternalStore 订阅它。
- * **选中项归一化放在 patch 里**而不是渲染期：渲染期改状态会与 React 的渲染顺序打架。
- *
- * ── 静态表头（本页最容易出错的地方）────────────────────
- * `index.html` 的 `<colgroup>` / `<thead>` 里带着 `col[data-col]` 与 `th[data-col]`，列的
- * 顺序与显隐靠 `wbColSettings.syncStaticHead` **就地重排既有元素**（隐藏的列是从 DOM 里摘掉
- * 而不是 display:none），不能按字符串重建：`<col>` 上带着 table-columns.js 拖出来的列宽，
- * `<th>` 里插着列宽把手，重建会把两者一起丢掉。
- *
- * 所以表骨架（colgroup + thead）在这里是**字面量 JSX**，永远按 index.html 的原始顺序渲染
- * 全部 8 列，且**不随任何状态变化**：
- *   · React 只在「同一位置、同一类型的子节点」上做属性 diff —— 除勾选列外，其余 7 个 th
- *     的 props 与文本逐字不变，重渲染时 React 一次 DOM 写都不会发生，syncStaticHead 摘掉的
- *     列不会被 React 塞回来（它压根不重新协调这几个节点）；
- *   · **勾选列是唯一内容会变的 th**：里面是 React 渲染的全选复选框（`allPickNode`）。
- *     它安全的前提是「React 只更新复选框这个元素、从不重建 th 节点本身」—— th 的
- *     props / 子结构除那颗复选框外逐字不变，syncStaticHead 把它连复选框一起搬去别的位置
- *     也不会被 React 挪回来；
- *   · 隐藏列的元素在 syncStaticHead 的缓存里（按表 id 记住），切回内置家时放得回去；
- *   · 表元素本身在 JSX 里的位置固定（没有条件渲染包着它），表引用不会变，缓存不会失效。
- * 数据行（tbody）相反：完全由 React 按 `visibleColumns()` 逐列渲染，与表头读同一份配置。
- *
- * ── 控件替换（组件库）与刻意保留的旧实现 ────────────────
- * 换组件库：左栏导航项（NavItem）、面板头两颗按钮、状态筛选（SegmentedControl）、搜索框
- * （InputGroup）、chip 上的映射开关（Switch size='sm'）、chip 上的等级标与删除 ×（Button 的
- * 2xs / icon-2xs 档）、「＋ 映射」（Button variant='dashed'）、模型 ID 的复制按钮、展开/收起、
- * 行内「移除」、三个弹窗整块（Dialog 一族 + Input / Select / Label / Tooltip；
- * 「模型能力」在 model-capability-dialog.tsx，能力位两列的单元格样式在 page-gateway.css）。
- * 操作列的「测试」也是组件库按钮，它的弹窗整块在 model-test-dialog.tsx（含那两条门禁）。
- * 保留旧实现的两处都不是控件本身：
- *   · 自定义家条目外层的 `.pv-row` 定位容器与那颗 `.pv-del` —— HTML 不允许 button 嵌套，
- *     删除 × 必须与 NavItem 做兄弟节点，靠 .pv-row 定位（见 rail 里的说明）；
- *   · chip 容器本身仍是 `span.alias` —— 它是药丸外壳而不是按钮，样式全在 page-gateway.css 里。
- * 另外：本页已经没有原生 `<select>`，所以不再调 `wbSelect.sync`（那个机制是给未迁移页面用的）。
- *
- * ── 视觉层（2026-10 重设计，原型在 prototype/model-redesign.html）────────
- *   · 面板头两行制：第一行「家名头像 + 统计 + 动作按钮」，第二行「状态筛选 + 搜索 + 批量条」
- *     （`.mm-titlebar` / `.mm-filters`，样式在 page-gateway.css）；
- *   · 左栏每家一枚头像（`.pv-ico`）：收录过图标的用真实图标（内置家按 id 查
- *     PROVIDER_ICONS，自定义家按名字match预置目录），没图标的回落色相 monogram
- *     （色相按 provider id 定，见 providerHue）；
- *   · 「能力」列由文字徽章改为图标圆点（`.cap-dot`，CAP_ICON），「来源」列由徽标改为
- *     色点 + 小字（`.src`）—— 两处都只换呈现，判定口径照抄 model-capability / 后端 source；
- *   · 映射 chip 去品牌色（中性表面底，品牌色只留给开关），样式在 page-gateway.css 的 .alias。
- *
- * ── 数据行不用 `hidden` 属性隐藏 ────────────────────
- * 组件库的工具类是**分层 + !important** 的，tokens.css 的 `[hidden] { display:none !important }`
- * 未分层；按 Cascade 5，important 的层序反转 —— 分层压过未分层。本文件的显隐一律用条件渲染。
- */
+
 
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
 import {
+  Badge,
   Button,
   Checkbox,
   Dialog,
@@ -94,6 +17,7 @@ import {
   InputGroupAddon,
   InputGroupInput,
   Label,
+  NavList,
   NavItem,
   SegmentedControl,
   Select,
@@ -106,7 +30,7 @@ import {
   TooltipContent,
   TooltipTrigger,
   cn,
-} from '@ui'
+  TableCell, TableRow, Card, CardHeader, ResponsiveSheet, Table, TableHeader, TableHead, TableBody } from '@ui'
 import { TableFooter, useClientPaging } from './table-shell'
 import {
   BOOLEAN_KEYS, CAPABILITY_LABELS, capabilitiesOf, capabilityState, capabilityTip, capSourceOf,
@@ -122,6 +46,7 @@ import { ALL_CUSTOM } from './models-custom-source'
 import type { ManageModel, ManageView } from './models-custom-source'
 // 内置家的图标映射（与添加账号弹窗、签到中心同一份，别处不要照抄这份映射）
 import { PROVIDER_ICONS } from './add-provider-pick'
+import { providerPresetIconOf } from './add-provider-metadata'
 import {
   GROUP_LIMIT, MODEL_SORT_OPTIONS, MODEL_STATE_OPTIONS, MODEL_VISIBILITY_OPTIONS, accept, bindingKeyOf, bindingsOf, builtinRailCounts,
   closeCapability, closeCustomModel, closeMapping, collapseGroup, currentProvider, customProviderOptions,
@@ -137,6 +62,7 @@ import {
   type Align, type Binding, type ColumnView, type CustomModelContext, type MappingContext,
 } from './models-panel-state'
 import { t } from '../i18n'
+import { Sidebar, Empty } from '@ui'
 
 
 /* ─── 页面本体 ───────────────────────────────── */
@@ -235,29 +161,17 @@ const GRID_GLYPH = (
   </svg>
 )
 
-/** 自定义家的图标：记录本身不带图标，按**名字**回match预置目录（与「已建过同名家」
-    的判据同一口径，见 add-provider-pick 的 providerCards）；没match到给空串（monogram 兜底） */
-function presetIconOfName(name: string): string {
-  if (!name) return ''
-  const list = shared().wbPresetProviders?.list
-  if (!Array.isArray(list)) return ''
-  const hit = list.find(preset => preset.name === name)
-  return (hit && shared().wbPresetProviders?.iconOf?.(String(hit.key || ''))) || ''
-}
-
-/** provider → 图标路径：内置家按 id（WorkBuddy 国际版回落同品牌那张，与签到中心同款）；
-    自定义家（含预置 API 创建的）按名字match预置目录。返回空串 = 没有图标，走 monogram。 */
-function providerIconOf(id: string, label: string): string {
-  if (customSource.isCustom(id)) return presetIconOfName(label)
+function providerIconOf(id: string): string {
+  if (customSource.isCustom(id)) return providerPresetIconOf(id)
   return PROVIDER_ICONS[id === 'workbuddy-intl' ? 'workbuddy' : id] || ''
 }
 
 /** 左栏 / 标题共用的头像节点（glyph 传 ReactNode 时直接渲染，如「全部」的网格）。
-    有真实图标（内置家 / 名字match到预置目录的自定义家）用 <img>（.img 形态，中性底），
+    有真实图标（内置家 / 带模板标识的自定义家）用 <img>（.img 形态，中性底），
     否则回落色相 monogram；两颗「全部」（内置 / 自定义组各自的聚合哨兵）都不是一家，
     挂 .mute 走中性灰，不参与色环。 */
 function providerAvatar(id: string, label: string, glyph?: React.ReactNode): React.ReactNode {
-  const icon = glyph ? '' : providerIconOf(id, label)
+  const icon = glyph ? '' : providerIconOf(id)
   const sentinel = id === 'all' || id === ALL_CUSTOM
   return (
     <span className={cn('pv-ico', sentinel && 'mute', icon && 'img')}
@@ -384,6 +298,7 @@ function ModelsPage() {
 
   const view = viewData()
   const all = Array.isArray(view.models) ? view.models : []
+  const providerModels = all.filter(model => provider === 'all' || provider === ALL_CUSTOM || (model.provider || '') === provider)
   const keyword = state.search.trim().toLowerCase()
   const shown = all.filter(model => matches(model, keyword, provider, state.stateFilter, state.visibilityFilter))
   /** 排序档位（'default' / 'rate-asc' / 'rate-desc'）；组内排序读它，见 rows() 里那一段 */
@@ -402,8 +317,8 @@ function ModelsPage() {
       : (custom
         ? String(customSource.record(provider)?.name || provider)
         : (builtinRailCounts().get(provider)?.label || providerLabelOf(provider))))
-  const enabledCount = all.filter(rowEnabled).length
-  const mappedCount = all.filter(model => (model.aliases || []).length > 0).length
+  const enabledCount = providerModels.filter(rowEnabled).length
+  const mappedCount = providerModels.filter(model => (model.aliases || []).length > 0).length
   /**
    * 客户端分页（通用表格外壳）：一家的模型可能上百条，全渲染既慢又难扫。
    *
@@ -455,8 +370,8 @@ function ModelsPage() {
     const customTotal = [...customCounts.values()].reduce((sum, item) => sum + item.n, 0)
     const customAllLabel = t('全部（{n} 家）', { n: [...customCounts.values()].filter(item => item.n > 0).length })
     return (
-      <aside className='prov-rail' id='prov-rail' aria-label={t('按提供商选择')}>
-        <div className='rail-scroll'>
+      <Sidebar className='prov-rail' id='prov-rail' aria-label={t('按提供商选择')}>
+        <NavList className='rail-scroll'>
           <div className='rail-label'>{t('内置提供商')}</div>
           {/* 条目是导航项而不是按钮，走 NavItem（选中态 / 悬浮态 / 字重 / 计数都在组件里，
               与原来的 .pv 是同一套令牌取值）。头像（icon=）按家给一枚色相 monogram，
@@ -467,8 +382,10 @@ function ModelsPage() {
             icon={providerAvatar('all', '', GRID_GLYPH)}
             className='shadow-none' onClick={() => selectProvider('all')}>{allLabel}</NavItem>
           {[...counts].map(([key, entry]) => (
-            <NavItem key={key} active={provider === key} data-provider={key} title={entry.label}
+            <NavItem key={key} active={provider === key} data-provider={key}
+              title={entry.n ? entry.label : t('{provider}：模型清单为空，等待获取', { provider: entry.label })}
               count={entry.n} icon={providerAvatar(key, entry.label)} className='shadow-none'
+              trailing={entry.n === 0 ? <Badge variant='outline'>{t('待获取')}</Badge> : undefined}
               onClick={() => selectProvider(key)}>{entry.label}</NavItem>
           ))}
           <div className='rail-label'>{t('自定义提供商')}</div>
@@ -494,20 +411,20 @@ function ModelsPage() {
                     icon={providerAvatar(id, label)}
                     className={cn('shadow-none', RAIL_HIDE_COUNT_ON_HOVER)}
                     onClick={() => selectProvider(id)}>{label}</NavItem>
-                  <button type='button' className='pv-del' aria-label={t('删除自定义提供商')}
+                  <Button size='default' variant='ghost' type='button' className='pv-del' aria-label={t('删除自定义提供商')}
                     title={t('删除这个自定义提供商（连同名下账号）')}
-                    onClick={() => void removeCustomProvider(id)}>×</button>
+                    onClick={() => void removeCustomProvider(id)}>×</Button>
                 </div>
               )
             }),
-          ] : <div className='rail-empty'>{t('还没有自定义提供商')}</div>}
-        </div>
+          ] : <Empty className='rail-empty'>{t('还没有自定义提供商')}</Empty>}
+        </NavList>
         <div className='rail-foot'>
           <NavItem variant='add' id='rail-add-custom'
             title={t('新建一个自定义提供商（同时创建它的第一个账号）')}
             onClick={() => openAddCustomProvider()}>{t('＋ 新建自定义提供商')}</NavItem>
         </div>
-      </aside>
+      </Sidebar>
     )
   }
 
@@ -689,7 +606,7 @@ function ModelsPage() {
     const hint = t('上下文窗口 {input} / 最大输出 Token {output} —— 点击修改模型能力', { input: exactTokens(input), output: exactTokens(output) })
       + tokenOriginSuffix(model)
     return (
-      <button type='button' className='caps-open' title={hint}
+      <Button size='default' variant='ghost' type='button' className='caps-open' title={hint}
         onClick={() => openCapability(model.provider || '', model.id)}>
         <span className={cn('cap-num', input === null && 'unset', capSourceOf(model, 'maxInputTokens') === 'modelsdev' && 'filled')}>
           {formatTokens(input)}
@@ -700,7 +617,7 @@ function ModelsPage() {
           {formatTokens(output)}
           {overrides.includes('maxOutputTokens') ? <i className='cap-mark' title={t('已覆盖上游值')} /> : null}
         </span>
-      </button>
+      </Button>
     )
   }
 
@@ -726,7 +643,7 @@ function ModelsPage() {
     const caps = capabilitiesOf(model)
     const overrides = normalizeOverrides(model.capOverrides)
     return (
-      <button type='button' className='caps-open caps-badges'
+      <Button size='default' variant='ghost' type='button' className='caps-open caps-badges'
         title={t('对下游声明的能力（工具调用 / 图片识别 / 视频识别 / 支持思考）—— 点击修改')}
         onClick={() => openCapability(model.provider || '', model.id)}>
         {BOOLEAN_KEYS.map(key => {
@@ -742,7 +659,7 @@ function ModelsPage() {
             </span>
           )
         })}
-      </button>
+      </Button>
     )
   }
 
@@ -778,41 +695,49 @@ function ModelsPage() {
     switch (column.key) {
       case 'check':
         return (
-          <td className={cellClass('cell-check', column.align)}>
+          <TableCell className={cellClass('cell-check', column.align)}>
             <Checkbox checked={selection.has(rowKeyOf(model))} title={t('勾选后可批量操作')}
               aria-label={t('勾选后可批量操作')}
               onCheckedChange={next => togglePick(rowKeyOf(model), next === true)} />
-          </td>
+          </TableCell>
         )
       case 'model':
         return (
-          <td className={cellClass('cell-model', column.align)}>
+          <TableCell className={cellClass('cell-model', column.align)}>
             {/* 名字本身就是复制入口（data-copy 走 clipboard.js 的全局委托，点一下
                 toast「已复制」）；title 同时承担两件事 —— 提示可点、长 ID 被
                 ellipsis 截断时悬停能看全。曾经这里另挂一颗 ⧉ 小按钮，已去掉：
                 点名字更省事，也少一个悬停才显形的控件 */}
             <div className='mid'>
               <span className='t' data-copy={model.id} title={t('点击复制：{name}', { name: model.id })}>{model.id}</span>
+              {model.kind === 'image' ? <span className='binding-default' title='POST /v1/images/generations'>{t('图片生成')}</span> : null}
+              {model.supports_image_editing ? <span className='binding-default' title='POST /v1/images/edits'>{t('图片编辑')}</span> : null}
+              {model.upstreamStatus === 'undeployed' ? (
+                <Badge variant='warning' shape='tag'
+                  title={t('上游目录列出了这个模型，但推理端尚未识别；保留在清单中，后续探测成功后自动清除标记')}>
+                  {t('上游未部署')}
+                </Badge>
+              ) : null}
             </div>
             {model.name && model.name !== model.id ? <div className='mname'>{model.name}</div> : null}
-          </td>
+          </TableCell>
         )
       case 'rate':
         return (
-          <td className={cellClass('cell-rate', column.align)}>
+          <TableCell className={cellClass('cell-rate', column.align)}>
             <span className='rate'>{model.credits ? formatCredits(model.credits) : '—'}</span>
-          </td>
+          </TableCell>
         )
       case 'source':
-        return <td className={cellClass('cell-source', column.align)}>{sourceCell(model)}</td>
+        return <TableCell className={cellClass('cell-source', column.align)}>{sourceCell(model)}</TableCell>
       case 'visibility':
-        return <td className={cellClass('cell-visibility', column.align)}>{visibilityCell(model)}</td>
+        return <TableCell className={cellClass('cell-visibility', column.align)}>{visibilityCell(model)}</TableCell>
       case 'budget':
-        return <td className={cellClass('cell-budget', column.align)}>{budgetCell(model)}</td>
+        return <TableCell className={cellClass('cell-budget', column.align)}>{budgetCell(model)}</TableCell>
       case 'caps':
-        return <td className={cellClass('cell-caps', column.align)}>{capsCell(model)}</td>
+        return <TableCell className={cellClass('cell-caps', column.align)}>{capsCell(model)}</TableCell>
       case 'alias':
-        return <td className={cellClass('cell-alias', column.align)}>{aliasCell(model)}</td>
+        return <TableCell className={cellClass('cell-alias', column.align)}>{aliasCell(model)}</TableCell>
       case 'act': {
         // 「测试」的门禁（该家没有可用账号）由 model-test-dialog 统一判定，这里只把
         // 理由挂到 title 上 —— 禁用而不说原因等于让用户猜。未启用的行**不置灰**：
@@ -824,7 +749,7 @@ function ModelsPage() {
         // 行由清单决定存在性），自定义家的每一行都是用户登记的、都可以移除
         const removable = model.source === 'manual' || customSource.isCustom(model.provider || '')
         return (
-          <td className={cellClass('cell-act r', column.align)}>
+          <TableCell className={cellClass('cell-act r', column.align)}>
             <div className='row-actions'>
               <Button variant='ghost' size='sm' disabled={Boolean(blocked)}
                 title={blocked || t('以这个上游模型发一次最小请求，走真实转发链路')}
@@ -836,7 +761,7 @@ function ModelsPage() {
                   onClick={() => void confirmRemoveModel()}>{t('移除')}</Button>
               ) : null}
             </div>
-          </td>
+          </TableCell>
         )
       }
       default:
@@ -849,11 +774,11 @@ function ModelsPage() {
     // 勾选的行挂 .sel：品牌淡底（比 hover 高一档），让「选中的是哪几行」在滚动后仍可辨
     const picked = selection.has(rowKeyOf(model))
     return (
-      <tr key={`${model.provider || ''}\u0001${model.id}`} className={cn(picked && 'sel')}>
+      <TableRow key={`${model.provider || ''}\u0001${model.id}`} className={cn(picked && 'sel')}>
         {columns.map(column => (
           <React.Fragment key={column.key}>{cellFor(column, model, busyRow)}</React.Fragment>
         ))}
-      </tr>
+      </TableRow>
     )
   }
 
@@ -862,8 +787,8 @@ function ModelsPage() {
    * 有搜索词或非「全部」的状态筛选时不折叠：用户在找东西，藏起来只会让他以为没有。
    */
   function body() {
-    if (!all.length) {
-      // 一条模型都没有：内置家是「还没加账号」，自定义家是「还没登记 / 还没拉取」，
+    if (!providerModels.length) {
+      // 一条模型都没有：内置家区分账号未添加与目录待获取，自定义家是未登记，
       // 自定义「全部」是「一家都还没有（或都没拉到模型）」。
       // 说清下一步该做什么才有用；目录还没就位时既不能说「已删除」也不能说「还没有模型」
       const empty = custom
@@ -874,11 +799,15 @@ function ModelsPage() {
             : customMissing
               ? t('该提供商已不存在（可能已被删除），请刷新列表')
               : t('这家还没有模型：点「添加模型」登记，或「获取上游模型」从上游拉取'))
-        : (state.data ? t('暂无模型（请先添加账号）') : t('加载中…'))
-      return <tr><td colSpan={columnCount} className='empty'>{empty}</td></tr>
+        : (!state.data
+          ? t('加载中…')
+          : builtinRailCounts().size
+            ? t('模型清单为空：已有可用账号，请点「获取模型」拉取目录')
+            : t('暂无模型（请先添加账号）'))
+      return <TableRow><TableCell colSpan={columnCount} className='empty'>{empty}</TableCell></TableRow>
     }
     if (!shown.length) {
-      return <tr><td colSpan={columnCount} className='empty'>{keyword ? t('没有匹配「{keyword}」的模型', { keyword }) : t('没有匹配当前筛选的模型')}</td></tr>
+      return <TableRow><TableCell colSpan={columnCount} className='empty'>{keyword ? t('没有匹配「{keyword}」的模型', { keyword }) : t('没有匹配当前筛选的模型')}</TableCell></TableRow>
     }
     // 分组带只在「全部」视图里出现：选中单家时标题已经写了是哪一家，再叠一条是重复的
     // 分组带在两个聚合视图（内置「全部」/ 自定义「全部」）里出现：选中单家时标题已经
@@ -925,30 +854,30 @@ function ModelsPage() {
       // 以为这一组只有当前页这几个（标题上的总数仍是**整组**的，不是这一页的）
       if (showGroups && onPage.length) {
         rows.push(
-          <tr className='tr-group' key={`group:${key}`}>
-            <td colSpan={columnCount}>
+          <TableRow className='tr-group' key={`group:${key}`}>
+            <TableCell colSpan={columnCount}>
               <span className='prov-tag'>{group.label}</span>{from > 0 ? t('（续）') : ''}{t('{n} 个模型', { n: group.items.length })}
-            </td>
-          </tr>,
+            </TableCell>
+          </TableRow>,
         )
       }
       for (const model of onPage) rows.push(modelRow(model))
       rowIndex += items.length
       if (rest > 0) {
         rows.push(
-          <tr className='tr-more' key={`more:${key}`}>
-            <td colSpan={columnCount}>
+          <TableRow className='tr-more' key={`more:${key}`}>
+            <TableCell colSpan={columnCount}>
               <Button variant='ghost' size='sm' onClick={() => expandGroup(key)}>{t('展开其余 {n} 个模型 ▾', { n: rest })}</Button>
-            </td>
-          </tr>,
+            </TableCell>
+          </TableRow>,
         )
       } else if (open && collapsible && group.items.length > GROUP_LIMIT) {
         rows.push(
-          <tr className='tr-more' key={`collapse:${key}`}>
-            <td colSpan={columnCount}>
+          <TableRow className='tr-more' key={`collapse:${key}`}>
+            <TableCell colSpan={columnCount}>
               <Button variant='ghost' size='sm' onClick={() => collapseGroup(key)}>{t('收起 ▴')}</Button>
-            </td>
-          </tr>,
+            </TableCell>
+          </TableRow>,
         )
       }
     }
@@ -957,7 +886,7 @@ function ModelsPage() {
 
   return (
     <>
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <div className='mm'>
           {rail()}
           <div className='mm-main'>
@@ -966,7 +895,7 @@ function ModelsPage() {
                 —— 状态筛选 + 搜索 + 批量条。两行都是通栏块，窄窗口由 flex-wrap 整体下折。
                 「列设置」按钮仍由 wbColSettings.register 追加进 .head-actions 末尾
                 （mount 选择器 .panel-head .head-actions 在这个结构下照旧命中）。 */}
-            <div className='panel-head'>
+            <CardHeader className='panel-head'>
               <div className='mm-titlebar'>
                 <div className='mm-title'>
                   {provider === 'all' || provider === ALL_CUSTOM
@@ -974,7 +903,7 @@ function ModelsPage() {
                     : providerAvatar(provider, titleLabel)}
                   <h2>{titleLabel}</h2>
                   <span className='mm-meta'>
-                    <b>{all.length}</b>{t(' 个模型 · 已启用 ')}<b>{enabledCount}</b>{t(' · 有映射 ')}<b>{mappedCount}</b>
+                    <b>{providerModels.length}</b>{t(' 个模型 · 已启用 ')}<b>{enabledCount}</b>{t(' · 有映射 ')}<b>{mappedCount}</b>
                   </span>
                 </div>
                 <div className='head-actions'>
@@ -989,7 +918,7 @@ function ModelsPage() {
                   <Button id='btn-add-custom-model' variant='outline' size='sm'
                     onClick={() => openCustomModel()}>{t('＋ 添加模型')}</Button>
                   {/* 窄屏「筛选」入口：桌面隐藏（CSS 控制）。角标是生效的筛选条数 */}
-                  <button type='button' className='mm-filter-open' onClick={() => setFilterOpen(true)}
+                  <Button size='default' variant='ghost' type='button' className='mm-filter-open hidden max-[767px]:inline-flex' onClick={() => setFilterOpen(true)}
                     aria-label={t('打开筛选')}>
                     {t('筛选')}
                     {(() => {
@@ -997,12 +926,19 @@ function ModelsPage() {
                         + (state.visibilityFilter !== 'all' ? 1 : 0)
                         + (state.sort !== 'default' ? 1 : 0)
                         + (String(state.search || '').trim() ? 1 : 0)
-                      return n > 0 ? <span className='mm-filter-badge'>{n}</span> : null
+                      return n > 0 ? <Badge variant='brand' shape='tag' className='mm-filter-badge'>{n}</Badge> : null
                     })()}
-                  </button>
+                  </Button>
                 </div>
               </div>
-              <div className={cn('mm-filters', filterOpen && 'open')}>
+              <ResponsiveSheet open={filterOpen} onOpenChange={setFilterOpen} title={t('筛选')}
+                inlineClassName='mm-filters' bodyClassName='model-filter-body'
+                actions={<Button variant='ghost' size='sm' onClick={() => {
+                  setStateFilter('all')
+                  setVisibilityFilter('all')
+                  setSort('default')
+                  setSearch('')
+                }}>{t('清空')}</Button>}>
                 {/* 状态筛选：语义、键盘、滑块都在组件库里，取值仍以快照为准（完全受控） */}
                 <SegmentedControl options={MODEL_STATE_OPTIONS} value={state.stateFilter}
                   onValueChange={setStateFilter} aria-label={t('按状态筛选')} className='shrink-0' />
@@ -1029,30 +965,15 @@ function ModelsPage() {
                 {/* 批量条：勾选后出现在筛选行（带计数的小药丸，照账号页批量栏的出现时机 ——
                     不勾就不占位置）。弹窗里可删除 / 启用 / 禁用 / 设置思考等级 */}
                 {selectedModels.length > 0 ? (
-                  <span className='batch-chip'>
+                  <Badge variant='brand' className='batch-chip'>
                     {t('已选 ')}<b>{selectedModels.length}</b>{t(' 个')}
                     <Button id='btn-batch-models' variant='outline' size='xs'
                       title={t('对选中的 {n} 个模型执行批量操作', { n: selectedModels.length })}
                       onClick={() => setBatchOpen(true)}>{t('批量操作')}</Button>
-                  </span>
+                  </Badge>
                 ) : null}
-              </div>
-              {/* 窄屏筛选抽屉的遮罩与标题栏（桌面 display:none，不占位）。
-                  三个分段筛选与搜索框由 CSS 从 .mm-filters 搬进右侧抽屉。 */}
-              <div className={cn('mm-filter-scrim', filterOpen && 'open')} onClick={() => setFilterOpen(false)} />
-              <div className={cn('mm-filter-head', filterOpen && 'open')}>
-                <span className='mm-filter-title'>{t('筛选')}</span>
-                <Button variant='ghost' size='sm' className='mm-filter-clear'
-                  onClick={() => {
-                    setStateFilter('all')
-                    setVisibilityFilter('all')
-                    setSort('default')
-                    setSearch('')
-                  }}>{t('清空')}</Button>
-                <Button variant='ghost' size='sm' className='mm-filter-close'
-                  onClick={() => setFilterOpen(false)} aria-label={t('关闭')}>✕</Button>
-              </div>
-            </div>
+              </ResponsiveSheet>
+            </CardHeader>
             <div className='models-table-wrap'>
               {/* 表骨架（colgroup + thead）是**字面量**、永远按 index.html 的原始顺序渲染全部
                   8 列、不随任何状态变化：列的显隐与顺序由 wbColSettings.syncStaticHead 就地
@@ -1062,7 +983,7 @@ function ModelsPage() {
                   回来（勾选列是全选复选框，唯一内容会变的 th —— 只会被更新、不会被重建，
                   完整论证见文件头的「静态表头」一节）。
                   数据行相反：完全按 visibleColumns() 逐列渲染，与表头读同一份配置。 */}
-              <table className='models-table' ref={el => setTableEl(el)}>
+              <Table container={false} className='models-table' ref={el => setTableEl(el)}>
                 <colgroup>
                   <col className='c-check' data-col='check' />
                   <col className='c-model' data-col='model' />
@@ -1074,17 +995,17 @@ function ModelsPage() {
                   <col className='c-alias' data-col='alias' />
                   <col className='c-act' data-col='act' />
                 </colgroup>
-                <thead><tr>
-                  <th data-col='check'>{allPickNode}</th>
-                  <th data-col='model'>{t('上游模型')}</th>
-                  <th data-col='rate'>{t('倍率')}</th>
-                  <th data-col='visibility' title={t('这个模型在官方客户端里是否会被展列；不展示的那些默认已关闭（含默认绑定）')}>{t('可见性')}</th>
-                  <th data-col='source'>{t('来源')}</th>
+                <TableHeader><TableRow>
+                  <TableHead data-col='check'>{allPickNode}</TableHead>
+                  <TableHead data-col='model'>{t('上游模型')}</TableHead>
+                  <TableHead data-col='rate'>{t('倍率')}</TableHead>
+                  <TableHead data-col='visibility' title={t('这个模型在官方客户端里是否会被展列；不展示的那些默认已关闭（含默认绑定）')}>{t('可见性')}</TableHead>
+                  <TableHead data-col='source'>{t('来源')}</TableHead>
                   {/* 表头只留短标题，完整口径进问号提示（原括号长标题让表头喧宾夺主）。
                       这是静态内容：重渲染时逐字不变，不会破坏「静态表头」的约定。
                       这两枚问号讲的是**同一套视觉语言**（这个值到底是不是上游说的）：
                       内侧描边 / 虚线底 = models.dev 补的，右上角小点 = 你改过 */}
-                  <th data-col='budget'>
+                  <TableHead data-col='budget'>
                     {t('上下文 / 输出')}
                     <span className='th-help' aria-hidden='true'
                       title={t('数字带虚线底 = 由 models.dev 补齐；右上角小点 = 你手动覆盖过；— = 未声明。点任意一格可改。')}>
@@ -1094,8 +1015,8 @@ function ModelsPage() {
                         </g>
                       </svg>
                     </span>
-                  </th>
-                  <th data-col='caps'>
+                  </TableHead>
+                  <TableHead data-col='caps'>
                     {t('能力')}
                     <span className='th-help' aria-hidden='true'
                       title={t('圆点带内侧描边 = 由 models.dev 补齐；右上角小点 = 你手动覆盖过；虚线圈 = 未声明。悬停某一枚可看逐项出处。')}>
@@ -1105,10 +1026,10 @@ function ModelsPage() {
                         </g>
                       </svg>
                     </span>
-                  </th>
+                  </TableHead>
                   {/* 表头只留短标题，完整口径进问号提示（原括号长标题让表头喧宾夺主）。
                       这是静态内容：重渲染时逐字不变，不会破坏「静态表头」的约定 */}
-                  <th data-col='alias'>
+                  <TableHead data-col='alias'>
                     {t('模型映射')}
                     <span className='th-help' aria-hidden='true'
                       title={t('每条映射 = 对外名 → 上游模型；原始 ID 与别名有独立开关，默认绑定永远存在（没有映射时是合成的那条）。')}>
@@ -1118,11 +1039,11 @@ function ModelsPage() {
                         </g>
                       </svg>
                     </span>
-                  </th>
-                  <th className='r' data-col='act'>{t('操作')}</th>
-                </tr></thead>
-                <tbody id='models'>{body()}</tbody>
-              </table>
+                  </TableHead>
+                  <TableHead className='r' data-col='act'>{t('操作')}</TableHead>
+                </TableRow></TableHeader>
+                <TableBody id='models'>{body()}</TableBody>
+              </Table>
             </div>
             {/* 表尾：读数 / 每页条数 / 跳页 / 翻页器由通用表格外壳（table-shell.tsx）统一渲染。
                 左侧说明只剩「自定义家」那一条（内置家原先那句按用户要求移除）；其余几张表
@@ -1144,7 +1065,7 @@ function ModelsPage() {
             />
           </div>
         </div>
-      </section>
+      </Card>
       {/* 弹窗走 Dialog（Esc / 点遮罩关闭、焦点陷阱、滚动锁定都内建），按需挂载、关闭即卸 */}
       {state.mapping ? <MappingDialog context={state.mapping} onClose={closeMapping} /> : null}
       {state.customModel
@@ -1351,7 +1272,7 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
           <div className='flex flex-col gap-1.5'>
             <div className='flex items-center gap-[7px]'>
               <Label htmlFor='mapping-reasoning'>{t('思考等级')}</Label>
-              {/* 问号走组件库 Tooltip（旧的 data-tip + tooltip.js 是同一目标的更简陋版本） */}
+              {/* 问号走组件库 Tooltip（旧的 data-tip + desktop-tooltip.tsx 是同一目标的更简陋版本） */}
               <Tooltip>
                 <TooltipTrigger render={<span className='tip-q' tabIndex={0} aria-label={t('思考等级的注入规则')} />}>?</TooltipTrigger>
                 <TooltipContent>{REASONING_TIP}</TooltipContent>
@@ -1375,8 +1296,7 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
                 <SelectItem value={CUSTOM_LEVEL}>{t('自定义等级…')}</SelectItem>
               </SelectContent>
             </Select>
-            {/* 自定义输入框只在「自定义等级」被选中时露出（条件渲染而不是 hidden：组件库的
-                工具类是分层 !important 的，[hidden] 那条未分层规则压不过它） */}
+
             {showCustomLevel ? (
               <Input id='mapping-reasoning-custom' maxLength={32} autoFocus
                 placeholder={t('自定义等级（例如 custom-high）')} autoComplete='off'

@@ -21,7 +21,7 @@
  */
 
 import { apiCall, url, type PanelStatus } from './client'
-import { activeServerId, readServerAuth, storeServerAuth } from '../lib/servers'
+import { activeServerId, readServerAuth, serverIdentity, storeServerAuth } from '../lib/servers'
 
 /** 题面（服务端 `altcha::challenge()` 的原样输出） */
 type Challenge = {
@@ -211,6 +211,8 @@ export async function authenticate(input: {
   password: string
   captcha: string | null
 }): Promise<AuthResult> {
+  const identity = serverIdentity()
+  const serverId = activeServerId()
   const body: Record<string, string> = {
     username: input.username,
     password: input.password,
@@ -244,8 +246,8 @@ export async function authenticate(input: {
       // 服务端没按标记给令牌（老版本网关）：告诉用户升级，而不是让他反复试
       return { error: '网关没有返回登录令牌，请确认网关版本（需要支持 x-panel-auth-mode 的版本）' }
     }
-    // 先落盘再返回：调用方紧接着就会用当前服务器 id 去读
-    storeServerAuth(activeServerId(), data.accessToken, data.refreshToken, data.expiresIn)
+    if (serverIdentity() !== identity) return { error: '服务器已切换，请在当前服务器重新登录' }
+    storeServerAuth(serverId, data.accessToken, data.refreshToken, data.expiresIn)
     return { access: data.accessToken, refresh: data.refreshToken }
   } catch (error) {
     return { error: `无法连接网关：${error instanceof Error ? error.message : String(error)}` }

@@ -18,6 +18,7 @@
 import * as React from 'react'
 import {
   Badge,
+  Checkbox,
   Button,
   Dialog,
   DialogBody,
@@ -27,9 +28,7 @@ import {
   DialogTitle,
   Select,
   SelectContent,
-  SelectGroup,
   SelectItem,
-  SelectLabel,
   SelectTrigger,
   SelectValue,
   Sheet,
@@ -41,7 +40,7 @@ import {
   Switch,
   Textarea,
   cn,
-} from '@ui'
+  Label } from '@ui'
 import { t } from '../i18n'
 import { ASSISTANT_TOOLS, TOOL_META } from './assistant-tools'
 import { DEFAULT_SYSTEM_PROMPT, type AssistantConfig, type PermissionMode } from './assistant-state'
@@ -138,7 +137,7 @@ export function AssistantSettingsDrawer({
             {/* ① 默认行为 */}
             <Section title={t('默认行为')} sub={t('新建对话时使用')}>
               <div className='asst-field'>
-                <label>{t('模型')}</label>
+                <Label>{t('模型')}</Label>
                 {/* 与聊天框里的模型列表同一份数据（父组件透传 names）：两处的
                     候选口径必须逐字一致，否则会出现「这里能选、聊天框选不到」。 */}
                 <Select
@@ -158,12 +157,9 @@ export function AssistantSettingsDrawer({
                   </SelectTrigger>
                   <SelectContent>
                     {models.length === 0 && <SelectItem value='none' disabled>{t('没有可用的模型')}</SelectItem>}
-                    <SelectGroup>
-                      <SelectLabel>{t('已启用的模型')}</SelectLabel>
-                      {models.map(name => (
-                        <SelectItem key={name} value={name}>{name}</SelectItem>
-                      ))}
-                    </SelectGroup>
+                    {models.map(name => (
+                      <SelectItem key={name} value={name}>{name}</SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
               </div>
@@ -173,35 +169,35 @@ export function AssistantSettingsDrawer({
                   不做成 chips 九宫格 —— 档位是有序的强弱序列，竖排列表读起来
                   才是「从弱到强」，网格会把它读成一组互不相干的选项。 */}
               <div className='asst-field col'>
-                <label>{t('思考等级')}</label>
+                <Label>{t('思考等级')}</Label>
                 <div className='asst-level-list'>
-                  <button type='button'
-                    className={cn('asst-level-row', !config?.reasoning && 'on')}
+                  <Button aria-pressed={!config?.reasoning} size='default' variant='ghost' type='button'
+                    className={cn('h-auto w-full justify-start whitespace-normal text-left asst-level-row', !config?.reasoning && 'on')}
                     disabled={!ready || busy}
                     onClick={() => { if (config) onSave({ ...config, reasoning: null }, t('思考等级已切换')) }}>
                     <span>{t('跟随模型')}</span>
                     <span className='asst-level-hint'>{t('不指定，交给映射绑定')}</span>
                     {!config?.reasoning && <CheckIcon size={12} />}
-                  </button>
+                  </Button>
                   {REASONING_LEVELS.map(level => (
-                    <button key={level} type='button'
-                      className={cn('asst-level-row', config?.reasoning === level && 'on')}
+                    <Button aria-pressed={config?.reasoning === level} size='default' variant='ghost' key={level} type='button'
+                      className={cn('h-auto w-full justify-start whitespace-normal text-left asst-level-row', config?.reasoning === level && 'on')}
                       disabled={!ready || busy}
                       onClick={() => { if (config) onSave({ ...config, reasoning: level }, t('思考等级已切换')) }}>
                       <span className='mono'>{level}</span>
                       <span className='asst-level-hint'>{levelLabel(level)}</span>
                       {config?.reasoning === level && <CheckIcon size={12} />}
-                    </button>
+                    </Button>
                   ))}
                 </div>
               </div>
 
               <div className='asst-field col'>
-                <label>{t('权限模式')}</label>
+                <Label>{t('权限模式')}</Label>
                 <div className='asst-mode-cards'>
                   {(['confirm', 'full'] as const).map(value => (
-                    <button key={value} type='button'
-                      className={cn('asst-mode-card', config?.mode === value && 'on', value === 'full' && 'warn')}
+                    <Button aria-pressed={config?.mode === value} size='default' variant='ghost' key={value} type='button'
+                      className={cn('h-auto w-full justify-start whitespace-normal text-left asst-mode-card', config?.mode === value && 'on', value === 'full' && 'warn')}
                       disabled={!ready || busy}
                       onClick={() => setMode(value)}>
                       <span className='asst-mc-ico'>
@@ -212,7 +208,7 @@ export function AssistantSettingsDrawer({
                         <small>{value === 'full' ? t('改动直接执行') : t('改动先列清单')}</small>
                       </span>
                       {config?.mode === value && <CheckIcon size={12} className='asst-mc-check' />}
-                    </button>
+                    </Button>
                   ))}
                 </div>
               </div>
@@ -269,11 +265,12 @@ export function AssistantSettingsDrawer({
                   }).map(meta => {
                     const tool = ASSISTANT_TOOLS.find(item => item.id === meta.id)
                     return (
-                      <label className='asst-tool-row' key={meta.id}>
-                        <input type='checkbox'
+                      <Label className='asst-tool-row' key={meta.id}>
+                        <Checkbox
                           checked={enabledTools[meta.id] === true}
                           disabled={!ready || busy}
-                          onChange={event => toggleTool(meta.id, event.currentTarget.checked)} />
+                          aria-label={meta.label}
+                          onCheckedChange={checked => toggleTool(meta.id, checked === true)} />
                         <span className='tt'>
                           <span className='tt-name'>
                             {meta.label}
@@ -282,7 +279,7 @@ export function AssistantSettingsDrawer({
                           </span>
                           <span className='tt-desc'>{meta.desc}</span>
                         </span>
-                      </label>
+                      </Label>
                     )
                   })}
                 </React.Fragment>

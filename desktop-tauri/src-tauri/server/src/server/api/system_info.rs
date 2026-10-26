@@ -124,7 +124,7 @@ pub async fn get_system_info(
             "sourceUrl": "https://github.com/aimod-cc/Agent2API",
             "licenseUrl": "https://github.com/aimod-cc/Agent2API/blob/main/LICENSE",
             "copyright": "Copyright (c) 2026 Agent2API",
-            "channel": if config::update_beta() { "beta" } else { "stable" },
+            "channel": config::update_channels().key(),
             "schemaVersion": db::schema::SCHEMA_VERSION,
             "dbSchemaVersion": db_schema,
             // 「上游客户端版本 / CLI 版本」两栏已随实现搬到提供商插件：网关
@@ -190,11 +190,13 @@ pub async fn get_system_info(
             "accounts": account_count,
             "enabledAccounts": enabled_accounts,
             "limitedAccounts": limited_accounts,
-            // 与 /api/health 同一口径：报国内版的清单条数（见那里的说明）
-            "models": crate::server::core::providers::catalog::manifest_for(
-                crate::server::core::providers::ProviderKind::WorkBuddy,
-            )
-            .len(),
+            "models": crate::server::core::providers::catalog::managed_manifests(state.store())
+                .into_iter()
+                .map(|(_, models)| models.into_iter()
+                    .map(|model| crate::server::core::models::model_id(&model).to_lowercase())
+                    .filter(|id| !id.is_empty())
+                    .collect::<std::collections::HashSet<_>>().len())
+                .sum::<usize>(),
             "inFlight": in_flight,
             "requests": requests,
             "logs": logs,

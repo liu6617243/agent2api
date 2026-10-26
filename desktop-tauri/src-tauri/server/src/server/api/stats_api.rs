@@ -8,8 +8,8 @@
 //! GET    /api/stats/requests/clear-preview  清理弹窗的预览统计（将删明细数 / 带正文数 / 库占用 / 压缩状态）
 //! DELETE /api/stats/requests           清理（mode=raw 只删原始正文 / mode=all 删明细，默认 all）
 //! POST   /api/stats/requests/compact   压缩数据库（checkpoint + VACUUM，后台执行）
-//! GET    /api/retention                三档保留天数（事件日志 / 请求日志 / 按天聚合）
-//! PUT    /api/retention                更新保留天数并**立即**触发清理
+//! GET    /api/retention                三档保留天数与日志 / 请求日志数量上限
+//! PUT    /api/retention                更新保留设置并**立即**触发清理
 //! ```
 //!
 //! ── 为什么两条前缀放在一个文件里 ─────────────────────────────
@@ -67,9 +67,11 @@ use axum::extract::{Query, State};
 use axum::response::Response;
 use serde_json::{json, Value};
 
+use super::date_range::{date_bounds, parse_day_param};
 use crate::server::config::{
-    self, RetentionPatch, RetentionSettings, KEY_DAILY_RETENTION_DAYS, KEY_LOG_RETENTION_DAYS,
-    KEY_REQUEST_RETENTION_DAYS, RETENTION_MAX_DAYS, RETENTION_MIN_DAYS,
+    self, RetentionPatch, RetentionSettings, KEY_DAILY_RETENTION_DAYS, KEY_LOG_RETENTION_COUNT,
+    KEY_LOG_RETENTION_DAYS, KEY_REQUEST_RETENTION_COUNT, KEY_REQUEST_RETENTION_DAYS,
+    RETENTION_MAX_COUNT, RETENTION_MAX_DAYS, RETENTION_MIN_COUNT, RETENTION_MIN_DAYS,
 };
 use crate::server::errors;
 use crate::server::http::{ok_json, parse_body, parse_query_ms};
@@ -186,30 +188,18 @@ pub async fn stats_summary(State(state): State<ServerState>, Query(params): Quer
     // 只读 24 小时窄列 + 命中率下推 SQL」在**工作量**上解决（见
     // `RequestStats::usage_summary` 的读取窗口说明）；这里解决的是「占着
     // runtime 线程」这一半。
+    let api_key = text_of(&params, "apiKey");
+    if api_key.as_deref().is_some_and(|value| crate::server::request_stats::ApiKeyIdentity::from_filter(value).is_none()) {
+        return errors::management_error(400, "apiKey 取值非法（需要 key:<id>、env、none 或 unknown）");
+    }
     let stats = state.request_stats();
-    let result = tokio::task::spawn_blocking(move || stats.usage_summary(&requested, custom)).await;
+    let result = tokio::task::spawn_blocking(move || stats.usage_summary(&requested, custom, api_key.as_deref())).await;
     match result {
         Ok(value) => ok_json(value),
         // 任务被取消（runtime 关闭中）或 panic：给一个可读的 500 而不是让
         // axum 把一个无 body 的错误连接丢给前端
         Err(error) => errors::management_error(500, format!("报表计算任务失败: {error}")),
     }
-}
-
-/// 解析 `YYYY-MM-DD` 的日期参数：缺失 / 空白 / 格式错都给可读的 400 文案。
-///
-/// 只认严格格式（`2026-1-5` 这种补零缺失的写法也拒绝）：这个值由前端的
-/// `<input type="date">` 产出，格式天然规范；宽容解析反而会掩盖「前端传了
-/// 别的东西」这类问题。错误文案把收到的原值带出来，便于对照。
-fn parse_day_param(
-    params: &Params,
-    key: &str,
-) -> Result<chrono::NaiveDate, String> {
-    let Some(text) = text_of(params, key) else {
-        return Err(format!("range=custom 时必须带 {key}（格式 YYYY-MM-DD）"));
-    };
-    chrono::NaiveDate::parse_from_str(&text, "%Y-%m-%d")
-        .map_err(|_| format!("{key} 格式非法: {text}（需要 YYYY-MM-DD）"))
 }
 
 /// GET /api/stats/requests?offset=&limit=&model=&provider=&status=&start=&end=
@@ -226,7 +216,8 @@ fn parse_day_param(
 /// 转发开始时就会插一条这样的行（见 `RequestStats::record_started`），
 /// 收尾后由终态记账覆盖。status 过滤也认 `running` 值（只看进行中）。
 pub async fn stats_requests(State(state): State<ServerState>, Query(params): Query<Params>) -> Response {
-    ok_json(state.request_stats().query_requests(&filter_from_params(&params)))
+    let filter = match checked_filter(&params) { Ok(value) => value, Err(response) => return response };
+    ok_json(state.request_stats().query_requests(&filter))
 }
 
 /// 从查询串解析筛选条件 —— GET / DELETE / clear-preview 三条路由共用同一份
@@ -240,12 +231,28 @@ fn filter_from_params(params: &Params) -> RequestQuery {
         model: text_of(&params, "model"),
         // provider id 精确匹配；空串当没筛（见 RequestQuery::provider）
         provider: text_of(&params, "provider"),
+        client: params.get("client").map(|value| value.trim().to_string()),
+        api_key: text_of(&params, "apiKey"),
+        production_only: params.get("productionOnly").is_some_and(|value| value == "1"),
+        completed_only: params.get("completedOnly").is_some_and(|value| value == "1"),
         // 只认 ok / error / running，其余值在存储层被忽略（不在这里重复实现归一）
         status: text_of(&params, "status"),
         // 闭开区间 [start, end)：翻页时上一页末尾的 ts 可直接当下页的 end
         start: parse_query_ms(params.get("start")),
         end: parse_query_ms(params.get("end")),
     }
+}
+
+fn checked_filter(params: &Params) -> Result<RequestQuery, Response> {
+    let mut filter = filter_from_params(params);
+    if filter.api_key.as_deref().is_some_and(|value| crate::server::request_stats::ApiKeyIdentity::from_filter(value).is_none()) {
+        return Err(errors::management_error(400, "apiKey 取值非法（需要 key:<id>、env、none 或 unknown）"));
+    }
+    if let Some((start, end)) = date_bounds(params).map_err(|message| errors::management_error(400, message))? {
+        filter.start = Some(start);
+        filter.end = Some(end);
+    }
+    Ok(filter)
 }
 
 /// GET /api/stats/requests/filters —— 筛选下拉的候选清单。
@@ -290,9 +297,13 @@ pub async fn clear_stats_requests(
             )
         }
     };
-    let filter = filter_from_params(&params);
+    let filter = match checked_filter(&params) { Ok(value) => value, Err(response) => return response };
     let has_filters = filter.model.is_some()
         || filter.provider.is_some()
+        || filter.client.is_some()
+        || filter.api_key.is_some()
+        || filter.production_only
+        || filter.completed_only
         || filter.status.is_some()
         || filter.start.is_some()
         || filter.end.is_some();
@@ -349,8 +360,8 @@ pub async fn clear_stats_requests(
 /// GET /api/stats/requests/raw?id=... —— 单条请求的原始正文。
 ///
 /// 详情弹窗（预览对话）的数据源：`{id, requestBody, responseBody, truncated}`，
-/// 两个文本字段原样返回（两侧各截断到存储层的采集上限，`truncated` 提示
-/// 前端正文可能不完整）。不存在给 404 —— 正文只在**调试模式开启期间**的
+/// 两个文本字段完整返回，`truncated` 仅提示旧版本保存的正文可能不完整。
+/// 不存在给 404 —— 正文只在**调试模式开启期间**的
 /// 请求上采集（关着时不写行，见 `api::pipeline::capture_raw_body`），
 /// 此外也可能已被清理过；两种情况都是正常状态，不是错误。
 pub async fn stats_request_raw(
@@ -377,7 +388,8 @@ pub async fn stats_clear_preview(
     State(state): State<ServerState>,
     Query(params): Query<Params>,
 ) -> Response {
-    ok_json(state.request_stats().clear_preview(&filter_from_params(&params)))
+    let filter = match checked_filter(&params) { Ok(value) => value, Err(response) => return response };
+    ok_json(state.request_stats().clear_preview(&filter))
 }
 
 /// POST /api/stats/requests/compact —— 压缩数据库（checkpoint + VACUUM）。
@@ -434,7 +446,7 @@ pub async fn get_retention(State(_state): State<ServerState>) -> Response {
     ok_json(retention_json(config::retention_settings()))
 }
 
-/// PUT /api/retention —— body `{logRetentionDays?, requestLogRetentionDays?, dailyAggregateRetentionDays?}`
+/// PUT /api/retention —— 支持部分更新三档天数及 logRetentionCount / requestLogRetentionCount。
 ///
 /// 允许部分字段（未出现的项保持原值）。校验通过后：写 config.json → 立即裁剪
 /// → 返回**生效后**的值（前端直接用响应刷新界面，不必再 GET 一次）。
@@ -451,48 +463,66 @@ pub async fn put_retention(State(state): State<ServerState>, body: Bytes) -> Res
         return errors::management_error(400, "请求体必须是 JSON 对象");
     };
 
-    // ── 校验：全部先过一遍再写盘 ──────────────────────────────
-    // 为什么先收集再写：三项里有一项非法时整体不落盘，避免出现
-    // 「日志天数改了、明细天数没改」的半套设置（用户以为保存失败，实际生效了一半）
+    // 全部字段先校验，任何一项非法都不写入。
     let mut patch = RetentionPatch::default();
-    let mut targets: [(&str, Option<&Value>, &mut Option<i64>); 3] = [
-        (KEY_LOG_RETENTION_DAYS, object.get(KEY_LOG_RETENTION_DAYS), &mut patch.log_days),
+    let targets = [
+        (
+            KEY_LOG_RETENTION_DAYS,
+            &mut patch.log_days,
+            RETENTION_MIN_DAYS,
+            RETENTION_MAX_DAYS,
+            "天",
+        ),
         (
             KEY_REQUEST_RETENTION_DAYS,
-            object.get(KEY_REQUEST_RETENTION_DAYS),
             &mut patch.request_days,
+            RETENTION_MIN_DAYS,
+            RETENTION_MAX_DAYS,
+            "天",
         ),
         (
             KEY_DAILY_RETENTION_DAYS,
-            object.get(KEY_DAILY_RETENTION_DAYS),
             &mut patch.daily_days,
+            RETENTION_MIN_DAYS,
+            RETENTION_MAX_DAYS,
+            "天",
+        ),
+        (
+            KEY_LOG_RETENTION_COUNT,
+            &mut patch.log_count,
+            RETENTION_MIN_COUNT,
+            RETENTION_MAX_COUNT,
+            "条",
+        ),
+        (
+            KEY_REQUEST_RETENTION_COUNT,
+            &mut patch.request_count,
+            RETENTION_MIN_COUNT,
+            RETENTION_MAX_COUNT,
+            "条",
         ),
     ];
-    for (key, value, slot) in targets.iter_mut() {
-        let Some(value) = value else {
+    for (key, slot, min, max, unit) in targets {
+        let Some(value) = object.get(key).filter(|value| !value.is_null()) else {
             continue;
         };
-        // null 视为「这一项不改」：前端把整份设置对象回传时未填项常见为 null，
-        // 为它报 400 会逼前端做无意义的清理
-        if value.is_null() {
-            continue;
-        }
-        match parse_days(key, value) {
-            Ok(days) => **slot = Some(days),
+        match parse_retention_value(key, value, min, max, unit) {
+            Ok(value) => *slot = Some(value),
             Err(message) => return errors::management_error(400, message),
         }
     }
 
-    // 三项都没给：不写盘（空 PUT 不该在 config.json 里留下痕迹），
-    // 也不记「已更新」日志（什么都没改，日志里不该出现一次伪更新），但仍返回当前值 ——
-    // 空 PUT 的语义就是「读一次当前设置」，调用方不用为此换成 GET
-    let updated =
-        patch.log_days.is_some() || patch.request_days.is_some() || patch.daily_days.is_some();
+    // 空 PUT 只返回当前值，不写盘、不清理、不记录伪更新。
+    let updated = patch.log_days.is_some()
+        || patch.log_count.is_some()
+        || patch.request_days.is_some()
+        || patch.request_count.is_some()
+        || patch.daily_days.is_some();
     if updated {
         if !config::set_retention(patch) {
             // 写盘失败：内存快照已更新（本次运行仍生效），但重启后会回到旧值 ——
             // 必须让用户知道，否则「改了设置重启又变回去」会被当成玄学问题
-            logging::log("[Config]", "⚠️  保留期写入 config.json 失败，本次运行内仍生效");
+            logging::log("[Config]", "⚠️  数据保留设置写入失败，本次运行内仍生效");
         }
         // ── 立即清理（两种数据各自的时机不同，这里一次触发）──
         // 请求统计：prune() 内部**动态取**保留期回调，所以取到的就是刚写入的值
@@ -502,7 +532,7 @@ pub async fn put_retention(State(state): State<ServerState>, body: Bytes) -> Res
         if let Some(store) = logging::store_ref() {
             let removed = store.prune();
             if removed > 0 {
-                logging::console_line("[Logs]", &format!("按保留期清理了 {removed} 条过期日志"));
+                logging::console_line("[Logs]", &format!("按保留设置清理了 {removed} 条日志"));
             }
         }
     }
@@ -512,15 +542,19 @@ pub async fn put_retention(State(state): State<ServerState>, body: Bytes) -> Res
         logging::log(
             "[Config]",
             &format!(
-                "数据保留期已更新: 事件日志 {} 天 / 请求日志 {} 天 / 按天聚合 {} 天",
-                settings.log_days, settings.request_days, settings.daily_days
+                "数据保留设置已更新: 日志 {} 天 / {} 条，请求日志 {} 天 / {} 条，按天聚合 {} 天",
+                settings.log_days,
+                settings.log_count,
+                settings.request_days,
+                settings.request_count,
+                settings.daily_days
             ),
         );
     }
     ok_json(retention_json(settings))
 }
 
-/// 三档保留天数的响应体（GET 与 PUT 共用，保证两边键名完全一致）。
+/// 数据保留设置的响应体（GET 与 PUT 共用，保证两边键名完全一致）。
 ///
 /// 键用**常量标识符**而不是手写字符串：`json!` 会把标识符当表达式求值再
 /// `.into()` 成键名，所以这里落到 JSON 里的就是常量的值（`"logRetentionDays"` 等）。
@@ -530,40 +564,20 @@ pub async fn put_retention(State(state): State<ServerState>, body: Bytes) -> Res
 fn retention_json(settings: RetentionSettings) -> Value {
     json!({
         KEY_LOG_RETENTION_DAYS: settings.log_days,
+        KEY_LOG_RETENTION_COUNT: settings.log_count,
         KEY_REQUEST_RETENTION_DAYS: settings.request_days,
+        KEY_REQUEST_RETENTION_COUNT: settings.request_count,
         KEY_DAILY_RETENTION_DAYS: settings.daily_days,
     })
 }
 
-/// 单个天数字段的校验：必须是 1–3650 的整数，否则给出可读的 400 文案。
-///
-/// 只认 JSON 数字（含 `30.0` 这种整数值的浮点，容忍 JS 的 number 形态）；
-/// 字符串 `"30"` 视为非法 —— 那是调用方把配置当字符串传，静默接受会让
-/// 「前端传错类型」这类 bug 一直藏着。
-fn parse_days(key: &str, value: &Value) -> Result<i64, String> {
-    let number = match value {
-        Value::Number(number) => number,
-        other => {
-            return Err(format!(
-                "{key} 必须是 {RETENTION_MIN_DAYS}-{RETENTION_MAX_DAYS} 的整数（收到: {other}）"
-            ))
-        }
-    };
-    let days = number.as_i64().or_else(|| {
-        number
-            .as_f64()
-            .filter(|raw| raw.is_finite() && raw.fract() == 0.0)
-            .map(|raw| raw as i64)
-    });
-    let Some(days) = days else {
-        return Err(format!(
-            "{key} 必须是 {RETENTION_MIN_DAYS}-{RETENTION_MAX_DAYS} 的整数（收到: {number}）"
-        ));
-    };
-    if !(RETENTION_MIN_DAYS..=RETENTION_MAX_DAYS).contains(&days) {
-        return Err(format!(
-            "{key} 超出范围: {days}（合法范围 {RETENTION_MIN_DAYS}-{RETENTION_MAX_DAYS} 天）"
-        ));
-    }
-    Ok(days)
+fn parse_retention_value(
+    key: &str,
+    value: &Value,
+    min: i64,
+    max: i64,
+    unit: &str,
+) -> Result<i64, String> {
+    config::parse::int_in_range(value, min, max)
+        .ok_or_else(|| format!("{key} 必须是 {min}-{max} {unit}范围内的整数（收到: {value}）"))
 }

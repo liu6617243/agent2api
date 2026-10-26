@@ -248,8 +248,12 @@ pub fn configure(id: &str, patch: IntervalTaskPatch) -> Result<Value, String> {
         }
     }
     let before = settings_of(config::scheduled_settings(), id);
-    config::set_scheduled_task(id, patch, task.min, task.max);
+    let plugins_before = (id == TASK_UPDATE_CHECK).then(crate::server::core::plugin_host::settings::current);
+    let saved = config::set_scheduled_task(id, patch, task.min, task.max);
     let after = settings_of(config::scheduled_settings(), id);
+    if let Some(before) = plugins_before {
+        crate::server::core::plugin_host::settings::notify_changed(before);
+    }
     if task.runner == Runner::Backend {
         if !before.enabled && after.enabled {
             // 刚开启：保留改造前「开启即跑一次」的语义（下一个 tick 就执行），
@@ -270,7 +274,9 @@ pub fn configure(id: &str, patch: IntervalTaskPatch) -> Result<Value, String> {
             if after.enabled { "开启" } else { "关闭" }, after.interval,
             if task.unit == "seconds" { "秒" } else { "分钟" }));
     }
-    Ok(task_by_id(id))
+    let mut result = task_by_id(id);
+    result["saved"] = json!(saved);
+    Ok(result)
 }
 
 pub async fn run_now(store: &AccountStore, update: &UpdateManager, id: &str) -> Result<String, String> {

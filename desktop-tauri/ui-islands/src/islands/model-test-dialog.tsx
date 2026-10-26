@@ -271,6 +271,9 @@ function formatMs(value: unknown): string {
  * 直发、映射上的思考等级不注入 —— 测的就是这个模型在这家上游的**真实形态**。
  */
 export function testBlockReason(provider: string, model: ManageModel): string {
+  if (model.kind === 'image') {
+    return t('图片生成模型请通过 /v1/images/generations 调用，暂不支持对话测试')
+  }
   if (!usableAccounts(provider).length) {
     return t('该提供商没有可用账号（要在账号页启用一个、且凭证完整），一行都发不出去')
   }

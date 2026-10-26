@@ -8,16 +8,14 @@
  * 手机端早先只发 messages、不带 tools，于是模型拿到的是一个没有身份设定的
  * 通用对话 —— 用户问「各账号余额」，它答成了银行账户余额。
  *
- * 所以这里移植桌面端的九只工具。执行全部走**网关的管理 API**（手机端本来就
+ * 原有九只操作/查询工具和共享的六只诊断工具都走**网关的管理 API**（手机端本来就
  * 在用那些接口），不经过桌面壳的桥。
  *
  * ── 与桌面端的差异 ────────────────────────────────────────────
  *   · 执行层从 `window.workbuddyDesktop` 换成 `api/gateway` 的 HTTP 调用；
  *   · 自定义提供商（`custom-` 前缀）的读写走 `/api/custom-providers`；
- *   · 去掉「确认卡」：手机屏幕小，一次确认卡要占掉半屏。这里的做法是**只让
- *     模型看到用户在设置里勾选过的工具**，并把写操作的结果如实回报 ——
- *     与桌面端「勾选表即权限」同一套语义（未勾选的工具根本不在请求里，
- *     模型看不见也就调不到）。
+ *   · 写操作与额度消耗遵守同一份 confirm / full 配置，手机端用确认弹窗展示参数；
+ *     未勾选的工具不进入请求，执行入口仍须再次核对权限。
  */
 
 import {
@@ -32,10 +30,16 @@ import {
 } from '../api/gateway'
 import { apiCall } from '../api/client'
 import { accountName } from '../lib/format'
-import { usageIndex, usageText } from '../lib/usage'
+import { createBalanceTool } from '../../../ui-shared/assistant-read-balance'
 import { t } from '../i18n'
+import { ASSISTANT_READ_TOOLS } from './assistant-read-tools'
+import { ASSISTANT_IMAGE_TOOLS } from './assistant-image-tools'
+import type { ImageAsset, ImageToolContext } from '../../../ui-shared/assistant-image-tools'
+import { checkToolSignal, providerGroups, runToolBatch } from '../../../ui-shared/assistant-tool-execution'
+import { safeText } from '../../../ui-shared/assistant-read-data'
+import { isCustomModelProvider, readCustomModelView, removeCustomMapping, setCustomBinding, setCustomCapabilities } from './assistant-custom-models'
 
-export type ToolResult = { text: string; summary: string }
+export type ToolResult = { text: string; summary: string; images?: ImageAsset[] }
 
 export type AssistantTool = {
   id: string
@@ -43,7 +47,8 @@ export type AssistantTool = {
   kind: 'read' | 'write' | 'run'
   desc: string
   params: Record<string, unknown>
-  run: (args: Record<string, unknown>) => Promise<ToolResult>
+  plan?: (args: Record<string, unknown>) => { lead: string; table?: { head: string[]; rows: string[][] }; note?: string }
+  run: (args: Record<string, unknown>, context?: ImageToolContext) => Promise<ToolResult>
 }
 
 /* ─── 入参读取（模型给的东西不一定守规矩，坏值一律当缺）── */
@@ -111,13 +116,14 @@ async function readAccounts(): Promise<Account[]> {
     .sort((a, b) => Number(a.priority ?? 0) - Number(b.priority ?? 0))
 }
 
-/** 模型行 + 映射（自定义提供商由 `/api/models/manage` 一并给出，见后端说明） */
-async function readModels(): Promise<ManageModel[]> {
-  const view = await fetchManage()
-  return Array.isArray(view.models) ? view.models : []
+async function readModels(): Promise<{ models: ManageModel[]; mappings: Record<string, unknown>[] }> {
+  const [view, custom] = await Promise.all([fetchManage(), readCustomModelView()])
+  if (!Array.isArray(view.models)) throw new Error(t('读取模型清单失败'))
+  const mappings = (view as { mappings?: Record<string, unknown>[] }).mappings
+  return { models: [...view.models, ...custom.models] as ManageModel[], mappings: [...(mappings || []), ...custom.mappings] }
 }
 
-/* ─── 九只工具 ─────────────────────────────── */
+/* ─── 原有工具（诊断读取由 assistant-read-tools 共享）── */
 
 /** 1 · 获取模型列表（只读，分页） */
 const listModels: AssistantTool = {
@@ -131,6 +137,7 @@ const listModels: AssistantTool = {
       provider: { type: 'string', description: '只看某一家（提供商 id）；不填 = 全部' },
       keyword: { type: 'string', description: '按模型 ID 或映射名做子串过滤；不填 = 不过滤' },
       enabledOnly: { type: 'boolean', description: 'true = 只看已启用的模型' },
+      section: { type: 'string', enum: ['models', 'mappings', 'both'], description: '默认 both；模型与映射各自分页' },
       offset: { type: 'number', description: '本页起点（从 0 开始）；翻页时传上一页的 nextOffset' },
       limit: { type: 'number', description: `每页条数（默认 ${PAGE_DEFAULT}，最多 ${PAGE_MAX}）` },
     },
@@ -142,8 +149,10 @@ const listModels: AssistantTool = {
     const offset = Math.max(0, Math.round(num(args.offset) ?? 0))
     const limit = Math.max(1, Math.min(PAGE_MAX, Math.round(num(args.limit) ?? PAGE_DEFAULT)))
 
-    const models = await readModels()
-    const filtered = models.filter(row => {
+    const section = str(args.section) || 'both'
+    if (!['models', 'mappings', 'both'].includes(section)) throw new Error(t('section 只能是 models / mappings / both'))
+    const data = await readModels()
+    const filtered = data.models.filter(row => {
       if (provider && str(row.provider).toLowerCase() !== provider) return false
       if (enabledOnly && row.enabled !== true) return false
       if (!keyword) return true
@@ -156,66 +165,36 @@ const listModels: AssistantTool = {
         providerLabel: str(row.providerLabel) || str(row.provider),
         id: str(row.id),
         enabled: row.enabled === true,
+        kind: row.kind || 'chat',
+        supports_image_generation: row.supports_image_generation === true,
+        supports_image_editing: row.supports_image_editing === true,
         aliases: Array.isArray(row.aliases) ? row.aliases : [],
       })),
       offset,
       limit,
     )
+    const mappings = data.mappings.filter(row => (!provider || str(row.provider).toLowerCase() === provider)
+      && (!enabledOnly || row.enabled === true)
+      && (!keyword || [str(row.alias), str(row.target)].join(' ').toLowerCase().includes(keyword)))
+    const mappingPage = paginate(mappings.map(row => ({
+      provider: str(row.provider), alias: str(row.alias), target: str(row.target),
+      enabled: row.enabled === true, isDefault: row.isDefault === true, dangling: row.dangling === true,
+    })), offset, limit)
     return {
-      text: JSON.stringify({ models: { ...page.meta, items: page.items } }),
-      summary: t('{n} 个模型', { n: page.meta.total }),
+      text: JSON.stringify({
+        ...(section !== 'mappings' ? { models: { ...page.meta, items: page.items } } : {}),
+        ...(section !== 'models' ? { mappings: { ...mappingPage.meta, items: mappingPage.items } } : {}),
+      }),
+      summary: section === 'mappings' ? t('{n} 条映射', { n: mappingPage.meta.total }) : t('{n} 个模型', { n: page.meta.total }),
     }
   },
 }
 
-/** 2 · 查询账号余额（只读） */
-const listAccountBalance: AssistantTool = {
-  id: 'list_account_balance',
-  label: t('查询账号余额'),
-  kind: 'read',
-  desc: '查询各账号的余额 / 剩余额度。回答「还剩多少」「哪个账号快用完了」这类问题之前先调用它。读的是网关的余额快照（不逐个打上游）；要给某个账号做实时查询，用户需要在账号详情里点「查询余额」。',
-  params: {
-    type: 'object',
-    properties: {
-      account: { type: 'string', description: '只查某个账号（账号名或 id）；不填 = 全部账号' },
-      refresh: { type: 'boolean', description: 'true = 顺带向上游做一次实时查询（较慢，会打上游）' },
-    },
-  },
-  run: async args => {
-    const ref = str(args.account, 128)
-    const live = bool(args.refresh) === true
-
-    if (live && ref) {
-      const target = findAccount(await readAccounts(), ref)
-      const payload = await fetchAccountUsage(target.id)
-      const row = payload.results?.[0]
-      const view = usageText(row)
-      return {
-        text: JSON.stringify({ account: accountName(target), usage: view.text, detail: view.detail }),
-        summary: view.text,
-      }
-    }
-
-    const snapshot = await fetchUsageSnapshot()
-    const index = usageIndex(snapshot)
-    const accounts = await readAccounts()
-    const picked = ref ? [findAccount(accounts, ref)] : accounts
-    const out = picked.map(row => {
-      const view = usageText(index.get(row.id))
-      return {
-        account: accountName(row),
-        provider: row.provider || '',
-        enabled: row.enabled === true,
-        usage: view.text,
-        detail: view.detail,
-      }
-    })
-    return {
-      text: JSON.stringify({ accounts: out.slice(0, 60) }).slice(0, 12000),
-      summary: t('{n} 个账号', { n: out.length }),
-    }
-  },
-}
+const listAccountBalance: AssistantTool = createBalanceTool({
+  accounts: () => fetchAccounts(),
+  usageSnapshot: () => fetchUsageSnapshot(),
+  refreshBalance: id => fetchAccountUsage(id),
+}, t)
 
 /** 3 · 启用 / 禁用模型（改动） */
 const setModelEnabledTool: AssistantTool = {
@@ -242,24 +221,15 @@ const setModelEnabledTool: AssistantTool = {
     },
     required: ['items'],
   },
-  run: async args => {
-    const items = rows(args.items)
-    const done: string[] = []
-    for (const item of items) {
-      const provider = str(item.provider)
-      const id = str(item.id)
-      const enabled = bool(item.enabled)
-      if (!provider || !id || enabled === undefined) {
-        throw new Error(t('参数不完整（需要 provider / id / enabled）'))
-      }
-      await setModelEnabled({ provider, id, enabled })
-      done.push(`${enabled ? '启用' : '禁用'} ${provider}/${id}`)
-    }
-    return {
-      text: JSON.stringify({ ok: true, changed: done }),
-      summary: t('已修改 {n} 个模型', { n: done.length }),
-    }
-  },
+  run: async (args, context) => runToolBatch(rows(args.items), context, async item => {
+    const provider = str(item.provider)
+    const id = str(item.id)
+    const enabled = bool(item.enabled)
+    if (!provider || !id || enabled === undefined) throw new Error(t('参数不完整（需要 provider / id / enabled）'))
+    if (isCustomModelProvider(provider)) await setCustomBinding(provider, id, id, enabled, context)
+    else await setModelEnabled({ provider, id, enabled })
+    return `${enabled ? '启用' : '禁用'} ${provider}/${id}`
+  }, t),
 }
 
 /** 4 · 设置模型映射 ID（改动） */
@@ -288,36 +258,20 @@ const setModelMapping: AssistantTool = {
     },
     required: ['items'],
   },
-  run: async args => {
-    const items = rows(args.items)
-    const done: string[] = []
-    for (const item of items) {
-      const provider = str(item.provider)
-      const target = str(item.id)
-      const alias = str(item.alias, 128)
-      const action = str(item.action) === 'remove' ? 'remove' : 'add'
-      if (!provider || !target || !alias) {
-        throw new Error(t('参数不完整（需要 provider / id / alias）'))
-      }
-      if (action === 'remove') {
-        await apiCall('/api/models/mappings/remove', {
-          method: 'POST',
-          body: { provider, target, alias },
-        })
-        done.push(`删除 ${alias} → ${provider}/${target}`)
-      } else {
-        await apiCall('/api/models/mappings', {
-          method: 'POST',
-          body: { provider, target, alias },
-        })
-        done.push(`新增 ${alias} → ${provider}/${target}`)
-      }
+  run: async (args, context) => runToolBatch(rows(args.items), context, async item => {
+    const provider = str(item.provider)
+    const target = str(item.id)
+    const alias = str(item.alias, 128)
+    const action = str(item.action)
+    if (!provider || !target || !alias || !['add', 'remove'].includes(action)) throw new Error(t('参数不完整（需要 provider / id / alias / action）'))
+    if (isCustomModelProvider(provider)) {
+      if (action === 'remove') await removeCustomMapping(provider, alias, target, context)
+      else await setCustomBinding(provider, alias, target, true, context)
+    } else {
+      await apiCall(`/api/models/mappings${action === 'remove' ? '/remove' : ''}`, { method: 'POST', body: { provider, target, alias } })
     }
-    return {
-      text: JSON.stringify({ ok: true, changed: done }),
-      summary: t('已改动 {n} 条映射', { n: done.length }),
-    }
-  },
+    return `${action === 'remove' ? '删除' : '新增'} ${alias} → ${provider}/${target}`
+  }, t),
 }
 
 /** 5 · 修改模型能力（改动） */
@@ -364,7 +318,8 @@ const setModelCapability: AssistantTool = {
     },
     required: ['provider', 'id', 'capabilities'],
   },
-  run: async args => {
+  run: async (args, context) => {
+    checkToolSignal(context)
     const provider = str(args.provider)
     const id = str(args.id)
     const raw = (args.capabilities && typeof args.capabilities === 'object'
@@ -393,10 +348,8 @@ const setModelCapability: AssistantTool = {
     if (!provider || !id || !Object.keys(caps).length) {
       throw new Error(t('参数不完整（需要 provider / id / capabilities）'))
     }
-    await apiCall('/api/models/capabilities', {
-      method: 'POST',
-      body: { provider, id, capabilities: caps },
-    })
+    if (isCustomModelProvider(provider)) await setCustomCapabilities(provider, id, caps, context)
+    else await apiCall('/api/models/capabilities', { method: 'POST', body: { provider, id, capabilities: caps } })
     return {
       text: JSON.stringify({ ok: true, provider, id, capabilities: caps }),
       summary: t('已修改 {n} 项能力', { n: Object.keys(caps).length }),
@@ -419,29 +372,33 @@ const testModel: AssistantTool = {
     },
     required: ['provider', 'id'],
   },
-  run: async args => {
-    const payload: Record<string, unknown> = {
-      provider: str(args.provider),
-      model: str(args.id),
-    }
+  run: async (args, context) => {
+    checkToolSignal(context)
+    const testId = crypto.randomUUID()
+    const payload: Record<string, unknown> = { provider: str(args.provider), model: str(args.id), test_id: testId }
     const prompt = str(args.prompt, 4000)
     if (prompt) payload.prompt = prompt
-    const result = (await apiCall('/api/models/test', { method: 'POST', body: payload })) as
-      | Record<string, unknown>
-      | undefined
+    const cancel = () => { void apiCall(`/api/stats/requests/terminate?id=${encodeURIComponent(testId)}`, { method: 'POST' }).catch(() => {}) }
+    context?.signal?.addEventListener('abort', cancel, { once: true })
+    let result: Record<string, unknown> | undefined
+    try {
+      result = await apiCall('/api/models/test', { method: 'POST', body: payload }) as Record<string, unknown> | undefined
+    } finally {
+      context?.signal?.removeEventListener('abort', cancel)
+    }
     const status = String(result?.status ?? '')
     const ok = result?.success === true
     const slim = {
       ok,
       status,
-      error: result?.error ?? null,
-      reply: String(result?.reply ?? '').slice(0, 1500),
+      error: result?.error ? safeText(result.error, 3000) : null,
+      reply: safeText(result?.reply, 1500),
       duration_ms: result?.duration_ms ?? null,
       ttfb_ms: result?.ttfb_ms ?? null,
       account: result?.account_name ?? null,
     }
     return {
-      text: JSON.stringify(slim).slice(0, 6000),
+      text: JSON.stringify(slim),
       summary: ok
         ? t('连通 · {ms}ms', { ms: String(slim.duration_ms ?? '') })
         : t('失败 · {status}', { status: status || '—' }),
@@ -463,28 +420,21 @@ const setProviderOrder: AssistantTool = {
     },
     required: ['provider', 'position'],
   },
-  run: async args => {
+  run: async (args, context) => {
+    checkToolSignal(context)
     const provider = str(args.provider).toLowerCase()
     const position = num(args.position)
     if (!provider || position === undefined) {
       throw new Error(t('参数不完整（需要 provider / position）'))
     }
     const accounts = await readAccounts()
-    // 按家分组，保持组内原有相对顺序
-    const groups: Array<{ provider: string; ids: string[] }> = []
-    for (const row of accounts) {
-      const id = str(row.id)
-      if (!id) continue
-      const key = str(row.provider).toLowerCase()
-      const last = groups[groups.length - 1]
-      if (last && last.provider === key) last.ids.push(id)
-      else groups.push({ provider: key, ids: [id] })
-    }
+    const groups = providerGroups(accounts)
     const from = groups.findIndex(group => group.provider === provider)
     if (from < 0) throw new Error(t('没有找到提供商「{provider}」的账号', { provider }))
     const to = Math.max(0, Math.min(groups.length - 1, Math.round(position) - 1))
     const [moved] = groups.splice(from, 1)
     groups.splice(to, 0, moved)
+    checkToolSignal(context)
     await apiCall('/api/accounts/reorder', {
       method: 'POST',
       body: { queue: groups.flatMap(group => group.ids) },
@@ -510,7 +460,8 @@ const setAccountOrder: AssistantTool = {
     },
     required: ['account', 'position'],
   },
-  run: async args => {
+  run: async (args, context) => {
+    checkToolSignal(context)
     const ref = str(args.account, 128)
     const position = num(args.position)
     if (!ref || position === undefined) {
@@ -524,6 +475,7 @@ const setAccountOrder: AssistantTool = {
     ids.splice(from, 1)
     const to = Math.max(0, Math.min(ids.length, Math.round(position) - 1))
     ids.splice(to, 0, target.id)
+    checkToolSignal(context)
     await apiCall('/api/accounts/reorder', { method: 'POST', body: { queue: ids } })
     return {
       text: JSON.stringify({ ok: true, account: accountName(target), from: from + 1, to: to + 1 }),
@@ -556,32 +508,29 @@ const setAccountEnabledTool: AssistantTool = {
     },
     required: ['items'],
   },
-  run: async args => {
-    const items = rows(args.items)
+  run: async (args, context) => {
+    checkToolSignal(context)
     const accounts = await readAccounts()
-    const done: string[] = []
-    for (const item of items) {
+    return runToolBatch(rows(args.items), context, async item => {
       const enabled = bool(item.enabled)
       if (enabled === undefined) throw new Error(t('参数不完整（需要 account / enabled）'))
       const target = findAccount(accounts, str(item.account, 128))
       await setAccountEnabled(target.id, enabled)
-      done.push(`${enabled ? '启用' : '禁用'} ${accountName(target)}`)
-    }
-    return {
-      text: JSON.stringify({ ok: true, changed: done }),
-      summary: t('已修改 {n} 个账号', { n: done.length }),
-    }
+      return `${enabled ? '启用' : '禁用'} ${accountName(target)}`
+    }, t)
   },
 }
 
 /** 全部工具（顺序 = 设置页清单顺序：只读在前，改动在后，高危最后） */
 export const ASSISTANT_TOOLS: AssistantTool[] = [
+  ...ASSISTANT_READ_TOOLS,
   listModels,
   listAccountBalance,
   setModelEnabledTool,
   setModelMapping,
   setModelCapability,
   testModel,
+  ...ASSISTANT_IMAGE_TOOLS,
   setProviderOrder,
   setAccountOrder,
   setAccountEnabledTool,

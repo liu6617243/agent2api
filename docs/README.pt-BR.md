@@ -12,7 +12,7 @@
 [![stars](https://img.shields.io/github/stars/aimod-cc/Agent2API?style=flat&color=yellow)](https://github.com/aimod-cc/Agent2API/stargazers)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/aimod-cc/Agent2API/releases/latest)
 
-[✨ Principais recursos](#-principais-recursos) • [💬 Comunidade e suporte](#-comunidade-e-suporte) • [🧩 Extensões por plugins](#-extensões-por-plugins) • [🚀 Início rápido](#-início-rápido) • [📦 Instalação e implantação](./install.pt-BR.md) • [📸 Capturas de tela](#-capturas-de-tela) • [🔧 Desenvolvimento e build](#-desenvolvimento-e-build) • [📜 Aviso de uso](#-aviso-de-uso)
+[✨ Principais recursos](#-principais-recursos) • [💬 Comunidade e suporte](#-comunidade-e-suporte) • [🚀 Início rápido](#-início-rápido) • [📦 Instalação e implantação](./install.pt-BR.md) • [📸 Capturas de tela](#-capturas-de-tela) • [🔧 Desenvolvimento e build](#-desenvolvimento-e-build) • [📜 Aviso de uso](#-aviso-de-uso)
 
 </div>
 
@@ -24,7 +24,7 @@ Este repositório contém apenas a infraestrutura do gateway e do gerenciamento 
 
 ## ✨ Principais recursos
 
-- 🔌 **APIs de modelos unificadas** — OpenAI Chat / Responses, Anthropic Messages e catálogo unificado
+- 🔌 **APIs de modelos unificadas** — OpenAI Chat / Responses / Images, Anthropic Messages e catálogo unificado; Raccoon, Loomy e Antigravity geram imagens, e Loomy e Antigravity também editam imagens de referência. Ambos os recursos estão disponíveis como ferramentas do assistente de IA
 - 🧭 **Roteamento de IA** — modelos, prioridade de contas, balanceamento, afinidade de sessão e failover
 - 🤖 **Gerenciamento de clientes Agent** — vários perfis, importação de configurações, prévia de gravação e alternância de serviços
 - 🧩 **Extensões por plugins** — provedores instalados e atualizados separadamente; o gateway funciona sem eles
@@ -49,20 +49,11 @@ Este repositório contém apenas a infraestrutura do gateway e do gerenciamento 
 
 ## 💬 Comunidade e suporte
 
-- **Grupos do QQ**: grupos de chat do Agent2API — **o grupo 1 (`1127656296`) está quase lotado, prefira o grupo 2 (`1130894674`)**; pesquise o número no QQ para entrar.
+- **Grupos do QQ**: grupos de chat do Agent2API — **os grupos 1 (`1127656296`) e 2 (`1130894674`) estão quase lotados, entre no grupo 3 (`1108276647`)**; pesquise o número no QQ para entrar.
 - **Grupo do Telegram**: <https://t.me/+9gM8YPvgRL02NGRl>
 - **Servidor do Discord**: <https://discord.gg/z9GzSJMWp>
 - **💖 Doação**: se o Agent2API ajuda você, fique à vontade para [pagar um café ao autor](./SPONSOR.md); doações são voluntárias e não desbloqueiam nada.
 - **🤝 Patrocínio / negócios**: quer patrocinar o projeto ou divulgar seu produto aqui? Envie um e-mail para [541675139@qq.com](mailto:541675139@qq.com).
-
-## 🧩 Extensões por plugins
-
-O aplicativo principal cuida do roteamento, das configurações de clientes Agent e do gerenciamento de plugins, sem incluir implementações dos provedores. Instale **Provider Enhancement (提供商增强)** ou outros plugins compatíveis na página "Plugins" quando precisar dessas funções.
-
-- [Código dos plugins e capacidades suportadas](https://github.com/ProvidersPlugin/Agent2Providers)
-- [Índice de plugins](https://github.com/Agent2plugin/Agent2plugin)
-
-Os plugins são opcionais. Instalação, ativação e atualização são independentes do aplicativo. Provedores e recursos são definidos pelos manifestos e repositórios dos plugins.
 
 ## 🚀 Início rápido
 
@@ -146,10 +137,6 @@ O artefato de build é `target/release/bundle/nsis/Agent2API_<versão>_x64-setup
 O `.dmg` do macOS **só pode ser compilado no macOS** (`npm --prefix desktop-tauri run build -- --target universal-apple-darwin`) — não há compilação cruzada a partir do Windows, então o artefato oficial sai do workflow `build` da CI (`macos-latest`, dois alvos mesclados). Os pacotes do desktop Linux saem do job `linux-desktop` do mesmo workflow (deb + AppImage); as imagens Docker e os pacotes de servidor usados na atualização dentro do contêiner saem do job `linux-server`, que reaproveita o caminho de compilação do Dockerfile, de modo que o executável dentro do pacote vem da mesma toolchain da imagem.
 
 ## 📜 Aviso de uso
-
-### Escopo do projeto
-
-Fornece roteamento de IA e gerenciamento de clientes Agent locais. Não é um produto oficial de serviços de modelos ou fabricantes de clientes, nem implica endosso ou patrocínio. Confira termos do serviço, permissões e origem do plugin antes de usar.
 
 ### Segurança de credenciais e dados
 

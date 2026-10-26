@@ -19,13 +19,15 @@
 import * as React from 'react'
 import {
   Input,
-  Label,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
   Switch,
+  Field,
+  FieldGroup,
+  FieldLabel,
 } from '@ui'
 import { t } from '../i18n'
 import { type AccountRecord } from './accounts-shared'
@@ -108,19 +110,21 @@ export function UsageSettingsSection({
   const patch = (next: Partial<UsageDraft>): void => onChange({ ...draft, ...next })
   return (
     <>
-      <div className='field-row mt-2.5'>
-        <Label className='inline-flex cursor-pointer items-center gap-2.5 font-normal'>
+      <Field orientation='horizontal' className='field-row mt-2.5'>
+        <FieldLabel className='inline-flex cursor-pointer items-center gap-2.5 font-normal'>
           <Switch checked={draft.enabled} onCheckedChange={next => patch({ enabled: next === true })}
             aria-label={t('自动查询余额')} />
           <span className='text-xs text-subtle'>{t('自动查询余额（按下面的间隔自动刷新余额列的读数）')}</span>
-        </Label>
-      </div>
+        </FieldLabel>
+      </Field>
       {draft.enabled ? (
-        <div className='field-row mt-2.5'>
-          <label htmlFor={`${idPrefix}-interval`}>{t('查询间隔')}</label>
-          <Input id={`${idPrefix}-interval`} type='number' min={1} step={1}
-            className='max-w-[110px]' value={draft.intervalInput}
-            onChange={event => patch({ intervalInput: event.currentTarget.value })} />
+        <FieldGroup orientation='horizontal' className='field-row mt-2.5'>
+          <Field className='contents'>
+            <FieldLabel htmlFor={`${idPrefix}-interval`}>{t('查询间隔')}</FieldLabel>
+            <Input id={`${idPrefix}-interval`} type='number' min={1} step={1}
+              className='max-w-[110px]' value={draft.intervalInput}
+              onChange={event => patch({ intervalInput: event.currentTarget.value })} />
+          </Field>
           <Select value={draft.unit} onValueChange={value => patch({ unit: value as IntervalUnit })}>
             <SelectTrigger className='w-[92px]' aria-label={t('间隔单位')}>
               <SelectValue>{draft.unit === 'hours' ? t('小时') : draft.unit === 'minutes' ? t('分钟') : t('秒')}</SelectValue>
@@ -132,7 +136,7 @@ export function UsageSettingsSection({
             </SelectContent>
           </Select>
           <span className='detail'>{t('30 秒 ~ 24 小时；手动查询会顺延下一轮')}</span>
-        </div>
+        </FieldGroup>
       ) : null}
     </>
   )

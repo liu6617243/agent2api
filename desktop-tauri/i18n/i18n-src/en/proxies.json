@@ -251,5 +251,13 @@
   "首次购买使用优惠码 AGENT2API25 享 75 折。": "Use code AGENT2API25 for 25% off your first purchase.",
   "＋ 新增代理": "+ New proxy",
   "＋ 新增订阅": "+ New subscription",
-  "，": ", "
+  "，": ", ",
+  "软件 / 插件更新": "Software / plugin updates",
+  "内核下载": "Kernel download",
+  "此代理用于{services}；删除后这些线路将不可用，不会自动回退直连。": "This proxy is used for {services}. Deleting it makes those routes unavailable; they will not fall back to a direct connection.",
+  "选中的代理用于{services}；删除后这些线路将不可用，不会自动回退直连。": "The selected proxies are used for {services}. Deleting them makes those routes unavailable; they will not fall back to a direct connection.",
+  "代理内核未安装（下载内核后，被账号或服务线路引用的节点会自动开监听端口）": "The proxy kernel is not installed. After downloading it, nodes referenced by accounts or service routes will automatically get listening ports.",
+  "已有账号或服务线路引用它，监听端口尚未就绪；请稍等，或检查内核状态": "An account or service route references this node, but its listening port is not ready. Wait a moment or check the kernel status.",
+  "还没有账号或服务线路使用它；在账号或更新设置中选中并保存后，内核会自动开端口": "No account or service route uses this node yet. Select it in account or update settings and save to have the kernel open a port automatically.",
+  "更新出网线路已保存，正在准备监听端口": "The update route has been saved; preparing its listening port."
 }

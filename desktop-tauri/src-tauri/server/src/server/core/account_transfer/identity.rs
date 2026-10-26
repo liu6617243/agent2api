@@ -374,12 +374,21 @@ enum IdentityShape {
 
 /// 导入记录的业务身份；无法确定身份时 Err（该条失败，不做猜测性匹配）。
 pub(super) fn identity_of_item(provider: &str, item: &Map<String, Value>) -> Result<String, String> {
+    if let Some(Value::Object(secret)) = item.get("pluginSecret") {
+        let mut fields = item.clone();
+        for (key, value) in secret {
+            if !matches!(key.as_str(), "id" | "provider") {
+                fields.insert(key.clone(), value.clone());
+            }
+        }
+        return identity_from_fields(provider, &fields);
+    }
     identity_from_fields(provider, item)
 }
 
 /// 本机记录的业务身份（与 `identity_of_item` 同一份判据）；身份缺失时 None。
 pub(super) fn identity_of_record(provider: &str, record: &StoredAccount) -> Option<String> {
-    identity_from_fields(provider, record.fields()).ok()
+    identity_of_item(provider, record.fields()).ok()
 }
 
 /// 分配一个**真正全局唯一**的账号 id：优先用导入原值，被占用时依次尝试

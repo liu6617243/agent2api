@@ -18,10 +18,13 @@
  */
 
 import type {
-  AutoState, CheckinCenter, KeepaliveState, OnboardingTask, RecordsPage, RecordRow, TravelRunResult,
+  AutoState, CheckinCenter, CheckinSection, KeepaliveState, OnboardingTask, RecordsPage, RecordRow, TravelRunResult,
   TravelState,
 } from './checkin-types'
 import { t } from '../i18n'
+import type { CheckinResultRow } from '../../../ui-shared/checkin'
+import { rowCompleted, rowPending, rowMessage as resultMessage } from '../../../ui-shared/checkin-result'
+import { onboardingFromCenter } from './checkin-onboarding-cache'
 
 /** 新手福利的按账号缓存（明细要打上游，查一次存一次） */
 export type OnboardingCache = {
@@ -29,6 +32,8 @@ export type OnboardingCache = {
   tasks: OnboardingTask[]
   earned: number
   claiming: boolean
+  settled: boolean
+  settledAt?: number
   checkedAt?: number
   error?: string
 }
@@ -84,7 +89,7 @@ type CheckinBridge = {
   getCheckinSchedules?: () => Promise<AutoState | null | undefined>
   saveCheckinSchedule?: (patch: Record<string, unknown>) => Promise<AutoState | null | undefined>
   deleteCheckinSchedule?: (id: string) => Promise<unknown>
-  runCheckinSchedule?: (id: string) => Promise<unknown>
+  runCheckinSchedule?: (id: string) => Promise<CheckinRunResult | null | undefined>
   saveAutoCheckin?: (patch: Record<string, unknown>) => Promise<AutoState | null | undefined>
   getCheckinKeepalive?: () => Promise<KeepaliveState | null | undefined>
   saveCheckinKeepalive?: (models: string[]) => Promise<KeepaliveState | null | undefined>
@@ -119,6 +124,8 @@ type OnboardingPayload = {
   earned?: number
   total?: number
   settled?: boolean
+  settledAt?: number | null
+  failed?: number
   message?: string
 }
 
@@ -129,14 +136,15 @@ export type UmidState = {
   installSupported?: boolean
 }
 
-/** 一次签到的返回（`{...summary, state}`，见 api::checkin_schedules 的 run） */
-type CheckinRunResult = {
+/** 批量签到返回汇总与 results，活动分档接口直接返回账号行。 */
+type CheckinRunResult = CheckinResultRow & {
   succeeded?: number
   active?: number
   total?: number
   skipped?: number
   failedCount?: number
   failed?: string[]
+  results?: CheckinResultRow[]
   reason?: string
   state?: AutoState
 }
@@ -165,7 +173,7 @@ function app(): SharedWindow['wbApp'] {
 }
 
 /** 提示：优先走壳的 toast（与其它页同一套），没有就退回 `console` */
-export function toast(message: string, tone: 'ok' | 'err' = 'ok'): void {
+export function toast(message: string, tone: 'ok' | 'err' | 'warn' = 'ok'): void {
   const host = app()
   if (host?.toast) {
     host.toast(message, tone)
@@ -191,6 +199,7 @@ export function errorMessage(error: unknown): string {
 export type Store = {
   /** 聚合快照（null = 还没读到） */
   center: CheckinCenter | null
+  centerSection: CheckinSection
   loaded: boolean
   /** 首屏 / 刷新的错误（页面顶部错误条） */
   loadError: string
@@ -231,6 +240,7 @@ export type Store = {
 
 export const store: Store = {
   center: null,
+  centerSection: 'daily',
   loaded: false,
   loadError: '',
   saving: false,
@@ -277,6 +287,7 @@ export async function loadCenter(): Promise<void> {
     }
     patch({
       center: data,
+      onboarding: onboardingFromCenter(data, store.onboarding),
       loaded: true,
       loadError: '',
       // 快照到手 = 草稿该跟着它走（写动作成功后也会清，两处不冲突）
@@ -378,26 +389,40 @@ export async function signSingle(accountId: string, mode: string): Promise<void>
   }
 }
 
-/** 把一次签到的结果变成一条提示（与旧实现同一套文案口径） */
+function rowMessage(row: CheckinResultRow): string {
+  return resultMessage(row) || t('未完成，请查看签到记录')
+}
+
+/** 提示以逐账号执行结果为准，HTTP 成功仅表示整轮执行完毕。 */
 function reportRunResult(result: CheckinRunResult | null | undefined, single = false): void {
   if (!result) return
+  const rows = Array.isArray(result.results) ? result.results
+    : result.claim || result.activity || result.error ? [result] : []
+  if (single && rows.length === 1) {
+    const row = rows[0]
+    const completed = rowCompleted(row)
+    const message = completed ? row.claim?.msg?.trim() || result.reason || '签到完成' : rowMessage(row)
+    toast(completed ? `✅ ${message}` : message, completed ? 'ok' : rowPending(row) ? 'warn' : 'err')
+    return
+  }
   const succeeded = Number(result.succeeded) || 0
   const active = Number(result.active) || 0
-  const total = Number(result.total) || 0
-  const failed = Number(result.failedCount) || 0
+  const total = Number(result.total) || rows.length
+  const failedRows = rows.filter(row => !rowCompleted(row) && !rowPending(row))
+  const failed = result.failedCount ?? result.failed?.length ?? failedRows.length
   const activeText = active > 0 ? `，日活保活 ${active} 个` : ''
   if (failed > 0) {
-    const names = Array.isArray(result.failed) && result.failed.length
-      ? `（${result.failed.join('、')}）`
-      : ''
+    const failures = result.failed?.length ? result.failed : failedRows.map(rowMessage)
+    const names = failures.length ? `（${failures.slice(0, 5).join('、')}）` : ''
     toast(`签到完成：${succeeded}/${total} 成功${activeText}，${failed} 个失败${names}`, 'err')
     return
   }
   if (single) {
-    toast(`✅ ${result.reason || '签到完成'}`)
+    const completed = succeeded > 0 || active > 0
+    toast(completed ? `✅ ${result.reason || '签到完成'}` : t('未完成，请查看签到记录'), completed ? 'ok' : 'warn')
     return
   }
-  toast(`✅ 签到完成：${succeeded}/${total} 个账号成功领取${activeText}`)
+  toast(`✅ 签到完成：${succeeded}/${total} 个账号成功领取${activeText}`, succeeded > 0 || active > 0 ? 'ok' : 'warn')
 }
 
 /** 定时签到总开关 */
@@ -447,8 +472,8 @@ export async function runScheduleEntry(id: string): Promise<void> {
   if (store.runningScheduleId) return
   patch({ runningScheduleId: id })
   try {
-    await bridge().runCheckinSchedule?.(id)
-    toast('✅ 已执行')
+    const result = await bridge().runCheckinSchedule?.(id)
+    reportRunResult(result)
   } catch (error) {
     toast(`执行失败：${errorMessage(error)}`, 'err')
   } finally {

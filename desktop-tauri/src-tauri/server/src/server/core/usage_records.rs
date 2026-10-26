@@ -196,6 +196,9 @@ pub fn mark_attempt(account_id: &str) {
 /// 内存事实表同步更新：成功且有数字 → 刷新；成功但判不出（unlimited / 形状不认）
 /// → 摘除（不能让一个过期的旧数字把账号永久挡在选路之外）。
 pub fn write_result(account_id: &str, outcome: &UsageOutcome) {
+    if let Some(usage) = &outcome.usage {
+        crate::server::core::limiter::sources::note(account_id, usage);
+    }
     let now = logging::now_ms();
     let Some(db) = database() else { return };
     // 闭包返回 `(是否成功, 成功时提出的数字)`：失败分支只写原因、保留旧数值

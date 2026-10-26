@@ -32,6 +32,8 @@
    app.js 的 showPage 会遍历所有 .nav-item 并按 data-page 重置 active，
    设置页的分类项会被顺手清掉选中态（点分类后一切页就跳回「通用」）。 */
 .settings-nav {
+  --ui-selection-bg: var(--primary-soft);
+  --ui-selection-border: transparent;
   flex: 0 0 auto;
   width: 140px;
   display: flex;
@@ -51,9 +53,10 @@
      不覆盖的话三个分类会各自居中，看着不像一排导航 */
   justify-content: flex-start;
   width: 100%;
-  /* 高度沿用通用 button 的 30px，与主侧栏 .nav-item 等高（那儿的高度也来自这条基线）。
-     不另设 height / line-height：12.5px 的行盒远小于 30px，不会溢出 */
+  /* 与主侧栏一致的紧凑行高；NavItem 默认按内边距撑高，这里固定为 30px。 */
+  height: 30px;
   padding: 0 10px;
+  gap: 7px;
   border: 1px solid transparent;
   border-radius: var(--r-sm);
   background: transparent;
@@ -67,16 +70,14 @@
   transition: background .15s ease, color .15s ease;
 }
 
-/* 分类图标槽：尺寸/取色与主侧栏的 .nav-item .ico 一致（17px 盒、currentColor，
-   选中态自动变主题色；svg 撑满盒子）。间距用 margin 而不是 gap —— 老浏览器之外
-   没差别，但这里与 .nav-item 的写法保持一致，两处对照着读更容易。 */
+/* 分类图标槽：尺寸与主侧栏一致，间距由导航项的 gap 给出。 */
 .settings-nav-item .ico {
   flex: 0 0 auto;
   width: 17px;
   height: 17px;
   display: grid;
   place-items: center;
-  margin-right: 7px;
+  margin-right: 0;
 }
 
 .settings-nav-item .ico svg { display: block; }
@@ -94,7 +95,7 @@
    一并声明 .active:hover，让悬停选中项时仍保持选中态。 */
 .settings-nav-item.active,
 .settings-nav-item.active:hover {
-  background: var(--primary-soft);
+  background: transparent;
   border-color: transparent;
   color: var(--primary-fg);
   font-weight: 600;
@@ -113,6 +114,60 @@
 
 .settings-pane { display: none; }
 .settings-pane.active { display: block; }
+
+.settings-dlg.settings-dlg {
+  width: min(820px, calc(100vw - 48px));
+  height: min(540px, calc(100dvh - 48px));
+}
+.settings-dlg > [data-slot='dialog-header'],
+.settings-dlg > [data-slot='dialog-footer'] { flex-shrink: 0; }
+.settings-dlg-body.settings-dlg-body {
+  flex: 1;
+  min-height: 0;
+  flex-direction: row;
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
+}
+.settings-dlg-rail { flex: 0 0 148px; min-width: 0; }
+.settings-dlg-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 16px 20px 20px;
+}
+.settings-dlg-pane-head { margin-bottom: 18px; }
+.settings-dlg-pane-head h3 { font-size: 13.5px; font-weight: 600; }
+.settings-dlg-pane-head p {
+  margin-top: 4px;
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.settings-dlg-fields { display: flex; flex-direction: column; gap: 14px; }
+.settings-dlg-fields p { line-height: 1.7; }
+.settings-dlg-footer p { min-width: 0; line-height: 1.6; }
+
+@media (max-width: 640px) {
+  .settings-dlg-body.settings-dlg-body { flex-direction: column; }
+  .settings-dlg-rail.settings-dlg-rail {
+    flex: none;
+    border-right: 0;
+    border-bottom: 1px solid var(--sidebar-border);
+  }
+  .settings-dlg-rail .rail-scroll {
+    flex: none;
+    flex-direction: row;
+    overflow-x: auto;
+    overflow-y: hidden;
+    gap: 4px;
+  }
+  .settings-dlg-rail .rail-label { display: none; }
+  .settings-dlg-rail [data-slot='nav-item'] { flex: 0 0 auto; width: auto; }
+  .settings-dlg-main { padding: 14px 16px 18px; }
+}
 
 /* 窄窗口（与主侧栏收起的断点一致）：两栏退化为「导航在上、内容在下」，
    导航转横排铺满整行；装不下时导航自己横向滚（下面 nav 的 overflow-x）。 */
@@ -184,15 +239,6 @@
 .io-result b { color: var(--text); }
 
 /* 危险提示区（导出含凭证） */
-.danger-zone {
-  padding: 12px 14px;
-  border: 1px solid var(--danger-bd);
-  border-radius: var(--r-md);
-  background: var(--danger-soft);
-  color: var(--text-2);
-  font-size: 12px;
-  line-height: 1.65;
-}
 
 .danger-zone strong { color: var(--danger); }
 
@@ -304,73 +350,12 @@
    「指定错误码不重试」用：一排已添加的状态码徽章 + 一个行内输入框，
    回车添加、点 ✕ 删除。整框是一个输入控件的观感 —— 点空白处也会聚焦
    输入框（settings-panel.js 里有对应绑定），所以框自己要有聚焦描边。 */
-.tag-input {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  width: 320px;
-  max-width: 100%;
-  min-height: 34px;
-  padding: 4px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-md, 8px);
-  background: var(--surface);
-  cursor: text;
-  transition: border-color .12s ease, box-shadow .12s ease;
-}
-.tag-input:focus-within {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px var(--primary-soft);
-}
-.tag-input.disabled { opacity: .55; cursor: default; }
-.tag-input.disabled:focus-within { border-color: var(--border); box-shadow: none; }
 
 /* 徽章：状态码走等宽字形（与上面的数字框同一取向，位数变化一眼可见） */
-.tag-input .tag-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  padding: 2px 4px 2px 9px;
-  border-radius: 999px;
-  background: var(--surface-3);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.5;
-  white-space: nowrap;
-}
 
 /* 徽章上的 ✕：小号、圆角热区，悬停加深 —— 「能点删」的视觉暗示 */
-.tag-input .tag-x {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: none;
-  color: var(--text-3);
-  font-size: 10px;
-  line-height: 1;
-  cursor: pointer;
-}
-.tag-input .tag-x:hover { background: var(--danger-soft, rgba(220, 38, 38, .12)); color: var(--danger, #dc2626); }
 
 /* 行内输入框：无框无底色（框的描边由外层 .tag-input 出），吃掉剩余宽度 */
-.tag-input .tag-input-field {
-  flex: 1 1 120px;
-  min-width: 120px;
-  border: none;
-  outline: none;
-  background: transparent;
-  color: var(--text);
-  font-size: 12.5px;
-  padding: 2px 0;
-}
-.tag-input .tag-input-field:disabled { background: transparent; }
 
 /* ─── 系统提示词（模式下拉 + 文件路径 + 正文按钮）───
    版式复用 .retention-row 的两列（定宽标签 + 输入），但输入不是「窄数字框」，
@@ -414,11 +399,6 @@
   font-weight: 400;
   letter-spacing: 0;
 }
-
-/* 「网关自带」那一行的标签：比普通行标签轻一档（它是同一家的**第二行**，
-   不是又一个并列的设置项），前缀一个竖线让它看起来挂在上面的家名下。
-   选择器写成 `.retention-row > label.prompt-gateway-label`：不与全局那条
-   `label` 规则比 `!important`，而是靠多一级类选择器拿到更高优先级。 */
 .retention-row > label.prompt-gateway-label {
   padding-left: 10px;
   border-left: 2px solid var(--border);
@@ -628,21 +608,8 @@
   .sysinfo-row,
   .sysinfo-groups .sysinfo-row { grid-template-columns: 108px minmax(0, 1fr); }
 }
-
-/* ─── 整库恢复的进度弹窗 ───
-   不可关闭：进行中只显示阶段与进度条，收口后给「知道了」。
-   样式与 `.modal` 一族同一套取值（弹窗本体由组件库的 Dialog 画，
-   这里只管内容区的排布）。
-
-   比标准弹窗窄一档：里面只有一行阶段文案 + 一条进度条 + 结果，
-   620px 会把那行字拉得离进度条很远。
-
-   `!important` 与双写类名都不是随手加的：宽度来自组件库的 Tailwind 工具类
-   `w-[min(620px,calc(100vw-48px))]`，而这份产物里的工具类**统一带
-   `!important`**（见 ui/islands/ui.css）。不这样写这条规则永远不生效，
-   弹窗会一直是 620px —— 正是「看着空、进度条离文字很远」的来源。 */
 .db-restore-dialog.db-restore-dialog {
-  width: min(460px, calc(100vw - 48px)) !important;
+  width: min(460px, calc(100vw - 48px));
 }
 
 .db-restore-body {

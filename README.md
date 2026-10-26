@@ -12,7 +12,7 @@
 [![stars](https://img.shields.io/github/stars/aimod-cc/Agent2API?style=flat&color=yellow)](https://github.com/aimod-cc/Agent2API/stargazers)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/aimod-cc/Agent2API/releases/latest)
 
-[✨ Key Features](#-key-features) • [💬 Community & Support](#-community--support) • [🧩 Plugin Extensions](#-plugin-extensions) • [🚀 Quick Start](#-quick-start) • [📦 Installation & deployment](./docs/install.en.md) • [📸 Screenshots](#-screenshots) • [🔧 Development & Build](#-development--build) • [📜 Usage Notice](#-usage-notice)
+[✨ Key Features](#-key-features) • [💬 Community & Support](#-community--support) • [🚀 Quick Start](#-quick-start) • [📦 Installation & deployment](./docs/install.en.md) • [📸 Screenshots](#-screenshots) • [🔧 Development & Build](#-development--build) • [📜 Usage Notice](#-usage-notice)
 
 </div>
 
@@ -24,7 +24,7 @@ This repository contains only the gateway and client configuration infrastructur
 
 ## ✨ Key Features
 
-- 🔌 **Unified model APIs** — OpenAI Chat / Responses and Anthropic Messages protocols, with a unified model catalog
+- 🔌 **Unified model APIs** — OpenAI Chat / Responses / Images and Anthropic Messages, with a unified model catalog; Raccoon, Loomy and Antigravity supply image generation, while Loomy and Antigravity also support reference-image editing. Both are available as AI assistant tools
 - 🧭 **AI routing** — model mapping, account priority, load balancing, session affinity and failover in one place
 - 🤖 **Agent client takeover** — manage multiple connection profiles for local clients, import existing settings, preview writes and switch between the gateway and custom services
 - 🧩 **Plugin extensions** — provider implementations are installed and updated separately, not bundled with the application; the routing gateway works without them
@@ -49,20 +49,11 @@ This repository contains only the gateway and client configuration infrastructur
 
 ## 💬 Community & Support
 
-- **QQ groups**: Agent2API chat groups — **group 1 (`1127656296`) is almost full, please join group 2 (`1130894674`) first**; search the number in QQ to join.
+- **QQ groups**: Agent2API chat groups — **group 1 (`1127656296`) and group 2 (`1130894674`) are almost full, please join group 3 (`1108276647`)**; search the number in QQ to join.
 - **Telegram group**: <https://t.me/+9gM8YPvgRL02NGRl>
 - **Discord server**: <https://discord.gg/z9GzSJMWp>
 - **💖 Donate**: if Agent2API helps you, you are welcome to [buy the author a coffee](./docs/SPONSOR.md); donations are voluntary and unlock nothing.
 - **🤝 Sponsorship / business**: want to sponsor the project, or feature your product here? Email [541675139@qq.com](mailto:541675139@qq.com).
-
-## 🧩 Plugin Extensions
-
-The main application provides the routing gateway, Agent client configuration and plugin management, without bundling provider-specific implementations. Install **Provider Enhancement** (提供商增强) or other compatible plugins from the Plugins page when those capabilities are needed.
-
-- [Provider plugin source and supported capabilities](https://github.com/ProvidersPlugin/Agent2Providers)
-- [Plugin index](https://github.com/Agent2plugin/Agent2plugin)
-
-Plugins are optional and installed, enabled and updated independently of the application. Available providers and capabilities are defined by each plugin's manifest and repository.
 
 ## 🚀 Quick start
 
@@ -146,10 +137,6 @@ The build artifact is `target/release/bundle/nsis/Agent2API_<version>_x64-setup.
 The macOS `.dmg` **can only be built on macOS** (`npm --prefix desktop-tauri run build -- --target universal-apple-darwin`) — it cannot be cross-compiled from Windows, so the official artifact comes from the CI `build` workflow (`macos-latest`, two targets merged). Docker images and the server archives used for in-container updates come from the same workflow's `linux-server` job, which reuses the Dockerfile's compile path so the executable inside is built from the same toolchain as the image.
 
 ## 📜 Usage Notice
-
-### Project scope
-
-This project provides an AI routing gateway and local Agent client configuration management. It is not an official product of any model service or client vendor and does not imply their authorization, endorsement or sponsorship. Provider-specific capabilities are maintained in independent plugins. Check service terms, account permissions and plugin origin before use.
 
 ### Credential and data security
 

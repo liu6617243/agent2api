@@ -4,7 +4,9 @@ import {
   buildProxyPick, EMPTY_PROXY_SELECTION, errorMessage, fetchProxySelection, openExternal,
   saveProxy, shared, toast, type ProxySelection, type UpdateTokenStatus,
 } from './update-shared'
+import { GithubAccessSettingsPanel } from './update-github-access'
 import { t } from '../i18n'
+import { isPortlessSubscription } from './accounts-shared'
 
 function tokenStatus(token: UpdateTokenStatus | null): { badge: React.ReactNode; hint: string } {
   if (!token) return { badge: <Badge shape='tag' variant='outline'>{t('读取中')}</Badge>, hint: '' }
@@ -26,29 +28,76 @@ function tokenStatus(token: UpdateTokenStatus | null): { badge: React.ReactNode;
   }
 }
 
-export function GithubUpdateSettings({ plugin = false }: { plugin?: boolean }) {
+export function GithubUpdateSettings({ plugin = false, pane }: {
+  plugin?: boolean
+  pane: 'network' | 'token' | null
+}) {
   const [selection, setSelection] = React.useState<ProxySelection>(EMPTY_PROXY_SELECTION)
   const [token, setToken] = React.useState<UpdateTokenStatus | null>(null)
   const [draft, setDraft] = React.useState('')
   const [busy, setBusy] = React.useState(false)
   const [proxyBusy, setProxyBusy] = React.useState(false)
-  const pick = buildProxyPick(selection)
+  const [proxyOpening, setProxyOpening] = React.useState(false)
+  const proxyRevision = React.useRef(0)
+  const pick = buildProxyPick(selection, proxyOpening)
 
   React.useEffect(() => {
     let alive = true
-    void fetchProxySelection().then(value => { if (alive) setSelection(value) })
+    const revision = proxyRevision.current
+    void fetchProxySelection().then(value => {
+      if (alive && revision === proxyRevision.current) setSelection(value)
+    })
     void shared().workbuddyDesktop?.getUpdateToken().then(value => {
       if (alive) setToken(value ?? null)
     }).catch(error => toast(t('读取设置失败：{error}', { error: errorMessage(error) }), 'err'))
     return () => { alive = false }
   }, [])
 
+  React.useEffect(() => {
+    if (!proxyOpening) return
+    let alive = true
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = Date.now() + 45_000
+    const revision = proxyRevision.current
+    async function refresh(): Promise<void> {
+      const next = await fetchProxySelection()
+      if (!alive || revision !== proxyRevision.current) return
+      if (!next.proxyLoaded || next.poolError) {
+        if (Date.now() >= deadline) setProxyOpening(false)
+        else timer = setTimeout(() => void refresh(), 1500)
+        return
+      }
+      setSelection(next)
+      const id = next.proxyChoice?.config?.proxyId
+      const item = next.pool?.find(entry => entry.id === id)
+      if (!next.proxyChoice?.error || !item || item.enabled === false || item.orphan
+        || !isPortlessSubscription(item) || Date.now() >= deadline) {
+        setProxyOpening(false)
+        return
+      }
+      timer = setTimeout(() => void refresh(), 1500)
+    }
+    timer = setTimeout(() => void refresh(), 1500)
+    return () => { alive = false; if (timer) clearTimeout(timer) }
+  }, [proxyOpening])
+
   async function handlePick(value: string): Promise<void> {
     if (proxyBusy) return
+    proxyRevision.current += 1
+    setProxyOpening(false)
     setProxyBusy(true)
     try {
       const result = await saveProxy(value)
-      if (result) setSelection(previous => ({ ...previous, proxyChoice: result.choice }))
+      if (result) {
+        setSelection(previous => ({ ...previous, proxyChoice: result.choice }))
+        setProxyOpening(result.opening)
+        const next = await fetchProxySelection()
+        setSelection(previous => ({
+          ...next,
+          proxyChoice: next.proxyLoaded ? next.proxyChoice : result.choice,
+          pool: next.poolError ? previous.pool : next.pool,
+        }))
+      }
     } finally { setProxyBusy(false) }
   }
 
@@ -75,53 +124,64 @@ export function GithubUpdateSettings({ plugin = false }: { plugin?: boolean }) {
   const stored = Boolean(token?.error) || token?.origin === 'stored'
   return (
     <>
-      <div>
-        <div className='text-[13px] font-semibold text-foreground'>{t('出网代理')}</div>
-        <div className='mt-1.5'>
-          <Select value={pick.current} disabled={proxyBusy}
-            onValueChange={value => void handlePick(String(value))}>
-            <SelectTrigger className={cn('w-full', pick.broken && 'border-destructive-bd')}
-              title={pick.title} aria-label={t('更新出网代理')}>
-              <SelectValue className='min-w-0 truncate'>{pick.selected?.label || t('直连')}</SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              {pick.items.map(item => (
-                <SelectItem key={item.value} value={item.value} disabled={item.disabled}>{item.label}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+      <div hidden={pane !== 'network'}>
+        <div className='settings-dlg-pane-head'>
+          <h3>{t('网络')}</h3>
+          {plugin ? <p>{t('与软件更新共用出网代理和 GitHub 凭证，修改任意一处都会同步生效。')}</p> : null}
         </div>
-        {plugin ? <p className='mt-1.5 text-[12px] text-subtle'>
-          {t('与软件更新共用出网代理和 GitHub 凭证，修改任意一处都会同步生效。')}
-        </p> : null}
+        <div className='settings-dlg-fields'>
+          <GithubAccessSettingsPanel />
+          <div className='h-px bg-hairline' />
+          <div>
+            <div className='text-[13px] font-semibold text-foreground'>{t('出网代理')}</div>
+            <div className='mt-1.5'>
+              <Select value={pick.current} disabled={proxyBusy}
+                onValueChange={value => void handlePick(String(value))}>
+                <SelectTrigger className={cn('w-full', pick.broken && 'border-destructive-bd')}
+                  title={pick.title} aria-label={t('更新出网代理')}>
+                  <SelectValue className='min-w-0 truncate'>{pick.selected?.label || t('直连')}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {pick.items.map(item => (
+                    <SelectItem key={item.value} value={item.value} disabled={item.disabled}>{item.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+        </div>
       </div>
-      <div className='h-px bg-hairline' />
-      <div>
-        <div className='flex items-center justify-between gap-2'>
-          <div className='text-[13px] font-semibold text-foreground'>{t('GitHub 令牌')}</div>
-          <Button variant='outline' size='xs'
-            title={t('在默认浏览器中打开 GitHub 的令牌创建页（备注已预设，无需勾选任何权限，直接点 Generate token）')}
-            onClick={() => void openExternal('https://github.com/settings/tokens/new?description='
-              + encodeURIComponent('Agent2API 更新检查'))}>
-            {t('打开 GitHub 令牌页面')}
-          </Button>
+      <div hidden={pane !== 'token'}>
+        <div className='settings-dlg-pane-head'>
+          <h3>{t('GitHub 令牌')}</h3>
+          {plugin ? <p>{t('与软件更新共用出网代理和 GitHub 凭证，修改任意一处都会同步生效。')}</p> : null}
         </div>
-        <div className='mt-1.5 flex items-center gap-2'>
-          {status.badge}<span className='text-[12px] text-subtle'>{status.hint}</span>
-        </div>
-        <div className='mt-2 flex items-center gap-2'>
-          <Input type='password' className='flex-1' autoComplete='new-password' spellCheck={false}
-            aria-label={t('GitHub 令牌')}
-            placeholder={token?.filled && token.origin !== 'env'
-              ? t('已填写（粘贴新令牌可覆盖）') : t('粘贴 GitHub 令牌（ghp_… / github_pat_…）')}
-            value={draft} onChange={event => setDraft(event.currentTarget.value)}
-            onKeyDown={event => {
-              if (event.key === 'Enter') { event.preventDefault(); void saveToken() }
-            }} />
-          <Button size='sm' disabled={busy || !draft.trim()} onClick={() => void saveToken()}>{t('保存')}</Button>
-          {stored ? <Button variant='outline' size='sm' disabled={busy} onClick={() => void saveToken(true)}>
-            {t('清除')}
-          </Button> : null}
+        <div className='settings-dlg-fields'>
+          <div className='flex flex-wrap items-center gap-2'>
+            {status.badge}<span className='text-[12px] text-subtle'>{status.hint}</span>
+          </div>
+          <div className='flex flex-wrap items-center gap-2'>
+            <Input type='password' className='min-w-0 flex-1' autoComplete='new-password' spellCheck={false}
+              aria-label={t('GitHub 令牌')}
+              placeholder={token?.filled && token.origin !== 'env'
+                ? t('已填写（粘贴新令牌可覆盖）') : t('粘贴 GitHub 令牌（ghp_… / github_pat_…）')}
+              value={draft} onChange={event => setDraft(event.currentTarget.value)}
+              onKeyDown={event => {
+                if (event.key === 'Enter') { event.preventDefault(); void saveToken() }
+              }} />
+            <Button size='sm' disabled={busy || !draft.trim()} onClick={() => void saveToken()}>{t('保存')}</Button>
+            {stored ? <Button variant='outline' size='sm' disabled={busy} onClick={() => void saveToken(true)}>
+              {t('清除')}
+            </Button> : null}
+          </div>
+          <div>
+            <Button variant='outline' size='sm'
+              title={t('在默认浏览器中打开 GitHub 的令牌创建页（备注已预设，无需勾选任何权限，直接点 Generate token）')}
+              onClick={() => void openExternal('https://github.com/settings/tokens/new?description='
+                + encodeURIComponent('Agent2API 更新检查'))}>
+              {t('打开 GitHub 令牌页面')}
+            </Button>
+          </div>
         </div>
       </div>
     </>

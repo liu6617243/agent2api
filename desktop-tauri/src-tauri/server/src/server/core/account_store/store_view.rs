@@ -44,7 +44,7 @@ use crate::server::core::proxies::describe_account_proxy;
 /// 自定义提供商的转发**仍在网关里**（`core::upstream::provider_loop` 按
 /// `custom-` 前缀直连，不经插件），它们没有插件可装 —— 按执行体判会把
 /// 用户自己建的 API 全藏起来。所以先看「是不是内置家的 id」。
-fn account_visible(provider: &str) -> bool {
+pub(super) fn account_visible(provider: &str) -> bool {
     if crate::server::core::providers::kind_from_id(provider).is_none() {
         return true;
     }
@@ -507,6 +507,37 @@ impl AccountStore {
                     "hasCredentials".to_string(),
                     Value::Bool(record.has_credentials()),
                 );
+                // 「需要重新登录」标记（issue #215）：上游注销了会话、refresh token
+                // 一并作废时由刷新链路落。界面据此把「刷新失败」显示成「需要重新
+                // 登录」—— 两者对用户的下一步动作完全不同（前者再点一次，后者必须
+                // 去登录）。
+                //
+                // ── 为什么在这一段统一注入 ──────────────────────────────
+                // 内置家的 `to_public_account` 早就写了自己那一份，但**插件家不走
+                // 那条投影**（它们的形状由插件的 `account_view` 给，见上面第一条
+                // 分支）—— 于是插件家即使记录上落了 `needsRelogin`，界面也读不到。
+                // 而「登录态失效」是**账号级事实**，与形状由谁拼无关：Loomy 这类
+                // 无续期家尤其只能靠它表达失效（上游回 020002 / 100002 时由
+                // `upstream::provider_loop` 落这个键，见那里的说明）。
+                // 键恒在（false 表示正常），前端不必判「键缺失」；插件申报的同名键
+                // 被这里覆盖也无妨 —— 网关的判定比插件自己的猜测更接近事实。
+                fields.insert(
+                    "needsRelogin".to_string(),
+                    Value::Bool(
+                        record
+                            .fields()
+                            .get("needsRelogin")
+                            .map(js_truthy)
+                            .unwrap_or(false),
+                    ),
+                );
+                fields.insert(
+                    "needsReloginReason".to_string(),
+                    value_or(
+                        record.fields().get("needsReloginReason"),
+                        Value::String(String::new()),
+                    ),
+                );
                 // 没有转发能力的家：界面据此说明「启用了也不会被转发」，
                 // 而不是把一个失效的启用开关当成正常账号展示。
                 // 各家现在都能转发，所以正常配置下这里恒为 true ——
@@ -527,6 +558,16 @@ impl AccountStore {
                 //
                 // 恒为数字（无记录时 0）而不是缺键：界面按 `Number(...) || 0` 读，
                 // 两种形态都能吃，但恒定的形状让「字段缺失」与「值为 0」不再需要分开判。
+                if super::is_zcode_family(&record.provider()) {
+                    let plan = crate::server::core::providers::zcode::normalize_plan(&record.zcode_plan())
+                        .unwrap_or(crate::server::core::providers::zcode::PLAN_CODING);
+                    fields.insert(crate::server::core::providers::zcode::PLAN_FIELD.to_string(), Value::String(plan.to_string()));
+                }
+                for key in ["claimAt", "claimPlanId", "claimPlans"] {
+                    if let Some(value) = record.get(key) {
+                        fields.insert(key.to_string(), value.clone());
+                    }
+                }
                 fields.insert("checkinAt".to_string(), Value::from(record.checkin_at()));
                 // 成长中心连登天数（WorkBuddy 国内版；签到后回读落库，见
                 // `AccountStore::mark_streak_days`）。恒为数字键（0 = 还没读到过），
@@ -556,6 +597,10 @@ impl AccountStore {
                         &record.provider(),
                         record.get("maxConcurrent"),
                     )),
+                );
+                fields.insert(
+                    "allowRouteSkip".to_string(),
+                    Value::Bool(record.get("allowRouteSkip").and_then(Value::as_bool).unwrap_or(true)),
                 );
                 // 用户显式设置过备注名（update_account 真正改到 name 时打的标，
                 // 见 apply_patch）。恒为布尔而不是缺键：界面据此决定「备注名赢过
@@ -592,6 +637,10 @@ impl AccountStore {
                     "limiters".to_string(),
                     crate::server::core::limiter::effective_rules_json_in(record.fields()),
                 );
+                fields.insert(
+                    "limiterGroups".to_string(),
+                    crate::server::core::limiter::types::json_of(&crate::server::core::limiter::effective_groups_in(record.fields())),
+                );
                 // 跨家统一注入的**账号展示名**：与前端 `displayNameOf` 同口径的
                 // 唯一后端实现（规则见本文件底部的 `display_name_of`）。
                 // 恒为非空字符串（`displayName` 全兜底失效时退 id），请求日志 /
@@ -611,7 +660,7 @@ impl AccountStore {
                 // 键只会让读侧多一个「要不要判它」的疑问。判据见
                 // `chatglm_accounts::guest_of_record`（只认确凿的访客证据，
                 // 与新手任务列表那边的兜底方向刻意相反）。
-                if record.provider() == super::CHATGLM_PROVIDER_ID {
+                if record.provider() == super::CHATGLM_PROVIDER_ID && !record.has_plugin_secret() {
                     fields.insert(
                         "isGuest".to_string(),
                         Value::Bool(super::chatglm_accounts::guest_of_record(record)),

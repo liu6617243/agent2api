@@ -14,7 +14,7 @@
  */
 
 import * as React from 'react'
-import { Button, cn } from '@ui'
+import { Alert, Badge, Button, Card, CardFooter, Collapsible, CollapsibleContent, CollapsibleTrigger, HtmlContent, cn, Table, TableHeader, TableRow, TableHead, TableBody, TableCell } from '@ui'
 import { t } from '../i18n'
 import { toolById, type ToolPlan } from './assistant-tools'
 import { parseToolArguments, type ToolCall } from './assistant-state'
@@ -24,6 +24,10 @@ import {
   ChevronIcon,
   LayersIcon,
 } from './assistant-icons'
+import { Spinner } from '@ui'
+import { AssistantImageResults } from '../../../ui-shared/assistant-image-results'
+import type { ImageAsset } from '../../../ui-shared/assistant-image-tools'
+import { loadAssistantImage } from './assistant-image-api'
 
 export type ToolCardItem = {
   kind: 'tool'
@@ -32,6 +36,7 @@ export type ToolCardItem = {
   plan?: ToolPlan
   summary?: string
   detail?: string
+  images?: ImageAsset[]
   error?: string
   /** 完全访问模式下自动执行的（卡头换成「已自动执行」） */
   auto?: boolean
@@ -42,6 +47,7 @@ export type UiMessage =
   | { kind: 'bot'; text: string; streaming?: boolean }
   | ToolCardItem
   | { kind: 'notice'; text: string; bad?: boolean }
+  | { kind: 'images'; images: ImageAsset[] }
 
 /* ─── 助手正文的 Markdown（走全局 wbMarkdown，与更新日志同一份实现）─── */
 
@@ -108,11 +114,9 @@ function BotMessage({ text, streaming }: { text: string; streaming?: boolean }) 
           <span>{timeLabel()}</span>
         </div>
         {text ? (
-          <div className='md' dangerouslySetInnerHTML={{ __html: renderMarkdown(text) }} />
+          <HtmlContent className='md' html={renderMarkdown(text)} />
         ) : (
-          <span className='asst-typing' aria-label={t('正在思考…')}>
-            <i /><i /><i />
-          </span>
+          <Spinner className='text-muted-foreground' aria-label={t('正在思考…')} />
         )}
         {streaming && text ? <span className='asst-caret' /> : null}
       </div>
@@ -157,21 +161,18 @@ function ToolCard({ item, onConfirm }: { item: ToolCardItem; onConfirm: (run: bo
   const expanded = item.state === 'confirm' || open
 
   return (
-    <div className={cn('asst-tool',
+    <Collapsible open={expanded} onOpenChange={setOpen} render={<Card />} className={cn('asst-tool',
       item.state === 'confirm' && 'confirm',
       item.state === 'confirm' && tool?.kind === 'run' && 'danger',
       item.state === 'failed' && 'failed',
       item.auto && 'auto')}>
-      <button
-        type='button'
+      <CollapsibleTrigger render={<Button variant='ghost' />}
         className='asst-tool-head'
-        onClick={() => { if (expandable) setOpen(prev => !prev) }}
-        aria-expanded={expandable ? expanded : undefined}
         disabled={!expandable}
       >
         <span className={cn('asst-tool-ico', item.state === 'failed' && 'bad', item.state === 'confirm' && 'warn')}>
           {item.state === 'running'
-            ? <span className='spin' />
+            ? <Spinner className='size-3' />
             : item.state === 'failed'
               ? '✕'
               : item.auto
@@ -181,31 +182,32 @@ function ToolCard({ item, onConfirm }: { item: ToolCardItem; onConfirm: (run: bo
         <span className='asst-tool-name'>{label}</span>
         {item.state === 'confirm' && <span className='asst-tool-sum'>{t('{n} 条改动', { n: planRowCount(item.plan) })}</span>}
         {item.state === 'done' && item.detail && !open && <span className='asst-tool-sum'>{t('查看结果')}</span>}
-        <span className={cn('asst-tool-state', state.tone)}>
+        <Badge variant={state.tone === 'ok' ? 'success' : state.tone === 'bad' ? 'destructive' : 'outline'} className={cn('asst-tool-state', state.tone)}>
           {item.state === 'done' && <CheckIcon size={12} />}
           {state.text}
-        </span>
+        </Badge>
         {expandable && <ChevronIcon size={12} className={cn('asst-tool-chev', open && 'open')} />}
-      </button>
+      </CollapsibleTrigger>
 
-      {expanded && (
+      {item.images?.length ? <AssistantImageResults images={item.images} load={loadAssistantImage} t={t} /> : null}
+      <CollapsibleContent>
         <>
           {item.state === 'confirm' && item.plan && (
             <div className='asst-tool-plan'>
               <div className='lead'>{item.plan.lead}</div>
               {item.plan.table && (
-                <table className='asst-mini-table'>
-                  <thead><tr>{item.plan.table.head.map((cell, i) => <th key={i}>{cell}</th>)}</tr></thead>
-                  <tbody>
+                <Table container={false} className='asst-mini-table'>
+                  <TableHeader><TableRow>{item.plan.table.head.map((cell, i) => <TableHead key={i}>{cell}</TableHead>)}</TableRow></TableHeader>
+                  <TableBody>
                     {item.plan.table.rows.slice(0, 20).map((row, i) => (
-                      <tr key={i}>
+                      <TableRow key={i}>
                         {row.map((cell, j) => (
-                          <td key={j} className={j === row.length - 1 ? 'mono hl' : ''}>{cell}</td>
+                          <TableCell key={j} className={j === row.length - 1 ? 'mono hl' : ''}>{cell}</TableCell>
                         ))}
-                      </tr>
+                      </TableRow>
                     ))}
-                  </tbody>
-                </table>
+                  </TableBody>
+                </Table>
               )}
               {item.plan.table && item.plan.table.rows.length > 20 && (
                 <div className='hint'>{t('（仅显示前 20 条，共 {n} 条）', { n: item.plan.table.rows.length })}</div>
@@ -215,7 +217,7 @@ function ToolCard({ item, onConfirm }: { item: ToolCardItem; onConfirm: (run: bo
           )}
 
           {item.state === 'failed' && item.error && (
-            <div className='asst-tool-error'>{item.error}</div>
+            <Alert variant='destructive' className='asst-tool-error'>{item.error}</Alert>
           )}
           {item.state === 'done' && item.detail && (
             <pre className='asst-tool-json'>{item.detail}</pre>
@@ -225,7 +227,7 @@ function ToolCard({ item, onConfirm }: { item: ToolCardItem; onConfirm: (run: bo
           )}
 
           {item.state === 'confirm' && (
-            <div className='asst-tool-foot'>
+            <CardFooter className='asst-tool-foot'>
               <span className={cn('hint', tool?.kind === 'run' && 'danger')}>
                 {tool?.kind === 'run' ? t('这会真实发起上游请求并消耗额度') : t('确认后立即生效')}
               </span>
@@ -233,11 +235,11 @@ function ToolCard({ item, onConfirm }: { item: ToolCardItem; onConfirm: (run: bo
               <Button size='sm' variant={tool?.kind === 'run' ? 'destructive' : 'default'}
                 onClick={() => onConfirm(true)}>{t('执行')}</Button>
               <Button size='sm' variant='outline' onClick={() => onConfirm(false)}>{t('取消')}</Button>
-            </div>
+            </CardFooter>
           )}
         </>
-      )}
-    </div>
+      </CollapsibleContent>
+    </Collapsible>
   )
 }
 
@@ -261,11 +263,14 @@ export function MessageList({ messages, onConfirm }: {
         if (message.kind === 'bot') {
           return <BotMessage key={index} text={message.text} streaming={message.streaming} />
         }
+        if (message.kind === 'images') {
+          return <AssistantImageResults key={index} images={message.images} load={loadAssistantImage} t={t} />
+        }
         if (message.kind === 'notice') {
           return (
-            <div key={index} className={cn('asst-notice', message.bad && 'bad')}>
+            <Alert variant={message.bad ? 'destructive' : 'default'} key={index} className={cn('asst-notice', message.bad && 'bad')}>
               {message.text}
-            </div>
+            </Alert>
           )
         }
         return <ToolCard key={index} item={message} onConfirm={onConfirm} />

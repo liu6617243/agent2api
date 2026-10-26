@@ -269,24 +269,18 @@ if [ "$MIRROR_TO_SOURCE" = "1" ]; then
     echo "⚠️  取不到源码仓库名（origin 不是 GitHub？），跳过镜像"
   else
     echo "→ 镜像到源码仓库 $SOURCE_REPO"
-    # 正文里加一句指向构建仓库：两个地方各有一份时，用户得知道更新检查读哪个
-    MIRROR_NOTES=$(mktemp)
-    {
-      cat "$NOTES_FILE"
-      printf '\n\n---\n同一份发布，也是应用更新检查读取的那一份：https://github.com/%s/releases/tag/%s\n' \
-        "$BUILD_REPO" "$TAG"
-    } > "$MIRROR_NOTES"
+    # 正文与构建仓库那份**逐字相同**（同一份更新日志），不追加任何说明行 ——
+    # 两个 Release 的内容应当一致，差异只该来自平台本身。
     if GH_TOKEN="$SOURCE_TOKEN" gh release view "$TAG" --repo "$SOURCE_REPO" >/dev/null 2>&1; then
-      GH_TOKEN="$SOURCE_TOKEN" gh release edit "$TAG" --repo "$SOURCE_REPO" --prerelease="$PRERELEASE" --notes-file "$MIRROR_NOTES"
+      GH_TOKEN="$SOURCE_TOKEN" gh release edit "$TAG" --repo "$SOURCE_REPO" --prerelease="$PRERELEASE" --notes-file "$NOTES_FILE"
     else
       GH_TOKEN="$SOURCE_TOKEN" gh release create "$TAG" --repo "$SOURCE_REPO" --prerelease="$PRERELEASE" \
-        --title "$TAG" --notes-file "$MIRROR_NOTES"
+        --title "$TAG" --notes-file "$NOTES_FILE"
     fi
     # 同样逐个上传：一批传会在已存在的附件上报 422（见上面那段注释）
     for asset in "${ASSETS[@]}"; do
       GH_TOKEN="$SOURCE_TOKEN" gh release upload "$TAG" "$asset" --repo "$SOURCE_REPO" --clobber
     done
-    rm -f "$MIRROR_NOTES"
     echo "  ↳ 已镜像 ${#ASSETS[@]} 个附件"
   fi
 fi

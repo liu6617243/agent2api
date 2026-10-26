@@ -12,7 +12,7 @@
 [![stars](https://img.shields.io/github/stars/aimod-cc/Agent2API?style=flat&color=yellow)](https://github.com/aimod-cc/Agent2API/stargazers)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/aimod-cc/Agent2API/releases/latest)
 
-[✨ 핵심 기능](#-핵심-기능) • [💬 커뮤니티 및 지원](#-커뮤니티-및-지원) • [🧩 플러그인 확장](#-플러그인-확장) • [🚀 빠른 시작](#-빠른-시작) • [📦 설치와 배포](./install.ko.md) • [📸 화면 미리보기](#-화면-미리보기) • [🔧 개발 및 빌드](#-개발-및-빌드) • [📜 사용 고지](#-사용-고지)
+[✨ 핵심 기능](#-핵심-기능) • [💬 커뮤니티 및 지원](#-커뮤니티-및-지원) • [🚀 빠른 시작](#-빠른-시작) • [📦 설치와 배포](./install.ko.md) • [📸 화면 미리보기](#-화면-미리보기) • [🔧 개발 및 빌드](#-개발-및-빌드) • [📜 사용 고지](#-사용-고지)
 
 </div>
 
@@ -24,7 +24,7 @@ Agent2API는 **AI 라우팅 게이트웨이와 Agent 클라이언트 설정 관�
 
 ## ✨ 핵심 기능
 
-- 🔌 **통합 모델 API** — OpenAI Chat / Responses, Anthropic Messages 및 통합 모델 목록
+- 🔌 **통합 모델 API** — OpenAI Chat / Responses / Images, Anthropic Messages 및 통합 모델 목록. Raccoon, Loomy, Antigravity가 이미지 생성을 제공하며 Loomy와 Antigravity는 참조 이미지 편집도 지원. 생성과 편집은 AI 어시스턴트 도구로도 사용 가능
 - 🧭 **AI 라우팅** — 모델 매핑, 계정 우선순위, 부하 분산, 세션 고정 및 장애 전환
 - 🤖 **Agent 클라이언트 설정 관리** — 여러 연결 프로필, 기존 설정 가져오기, 쓰기 미리보기 및 서비스 전환
 - 🧩 **플러그인 확장** — 공급자 구현은 본체에 포함되지 않고 별도 설치·업데이트. 게이트웨이만 사용할 수도 있음
@@ -49,20 +49,11 @@ Agent2API는 **AI 라우팅 게이트웨이와 Agent 클라이언트 설정 관�
 
 ## 💬 커뮤니티 및 지원
 
-- **QQ 그룹**: Agent2API 교류 그룹 —— **그룹 1(`1127656296`)은 곧 정원이 차므로 그룹 2(`1130894674`)에 먼저 참여해 주세요** (QQ에서 번호를 검색해 참여하세요).
+- **QQ 그룹**: Agent2API 교류 그룹 —— **그룹 1(`1127656296`)과 그룹 2(`1130894674`)은 곧 정원이 마감되므로 그룹 3(`1108276647`)에 참여해 주세요** (QQ에서 번호를 검색해 참여하세요).
 - **Telegram 그룹**: <https://t.me/+9gM8YPvgRL02NGRl>
 - **Discord 서버**: <https://discord.gg/z9GzSJMWp>
 - **💖 후원**: Agent2API가 도움이 되셨다면 [작성자에게 커피 한 잔](./SPONSOR.md)도 환영합니다. 후원은 자발적이며 아무 기능도 해제되지 않습니다.
 - **🤝 스폰서 / 비즈니스**: 프로젝트를 후원하거나 여기에 제품을 소개하고 싶다면 [541675139@qq.com](mailto:541675139@qq.com)으로 메일 주세요.
-
-## 🧩 플러그인 확장
-
-본체는 라우팅, Agent 클라이언트 설정과 플러그인 관리를 담당하며 공급자별 구현은 내장하지 않습니다. 필요할 때 "플러그인" 페이지에서 **Provider Enhancement(提供商增强)** 또는 호환 플러그인을 설치하세요.
-
-- [플러그인 소스 및 지원 기능](https://github.com/ProvidersPlugin/Agent2Providers)
-- [플러그인 인덱스](https://github.com/Agent2plugin/Agent2plugin)
-
-설치, 활성화와 업데이트는 본체와 독립적입니다. 공급자와 기능은 각 플러그인의 매니페스트 및 저장소 설명을 기준으로 합니다.
 
 ## 🚀 빠른 시작
 
@@ -146,10 +137,6 @@ npm run build:icon         # 아이콘 소스 이미지 생성(아이콘 디자�
 macOS 의 `.dmg` 는 **macOS 에서만 빌드할 수 있습니다**(`npm --prefix desktop-tauri run build -- --target universal-apple-darwin`). Windows 에서 크로스 컴파일할 수 없어 공식 산출물은 CI 의 `build` 워크플로(macos-latest 에서 두 타깃을 병합)가 만듭니다. Linux 데스크톱 패키지는 같은 워크플로의 `linux-desktop` job 이 만들고(deb + AppImage), Docker 이미지와 컨테이너 내 업데이트에 쓰는 서버 패키지는 `linux-server` job 이 만듭니다. 후자는 Dockerfile 의 컴파일 경로를 재사용하므로 패키지 안의 실행 파일이 이미지와 동일한 도구 체인의 산출물입니다.
 
 ## 📜 사용 고지
-
-### 프로젝트 범위
-
-AI 라우팅과 로컬 Agent 클라이언트 설정 관리를 제공합니다. 모델 서비스나 클라이언트 업체의 공식 제품이 아니며 업체의 승인이나 후원을 뜻하지 않습니다. 사용 전 서비스 약관, 계정 권한과 플러그인 출처를 확인하세요.
 
 ### 자격 증명과 데이터 보안
 

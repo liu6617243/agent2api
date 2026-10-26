@@ -167,12 +167,7 @@ pub async fn run_download() -> Result<DownloadOutcome, String> {
 /// Clash 混合端口兜底，与 `update::client` 的 `resolveEgressCandidates`
 /// 同一条顺序）。
 ///
-/// ── 选定线路**不回落**（与 updateProxy 的取向刻意不同）────────────
-/// 软件更新的口径是「指定出口解析不出来就退回默认链」—— 那条链路后台静默跑，
-/// 宁可降级也别失败。内核下载是用户**刚在弹窗里点过一条线路**的前台动作：
-/// 这时悄悄改走直连，失败信息会变成「无法连接 GitHub」，用户会去怀疑网络、
-/// 怀疑订阅，而真正的问题是那条线路已经不在了。所以这里报错，并把该去哪儿改
-/// 说清楚。
+/// 选定线路失效时明确报错，不静默改走直连；软件更新使用同一约束。
 fn egress_candidates() -> Result<Vec<Option<crate::server::core::proxies::ResolvedProxy>>, String> {
     if let Some(configured) = config::kernel_proxy() {
         return match resolve_account_proxy(Some(&configured)) {

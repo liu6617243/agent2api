@@ -16,10 +16,11 @@
   "{n} 个账号启用 · {m} 个限流中": "",
   "{n} 个账号正在限流，转发会自动跳过它们": "",
   "{n} 天": "",
-  "{n} 次请求": "",
+  "{n} 次请求": "{n} requisições",
   "{start} ~ {end}": "",
   "{tokens} tokens · 占 {pct}": "{tokens} tokens · {pct} do total",
   "…还有 {n} 个模型": "…e mais {n} modelos",
+  "…还有 {n} 项": "…e mais {n} itens",
   "一": "S",
   "三": "Q",
   "二": "T",
@@ -71,6 +72,7 @@
   "日": "D",
   "时间范围。「今天」是本地自然日今天 0 点到现在；「昨天」是昨天一整天（0 点到 24 点）；「近 7 天 / 近 30 天」含今天在内往前数，即今天与之前的 6 / 29 天，不是「不含今天的 7 / 30 天」。": "Período. \"Hoje\" é o dia local de 00:00 até agora; \"Ontem\" é o dia de ontem inteiro (00:00–24:00); \"Últimos 7 dias\" / \"Últimos 30 dias\" contam para trás incluindo hoje, ou seja, hoje mais os 6 / 29 dias anteriores — não 7 / 30 dias excluindo hoje.",
   "昨天": "Ontem",
+  "暂无可签到账号": "",
   "暂无热力图数据": "Ainda não há dados do mapa de calor",
   "暂无缓存趋势数据": "Ainda não há dados de tendência de cache",
   "暂无趋势数据": "Ainda não há dados de tendência",
@@ -112,5 +114,6 @@
   "还有 {n} 个待签": "",
   "还没有添加账号": "",
   "还没有请求记录": "",
+  "请求日志只展示仍保留的明细；清理明细不会减少日报中的历史用量。": "Os logs exibem apenas detalhes preservados; apagá-los não reduz o uso histórico nos relatórios diários.",
   "连续天数": ""
 }

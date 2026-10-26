@@ -66,10 +66,11 @@ pub async fn install(body: Bytes) -> Response {
 }
 
 async fn reload_result(enabled: bool) -> Value {
-    let reloaded = match plugin_accounts::shared() {
-        Some(store) => plugin_host::reload_host(store).await.is_some(),
-        None => false,
-    };
+    if let Some(store) = plugin_accounts::shared() {
+        plugin_host::reload_host(store).await;
+    }
+    let reloaded = plugin_host::list_packs().iter().filter(|pack| pack.enabled)
+        .all(|pack| plugin_host::host_for_pack(&pack.id).is_some_and(|host| host.status().running));
     let mut result = plugin_host::management_snapshot();
     result["ok"] = json!(true);
     result["hostError"] = if enabled && !reloaded {
@@ -96,10 +97,7 @@ pub async fn uninstall(body: Bytes) -> Response {
     if !plugin_host::list_packs().iter().any(|pack| pack.id == id) {
         return management_error(404, "没有安装这个插件包");
     }
-    if let Some(host) = plugin_host::current() {
-        host.shutdown().await;
-    }
-    plugin_host::detach();
+    plugin_host::shutdown_all().await;
     plugin_host::clear_providers();
     let outcome = plugin_host::uninstall(id);
     let result = reload_result(!plugin_host::list_packs().is_empty()).await;

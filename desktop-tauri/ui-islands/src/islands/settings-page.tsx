@@ -1,9 +1,13 @@
 import * as React from 'react'
+import { providerPromptRows } from './settings-prompt-rows'
 import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
 import {
   Badge,
   Button,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
   Dialog,
   DialogBody,
   DialogContent,
@@ -11,7 +15,11 @@ import {
   DialogHeader,
   DialogTitle,
   Input,
+  InputGroup,
+  InputGroupInput,
   Label,
+  NavList,
+  NavItem,
   SegmentedControl,
   Select,
   SelectContent,
@@ -19,7 +27,7 @@ import {
   SelectTrigger,
   SelectValue,
   Switch,
-} from '@ui'
+  CardHeader, Card, CardContent } from '@ui'
 import {
   CATEGORIES,
   CAPTCHA_POOL_FIELDS,
@@ -29,9 +37,6 @@ import {
   QUEUE_FIELDS,
   RETENTION_FIELDS,
   RETRY_FIELDS,
-  ROUTE_PROTECTION_SWITCHES,
-  ROUTE_STICKY_OPTIONS,
-  ROUTE_STRATEGIES,
   STATES,
   THEME_EVENT,
   THEME_MODES,
@@ -47,8 +52,6 @@ import {
   shared,
   type GatewayBlocks,
   type NumberField,
-  type RouteStickyValue,
-  type RouteStrategyValue,
   type ThemeMode,
 } from './settings-model'
 import {
@@ -77,8 +80,6 @@ import {
   refreshQueue,
   refreshRetention,
   refreshRetry,
-  refreshRouting,
-  refreshSanitize,
   refreshStorage,
   refreshTimeouts,
   removeProviderPrompt,
@@ -110,8 +111,6 @@ import {
   saveQueueField,
   saveRetentionField,
   saveRetryField,
-  saveRoutingField,
-  saveSanitize,
   saveDeveloperRoleCompat,
   saveTimeoutField,
   saveToggle,
@@ -132,7 +131,6 @@ import {
   type PromptState,
   type ProviderPromptOption,
   type ProviderPromptState,
-  type RoutingState,
   type SettingsSnapshot,
   type StorageState,
 } from './settings-state'
@@ -151,10 +149,12 @@ import {
 // 与设置页的快照 store 没有交集，见该文件的模块头
 import { CloudSyncPanel } from './settings-cloud-sync'
 import { DbRestoreDialog } from './settings-db-restore'
+import { SanitizePanel } from './settings-sanitize'
 // 侧边栏菜单面板（设置 → 显示）：显隐 / 顺序 / 分组。布局模型在
 // ui/sidebar-layout.js（经典脚本，主侧边栏渲染与这里共用同一份），见该文件的模块头
 import { SidebarPane } from './sidebar-pane'
 import { t } from '../i18n'
+import { Alert } from '@ui'
 
 /**
  * Agent2API · 设置页（React 岛）。
@@ -193,15 +193,8 @@ import { t } from '../i18n'
  * 左栏分类项带**图标**（icons.js 里那组描边风格的设置页图标，17px 图标盒与主侧栏
  * 同款）—— 标签因此不再受「两字」限制：图标负责一眼认出、文字负责说清。
  *
- * 三处细节：
- *   · 问号仍用 `[data-tip]`（10 条说明动辄几百字，tooltip.js 的自动增强仍在页面上跑，
- *     含 MutationObserver 接住 React 动态插入的元素）—— 不换成 Tooltip 是刻意的：换了要
- *     把十条长文各包一层组件，观感与行为却完全一样；
- *   · 数字框的宽度 / 居中 / 等宽数字写成工具类：组件库的 Input 自带 `w-full`（工具类带
- *     !important），page-settings.css 里 `.retention-input input[type="number"]` 的 92px
- *     只保得住 max-width，宽度得自己带（与任务面板的间隔框同一处理）；
- *   · 显隐一律**条件渲染**，不写 hidden / style.display —— 组件库的 Tailwind 工具类分层且
- *     带 !important，会压掉 tokens.css 里未分层的 `[hidden]{display:none!important}`。
+ * 问号的 `[data-tip]` 由公共提示桥接入组件库 Tooltip；数字框仅保留业务宽度约束。
+ * 分类面板通过显隐保留各自草稿，不让切换分类重置编辑态。
  */
 
 /* ─── 小组件 ───────────────────────────────── */
@@ -232,44 +225,29 @@ type PanelHeadProps = {
 /** 面板标题栏：标题 + 问号 + 徽章 + 右侧操作（DOM 顺序与静态骨架一致） */
 function PanelHead({ title, tip, badge, actions }: PanelHeadProps) {
   return (
-    <div className='panel-head'>
+    <CardHeader className='panel-head'>
       <h2>{title}</h2>
       {tip ? <span className='tip-q' data-tip={tip}></span> : null}
       {badge}
       {actions ? <div className='head-actions'>{actions}</div> : null}
-    </div>
+    </CardHeader>
   )
 }
 
-/**
- * 可折叠面板：标题栏就是 `<details>` 的 summary，正文平时收起 —— 给「行数多、
- * 但多数时候不用动」的面板用（目前是 Cline 伪装头）。开合状态不持久化，跟
- * 用户上次的选择，不需要额外持久化。
- */
+/** 折叠不卸载正文，避免丢失尚未提交的设置草稿。 */
 function CollapsiblePanel({ title, tip, badge, actions, children }: PanelHeadProps & { children: React.ReactNode }) {
-  // `summary` 里的一切点击都会切换开合（原生行为），而标题栏里有两类**独立
-  // 动作**的控件：问号提示（点开 tooltip）与右侧操作按钮（如「刷新」）。
-  // 点它们不该顺手把面板折起来 —— 尤其是「展开 → 点问号看说明」这个动作，
-  // 正文会在眼前消失。
-  //
-  // 用 `preventDefault` 而不是 `stopPropagation`：开合是 click 的**默认动作**
-  // （由 `<details>` 在事件传播结束后执行），`stopPropagation` 拦不住它。
-  function keepOpen(event: React.MouseEvent<HTMLElement>): void {
-    const target = event.target as HTMLElement
-    if (target.closest('.tip-q, .head-actions')) event.preventDefault()
-  }
-  return (
-    <details className='panel panel-fold'>
-      <summary className='panel-head' onClick={keepOpen}>
-        <span className='fold-caret' aria-hidden dangerouslySetInnerHTML={{ __html: iconHtml('caretRight', 14) }} />
+  return <Collapsible render={<Card />} className='panel panel-fold group/fold'>
+    <CardHeader className='panel-head'>
+      <CollapsibleTrigger className='h-auto flex-1 justify-start gap-2 px-0 text-left'>
+        <span className='transition-transform group-data-open/fold:rotate-90' aria-hidden dangerouslySetInnerHTML={{ __html: iconHtml('caretRight', 14) }} />
         <h2>{title}</h2>
-        {tip ? <span className='tip-q' data-tip={tip}></span> : null}
-        {badge}
-        {actions ? <div className='head-actions'>{actions}</div> : null}
-      </summary>
-      {children}
-    </details>
-  )
+      </CollapsibleTrigger>
+      {tip ? <span className='tip-q' data-tip={tip} /> : null}
+      {badge}
+      {actions ? <div className='head-actions'>{actions}</div> : null}
+    </CardHeader>
+    <CollapsibleContent keepMounted>{children}</CollapsibleContent>
+  </Collapsible>
 }
 
 type SwitchRowProps = {
@@ -277,7 +255,7 @@ type SwitchRowProps = {
   label: string
   checked: boolean
   disabled?: boolean
-  /** 行内问号提示（与 PanelHead 同款 `[data-tip]`，tooltip.js 统一服务） */
+  /** 行内问号提示（与 PanelHead 同款 `[data-tip]`，desktop-tooltip.tsx 统一服务） */
   tip?: string
   onCheckedChange: (next: boolean) => void
 }
@@ -288,11 +266,11 @@ type SwitchRowProps = {
  */
 function SwitchRow({ id, label, checked, disabled, tip, onCheckedChange }: SwitchRowProps) {
   return (
-    <label className='switch'>
+    <Label className='switch'>
       <Switch id={id} checked={checked} disabled={disabled} onCheckedChange={next => onCheckedChange(next)} />
       <span>{label}</span>
       {tip ? <span className='tip-q' data-tip={tip}></span> : null}
-    </label>
+    </Label>
   )
 }
 
@@ -324,7 +302,7 @@ function NumberRow({ field, value, disabled, onCommit }: NumberRowProps) {
 
   return (
     <div className='retention-row'>
-      <label htmlFor={field.id}>{field.label}</label>
+      <Label htmlFor={field.id}>{field.label}</Label>
       <span className='retention-input'>
         <Input
           id={field.id}
@@ -333,7 +311,9 @@ function NumberRow({ field, value, disabled, onCommit }: NumberRowProps) {
           max={field.max}
           step={1}
           inputMode='numeric'
-          className='w-[92px] max-w-[92px] text-center tabular-nums'
+          className={field.max > 99999
+            ? 'w-[132px] max-w-[132px] text-center tabular-nums'
+            : 'w-[92px] max-w-[92px] text-center tabular-nums'}
           value={text}
           disabled={disabled || value === null}
           onChange={event => setDraft(event.target.value)}
@@ -387,7 +367,7 @@ function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
 
   return (
     <>
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead
           title={t('启动与托盘')}
           tip={TIPS.tray}
@@ -397,7 +377,7 @@ function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
               ? <StatusBadge tone='bad'>{t('不可用')}</StatusBadge>
               : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
         />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <div className='settings-switches'>
             {/* 主进程没返回启动设置时开关仍可拨（照旧实现）：拨了直接发全量 patch，
                 保存成功即回到「已应用」，不必让用户重开程序 */}
@@ -426,13 +406,13 @@ function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
             />
           </div>
           <div className='settings-state'>{appState}</div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
       {!snap.panelLogin && (
-        <section className='panel'>
+        <Card render={<section />} className='panel'>
           <PanelHead title={t('局域网访问')} tip={TIPS.lan} />
-          <div className='panel-body'>
+          <CardContent className='panel-body'>
             <div className='settings-switches'>
               {/* 开 / 关都不直接落盘：走确认框（→ 需要时注册管理员 → 写设置并重启），
                   流程与文案在 settings-state 的 toggleLan / resolveLanConfirm */}
@@ -452,13 +432,13 @@ function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
               />
             </div>
             <div className='settings-state'>{lanStateText(snap)}</div>
-          </div>
-        </section>
+          </CardContent>
+        </Card>
       )}
 
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead title={t('计量单位')} tip={TIPS.units} />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <div className='settings-switches'>
             <SwitchRow
               id='settings-chinese-units'
@@ -470,8 +450,8 @@ function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
           <div className='settings-state'>
             {snap.unitsChinese ? STATES.unitsOn : STATES.unitsOff}
           </div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
     </>
   )
 }
@@ -556,9 +536,9 @@ function DisplayPane() {
 
   return (
     <>
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead title={t('显示模式')} tip={TIPS.displayTheme} />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <div>
             <SegmentedControl<ThemeMode>
               aria-label={t('显示模式')}
@@ -568,15 +548,15 @@ function DisplayPane() {
             />
           </div>
           <div className='settings-state'>{themeStateText(theme)}</div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead title={t('界面缩放')} tip={TIPS.displayZoom} />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <div className='retention-list'>
             <div className='retention-row'>
-              <label htmlFor='settings-zoom'>{t('缩放比例')}</label>
+              <Label htmlFor='settings-zoom'>{t('缩放比例')}</Label>
               <span className='prompt-input'>
                 {/* 档位是 80%–130% 的 11 个定值，用下拉而不是滑块：每一档都要能精确
                     复述（用户问「我现在多少」时答案是个整数），且组件库目前没有 Slider。
@@ -610,25 +590,25 @@ function DisplayPane() {
           <div className='settings-state'>
             {isWeb ? STATES.zoomWeb : zoom === 100 ? STATES.zoomDefault : t('当前按 {n}% 显示。', { n: zoom })}
           </div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead title={t('语言设置')} tip={TIPS.displayLanguage} />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <LanguageRow />
           <div className='settings-state'>{STATES.languageHint}</div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
       {/* 账号列表：合计口径 / 账号名掩码。与上面三项同属「怎么看这张表」的纯前端
           偏好（localStorage，见 accounts-store 的 GROUP_TOTAL_FILTERED_KEY 与
           NAMES_HIDDEN_KEY）—— 不碰转发、不碰账号数据，所以也不进 settings-state
           的后端快照。账号页有自己的入口改这两项（表头那颗眼睛、合计徽标本身），
           两边读写的是同一份键。 */}
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead title={t('账号列表')} tip={TIPS.accountList} />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <div className='settings-switches'>
             <SwitchRow
               id='settings-group-total-filtered'
@@ -646,8 +626,8 @@ function DisplayPane() {
           <div className='settings-state'>
             {groupTotalFiltered ? STATES.groupTotalFilteredOn : STATES.groupTotalFilteredOff}
           </div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
       {/* 侧边栏菜单：显隐 / 顺序 / 分组。权威副本在库里（kv 的 sidebarLayout
           键，经 /api/sidebar-layout 读写），localStorage 只是首帧缓存 ——
@@ -683,7 +663,7 @@ function LanguageRow() {
   return (
     <div className='retention-list'>
       <div className='retention-row'>
-        <label htmlFor='settings-language'>{t('界面语言')}</label>
+        <Label htmlFor='settings-language'>{t('界面语言')}</Label>
         <span className='prompt-input'>
           {/* 与「界面缩放」同一个 Select 形态：展示文案显式给 SelectValue，不依赖 value 自动显示。
               组件的 onValueChange 可能给 null（被清空），这里只在拿到非空值时切换 */}
@@ -719,15 +699,15 @@ function RetryCodesField({ codes, status, busy }: {
 
   return (
     <div className='retention-row'>
-      <label htmlFor='settings-retry-no-codes-input'>{t('指定错误码直接换号')}</label>
+      <Label htmlFor='settings-retry-no-codes-input'>{t('指定错误码直接换号')}</Label>
       <div className='retention-input'>
         {/* 点框体空白处 = 聚焦输入框（整框是一个输入控件的观感，旧实现同） */}
-        <div
-          className={locked ? 'tag-input disabled' : 'tag-input'}
+        <InputGroup
+          className={`h-auto w-[320px] max-w-full flex-wrap gap-1.5 px-2 py-1${locked ? ' opacity-55' : ''}`}
           onClick={() => inputRef.current?.focus()}
         >
           {(codes || []).map(code => (
-            <span className='tag-chip' key={code}>
+            <Badge variant='brand' className='tag-chip' key={code}>
               <span className='v'>{code}</span>
               {/* 徽章上的 ✕：小号圆角热区，悬停加深 —— 用组件库的小件档 + 语义色，
                   「能点删」的视觉暗示与旧实现一致 */}
@@ -742,15 +722,13 @@ function RetryCodesField({ codes, status, busy }: {
               >
                 ✕
               </Button>
-            </span>
+            </Badge>
           ))}
-          <Input
+          <InputGroupInput
             ref={inputRef}
             id='settings-retry-no-codes-input'
             type='text'
-            // 框的描边由外层 .tag-input 出，这里把组件库 Input 的边框 / 底色 / 内边距
-            // 用工具类压平（.tag-input-field 的老规则是非分层的，压不过工具类）
-            className='tag-input-field h-auto border-0 bg-transparent px-0 shadow-none focus:shadow-none'
+            className='h-6 min-w-[120px] flex-1 px-0'
             placeholder={locked ? '—' : t('输入状态码，回车添加')}
             inputMode='numeric'
             autoComplete='off'
@@ -768,7 +746,7 @@ function RetryCodesField({ codes, status, busy }: {
               if (event.key === 'Backspace' && !text) void dropLastRetryCode()
             }}
           />
-        </div>
+        </InputGroup>
       </div>
       <div className='hint'>{NOTES.retryCodes}</div>
     </div>
@@ -791,7 +769,7 @@ function PromptFileRow({ prompt, locked, busy }: {
 
   return (
     <div className='retention-row'>
-      <label htmlFor='settings-prompt-file'>{t('提示词文件')}</label>
+      <Label htmlFor='settings-prompt-file'>{t('提示词文件')}</Label>
       <span className='prompt-input'>
         <Input
           id='settings-prompt-file'
@@ -821,7 +799,6 @@ function promptStateText(prompt: PromptState): string {
   } else {
     parts.push(
       t('{mode}生效：上游收到的 system 来自{source}{lines}。', {
-        // 清道夫与「替换」是同一种加工方式（删光 system 再插入），文案随它
         mode: prompt.mode === 'append' ? t('追加') : t('替换'),
         source,
         lines: prompt.lines ? t('（{n} 行）', { n: prompt.lines }) : '',
@@ -897,7 +874,6 @@ function providerStateText(item: ProviderPromptState, configured: boolean): stri
   })
   if (item.mode === 'passthrough') return t('客户端 system 原样出站。')
   const head = t('{mode}生效：上游收到的 system 来自{source}{lines}。', {
-    // 清道夫与「替换」是同一种加工方式（删光 system 再插入），文案随它
     mode: item.mode === 'append' ? t('追加') : t('替换'),
     source: promptSourceText(item.source),
     lines: item.lines ? t('（{n} 行）', { n: item.lines }) : '',
@@ -927,7 +903,7 @@ function ProviderGatewayRow({ item, option, over, locked, busy }: {
   const edited = gatewayEditedText(over)
   return (
     <div className='retention-row'>
-      <label className='prompt-gateway-label'>{t('网关自带')}</label>
+      <Label className='prompt-gateway-label'>{t('网关自带')}</Label>
       <span className='prompt-input'>
         <SwitchRow
           id={`settings-prompt-gateway-${item.id}`}
@@ -948,53 +924,16 @@ function ProviderGatewayRow({ item, option, over, locked, busy }: {
   )
 }
 
-/**
- * 「按提供商配置」区块：列**两类**家 ——
- *
- *   1. 注册表里带 `gatewayNote` 的家（有网关自带提示词可拨开关）——**默认就列**，
- *      不需要先去「添加提供商…」：一个开关藏在添加动作后面等于没有；
- *   2. 用户单独配过模式 / 文件的家（`promptProviders` 里有的）。
- *
- * 第 1 类即使没有 `promptProviders` 项也要出现在列表里，所以这里合成一行
- * （模式 / 文件取全局默认值：`prompt` 自己那两份）。用户一动这个模式 / 文件，
- * 后端就会为它落一条显式覆盖 —— 这正是「从默认值开始配」的自然路径。
- */
+/** 只列已保存的模式、网关开关或正文覆盖；未配置的提供商从下拉手动添加。 */
 function ProviderPromptRows({ prompt, locked, busy }: {
   prompt: PromptState
   locked: boolean
   busy: boolean
 }) {
   const options = prompt.options
-  const configured = new Map(prompt.providers.map(item => [item.id, item]))
-  // 顺序：先按注册表顺序列出带开关的家，再补齐用户配过、但注册表里没标开关的家
-  // （自定义提供商不会出现在 options 里，它们只能靠 promptProviders 出现）
-  const rows: ProviderPromptState[] = []
-  for (const option of options) {
-    if (!option.gatewayNote) continue
-    rows.push(configured.get(option.id) ?? {
-      id: option.id,
-      // 没单独配过的行显示**生效值**（= 全局那份）：界面上一眼看不出「这行是不是
-      // 自己配过」，但显示的值必须是真的，否则「跟随默认」这句话就是空话
-      mode: prompt.mode,
-      // 显示**生效值**（= 全局那份）：这一行的模式 / 文件 / 正文都跟随全局，
-      // 输入框与编辑器里给出真实的那份；改动任何一个控件时会把当前显示的这几个值
-      // 一起落成这一家自己的覆盖（见 saveProviderPromptMode 的说明），
-      // 所以「只改模式」不会把全局的提示词文件弄丢
-      file: prompt.file,
-      text: prompt.text,
-      source: prompt.source,
-      lines: prompt.lines,
-      fileError: prompt.fileError,
-      gateway: prompt.gateway[option.id] ?? true,
-      configured: false,
-    })
-  }
-  for (const item of prompt.providers) {
-    if (rows.some(row => row.id === item.id)) continue
-    rows.push({ ...item, gateway: prompt.gateway[item.id] ?? true, configured: true })
-  }
+  const rows = providerPromptRows(prompt)
   const listed = new Set(rows.map(row => row.id))
-  const candidates = options.filter(item => !item.gatewayNote && !listed.has(item.id))
+  const candidates = options.filter(item => !listed.has(item.id))
   const [pending, setPending] = React.useState('')
   const labelOf = (id: string) => options.find(item => item.id === id)?.label || id
   const optionOf = (id: string) => options.find(item => item.id === id)
@@ -1010,7 +949,7 @@ function ProviderPromptRows({ prompt, locked, busy }: {
         return (
           <React.Fragment key={item.id}>
             <div className='retention-row'>
-              <label htmlFor={`settings-prompt-mode-${item.id}`}>{label}</label>
+              <Label htmlFor={`settings-prompt-mode-${item.id}`}>{label}</Label>
               <span className='prompt-input'>
                 <Select
                   value={item.mode}
@@ -1069,7 +1008,7 @@ function ProviderPromptRows({ prompt, locked, busy }: {
       })}
 
       <div className='retention-row'>
-        <label htmlFor='settings-prompt-provider-add'>{t('添加提供商')}</label>
+        <Label htmlFor='settings-prompt-provider-add'>{t('添加提供商')}</Label>
         <span className='prompt-input'>
           {/* 组件的 Select 不支持占位（必须有一个 value），所以第一个选项就是
               「选择要配置的提供商」这个动作本身；选完立刻重置回它。
@@ -1115,7 +1054,7 @@ function PromptPanel({ snap }: { snap: SettingsSnapshot }) {
   const modeLabel = PROMPT_MODES.find(item => item.value === prompt.mode)?.optionLabel ?? prompt.mode
 
   return (
-    <section className='panel'>
+    <Card render={<section />} className='panel'>
       <PanelHead
         title={t('系统提示词')}
         tip={TIPS.prompt}
@@ -1126,7 +1065,7 @@ function PromptPanel({ snap }: { snap: SettingsSnapshot }) {
             : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
         actions={<RefreshButton id='btn-prompt-refresh' onClick={() => void refreshPrompt()} />}
       />
-      <div className='panel-body'>
+      <CardContent className='panel-body'>
         <div className='retention-list'>
           {/* 两个分组条把「默认」与「某家的例外」分开：上面那几行是所有未单独配置的
               家共用的默认值，下面那张表是逐家的例外 —— 不分开时它们是一串同构的行，
@@ -1136,7 +1075,7 @@ function PromptPanel({ snap }: { snap: SettingsSnapshot }) {
           </div>
 
           <div className='retention-row'>
-            <label htmlFor='settings-prompt-mode'>{t('模式')}</label>
+            <Label htmlFor='settings-prompt-mode'>{t('模式')}</Label>
             <span className='prompt-input'>
               {/* 旧实现是原生 <select>（select.js 增强 + wbSelect.sync）；这里换成组件库的
                   Select：触发器是按钮，page-settings.css 的 `.prompt-input select{width:240px}`
@@ -1170,7 +1109,7 @@ function PromptPanel({ snap }: { snap: SettingsSnapshot }) {
           {/* 提示词正文：与文件是同一件事的两个来源（正文优先），所以紧挨着文件那一行。
               行里只放按钮与状态 —— 几百行文本塞进行内输入框既看不清也没法编辑 */}
           <div className='retention-row'>
-            <label htmlFor='btn-prompt-edit-body'>{t('提示词正文')}</label>
+            <Label htmlFor='btn-prompt-edit-body'>{t('提示词正文')}</Label>
             <span className='prompt-input'>
               <PromptTextButton prompt={prompt} locked={locked} busy={busy} />
             </span>
@@ -1193,7 +1132,7 @@ function PromptPanel({ snap }: { snap: SettingsSnapshot }) {
           {/* 降级行只在真的处于降级期时渲染（旧实现是切 hidden） */}
           {prompt.status === 'ready' && prompt.degradeActive ? (
             <div className='retention-row'>
-              <label>{t('内容拦截降级')}</label>
+              <Label>{t('内容拦截降级')}</Label>
               <span className='prompt-input'>
                 <Button
                   id='btn-prompt-clear-degrade'
@@ -1210,8 +1149,8 @@ function PromptPanel({ snap }: { snap: SettingsSnapshot }) {
         </div>
         <div className='settings-state'>{promptStateText(prompt)}</div>
         <div className='hint retention-note'>{NOTES.prompt}</div>
-      </div>
-    </section>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -1230,14 +1169,14 @@ function debugStateText(debug: DebugState): string {
 /** 请求超时（拆出理由见 settings-model 的 CATEGORIES 说明） */
 function TimeoutPane({ snap }: { snap: SettingsSnapshot }) {
   return (
-    <section className='panel'>
+    <Card render={<section />} className='panel'>
       <PanelHead
         title={t('请求超时')}
         tip={TIPS.timeouts}
         badge={numericBadge(snap.timeouts)}
         actions={<RefreshButton id='btn-timeouts-refresh' onClick={() => void refreshTimeouts()} />}
       />
-      <div className='panel-body'>
+      <CardContent className='panel-body'>
         <div className='retention-list'>
           {TIMEOUT_FIELDS.map(field => (
             <NumberRow
@@ -1250,22 +1189,22 @@ function TimeoutPane({ snap }: { snap: SettingsSnapshot }) {
           ))}
         </div>
         <div className='hint retention-note'>{NOTES.timeouts}</div>
-      </div>
-    </section>
+      </CardContent>
+    </Card>
   )
 }
 
 /** 请求重试：数字参数 + 「指定错误码」名单（两段共用同一份保存流程） */
 function RetryPane({ snap }: { snap: SettingsSnapshot }) {
   return (
-    <section className='panel'>
+    <Card render={<section />} className='panel'>
       <PanelHead
         title={t('请求重试')}
         tip={TIPS.retry}
         badge={numericBadge(snap.retry)}
         actions={<RefreshButton id='btn-retry-refresh' onClick={() => void refreshRetry()} />}
       />
-      <div className='panel-body'>
+      <CardContent className='panel-body'>
         <div className='retention-list'>
           {RETRY_FIELDS.map(field => (
             <NumberRow
@@ -1283,102 +1222,8 @@ function RetryPane({ snap }: { snap: SettingsSnapshot }) {
           />
         </div>
         <div className='hint retention-note'>{NOTES.retry}</div>
-      </div>
-    </section>
-  )
-}
-
-/* ─── 路由分类（转发选路的策略 + 会话粘性）── */
-
-/**
- * 自愈开关的后端键 → 前端状态字段。
- *
- * 两边命名不同（后端是 `routingSink` 这类带前缀的长键，前端状态是 `sink` 这类短字段），
- * 这里显式列一张表而不是拼字符串 —— 拼出来的名字一旦对不上，表现是「开关点了没反应」，
- * 那种静默失败最难查。
- */
-const PROTECTION_STATE_FIELD = {
-  routingFailoverBackoff: 'failoverBackoff',
-  routingSink: 'sink',
-  routingBreakerEnabled: 'breakerEnabled',
-} as const
-
-function RoutingPane({ snap }: { snap: SettingsSnapshot }) {
-  const routing: RoutingState = snap.routing
-  // 读不到（桥不在 / 后端不可用）或还在检测时锁住两档 —— 锁住比发出一次注定失败的保存强
-  const disabled = snap.busy === 'routing' || routing.status !== 'ready'
-  // 快照值只在档位表里取（老后端 / 异常值兜底回默认档），顺带把类型收窄到字面量联合
-  const strategy: RouteStrategyValue =
-    ROUTE_STRATEGIES.find(item => item.value === routing.strategy)?.value ?? 'order'
-  const sticky: RouteStickyValue =
-    ROUTE_STICKY_OPTIONS.find(item => item.value === routing.sticky)?.value ?? 'auto'
-  return (
-    <section className='panel'>
-      <PanelHead
-        title={t('账号路由')}
-        tip={TIPS.routing}
-        badge={routing.status === 'ready' ? undefined
-          : routing.status === 'unavailable'
-            ? <StatusBadge tone='bad'>{t('不可用')}</StatusBadge>
-            : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
-        actions={<RefreshButton id='btn-routing-refresh' onClick={() => void refreshRouting()} />}
-      />
-      <div className='panel-body'>
-        <div className='retention-list'>
-          {/* 两行的说明都收进行内问号（[data-tip]，tooltip.js 统一服务），并且**跟随当前档位**
-              换内容 —— 每档干的事不一样，一段固定文案说不清 */}
-          <div className='prompt-group'>{t('选路规则')}</div>
-          <div className='retention-row'>
-            <label>{t('路由策略')}</label>
-            <div className='routing-row'>
-              <span className='tip-q' data-tip={ROUTE_STRATEGIES.find(item => item.value === strategy)?.tip}></span>
-              <SegmentedControl
-                options={ROUTE_STRATEGIES.map(item => ({ value: item.value, label: item.label }))}
-                value={strategy}
-                disabled={disabled}
-                aria-label={t('路由策略')}
-                onValueChange={value => void saveRoutingField({ routingStrategy: String(value) })} />
-            </div>
-          </div>
-          <div className='retention-row'>
-            <label>{t('会话粘性')}</label>
-            <div className='routing-row'>
-              <span className='tip-q' data-tip={ROUTE_STICKY_OPTIONS.find(item => item.value === sticky)?.tip}></span>
-              <SegmentedControl
-                options={ROUTE_STICKY_OPTIONS.map(item => ({ value: item.value, label: item.label }))}
-                value={sticky}
-                disabled={disabled}
-                aria-label={t('会话粘性')}
-                onValueChange={value => void saveRoutingField({ routingSticky: String(value) })} />
-            </div>
-          </div>
-          {/* 三个自愈开关：分组条把「怎么排队」与「出了事怎么自愈」分开 —— 不分开时它们是
-              一串同构的行，读不出哪几行管选路、哪几行管失败处置 */}
-          <div className='prompt-group'>
-            {t('自愈保护')}<span className='note'>{t('默认值通常够用，出问题时才需要调')}</span>
-          </div>
-          {ROUTE_PROTECTION_SWITCHES.map(item => {
-            // label 与 Switch 靠 htmlFor/id 配对（同页既有写法，见 SwitchRow 与
-            // DB 面板）：点文字也能拨动，读屏才念得出这一项叫什么
-            const switchId = `route-protection-${item.key}`
-            return (
-              <div key={item.key} className='retention-row'>
-                <label htmlFor={switchId}>{item.label}</label>
-                <div className='routing-row'>
-                  <span className='tip-q' data-tip={item.tip}></span>
-                  <Switch
-                    id={switchId}
-                    checked={routing[PROTECTION_STATE_FIELD[item.key]]}
-                    disabled={disabled}
-                    onCheckedChange={next => void saveRoutingField({ [item.key]: next })} />
-                </div>
-              </div>
-            )
-          })}
-        </div>
-        <div className='hint retention-note'>{NOTES.routing}</div>
-      </div>
-    </section>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -1387,14 +1232,14 @@ function RoutingPane({ snap }: { snap: SettingsSnapshot }) {
 function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<string> }) {
   return (
     <>
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead
           title={t('排队等待')}
           tip={TIPS.queue}
           badge={numericBadge(snap.queue)}
           actions={<RefreshButton id='btn-queue-refresh' onClick={() => void refreshQueue()} />}
         />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <div className='retention-list'>
             {QUEUE_FIELDS.map(field => (
               <NumberRow
@@ -1407,13 +1252,13 @@ function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<str
             ))}
           </div>
           <div className='hint retention-note'>{NOTES.queue}</div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
       {/* 验证码令牌池：池子本体在 ZCode 插件里，网关只有节奏设置。
           插件没申报（没装 / 没装 ZCode）时这块不出现。 */}
       {panels.has('captcha_pool') ? (
-        <section className='panel'>
+        <Card render={<section />} className='panel'>
           <PanelHead
             title={t('验证码令牌池')}
             tip={TIPS.captchaPool}
@@ -1422,7 +1267,7 @@ function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<str
               <RefreshButton id='btn-captcha-pool-refresh' onClick={() => void refreshCaptchaPool()} />
             }
           />
-          <div className='panel-body'>
+          <CardContent className='panel-body'>
             <div className='retention-list'>
               {CAPTCHA_POOL_FIELDS.map(field => (
                 <NumberRow
@@ -1435,11 +1280,11 @@ function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<str
               ))}
             </div>
             <div className='hint retention-note'>{NOTES.captchaPool}</div>
-          </div>
-        </section>
+          </CardContent>
+        </Card>
       ) : null}
 
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead
           title={t('models.dev 模型元数据')}
           tip={TIPS.modelsDev}
@@ -1452,7 +1297,7 @@ function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<str
             <RefreshButton id='btn-modelsdev-refresh' onClick={() => void refreshModelsDev()} />
           }
         />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <SwitchRow
             id='settings-modelsdev'
             label={t('用 models.dev 补齐上游没声明的模型能力与思考档位（联网刷新，内嵌快照始终生效）')}
@@ -1462,43 +1307,12 @@ function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<str
           />
           <div className='settings-state'>{modelsDevStateText(snap.modelsDev)}</div>
           <div className='hint retention-note'>{NOTES.modelsDev}</div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
-      <section className='panel'>
-        <PanelHead
-          title={t('指纹脱敏')}
-          tip={TIPS.sanitize}
-          badge={snap.sanitize.status === 'ready'
-            ? <StatusBadge tone='ok'>{t('已生效')}</StatusBadge>
-            : snap.sanitize.status === 'unavailable'
-              ? <StatusBadge tone='bad'>{t('不可用')}</StatusBadge>
-              : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
-          actions={<RefreshButton id='btn-sanitize-refresh' onClick={() => void refreshSanitize()} />}
-        />
-        <div className='panel-body'>
-          <div className='settings-switches'>
-            <SwitchRow
-              id='settings-sanitize'
-              label={t('剥离上游审核黑名单指纹（改写请求体里的模板句与表头）')}
-              checked={snap.sanitize.on}
-              // 读到后端值之前不许切（否则会出现「切了但不知道后端原本是什么」，回滚也没依据）
-              disabled={snap.sanitize.status !== 'ready' || snap.busy === 'sanitize'}
-              onCheckedChange={next => void saveSanitize(next)}
-            />
-          </div>
-          <div className='settings-state'>
-            {snap.sanitize.status === 'loading'
-              ? STATES.appLoading
-              : snap.sanitize.status === 'unavailable'
-                ? STATES.sanitizeUnavailable
-                : snap.sanitize.on ? STATES.sanitizeOn : STATES.sanitizeOff}
-          </div>
-          <div className='hint retention-note'>{NOTES.sanitize}</div>
-        </div>
-      </section>
+      <SanitizePanel snap={snap} />
 
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead
           title={t('开发者角色兼容')}
           tip={TIPS.developerRoleCompat}
@@ -1511,7 +1325,7 @@ function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<str
             <RefreshButton id='btn-role-compat-refresh' onClick={() => void refreshDeveloperRoleCompat()} />
           }
         />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <div className='settings-switches'>
             <SwitchRow
               id='settings-developer-role-compat'
@@ -1530,8 +1344,8 @@ function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<str
                 : snap.developerRoleCompat.on ? STATES.roleCompatOn : STATES.roleCompatOff}
           </div>
           <div className='hint retention-note'>{NOTES.developerRoleCompat}</div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
       {/* Cline 伪装头：实现与默认值都在插件里，插件没申报就不画。
           放在「网关」分类下是历史位置，语义上它属于插件面板。 */}
@@ -1544,7 +1358,7 @@ function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<str
 
       <PromptPanel snap={snap} />
 
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead
           title={t('调试模式')}
           tip={TIPS.debug}
@@ -1555,7 +1369,7 @@ function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<str
               : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
           actions={<RefreshButton id='btn-debug-refresh' onClick={() => void refreshDebug()} />}
         />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <div className='settings-switches'>
             <SwitchRow
               id='settings-debug-mode'
@@ -1567,8 +1381,8 @@ function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<str
           </div>
           <div className='settings-state'>{debugStateText(snap.debug)}</div>
           <div className='hint retention-note'>{NOTES.debug}</div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
     </>
   )
 }
@@ -1653,7 +1467,7 @@ function ClineHeadersPanel({ snap }: { snap: SettingsSnapshot }) {
           : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
       actions={<RefreshButton id='btn-cline-headers-refresh' onClick={() => void refreshClineHeaders()} />}
     >
-      <div className='panel-body'>
+      <CardContent className='panel-body'>
         <div className='retention-list'>
           {ready
             ? rows.map((row, index) => (
@@ -1723,7 +1537,7 @@ function ClineHeadersPanel({ snap }: { snap: SettingsSnapshot }) {
                     : t('（全部为默认值）'))}
         </div>
         <div className='hint retention-note'>{NOTES.clineHeaders}</div>
-      </div>
+      </CardContent>
     </CollapsiblePanel>
   )
 }
@@ -1765,7 +1579,7 @@ function ZcodeVersionPanel({ snap }: { snap: SettingsSnapshot }) {
           : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
       actions={<RefreshButton id='btn-zcode-version-refresh' onClick={() => void refreshZcodeVersion()} />}
     >
-      <div className='panel-body'>
+      <CardContent className='panel-body'>
         <div className='retention-list'>
           <div className='flex items-center gap-2'>
             <Input
@@ -1801,7 +1615,7 @@ function ZcodeVersionPanel({ snap }: { snap: SettingsSnapshot }) {
                   : t('未设置，使用插件内置的默认版本号')}
         </div>
         <div className='hint retention-note'>{NOTES.zcodeVersion}</div>
-      </div>
+      </CardContent>
     </CollapsiblePanel>
   )
 }
@@ -1819,7 +1633,7 @@ function SecurityPane({ snap }: { snap: SettingsSnapshot }) {
 
   return (
     <>
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead
           title={t('网关跨域访问（CORS）')}
           tip={TIPS.cors}
@@ -1832,7 +1646,7 @@ function SecurityPane({ snap }: { snap: SettingsSnapshot }) {
               : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
           actions={<RefreshButton id='btn-cors-refresh' onClick={() => void refreshCors()} />}
         />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <div className='settings-switches'>
             <SwitchRow
               id='settings-cors'
@@ -1851,17 +1665,17 @@ function SecurityPane({ snap }: { snap: SettingsSnapshot }) {
                 : snap.cors.on ? STATES.corsOn : STATES.corsOff}
           </div>
           <div className='hint retention-note'>{NOTES.cors}</div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
       {/* 机器人校验搬到「账户」分类（与管理员账号、登录开关同层）。
           这里保留「退出登录」—— 它属于「当前这一端的会话」，与安全分类的
           其它项（跨域、脱敏）不是一类。 */}
       {/* 面板登录：仅网页端（桌面壳的面板跟着应用走，没有「登录面板」的概念） */}
       {snap.panelLogin ? (
-        <section className='panel' id='panel-login-section'>
+        <Card render={<section />} className='panel' id='panel-login-section'>
           <PanelHead title={t('面板登录')} />
-          <div className='panel-body'>
+          <CardContent className='panel-body'>
             <div className='hint'>{NOTES.panelLogin}</div>
             <div className='mt-2.5'>
               <Button
@@ -1873,8 +1687,8 @@ function SecurityPane({ snap }: { snap: SettingsSnapshot }) {
                 {t('退出登录')}
               </Button>
             </div>
-          </div>
-        </section>
+          </CardContent>
+        </Card>
       ) : null}
     </>
   )
@@ -1919,7 +1733,7 @@ function AccountPane({ snap }: { snap: SettingsSnapshot }) {
 
   return (
     <>
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead
           title={t('管理员账号')}
           badge={
@@ -1943,7 +1757,7 @@ function AccountPane({ snap }: { snap: SettingsSnapshot }) {
             ) : null
           }
         />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <div className='settings-state' id='account-username'>
             {account.status === 'unavailable'
               ? t('未能读取账户信息，请稍后重试')
@@ -1956,10 +1770,10 @@ function AccountPane({ snap }: { snap: SettingsSnapshot }) {
               {t('修改密码需要输入当前密码；修改成功后，其他设备 / 浏览器上的登录会立即失效，当前这条会话保留。')}
             </div>
           ) : null}
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead
           title={t('机器人校验')}
           tip={TIPS.captchaSides}
@@ -1967,7 +1781,7 @@ function AccountPane({ snap }: { snap: SettingsSnapshot }) {
             ? <StatusBadge tone='bad'>{t('不可用')}</StatusBadge>
             : null}
         />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <div className='settings-switches'>
             <SwitchRow
               id='settings-captcha-desktop'
@@ -1989,20 +1803,20 @@ function AccountPane({ snap }: { snap: SettingsSnapshot }) {
             />
           </div>
           <div className='hint'>{NOTES.captcha}</div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead title={t('重置管理员')} />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <div className='hint'>
             {t('忘记密码时无法在界面里找回：需要停掉程序后，从数据库删除管理员记录（kv 表的 panelAdmin 键），重启后按首次使用重新注册。具体命令与各形态的库文件路径见 docs 目录下的「重置管理员」文档。')}
           </div>
-          <div className='danger-zone'>
+          <Alert variant='destructive' className='danger-zone'>
             <strong>{t('重置会清空管理员账号与密码，面板将回到「未注册」状态。')}</strong>
-          </div>
-        </div>
-      </section>
+          </Alert>
+        </CardContent>
+      </Card>
     </>
   )
 }
@@ -2029,7 +1843,7 @@ function DataPane({ snap }: { snap: SettingsSnapshot }) {
           文件对话框，网页端走浏览器下载 / 上传，桥两侧的返回值同形（见
           web_shim.rs 的 exportDatabase / importDatabase）。
           排在「账号导入 / 导出」之前 —— 恢复是整库替换，两种语义别让用户混着看 */}
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead
           title={t('整库备份 / 恢复')}
           tip={TIPS.backup}
@@ -2054,21 +1868,21 @@ function DataPane({ snap }: { snap: SettingsSnapshot }) {
             </>
           }
         />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           {/* 恢复后的密钥警告（后端 warning 原文，密钥对不上时导入后账号解不开）：
               排在面板最前 —— 用户刚点完标题栏的「恢复整库」，视线就在这片区域，
               这条警告必须第一眼看到；而且它**常驻**，不像 toast 那样几秒后消失。
               呈现沿用本页既有的 .danger-zone 警示框（与下面那条备份说明同款），
               不自造组件；文案是服务端生成的数据，原样显示、不翻译 */}
           {snap.dbWarning ? (
-            <div className='danger-zone' id='settings-db-warning'>
+            <Alert variant='destructive' className='danger-zone' id='settings-db-warning'>
               <strong>{t('⚠️ 密钥警告')}</strong>
               <br />
               {snap.dbWarning}
-            </div>
+            </Alert>
           ) : null}
           <div className='retention-row'>
-            <label htmlFor='settings-db-include-logs'>{t('包含日志与调试报文')}</label>
+            <Label htmlFor='settings-db-include-logs'>{t('包含日志与调试报文')}</Label>
             <Switch
               id='settings-db-include-logs'
               checked={snap.dbIncludeLogs}
@@ -2079,13 +1893,13 @@ function DataPane({ snap }: { snap: SettingsSnapshot }) {
               {t('取消勾选后只备份业务数据（账号、配置与余额记录），文件显著变小；事件日志、请求统计与调试报文不会进备份文件。')}
             </div>
           </div>
-          <div className='danger-zone'>
+          <Alert variant='destructive' className='danger-zone'>
             <strong>{NOTES.backupDanger}</strong>
-          </div>
-        </div>
-      </section>
+          </Alert>
+        </CardContent>
+      </Card>
 
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead
           title={t('账号导入 / 导出')}
           tip={TIPS.io}
@@ -2112,11 +1926,11 @@ function DataPane({ snap }: { snap: SettingsSnapshot }) {
             </>
           }
         />
-        <div className='panel-body'>
-          <div className='danger-zone'>
+        <CardContent className='panel-body'>
+          <Alert variant='destructive' className='danger-zone'>
             <strong>{t('导出文件内含 accessToken / refreshToken / apiKey 等凭证与自定义提供商定义')}</strong>
             {t('，可直接用于登录。请妥善保管，不要外传或上传到公共位置。')}
-          </div>
+          </Alert>
           {/* 失败明细（旧实现写 innerHTML 并 display:none 收起空结果，这里条件渲染） */}
           {snap.ioFailure ? (
             <div className='io-result'>
@@ -2126,17 +1940,17 @@ function DataPane({ snap }: { snap: SettingsSnapshot }) {
               </span>
             </div>
           ) : null}
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead
           title={t('数据保留')}
           tip={TIPS.retention}
           badge={numericBadge(snap.retention)}
           actions={<RefreshButton id='btn-retention-refresh' onClick={() => void refreshRetention()} />}
         />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <div className='retention-list'>
             {RETENTION_FIELDS.map(field => (
               <NumberRow
@@ -2149,20 +1963,20 @@ function DataPane({ snap }: { snap: SettingsSnapshot }) {
             ))}
           </div>
           <div className='hint retention-note'>{NOTES.retention}</div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
-      <section className='panel'>
+      <Card render={<section />} className='panel'>
         <PanelHead
           title={t('数据存储')}
           tip={TIPS.storage}
           badge={storageBadge(storage)}
           actions={<RefreshButton id='btn-storage-refresh' onClick={() => void refreshStorage()} />}
         />
-        <div className='panel-body'>
+        <CardContent className='panel-body'>
           <div className='retention-list'>
             <div className='retention-row'>
-              <label htmlFor='storage-db-path'>{t('数据库文件')}</label>
+              <Label htmlFor='storage-db-path'>{t('数据库文件')}</Label>
               <span className='storage-line'>
                 {/* 悬停看完整路径（元素上是折行显示的，长路径会被截成好几行） */}
                 <span className='storage-path' id='storage-db-path' title={path}>{path}</span>
@@ -2170,7 +1984,7 @@ function DataPane({ snap }: { snap: SettingsSnapshot }) {
               <div className='hint'>{NOTES.storageFile}</div>
             </div>
             <div className='retention-row'>
-              <label htmlFor='storage-db-size'>{t('占用大小')}</label>
+              <Label htmlFor='storage-db-size'>{t('占用大小')}</Label>
               <span className='storage-line'>
                 <span className='storage-path' id='storage-db-size'>
                   {counts ? formatBytes(storage.bytes) : '—'}
@@ -2187,8 +2001,8 @@ function DataPane({ snap }: { snap: SettingsSnapshot }) {
             <StorageCount label={t('调试报文')} value={count(storage.debug)} />
           </div>
           <div className='hint retention-note'>{NOTES.storage}</div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
     </>
   )
 }
@@ -2223,9 +2037,9 @@ const FEEDBACK_LINKS = [
 
 function FeedbackPane() {
   return (
-    <section className='panel'>
+    <Card render={<section />} className='panel'>
       <PanelHead title={t('反馈与需求')} />
-      <div className='panel-body'>
+      <CardContent className='panel-body'>
         <div className='hint'>
           {t('点下面的入口会用系统默认浏览器打开 GitHub 的对应表单（需要 GitHub 账号，模板已预设好，填完直接提交即可）。')}
         </div>
@@ -2245,8 +2059,8 @@ function FeedbackPane() {
             </div>
           ))}
         </div>
-      </div>
-    </section>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -2267,13 +2081,13 @@ function RetentionConfirmDialog({ confirm }: { confirm: { head: string } | null 
       {/* 旧 .modal-confirm 把宽度收到 440px（这类框只有一段话加两个按钮，620px 太宽） */}
       <DialogContent className='w-[min(440px,calc(100vw-48px))]' initialFocus={cancelRef}>
         <DialogHeader>
-          <DialogTitle>{t('确认缩短保留天数')}</DialogTitle>
+          <DialogTitle>{t('确认缩减数据保留')}</DialogTitle>
         </DialogHeader>
         <DialogBody>
-          <div className='danger-zone'>
+          <Alert variant='destructive' className='danger-zone'>
             {confirm?.head}
             <br />
-            <strong>{t('超出的历史数据会被立即删除，且不可恢复。')}</strong>{t('确定继续？')}</div>
+            <strong>{t('超出的历史数据会被立即删除，且不可恢复。')}</strong>{t('确定继续？')}</Alert>
         </DialogBody>
         <DialogFooter>
           <div className='mr-auto' />
@@ -2452,12 +2266,12 @@ function DbBackupConfirmDialog({ confirm }: { confirm: { includeLogs: boolean } 
           <DialogTitle>{t('恢复整库备份')}</DialogTitle>
         </DialogHeader>
         <DialogBody>
-          <div className='danger-zone'>
+          <Alert variant='destructive' className='danger-zone'>
             {t('本机的全部数据（账号、网关配置、日志统计与桌面设置）将被所选备份文件')}
             <strong>{t('整体替换')}</strong>{t('，包括恢复后需要重新登录管理面板。')}
             <br />
             <strong>{t('替换前会自动把当前数据备份到配置目录的 backups/ 文件夹。')}</strong>{t('确定继续？')}
-          </div>
+          </Alert>
         </DialogBody>
         <DialogFooter>
           <div className='mr-auto' />
@@ -2639,35 +2453,33 @@ function SettingsPage() {
 
   return (
     <div className={mobileDetail ? 'settings-layout is-detail' : 'settings-layout'}>
-      <nav className='settings-nav' id='settings-nav'>
+      <NavList render={<nav />} className='settings-nav' id='settings-nav'>
         {CATEGORIES.map(item => (
-          <button
+          <NavItem
             key={item.id}
-            type='button'
+            active={snap.category === item.id}
             className={snap.category === item.id ? 'settings-nav-item active' : 'settings-nav-item'}
             data-cat={item.id}
+            icon={<span className='ico' dangerouslySetInnerHTML={{ __html: iconHtml(item.icon, 17) }} />}
             onClick={() => {
               selectCategory(item.id)
               setMobileDetail(true)
             }}
           >
-            {/* 分类图标（icons.js）：与主侧栏同款 17px 图标盒，颜色随 currentColor
-                （选中态自动变主题色） */}
-            <span className='ico' dangerouslySetInnerHTML={{ __html: iconHtml(item.icon, 17) }} />
             {item.label}
-          </button>
+          </NavItem>
         ))}
-      </nav>
+      </NavList>
 
       {/* 二级页顶部返回栏：只在手机（≤767px）且已进入某一分类时显示，
           桌面由 CSS 排除。文案里的分类名跟着当前分类走，让用户知道自己在哪。
           图标复用 caretRight 并水平翻转（icons.js 里没有专用的 back 箭头，
           为这一个按钮新增图标不值得）。 */}
       <div className='settings-back-bar'>
-        <button type='button' className='settings-back-btn' onClick={() => setMobileDetail(false)}>
+        <Button size='default' variant='ghost' type='button' className='settings-back-btn' onClick={() => setMobileDetail(false)}>
           <span className='ico' dangerouslySetInnerHTML={{ __html: iconHtml('caretRight', 17) }} />
           {t('返回')}
-        </button>
+        </Button>
         <span className='settings-back-title'>{activeCategory.label}</span>
       </div>
 
@@ -2683,9 +2495,6 @@ function SettingsPage() {
         </div>
         <div className={paneClass('gateway')} data-cat='gateway'>
           <GatewayPane snap={snap} panels={adminPanels} />
-        </div>
-        <div className={paneClass('routing')} data-cat='routing'>
-          <RoutingPane snap={snap} />
         </div>
         <div className={paneClass('retry')} data-cat='retry'>
           <RetryPane snap={snap} />

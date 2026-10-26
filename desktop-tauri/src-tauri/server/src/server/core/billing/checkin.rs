@@ -41,6 +41,9 @@ use crate::server::core::billing::BillingService;
 use crate::server::core::billing::WorkbuddyActivity;
 use crate::server::logging;
 
+mod summary;
+pub(crate) use summary::failure_of;
+
 /// 签到路径上的错误。对应 Node 版抛出的 AccountStoreError：
 /// 404「账号不存在」与 400「国际版账号暂不支持签到」。
 #[derive(Clone, Debug)]
@@ -288,9 +291,8 @@ pub fn resolve_checkin_targets(
 ///   - **CodeArts**：当日 ops 福利（实现已搬到插件，走插件分支）。
 ///
 /// `manual` 现在只剩「用户在面板上点出来的」这一个语义（单账号 `single` /
-/// 批量 `manual` 为真，定时与启动补签为假）。目前没有内置分支读它 ——
-/// 需要按它分档的家（例如 CodeArts 的两道写闸）已经在插件里按自己的口径
-/// 处理；保留参数是为了不让调用点随分支增删而改签名。
+/// 批量 `manual` 为真，定时与启动补签为假），经插件 RPC 透传给 CodeArts 等
+/// 需要按触发来源执行写请求限制的提供商。
 ///
 /// 拿一家的 token 去打另一家的签到接口只会稳定报错，所以这条分派是必需的而不是
 /// 优化。各分支的收尾（claim → 结果行 + 日志）完全一致，共用 [`claim_result`]；
@@ -300,7 +302,7 @@ pub async fn checkin_for(
     store: &AccountStore,
     billing: &BillingService,
     account: &Value,
-    _manual: bool,
+    manual: bool,
 ) -> Value {
     let id = account.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     // 结果行的 name 是**签到记录台账与前端结果卡的展示名快照**：优先读统一
@@ -325,7 +327,7 @@ pub async fn checkin_for(
         if let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(provider_id) {
             if adapter.plugin_checkin_capability() == Some(true) {
                 let claim = adapter
-                    .checkin_claim(store, &id)
+                    .checkin_claim_with_options(store, &id, manual)
                     .await
                     .map_err(|error| error.message);
                 return claim_result(id, name, &display, true, claim);
@@ -613,7 +615,7 @@ fn claim_result(
 /// `pub`：签到记录台账（`core::checkin_records`）的 outcome 判定复用它 ——
 /// 「今天已完成」的口径在调度、落账与台账三处必须是同一份（判据只此一份）。
 ///
-/// 三种情况都算，因为它们在「今天不能再领」这件事上没有区别：
+/// 插件的结构化 outcome 优先；下面三条只兼容没有 outcome 的旧结果：
 ///   1. `success === true`：本次真的领到了；
 ///   2. `alreadyCompleted === true`：上游明确告知今天已完成
 ///      （AutoClaw 的 `daily_signin` 会带这个字段，插件原样透出）；
@@ -629,14 +631,20 @@ fn claim_result(
 /// 实测见过自动签到 4 个账号全部未领取、17 秒后手动逐个重试全部成功
 /// （批次撞上上游风控），所以判据必须收紧到「上游说签过了」。
 pub fn checkin_completed_today(claim: &Value) -> bool {
-    if claim.get("success").and_then(Value::as_bool) == Some(true) {
-        return true;
+    if claim.get("error").and_then(Value::as_str).is_some_and(|text| !text.trim().is_empty()) {
+        return false;
     }
-    if claim.get("alreadyCompleted").and_then(Value::as_bool) == Some(true) {
+    if let Some(outcome) = claim.get("outcome").and_then(Value::as_str) {
+        return matches!(outcome, "claimed" | "done");
+    }
+    if claim.get("success").and_then(Value::as_bool) == Some(true)
+        || claim.get("alreadyCompleted").and_then(Value::as_bool) == Some(true)
+    {
         return true;
     }
     let message = claim.get("msg").and_then(Value::as_str).unwrap_or("");
-    message.contains("已签到") || message.contains("已领取")
+    !(message.contains("可能") || message.contains("未能") || message.contains("未见") || message.contains("失败"))
+        && (message.contains("已签到") || message.contains("已领取"))
 }
 
 /// 行的 `activity` 段是否携带「活跃上报成功」读数（`report.succeeded`）。
@@ -680,6 +688,9 @@ pub fn web_conversation_ok(row: &Value) -> bool {
 /// 上游的活跃计数不认它；失败（网络错误 / 凭证失效）也不算 —— 失败行照旧
 /// 显示待签，与 [`checkin_completed_today`] 的收紧原则一致。
 pub fn day_completed(row: &Value) -> bool {
+    if row.get("error").and_then(Value::as_str).is_some_and(|text| !text.trim().is_empty()) {
+        return false;
+    }
     row.get("claim")
         .map(checkin_completed_today)
         .unwrap_or(false)
@@ -688,12 +699,8 @@ pub fn day_completed(row: &Value) -> bool {
 }
 
 /// 这条领取结果是「中性未领取」—— 不是成功、不是已签、也不是失败，而是
-/// 「此刻没有可领的活动」。Qoder 国际版的活动窗口每天 10:00（UTC+8）才开，
-/// 定时签到在这个窗口之前跑完时结果必然长这样；自动签到调度据此判断
-/// 「今天要不要保持未落账、过段时间重试」（见 `auto_checkin::tick`）。
-///
-/// 判据刻意与 [`checkin_completed_today`] 相反且**只认中性文案**：把失败
-/// （网络错误 / 凭证失效）也当成 pending 会让坏账号整天反复重试打上游。
+/// 「此刻没有可领的活动」。它不落 checkinAt，也不计失败；是否自动重试还要看
+/// 插件的 retryAt（见 auto_checkin::retry），不是所有无活动结果都能靠等待恢复。
 pub fn claim_pending(claim: &Value) -> bool {
     if checkin_completed_today(claim) {
         return false;
@@ -702,15 +709,13 @@ pub fn claim_pending(claim: &Value) -> bool {
     if claim.get("error").and_then(Value::as_str).is_some_and(|text| !text.trim().is_empty()) {
         return false;
     }
+    if let Some(outcome) = claim.get("outcome").and_then(Value::as_str) {
+        return matches!(outcome, "inactive" | "ineligible");
+    }
     let message = claim.get("msg").and_then(Value::as_str).unwrap_or("");
-    // 两个地区的「无活动」文案都含这一句；实现改措辞时这里要跟着对齐
-    //（`providers::qoder::checkin::no_claim` 与 trae 的「未领取 + 原因」不同形，
-    // trae 不走这条 pending 逻辑 —— 它没有窗口概念）。
-    // 「暂无可领取活动」是运营活动还没下发（再过一阵可能就有），「等待重试」是
-    // 被本家的本地写闸挡住（今天还有额度、只是间隔没到）—— 两者都该让定时链
-    // 稍后重试，而不是记成失败。改插件侧的文案时这几条也要跟着改。
     message.contains("没有可领取的签到活动")
         || message.contains("未下发每日积分活动")
+        || message.contains("暂未给该账号下发每日积分活动")
         || message.contains("暂无可领取活动")
         || message.contains("等待重试")
 }
@@ -732,7 +737,23 @@ pub async fn run_checkin(
     reason: &str,
     source: &str,
 ) -> Result<Value, CheckinError> {
-    let (targets, skipped) = resolve_checkin_targets(store, providers, id)?;
+    run_checkin_selected(store, billing, providers, id, reason, source, None).await
+}
+
+pub(crate) async fn run_checkin_selected(
+    store: &AccountStore,
+    billing: &BillingService,
+    providers: &[String],
+    id: Option<&str>,
+    reason: &str,
+    source: &str,
+    selected: Option<&[String]>,
+) -> Result<Value, CheckinError> {
+    let (mut targets, skipped) = resolve_checkin_targets(store, providers, id)?;
+    if let Some(selected) = selected {
+        targets.retain(|account| account.get("id").and_then(Value::as_str)
+            .is_some_and(|id| selected.iter().any(|selected| selected == id)));
+    }
     // 「这次是用户在面板上点的吗」——只有 CodeArts 用得上（它的福利是写请求，
     // 有两道本地限流闸）。单账号 single 与批量 manual 都是点击触发；
     // schedule / startup 是无人值守，必须受闸。见 `checkin_for` 的说明。
@@ -775,7 +796,7 @@ pub async fn run_checkin(
     let succeeded = results
         .iter()
         .filter(|item| {
-            item.get("claim")
+            day_completed(item) && item.get("claim")
                 .map(checkin_completed_today)
                 .unwrap_or(false)
         })
@@ -793,6 +814,7 @@ pub async fn run_checkin(
                 || web_conversation_ok(item)
         })
         .count();
+    let failures: Vec<String> = results.iter().filter_map(failure_of).collect();
     if skipped > 0 {
         logging::log(
             "[Accounts]",
@@ -852,6 +874,8 @@ pub async fn run_checkin(
         "active": active,
         "total": results.len(),
         "skipped": skipped,
+        "failed": failures.iter().take(5).cloned().collect::<Vec<_>>(),
+        "failedCount": failures.len(),
     }))
 }
 

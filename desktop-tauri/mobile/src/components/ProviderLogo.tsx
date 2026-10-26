@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { Icon } from './Icon'
 import { providerIcon, providerLabel } from '../lib/providers'
 
@@ -16,11 +17,12 @@ export function ProviderLogo({
   size?: 'default' | 'lg'
 }) {
   const icon = providerIcon(id)
+  const [failedIcon, setFailedIcon] = useState('')
   const text = providerLabel(id, label)
   return (
     <span className={size === 'lg' ? 'm-logo m-lg' : 'm-logo'}>
-      {icon ? (
-        <img src={icon} alt='' loading='lazy' />
+      {icon && failedIcon !== icon ? (
+        <img src={icon} alt='' loading='lazy' onError={() => setFailedIcon(icon)} />
       ) : (
         <span style={{ fontSize: size === 'lg' ? 16 : 14, fontWeight: 600 }}>{text.slice(0, 1)}</span>
       )}

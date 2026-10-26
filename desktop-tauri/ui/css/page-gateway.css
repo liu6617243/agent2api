@@ -119,17 +119,8 @@
 /* 批量条：勾选后出现在筛选行的带计数小药丸（原「批量操作」孤按钮升级）——
    计数本身是这条存在的原因，写进药丸里比按钮 title 更可读 */
 .batch-chip {
-  display: inline-flex;
-  align-items: center;
   gap: 8px;
-  height: 28px;
   flex: 0 0 auto;
-  padding: 0 4px 0 11px;
-  border: 1px solid var(--primary-bd);
-  border-radius: var(--r-pill);
-  background: var(--primary-soft);
-  color: var(--primary-fg);
-  font-size: 12px;
   white-space: nowrap;
 }
 .batch-chip b { font-weight: 700; font-variant-numeric: tabular-nums; }
@@ -243,15 +234,6 @@
 .keys-table .k-time { width: 16%; }
 .keys-table .k-state { width: 8%; }
 .keys-table .k-act { width: 10%; }
-
-/* 代理池表（islands/proxies-page.tsx）的默认列宽。
-   与上面两组同一条口径：默认宽度写在**普通类**上、由 colgroup 的 <col> 带上，
-   没拖过的列走它，拖过的列由 table-columns.js 往 <col> 写 inline width 盖掉它。
-   所以这里不能用 Tailwind 的 w-[196px] 那类工具类 —— 组件库的 Tailwind 是
-   `!important` 导出的（见 ui-kit/styles/globals.css），`width: 196px !important`
-   会反过来压住拖动写下的 inline 宽度，表现为「拖完松手、列宽弹回原值」。
-   节点列不给宽度：它是全表唯一内容长度不可控的列（名字 + 协议 + 引用数），
-   由 table-layout: fixed 把剩余宽度分给它。 */
 .proxies-table .p-pick { width: 36px; }
 .proxies-table .p-addr { width: 196px; }
 .proxies-table .p-state { width: 58px; }
@@ -566,6 +548,8 @@
   overflow: hidden;
 }
 
+.page[data-page="gateway"] .prov-rail [data-slot='nav-item'] { padding-top: 6px; padding-bottom: 6px; }
+
 /* 条目区： aside 里唯一滚动的块（家数多了自己滚） */
 .rail-scroll {
   flex: 1;
@@ -651,11 +635,6 @@
 .prov-rail [data-slot='nav-item'][data-active] [data-slot='nav-item-count'] {
   background: color-mix(in srgb, currentColor 18%, transparent);
 }
-
-/* 条目本体（一家一行）已换成组件库 NavItem（models-page.tsx 的 rail()）：
-   行高、圆角、字号、字重、选中态配色、过渡曲线都在组件里取同一套令牌，
-   旧的 .pv / .pv.on / .pv .n 一组规则随之删除 —— 左栏剩下的自定义样式只有
-   头像（.pv-ico）、计数药丸（上面两条）与下面的删除 ×。 */
 
 /* 自定义家条目外层的定位容器（条目本体是组件库 NavItem 的 button，删除按钮不能嵌在
    它里面 —— button 套 button 会被解析器拆开，绝对定位也跟着失去参照）。

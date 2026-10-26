@@ -6,7 +6,7 @@
 //! [`crate::server::core::providers::adapter::ProviderAdapter`]；这个模块
 //! 提供 [`RpcAdapter`]（那个 trait 的远程实现）与 [`Host`]（进程生命周期）。
 //!
-//! ── 进程模型：一个宿主跑全部 provider ────────────────────────
+//! ── 进程模型：每个插件包一个宿主 ──────────────────────────────
 //! 与 magpie 同款：一个包 = 一个进程 = 若干家 provider。理由：
 //!   - 21 份 tokio 运行时与连接池的代价在桌面端很明显（每份至少几 MB 常驻）；
 //!   - 跨 provider 的共享状态（HTTP 客户端、模型缓存）只存一份；
@@ -33,9 +33,14 @@
 mod bootstrap;
 pub mod catalog;
 mod errors;
+mod gemini_signatures;
 mod install;
+mod logs;
 mod management;
+mod model_sync;
 pub mod operations;
+mod ownership;
+mod runtime;
 mod packages;
 mod pack_view;
 mod registry;
@@ -110,7 +115,7 @@ pub(crate) use stream::RpcStream;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use agent2api_provider_protocol as proto;
@@ -118,36 +123,9 @@ use tokio::sync::{oneshot, Mutex};
 
 use crate::server::logging;
 
-/// 进程级宿主句柄。
-///
-/// ── 为什么不是 `OnceLock<Arc<Host>>` ─────────────────────────
-/// 插件可以在运行期安装 / 升级 / 卸载（`api::plugins`），宿主必须能**换一个**。
-/// `OnceLock` 只允许装一次，换宿主就得泄漏旧值 —— 而旧宿主还占着一个子进程。
-/// 改成「一把 std Mutex 包住 `Option`」：读多写极少，临界区里没有 await。
-static HOST: OnceLock<StdMutex<Option<Arc<Host>>>> = OnceLock::new();
-
-fn host_slot() -> &'static StdMutex<Option<Arc<Host>>> {
-    HOST.get_or_init(|| StdMutex::new(None))
-}
-
-/// 装入宿主（覆盖旧的 —— 重装 / 升级走这条）。
-pub fn install(host: Arc<Host>) {
-    if let Ok(mut slot) = host_slot().lock() {
-        *slot = Some(host);
-    }
-}
-
-/// 摘掉宿主句柄（关闭后调，避免后续调用拿到一个已死的宿主）。
-pub fn detach() {
-    if let Ok(mut slot) = host_slot().lock() {
-        *slot = None;
-    }
-}
-
-/// 取当前宿主（没装过 = 插件架构未启用）。
-pub fn current() -> Option<Arc<Host>> {
-    host_slot().lock().ok().and_then(|slot| slot.clone())
-}
+pub use ownership::ProviderCategory;
+pub use runtime::{current, detach, host_for_pack, host_for_provider, install, provider_category, provider_pack, shutdown_all};
+use runtime::provider_info;
 
 /// 当前已加载的 provider 申报了哪些**管理面板**（去重）。
 ///
@@ -158,14 +136,7 @@ pub fn current() -> Option<Arc<Host>> {
 ///
 /// 宿主没起（没装包 / 崩溃中）时返回空表，与「一个面板都没有」同义。
 pub fn admin_panels() -> Vec<proto::AdminPanel> {
-    let Some(host) = current() else {
-        return Vec::new();
-    };
-    let providers = host
-        .providers
-        .lock()
-        .map(|list| list.clone())
-        .unwrap_or_default();
+    let providers = runtime::provider_infos();
     let mut panels: Vec<proto::AdminPanel> = Vec::new();
     for info in providers {
         for panel in info.admin_panels {
@@ -181,17 +152,7 @@ pub fn admin_panels() -> Vec<proto::AdminPanel> {
 
 /// 某一家是否申报了某个管理面板（面板要按 provider 定位时用）。
 pub fn has_admin_panel(provider: &str, panel: proto::AdminPanel) -> bool {
-    let Some(host) = current() else {
-        return false;
-    };
-    host.providers
-        .lock()
-        .map(|list| {
-            list.iter().any(|info| {
-                info.id.as_str() == provider && info.admin_panels.contains(&panel)
-            })
-        })
-        .unwrap_or(false)
+    provider_info(provider).is_some_and(|info| info.admin_panels.contains(&panel))
 }
 
 /// 各家申报的**账号行渲染参数**（`provider id → AccountFeatures`）。
@@ -205,14 +166,7 @@ pub fn has_admin_panel(provider: &str, panel: proto::AdminPanel) -> bool {
 /// 兜底表 —— 这样升级是渐进的，不必等所有插件同时发版。
 pub fn account_features() -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
-    let Some(host) = current() else {
-        return map;
-    };
-    let providers = host
-        .providers
-        .lock()
-        .map(|list| list.clone())
-        .unwrap_or_default();
+    let providers = runtime::provider_infos();
     for info in providers {
         let Some(features) = info.account_features else {
             continue;
@@ -228,26 +182,12 @@ pub fn account_features() -> serde_json::Map<String, serde_json::Value> {
 
 /// 某一家申报的账号行参数（没申报 = `None`）。
 pub fn account_features_of(provider: &str) -> Option<proto::AccountFeatures> {
-    let host = current()?;
-    let guard = host.providers.lock().ok()?;
-    let found = guard
-        .iter()
-        .find(|info| info.id.as_str() == provider)
-        .and_then(|info| info.account_features.clone());
-    drop(guard);
-    found
+    provider_info(provider)?.account_features
 }
 
 /// 某一家申报的签到能力（没申报 = `None`）。
 pub fn checkin_of(provider: &str) -> Option<proto::CheckinInfo> {
-    let host = current()?;
-    let guard = host.providers.lock().ok()?;
-    let found = guard
-        .iter()
-        .find(|info| info.id.as_str() == provider)
-        .and_then(|info| info.checkin.clone());
-    drop(guard);
-    found
+    provider_info(provider)?.checkin
 }
 
 /// 全部申报的签到能力（`provider id → 申报`）。
@@ -256,14 +196,7 @@ pub fn checkin_of(provider: &str) -> Option<proto::CheckinInfo> {
 /// （`Capabilities::checkin`），升级因此是渐进的。
 pub fn checkin_features() -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
-    let Some(host) = current() else {
-        return map;
-    };
-    let providers = host
-        .providers
-        .lock()
-        .map(|list| list.clone())
-        .unwrap_or_default();
+    let providers = runtime::provider_infos();
     for info in providers {
         let Some(checkin) = info.checkin else {
             continue;
@@ -445,6 +378,18 @@ pub trait GatewayCallbacks: Send + Sync + 'static {
         >,
     >;
 
+    fn store_update_with_public(
+        &self,
+        account: String,
+        expect: serde_json::Value,
+        secret: serde_json::Value,
+        _public: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<serde_json::Value, proto::WireError>> + Send + '_>,
+    > {
+        self.store_update(account, expect, secret)
+    }
+
     /// `store.mark_limited`
     fn store_mark_limited(
         &self,
@@ -505,6 +450,10 @@ pub trait GatewayCallbacks: Send + Sync + 'static {
 
     /// 插件日志（进运行日志页）。
     fn log(&self, level: String, message: String);
+
+    fn log_context(&self, level: String, message: String, _context: serde_json::Value) {
+        self.log(level, message);
+    }
 
     /// 插件通知界面（账号状态变化、进度）。
     fn notify(&self, kind: String, payload: serde_json::Value);
@@ -806,7 +755,7 @@ impl Host {
             Some("log") => {
                 let level = frame.level.unwrap_or_else(|| "info".to_string());
                 let message = frame.message.unwrap_or_default();
-                self.callbacks.log(level, message);
+                self.callbacks.log_context(level, message, frame.params.unwrap_or(serde_json::Value::Null));
             }
             Some("head") => self.deliver_head(frame),
             Some("chunk") => self.deliver_chunk(frame),
@@ -892,7 +841,7 @@ impl Host {
             proto::methods::plugin::STORE_LIST => self.callbacks.store_list(text("provider")).await,
             proto::methods::plugin::STORE_UPDATE => {
                 self.callbacks
-                    .store_update(text("account"), value("expect"), value("secret"))
+                    .store_update_with_public(text("account"), value("expect"), value("secret"), value("public"))
                     .await
             }
             proto::methods::plugin::STORE_MARK_LIMITED => {
@@ -921,12 +870,27 @@ impl Host {
                     .map(|()| serde_json::Value::Null)
             }
             proto::methods::plugin::LOG => {
-                self.callbacks.log(text("level"), text("message"));
+                self.callbacks.log_context(text("level"), text("message"), value("context"));
                 Ok(serde_json::Value::Null)
             }
             proto::methods::plugin::NOTIFY => {
-                self.callbacks.notify(text("kind"), value("payload"));
-                Ok(serde_json::Value::Null)
+                let payload = value("payload");
+                if text("kind") == "models_changed" {
+                    let provider = payload.get("provider").and_then(serde_json::Value::as_str).unwrap_or("");
+                    let owner = runtime::host_for_provider(provider);
+                    if !owner.as_ref().is_some_and(|host| std::ptr::eq(host.as_ref(), self)) {
+                        Err(proto::WireError::with_code(
+                            "模型通知不属于当前插件进程",
+                            proto::WireError::UNSUPPORTED,
+                        ))
+                    } else {
+                        self.callbacks.notify(text("kind"), payload);
+                        Ok(serde_json::Value::Null)
+                    }
+                } else {
+                    self.callbacks.notify(text("kind"), payload);
+                    Ok(serde_json::Value::Null)
+                }
             }
             other => Err(proto::WireError::with_code(
                 format!("不认识的回调 {other}"),

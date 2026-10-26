@@ -23,9 +23,11 @@ const ICONS: Record<string, string> = {
   'autoclaw-intl': 'assets/providers/autoclaw.png',
   qoder: 'assets/providers/qoder.png',
   'qoder-intl': 'assets/providers/qoder.png',
+  'cline-free': 'assets/providers/cline.png',
   cline: 'assets/providers/cline.png',
   'cline-pass': 'assets/providers/cline.png',
   accio: 'assets/providers/accio.png',
+  'accio-cn': 'assets/providers/accio.png',
   'accio-intl': 'assets/providers/accio.png',
   zcode: 'assets/providers/zcode.png',
   'zcode-intl': 'assets/providers/zcode.png',
@@ -40,6 +42,10 @@ const ICONS: Record<string, string> = {
   officeace: 'assets/providers/officeace.png',
   orcaterm: 'assets/providers/orcaterm.png',
   chatglm: 'assets/providers/chatglm.png',
+  modelscope: 'assets/providers/modelscope.png',
+  'modelscope-intl': 'assets/providers/modelscope.png',
+  atomcode: 'assets/providers/atomcode.png',
+  lobsterai: 'assets/providers/lobsterai.png',
 }
 
 /** 后端没给 label 时的兜底展示名（认不出的 id 原样显示） */
@@ -52,9 +58,11 @@ const LABELS: Record<string, string> = {
   'autoclaw-intl': 'AutoClaw 国际版',
   qoder: 'Qoder 中国版',
   'qoder-intl': 'Qoder 国际版',
+  'cline-free': 'Cline 免费池',
   cline: 'Cline Free',
   'cline-pass': 'Cline Pass',
   accio: 'Accio 国际版',
+  'accio-cn': 'Accio 国内版',
   'accio-intl': 'Accio 国内版',
   zcode: 'ZCode 国内版',
   'zcode-intl': 'ZCode 国际版',
@@ -69,6 +77,10 @@ const LABELS: Record<string, string> = {
   officeace: 'OfficeAce 果办',
   orcaterm: 'OrcaTerm',
   chatglm: '智谱清言',
+  modelscope: 'ModelScope 国内版',
+  'modelscope-intl': 'ModelScope 国际版',
+  atomcode: 'AtomCode',
+  lobsterai: 'LobsterAI',
 }
 
 /** 图标地址；认不出的 id 返回空串（调用方画首字徽章） */

@@ -49,13 +49,14 @@
         // 展示名需要翻译时由各展示处自行处理，别在这里动。
         label: typeof item.label === 'string' && item.label ? item.label : item.id,
         count: Number(item.count) || 0,
+        category: item.category === 'web' ? 'web' : 'agent',
       }));
   }
 
   /** 主状态里的那份摘要（app.js 的 refresh 一直在维护它，读它零成本） */
   function fromAppState() {
     const list = window.wbApp?.getState?.()?.accounts?.providers;
-    return Array.isArray(list) ? normalize(list) : [];
+    return Array.isArray(list) ? normalize(list) : null;
   }
 
   /**
@@ -64,7 +65,7 @@
    */
   function all() {
     const live = fromAppState();
-    if (live.length) return live;
+    if (live !== null) return live;
     return fallback || [];
   }
 
@@ -189,7 +190,7 @@
       inflight = api.getState()
         .then(data => {
           const list = normalize(data?.accounts?.providers);
-          if (list.length) fallback = list;
+          if (Array.isArray(data?.accounts?.providers)) fallback = list;
           return list;
         })
         .finally(() => { inflight = null; });
@@ -206,7 +207,7 @@
    */
   async function load({ force = false } = {}) {
     const live = fromAppState();
-    if (live.length && !force) return live;
+    if (live !== null && !force) return live;
     try {
       const fetched = await fetchProviders();
       return fetched.length ? fetched : all();

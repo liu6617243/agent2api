@@ -13,6 +13,7 @@ import {
 import { formatRelative, formatStamp } from '../lib/format'
 import { usePolling } from '../lib/usePolling'
 import { t } from '../i18n'
+import { Button, Card, InputGroup, InputGroupAddon, InputGroupInput, InputGroupText, Label, Sheet, SheetBody, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle, Switch as UiSwitch } from '@ui'
 
 /**
  * 定时任务。
@@ -52,8 +53,8 @@ export function TasksPage() {
     if (!task.id) return
     setBusy(task.id)
     try {
-      const data = await patchScheduledTask(task.id, { enabled: next })
-      setTasks(data.tasks || [])
+      const updated = await patchScheduledTask(task.id, { enabled: next })
+      setTasks(previous => previous?.map(item => item.id === updated.id ? updated : item) || [updated])
       store.toast(t('已{action}「{name}」', {
         action: next ? t('开启') : t('关闭'),
         name: task.label || task.id,
@@ -91,8 +92,8 @@ export function TasksPage() {
     }
     setBusy(editing.id)
     try {
-      const data = await patchScheduledTask(editing.id, { interval: value })
-      setTasks(data.tasks || [])
+      const updated = await patchScheduledTask(editing.id, { interval: value })
+      setTasks(previous => previous?.map(item => item.id === updated.id ? updated : item) || [updated])
       store.toast(t('已更新间隔'))
       setEditing(null)
     } catch (failure) {
@@ -117,7 +118,7 @@ export function TasksPage() {
             <div className='m-section-head'>
               <h2>{t('后台任务')}</h2>
             </div>
-            <div className='m-card'>
+            <Card className='m-card'>
               {backend.length ? (
                 backend.map(task => (
                   <TaskRow
@@ -135,7 +136,7 @@ export function TasksPage() {
               ) : (
                 <Empty text={t('没有后台任务')} />
               )}
-            </div>
+            </Card>
           </div>
 
           {frontend.length ? (
@@ -143,7 +144,7 @@ export function TasksPage() {
               <div className='m-section-head'>
                 <h2>{t('页面自动刷新')}</h2>
               </div>
-              <div className='m-card'>
+              <Card className='m-card'>
                 {frontend.map(task => (
                   <TaskRow
                     key={task.id}
@@ -152,7 +153,7 @@ export function TasksPage() {
                     onToggle={next => void toggle(task, next)}
                   />
                 ))}
-              </div>
+              </Card>
               <div style={{ marginTop: 8, fontSize: 11.5, color: 'var(--m-text-3)', padding: '0 2px' }}>
                 {t('页面刷新由浏览器执行，只在页面打开时生效')}
               </div>
@@ -161,69 +162,40 @@ export function TasksPage() {
         </>
       ) : null}
 
-      {/* 间隔编辑：用底部抽屉而不是居中弹窗 */}
       {editing ? (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 50,
-            display: 'flex',
-            alignItems: 'flex-end',
-            background: 'color-mix(in srgb, black 42%, transparent)',
-          }}
-          onClick={() => setEditing(null)}
-        >
-          <div
-            onClick={event => event.stopPropagation()}
-            style={{
-              width: '100%',
-              padding: '18px 18px calc(20px + var(--m-safe-b))',
-              borderTopLeftRadius: 24,
-              borderTopRightRadius: 24,
-              background: 'var(--m-surface)',
-              borderTop: '1px solid var(--m-line)',
-            }}
-          >
-            <div style={{ fontSize: 16, fontWeight: 600 }}>{editing.label}</div>
-            <div style={{ fontSize: 12, color: 'var(--m-text-3)', marginTop: 4 }}>
-              {t('可填 {min}–{max} {unit}', {
-                min: editing.min || 1,
-                max: editing.max || 9999,
-                unit: editing.unit === 'seconds' ? t('秒') : t('分钟'),
-              })}
-            </div>
-            <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
-              <input
-                value={draft}
-                onChange={event => setDraft(event.target.value.replace(/[^\d]/g, ''))}
-                inputMode='numeric'
-                style={{
-                  flex: 1,
-                  height: 46,
-                  padding: '0 12px',
-                  borderRadius: 12,
-                  border: '1px solid var(--m-line-strong)',
-                  background: 'var(--m-surface-2)',
-                  color: 'var(--m-text)',
-                  fontSize: 16,
-                  fontFamily: 'var(--m-mono)',
-                }}
-              />
-              <span style={{ display: 'grid', placeItems: 'center', fontSize: 13, color: 'var(--m-text-3)', width: 40 }}>
-                {editing.unit === 'seconds' ? t('秒') : t('分')}
-              </span>
-            </div>
-            <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
-              <button type='button' className='m-btn m-ghost' style={{ flex: 1 }} onClick={() => setEditing(null)}>
-                {t('取消')}
-              </button>
-              <button type='button' className='m-btn' style={{ flex: 1 }} onClick={() => void saveInterval()}>
-                {t('保存')}
-              </button>
-            </div>
-          </div>
-        </div>
+        <Sheet open onOpenChange={open => { if (!open) setEditing(null) }}>
+          <SheetContent>
+            <SheetHeader className='flex-col items-start gap-1'>
+              <SheetTitle>{editing.label || editing.id}</SheetTitle>
+              <SheetDescription className='text-[12px] text-muted-foreground'>
+                {t('可填 {min}–{max} {unit}', {
+                  min: editing.min || 1,
+                  max: editing.max || 9999,
+                  unit: editing.unit === 'seconds' ? t('秒') : t('分钟'),
+                })}
+              </SheetDescription>
+            </SheetHeader>
+            <SheetBody>
+              <Label htmlFor='task-interval'>{t('{name}间隔', { name: editing.label || editing.id || '' })}</Label>
+              <InputGroup className='h-[46px]'>
+                <InputGroupInput
+                  id='task-interval'
+                  value={draft}
+                  onChange={event => setDraft(event.target.value.replace(/[^\d]/g, ''))}
+                  inputMode='numeric'
+                  className='font-mono text-base'
+                />
+                <InputGroupAddon align='inline-end'>
+                  <InputGroupText>{editing.unit === 'seconds' ? t('秒') : t('分')}</InputGroupText>
+                </InputGroupAddon>
+              </InputGroup>
+            </SheetBody>
+            <SheetFooter>
+              <Button size='touch' variant='outline' className='flex-1' onClick={() => setEditing(null)}>{t('取消')}</Button>
+              <Button size='touch' className='flex-1' disabled={busy === editing.id} onClick={() => void saveInterval()}>{t('保存')}</Button>
+            </SheetFooter>
+          </SheetContent>
+        </Sheet>
       ) : null}
     </div>
   )
@@ -271,7 +243,7 @@ function TaskRow({
         ) : null}
         {task.canRun && onRun ? (
           <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
-            <button
+            <Button size='touch-sm' variant='outline'
               type='button'
               className='m-btn m-sm m-ghost'
               disabled={busy || task.running}
@@ -280,9 +252,9 @@ function TaskRow({
             >
               <Icon name='play' style={{ width: 12, height: 12 }} />
               {task.running ? t('执行中…') : t('立即执行')}
-            </button>
+            </Button>
             {onEdit ? (
-              <button
+              <Button size='touch-sm' variant='outline'
                 type='button'
                 className='m-btn m-sm m-ghost'
                 disabled={busy}
@@ -291,7 +263,7 @@ function TaskRow({
               >
                 <Icon name='edit' style={{ width: 12, height: 12 }} />
                 {t('改间隔')}
-              </button>
+              </Button>
             ) : null}
           </div>
         ) : null}
@@ -313,39 +285,6 @@ function SwitchSmall({
   label: string
 }) {
   return (
-    <button
-      type='button'
-      role='switch'
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      style={{
-        width: 40,
-        height: 24,
-        borderRadius: 999,
-        border: checked ? '0' : '1px solid var(--m-line-strong)',
-        background: checked ? 'var(--m-ok)' : 'var(--m-surface-3)',
-        position: 'relative',
-        transition: 'background .18s',
-        padding: 0,
-        flex: 'none',
-        opacity: disabled ? 0.5 : 1,
-      }}
-    >
-      <span
-        style={{
-          position: 'absolute',
-          top: 2,
-          left: checked ? 18 : 2,
-          width: 20,
-          height: 20,
-          borderRadius: '50%',
-          background: '#fff',
-          boxShadow: '0 1px 3px rgba(0,0,0,.25)',
-          transition: 'left .18s cubic-bezier(.3,.9,.4,1)',
-        }}
-      />
-    </button>
+    <UiSwitch size='touch' variant='success' checked={checked} aria-label={label} disabled={disabled} onCheckedChange={onChange} />
   )
 }

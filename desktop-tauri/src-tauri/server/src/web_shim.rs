@@ -955,8 +955,11 @@ pub fn shim_js() -> &'static str {
     export_accounts: function () {
       return downloadFile('GET', '/api/accounts/export', 'agent2api-accounts.json');
     },
-    export_logs: function () {
-      return downloadFile('GET', '/api/logs/download', 'agent2api-logs.txt');
+    export_account_files: function (args) {
+      return exportAccountFilesViaDownload(args && args.selection);
+    },
+    export_logs: function (args) {
+      return downloadFile('GET', '/api/logs/download' + toQuery(args && args.query), 'agent2api-logs.jsonl');
     },
   };
 
@@ -996,6 +999,27 @@ pub fn shim_js() -> &'static str {
     link.click();
     link.remove();
     setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+  }
+
+  async function exportAccountFilesViaDownload(selection) {
+    var data = await call('POST', '/api/accounts/export-files', selection || {});
+    if (!data || !Array.isArray(data.files)) throw new Error('账号导出响应格式无效');
+    var failed = Array.isArray(data.failed) ? data.failed.slice() : [];
+    var count = 0;
+    for (var index = 0; index < data.files.length; index++) {
+      var item = data.files[index];
+      try {
+        var blob = new Blob([JSON.stringify(item.content, null, 2)], { type: 'application/json' });
+        saveBlob(blob, item.fileName);
+        count++;
+      } catch (error) {
+        failed.push({ id: item.id, name: item.name, error: asError(error).message });
+      }
+      if (index + 1 < data.files.length) {
+        await new Promise(function (resolve) { setTimeout(resolve, 150); });
+      }
+    }
+    return { total: data.total, count: count, failed: failed, downloadStarted: count > 0 };
   }
 
   /** 面板 / API Key 的请求头（下载、上传这类非 JSON 请求共用） */
@@ -1232,8 +1256,12 @@ pub fn shim_js() -> &'static str {
       document_ = document_.data;
     }
     var accounts = Array.isArray(document_) ? document_ : (document_ && document_.accounts);
+    if (!Array.isArray(accounts) && document_ && typeof document_.id === 'string'
+      && document_.id.trim() && !Object.prototype.hasOwnProperty.call(document_, 'accounts')) {
+      accounts = [document_];
+    }
     if (!Array.isArray(accounts)) {
-      throw new Error('文件里没有 accounts 数组（不是本程序导出的账号文件？）');
+      throw new Error('文件里没有 accounts 数组，也不是单账号导出文件');
     }
     var body = { accounts: accounts };
     if (document_ && !Array.isArray(document_) && document_.customProviders) {
@@ -1445,6 +1473,7 @@ pub fn shim_js() -> &'static str {
     deleteKey: function (id) { return call('DELETE', '/api/keys/' + encodeURIComponent(id)); },
 
     // ── 多账号 ──
+    getAccounts: function () { return call('GET', '/api/accounts'); },
     switchAccount: function (id) { return call('POST', '/api/accounts/current', { id: id }); },
     refreshAccountToken: function (id) { return call('POST', '/api/accounts/refresh', id ? { id: id } : {}); },
     removeAccount: function (id) { return call('DELETE', '/api/accounts/' + encodeURIComponent(id)); },
@@ -1481,6 +1510,7 @@ pub fn shim_js() -> &'static str {
         body.maxConcurrent = payload.maxConcurrent;
       }
       if (Object.prototype.hasOwnProperty.call(payload, 'usageQuery')) body.usageQuery = payload.usageQuery;
+      if (Object.prototype.hasOwnProperty.call(payload, 'limiterGroups')) body.limiterGroups = payload.limiterGroups;
       if (Object.prototype.hasOwnProperty.call(payload, 'limiters')) body.limiters = payload.limiters;
       if (Object.prototype.hasOwnProperty.call(payload, 'limiterMode')) body.limiterMode = payload.limiterMode;
       return call('POST', '/api/accounts/batch', body);
@@ -1488,6 +1518,13 @@ pub fn shim_js() -> &'static str {
 
     // ── 账号路由（与 bridge.rs 的同名方法成对，缺一边会报「桥接方法缺失」）──
     getRoutingConfig: function () { return call('GET', '/api/routing'); },
+    getRoutingWorkspace: function (model) { return call('GET', '/api/routing/workspace' + toQuery({ model: model })); },
+    saveRoutingProfile: function (payload) { return call('PUT', '/api/routing/profile', payload || {}); },
+    getRoutingSticky: function (model) { return call('GET', '/api/routing/sticky' + toQuery({ model: model })); },
+    clearRoutingSticky: function (payload) { return call('POST', '/api/routing/sticky/clear', payload || {}); },
+    getRoutingReplays: function (query) { return call('GET', '/api/routing/replays' + toQuery(query)); },
+    getRoutingTrace: function (query) { return call('GET', '/api/routing/trace' + toQuery(query)); },
+    getRoutingTraceRequest: function (query) { return call('GET', '/api/routing/trace/request' + toQuery(query)); },
     setRoutingConfig: function (patch) { return call('PUT', '/api/routing', patch || {}); },
     getRoutingQueue: function (model) {
       return call('GET', '/api/routing/queue' + (model ? '?model=' + encodeURIComponent(model) : ''));
@@ -1711,6 +1748,8 @@ pub fn shim_js() -> &'static str {
     // 「软件更新」的出网线路（null = 直连）：与桌面 bridge 对齐，面板下拉读写
     getUpdateProxy: function () { return call('GET', '/api/update/proxy'); },
     setUpdateProxy: function (payload) { return call('POST', '/api/update/proxy', payload); },
+    getGithubAccess: function () { return call('GET', '/api/update/github'); },
+    setGithubAccess: function (payload) { return call('POST', '/api/update/github', payload); },
     // GitHub 令牌：读只报 {filled, origin}，写传 {token: '…' | null}
     getUpdateToken: function () { return call('GET', '/api/update/token'); },
     setUpdateToken: function (payload) { return call('POST', '/api/update/token', payload); },
@@ -1718,6 +1757,8 @@ pub fn shim_js() -> &'static str {
     // 逐字同形 —— 两侧接口名与签名必须一致，界面代码零改动地跑在两边）
     getUpdateBeta: function () { return call('GET', '/api/update/beta'); },
     setUpdateBeta: function (payload) { return call('POST', '/api/update/beta', payload); },
+    getUpdateChannels: function () { return call('GET', '/api/update/channels'); },
+    setUpdateChannels: function (payload) { return call('POST', '/api/update/channels', payload); },
     downloadUpdate: function (payload) { return invokeShell('download_update', payload); },
     updateProgress: function () { return invokeShell('update_progress'); },
     cancelUpdate: function () { return invokeShell('cancel_update'); },
@@ -1737,8 +1778,9 @@ pub fn shim_js() -> &'static str {
 
     // ── 出站指纹脱敏 ──
     getSanitize: function () { return call('GET', '/api/sanitize'); },
-    saveSanitize: function (enabled) {
-      return call('PUT', '/api/sanitize', { sanitizeBlacklistFingerprints: enabled === true });
+    saveSanitize: function (patch) {
+      return call('PUT', '/api/sanitize', typeof patch === 'boolean'
+        ? { sanitizeBlacklistFingerprints: patch } : patch);
     },
 
     // ── 开发者角色兼容 ──
@@ -1811,16 +1853,17 @@ pub fn shim_js() -> &'static str {
       return call('PUT', '/api/sidebar-layout', { layout: layout === undefined ? null : layout });
     },
     clearLogs: function (query) { return call('DELETE', '/api/logs' + toQuery(query)); },
-    exportLogs: function () { return invokeShell('export_logs'); },
+    exportLogs: function (query) { return invokeShell('export_logs', { query: query }); },
 
     // ── 请求统计报表 / 数据保留 ──
     // dates（`{start, end}`，`YYYY-MM-DD`）只在 range=custom 时给，
     // 与桌面壳 bridge.rs 的同名方法同一口径（toQuery 负责跳过空值）
-    getStatsSummary: function (range, dates) {
+    getStatsSummary: function (range, dates, options) {
       return call('GET', '/api/stats/summary' + toQuery({
         range: range,
         startDate: dates && dates.start,
         endDate: dates && dates.end,
+        apiKey: options && options.apiKey,
       }));
     },
     getStatsRequests: function (query) { return call('GET', '/api/stats/requests' + toQuery(query)); },
@@ -2018,6 +2061,7 @@ pub fn shim_js() -> &'static str {
       return Promise.resolve(Object.assign({ closeToTray: false, autostart: false, proxyPort: 0, lightweightMode: false }, patch));
     },
     exportAccounts: function () { return invokeShell('export_accounts'); },
+    exportAccountFiles: function (selection) { return invokeShell('export_account_files', { selection: selection }); },
     importAccounts: function () { return invokeShell('import_accounts'); },
 
     // ── 整库备份 / 恢复 ──

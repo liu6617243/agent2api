@@ -1,10 +1,12 @@
+import { Progress as UiProgress, Verification } from '@ui'
 import { useEffect, useRef, useState } from 'react'
 import { Icon } from '../components/Icon'
 import { store, useStore } from '../state/store'
 import { authenticate, fetchPanelStatus, solveCaptcha } from '../api/auth'
 import { storeApiKey } from '../api/client'
-import { baseLabel } from '../lib/servers'
+import { baseLabel, serverIdentity } from '../lib/servers'
 import { t } from '../i18n'
+import { Alert, AppFrame, Button, Field as UiField, FieldLabel, Input } from '@ui'
 
 /**
  * 登录 / 首次注册（APK 独立整屏页）。
@@ -101,6 +103,7 @@ export function LoginPage({ mode, onDone }: { mode: 'login' | 'key'; onDone?: ()
   }, [])
 
   const submit = async () => {
+    const identity = serverIdentity()
     if (mode === 'key') {
       const value = apiKey.trim()
       if (!value) return
@@ -128,6 +131,7 @@ export function LoginPage({ mode, onDone }: { mode: 'login' | 'key'; onDone?: ()
       password,
       captcha,
     })
+    if (serverIdentity() !== identity) return
     setBusy(false)
     if ('error' in result) {
       setError(result.error)
@@ -147,7 +151,7 @@ export function LoginPage({ mode, onDone }: { mode: 'login' | 'key'; onDone?: ()
       : !statusKnown || !username.trim() || !password || captchaState === 'solving')
 
   return (
-    <div
+    <AppFrame
       style={{
         position: 'fixed',
         inset: 0,
@@ -197,9 +201,9 @@ export function LoginPage({ mode, onDone }: { mode: 'login' | 'key'; onDone?: ()
 
       <div style={{ flex: 1, padding: '0 20px', display: 'flex', flexDirection: 'column', gap: 10 }}>
         {/* 当前服务器：登录前最该确认的一件事，给成一条可点的行 */}
-        <button
+        <Button size='default' variant='ghost'
           type='button'
-          className='m-row'
+          className='m-row h-auto min-h-[52px] w-full justify-start rounded-none border-0 px-3.5 py-3 text-left'
           disabled={busy}
           onClick={() => packaged && store.push('servers')}
           style={{
@@ -228,7 +232,7 @@ export function LoginPage({ mode, onDone }: { mode: 'login' | 'key'; onDone?: ()
               <Icon name='chev' />
             </span>
           ) : null}
-        </button>
+        </Button>
 
         {mode === 'key' ? (
           <Field
@@ -260,126 +264,41 @@ export function LoginPage({ mode, onDone }: { mode: 'login' | 'key'; onDone?: ()
               autoComplete={setup ? 'new-password' : 'current-password'}
             />
 
-            {/* 人机验证：这一行必须可见 —— 它是登录能不能点的前提 */}
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 9,
-                minHeight: 46,
-                padding: '10px 13px',
-                borderRadius: 'var(--m-r-md)',
-                border: '1px solid var(--m-line)',
-                background: 'var(--m-surface)',
-              }}
-            >
-              <span
-                style={{
-                  width: 20,
-                  height: 20,
-                  borderRadius: '50%',
-                  flex: 'none',
-                  display: 'grid',
-                  placeItems: 'center',
-                  background:
-                    captchaState === 'ready'
-                      ? 'var(--m-ok)'
-                      : captchaState === 'failed'
-                        ? 'var(--m-danger-soft)'
-                        : 'var(--m-surface-3)',
-                  color: captchaState === 'ready' ? '#fff' : captchaState === 'failed' ? 'var(--m-danger)' : 'var(--m-text-3)',
-                  fontSize: 12,
-                }}
-              >
-                {captchaState === 'ready' ? (
-                  <Icon name='check' style={{ width: 12, height: 12 }} />
-                ) : captchaState === 'failed' ? (
-                  <Icon name='alert' style={{ width: 12, height: 12 }} />
-                ) : (
-                  <span
-                    style={{
-                      width: 10,
-                      height: 10,
-                      borderRadius: '50%',
-                      border: '2px solid currentColor',
-                      borderTopColor: 'transparent',
-                      animation:
-                        captchaState === 'solving' ? 'm-ptr-rotate 0.7s linear infinite' : undefined,
-                    }}
-                  />
-                )}
-              </span>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 13 }}>
-                  {captchaState === 'ready'
-                    ? t('人机验证已完成')
-                    : captchaState === 'solving'
-                      ? t('正在完成人机验证…')
-                      : captchaState === 'failed'
-                        ? t('人机验证失败')
-                        : captchaState === 'off'
-                          ? t('这台网关未启用机器人校验')
-                          : t('人机验证')}
-                </div>
-                {captchaState === 'solving' && progress > 0 ? (
-                  <div style={{ marginTop: 4, height: 3, borderRadius: 2, background: 'var(--m-surface-3)', overflow: 'hidden' }}>
-                    <i
-                      style={{
-                        display: 'block',
-                        height: '100%',
-                        width: `${Math.round(progress * 100)}%`,
-                        background: 'var(--m-primary)',
-                        transition: 'width .2s linear',
-                      }}
-                    />
-                  </div>
-                ) : null}
-                {captchaState === 'failed' ? (
-                  <div style={{ marginTop: 2, fontSize: 11, color: 'var(--m-text-3)' }}>
-                    {t('通常是网络问题，点右侧重试')}
-                  </div>
-                ) : null}
-              </div>
-              {captchaState === 'failed' ? (
-                <button type='button' className='m-btn m-sm m-ghost' onClick={() => void runCaptcha()}>
-                  {t('重试')}
-                </button>
+            <div className='flex flex-col gap-1.5'>
+              <Verification className='w-full justify-start whitespace-normal text-left'
+                state={captchaState === 'ready' ? 'verified' : captchaState === 'solving' ? 'verifying' : captchaState === 'failed' ? 'error' : 'idle'}
+                disabled={captchaState !== 'failed'} onClick={() => void runCaptcha()}>
+                {captchaState === 'ready' ? t('人机验证已完成')
+                  : captchaState === 'solving' ? t('正在完成人机验证…')
+                    : captchaState === 'failed' ? t('人机验证失败')
+                      : captchaState === 'off' ? t('这台网关未启用机器人校验') : t('人机验证')}
+              </Verification>
+              {captchaState === 'solving' && progress > 0 ? (
+                <UiProgress value={Math.round(progress * 100)} aria-label={t('人机验证')} />
               ) : null}
+              {captchaState === 'failed' ? <Button size='touch-sm' variant='outline' onClick={() => void runCaptcha()}>{t('重试')}</Button> : null}
             </div>
           </>
         )}
 
-        {error ? (
-          <div
-            style={{
-              padding: '10px 13px',
-              borderRadius: 'var(--m-r-md)',
-              background: 'var(--m-danger-soft)',
-              color: 'var(--m-danger)',
-              fontSize: 12.5,
-              lineHeight: 1.55,
-            }}
-          >
-            {error}
-          </div>
-        ) : null}
+        {error ? <Alert variant='destructive'>{error}</Alert> : null}
 
-        <button
+        <Button size='touch' variant='default'
           type='button'
-          className='m-btn'
+          className='m-btn w-full'
           style={{ marginTop: 4, height: 46 }}
           disabled={submitDisabled}
           onClick={() => void submit()}
         >
           {busy ? t('验证中…') : mode === 'key' ? t('保存并继续') : setup ? t('创建并进入') : t('登录')}
-        </button>
+        </Button>
 
         {/*
           登录页是整屏的，用户被登出后看不到「设置 → 服务器」——
           这里给一个直达入口：压进服务器页，选/加完一台后它会自己退回原页。
         */}
         {packaged ? (
-          <button
+          <Button size='default' variant='ghost'
             type='button'
             disabled={busy}
             onClick={() => store.push('servers')}
@@ -395,7 +314,7 @@ export function LoginPage({ mode, onDone }: { mode: 'login' | 'key'; onDone?: ()
             }}
           >
             {t('换一台服务器')}
-          </button>
+          </Button>
         ) : null}
       </div>
 
@@ -410,7 +329,7 @@ export function LoginPage({ mode, onDone }: { mode: 'login' | 'key'; onDone?: ()
       >
         {t('凭证只保存在这台手机上，按服务器分别存放')}
       </div>
-    </div>
+    </AppFrame>
   )
 }
 
@@ -437,11 +356,9 @@ function Field({
   spellCheck?: boolean
 }) {
   return (
-    <label style={{ display: 'block' }}>
-      <span style={{ display: 'block', fontSize: 12, color: 'var(--m-text-3)', marginBottom: 6, paddingLeft: 2 }}>
-        {label}
-      </span>
-      <input
+    <UiField className='gap-1.5'>
+      <FieldLabel className='block text-[12px] text-muted-foreground'>{label}</FieldLabel>
+      <Input
         value={value}
         onChange={event => onChange(event.target.value)}
         placeholder={placeholder}
@@ -450,20 +367,9 @@ function Field({
         autoCapitalize={autoCapitalize}
         autoCorrect={autoCorrect}
         spellCheck={spellCheck}
-        style={{
-          width: '100%',
-          boxSizing: 'border-box',
-          height: 46,
-          padding: '0 13px',
-          borderRadius: 'var(--m-r-md)',
-          border: '1px solid var(--m-line-strong)',
-          background: 'var(--m-surface)',
-          color: 'var(--m-text)',
-          // 16px 是 iOS 的阈值：小于它聚焦时 Safari 会自动放大整页
-          fontSize: 16,
-          fontFamily: type === 'password' ? 'var(--m-mono)' : 'inherit',
-        }}
+        className={`h-[46px] text-base${type === 'password' ? ' font-mono' : ''}`}
+        aria-label={label}
       />
-    </label>
+    </UiField>
   )
 }

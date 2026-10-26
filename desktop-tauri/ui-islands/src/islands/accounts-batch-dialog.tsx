@@ -5,16 +5,18 @@ import {
   Button, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogSection,
   DialogTitle, Input, Label, RadioGroup, RadioGroupItem, Select, SelectContent,
   SelectItem, SelectTrigger, SelectValue,
+  Field, FieldLabel, FieldSet,
 } from '@ui'
 import { t } from '../i18n'
 import {
   ACCOUNT_CONCURRENCY_MAX as CONC_MAX, errorMessage, esc, shared, toast,
-  type AccountRecord, type BatchAccountsPayload, type BatchLimiterMode, type LimiterRule,
+  type AccountRecord, type BatchAccountsPayload, type BatchLimiterMode, type LimiterGroup,
 } from './accounts-shared'
 import {
   displayNameOf, providerFeatures, providerOf, supportsProxyRotate, supportsUsage,
 } from './accounts-domain'
-import { allAccounts, findAccount } from './accounts-data'
+import { allAccounts, findAccount, syncBalancesSnapshot } from './accounts-data'
+import { confirmBatchResult, refreshSavedAccounts } from './accounts-update'
 import { limiterDraftOf, LimiterSection } from './accounts-dialog-limiter'
 import { readUsageDraft, UsageSettingsSection, usageDraftOf, type UsageDraft } from './accounts-dialog-usage'
 import { draftOfProxy, ProxyForm, readProxyDraft, type ProxyDraft } from './accounts-proxy-form'
@@ -48,7 +50,7 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
   // 混选时没有共同的间隔；不预填，避免直接执行就覆盖整组配置。
   const [usageDraft, setUsageDraft] = React.useState<UsageDraft>({ enabled: true, intervalInput: '', unit: 'minutes' })
   const [limiterMode, setLimiterMode] = React.useState<BatchLimiterMode>('append')
-  const [limiterDraft, setLimiterDraft] = React.useState<LimiterRule[]>([])
+  const [limiterDraft, setLimiterDraft] = React.useState<LimiterGroup[]>([])
   const [sourceId, setSourceId] = React.useState('')
   const [busy, setBusy] = React.useState(false)
   const [result, setResult] = React.useState<React.ReactNode>('')
@@ -56,7 +58,7 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
   const accounts = ids.map(id => findAccount(id)).filter((account): account is AccountRecord => account !== null)
   const usageAccounts = accounts.filter(supportsUsage)
   const editingRules = current === 'limiters' && (limiterMode === 'append' || limiterMode === 'replace')
-  const needsBalance = editingRules && limiterDraft.some(rule => rule.type === 'balance')
+  const needsBalance = editingRules && limiterDraft.some(group => group.conditions.some(condition => condition.metric !== 'tokens' && condition.metric !== 'requests'))
   const targets = current === 'usageQuery' || needsBalance ? usageAccounts : accounts
   const skippedAccounts = accounts.filter(account => !targets.includes(account))
   const copyOptions = current === 'usageQuery' ? usageAccounts : accounts
@@ -144,7 +146,11 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
         payload.limiterMode = limiterMode
         if (editingRules) {
           if (!limiterDraft.length) throw new Error(t('请至少添加一条限制规则；清空请使用清空操作'))
-          payload.limiters = limiterDraft.map(rule => ({ ...rule }))
+          if (limiterDraft.some(group => group.conditions.some(condition =>
+            condition.sourceId !== '' && condition.sourceId !== 'local' && condition.sourceId !== 'account'))) {
+            throw new Error(t('套餐实例不能跨账号复制，请改用通用额度或本地保护条件'))
+          }
+          payload.limiterGroups = structuredClone(limiterDraft)
         }
       }
     } catch (error) {
@@ -160,10 +166,7 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
       if (!(await confirmOperation())) return
       const bridge = shared().workbuddyDesktop
       if (!bridge?.batchAccounts) throw new Error(t('批量操作接口不可用，请重新打开页面'))
-      const data = await bridge.batchAccounts(payload)
-      if (!data || (!Array.isArray(data.ok) && !Array.isArray(data.removed))) {
-        throw new Error(t('批量操作未返回结果，请刷新后确认状态'))
-      }
+      const data = confirmBatchResult(await bridge.batchAccounts(payload), payload)
       const accepted = data.ok || []
       const changed = current === 'remove' ? (data.removed || []).length : accepted.filter(item => item.changes?.length).length
       const unchanged = current === 'remove' ? 0 : accepted.length - changed
@@ -187,7 +190,8 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
         onClose()
       }
       try {
-        await shared().wbApp?.refresh?.()
+        await refreshSavedAccounts()
+        await syncBalancesSnapshot()
       } catch (error) {
         toast(t('批量操作已保存，但列表刷新失败：{error}', { error: errorMessage(error) }), 'err')
       }
@@ -205,7 +209,7 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
       <DialogContent className='w-[min(900px,calc(100vw-48px))]' showCloseButton={!busy}>
         <DialogHeader><DialogTitle>{t('批量操作 · 已选 {count} 个账号', { count: ids.length })}</DialogTitle></DialogHeader>
         <DialogBody>
-          <fieldset disabled={busy} className='m-0 flex min-w-0 flex-col gap-4 border-0 p-0'>
+          <FieldSet disabled={busy} className='m-0 flex min-w-0 flex-col gap-4 border-0 p-0'>
             <DialogSection>
               <h3>{t('将作用于以下账号')}</h3>
               <p className='max-h-[84px] overflow-y-auto'>{targets.map(labelOf).join(t('、')) || t('没有适用于本次操作的账号')}</p>
@@ -226,27 +230,27 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
                 <ProxyForm draft={proxyDraft} onChange={setProxyDraft} idPrefix='batch-proxy' allowRotate={allowRotate} />
               </div> : null}
               {current === 'concurrency' ? <div className='mt-2.5'>
-                <div className='field-row'>
-                  <label htmlFor='batch-conc-input'>{t('并发上限')}</label>
+                <Field orientation='horizontal' className='field-row'>
+                  <FieldLabel htmlFor='batch-conc-input'>{t('并发上限')}</FieldLabel>
                   <Input id='batch-conc-input' type='number' min={0} max={CONC_MAX} step={1}
                     className='max-w-[110px]' placeholder={t('并发上限')} value={concDraft}
                     onChange={event => setConcDraft(event.currentTarget.value)} />
                   <span className='detail'>{t('0 = 不限')}</span>
-                </div>
+                </Field>
                 <p className='detail mt-2.5'>{concHardCap > 0
                   ? t('并发上限 0~{max}；CodeArts 等有默认值的家填 0 即按本家默认；达到上限的账号会被跳过、请求转给其他账号', { max: CONC_MAX })
                   : t('并发上限 0~{max}；达到上限的账号会被跳过、请求转给其他账号', { max: CONC_MAX })}</p>
               </div> : null}
               {current === 'limiters' ? <div className='mt-2.5'>
-                <div className='field-row'>
-                  <label htmlFor='batch-limiter-mode'>{t('规则操作')}</label>
+                <Field orientation='horizontal' className='field-row'>
+                  <FieldLabel htmlFor='batch-limiter-mode'>{t('规则操作')}</FieldLabel>
                   <Select value={limiterMode} onValueChange={value => { setLimiterMode(value as BatchLimiterMode); setResult('') }}>
                     <SelectTrigger id='batch-limiter-mode' className='min-w-[220px]'>
                       <SelectValue>{LIMITER_MODES.find(item => item.value === limiterMode)!.label()}</SelectValue>
                     </SelectTrigger>
                     <SelectContent>{LIMITER_MODES.map(item => <SelectItem key={item.value} value={item.value}>{item.label()}</SelectItem>)}</SelectContent>
                   </Select>
-                </div>
+                </Field>
                 <p className='detail mt-2.5'>{limiterMode === 'append'
                   ? t('保留各账号原有规则，只追加下面的规则；完全相同的规则不会重复添加。')
                   : limiterMode === 'replace'
@@ -256,8 +260,8 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
                       : t('仅统一修改现有规则的开关，保留阈值、动作和重置方式；不改变账号的启用状态。')}</p>
               </div> : null}
               {current === 'usageQuery' || editingRules ? <div className='mt-2.5'>
-                <div className='field-row'>
-                  <label htmlFor='batch-settings-source'>{t('复制自账号')}</label>
+                <Field orientation='horizontal' className='field-row'>
+                  <FieldLabel htmlFor='batch-settings-source'>{t('复制自账号')}</FieldLabel>
                   <Select value={source?.id || ''} disabled={!copyOptions.length} onValueChange={value => setSourceId(String(value))}>
                     <SelectTrigger id='batch-settings-source' className='min-w-0 flex-1'>
                       <SelectValue>{source ? labelOf(source) : t('选择所选账号作为模板（可选）')}</SelectValue>
@@ -265,7 +269,7 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
                     <SelectContent>{copyOptions.map(account => <SelectItem key={account.id} value={account.id}>{labelOf(account)}</SelectItem>)}</SelectContent>
                   </Select>
                   <Button variant='outline' size='sm' disabled={!source} onClick={copySettings}>{t('复制当前设置')}</Button>
-                </div>
+                </Field>
                 {current === 'usageQuery' ? <>
                   <UsageSettingsSection draft={usageDraft} onChange={setUsageDraft} idPrefix='batch-usage' />
                   <p className='detail mt-2.5'>{t('统一设置自动查询的开关和间隔；不会复制或覆盖余额查询凭证。')}</p>
@@ -278,7 +282,7 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
                 {t('Token 规则按每个账号已有的窗口消耗判定，保存不会清零；停用或清空规则不会自动启用账号。')}
               </p> : null}
             </DialogSection>
-          </fieldset>
+          </FieldSet>
           <div className='detail min-h-[18px]'>{result}</div>
         </DialogBody>
         <DialogFooter>

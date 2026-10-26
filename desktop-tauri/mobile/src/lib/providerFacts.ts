@@ -110,11 +110,20 @@ export function declaredProviderFacts(): ReadonlyMap<string, ProviderFacts> {
   return declared
 }
 
-/** 这家账号能不能查余额：自定义提供商看 balanceQuery.scheme，插件家看申报 */
+/**
+ * 这家账号能不能查余额：自定义提供商看 balanceQuery.scheme，插件家看申报。
+ *
+ * 访客账号（`isGuest`）一律 false：智谱清言的访客没有积分体系（上游接口
+ * 一律 401），查询只会得到恒定的失败。判据与桌面端 `accounts-domain` 的同名
+ * 函数、以及后端 `usage_query::supports_usage` 同口径 —— 三处必须一致，
+ * 否则界面算的目标集合与后端返回的行会对不上。
+ */
 export function supportsUsage(account: {
   provider?: string
   balanceQuery?: unknown
+  isGuest?: boolean
 }): boolean {
+  if (account.isGuest === true) return false
   const id = String(account.provider || '')
   if (id.startsWith('custom-')) {
     const scheme = (account.balanceQuery as { scheme?: unknown } | undefined)?.scheme

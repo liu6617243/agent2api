@@ -39,11 +39,13 @@ import {
 } from './accounts-domain'
 import * as domain from './accounts-domain'
 import { t } from '../i18n'
+import { adoptLimiterSnapshot } from './accounts-limiter-model'
 import {
   allAccounts, bump, findAccount, getStore, isPicked, patch,
 } from './accounts-store'
 import { proxyPoolSnapshot, refreshProxyPool } from './proxy-pool-cache'
 import { installListRefresh, refreshList } from './accounts-refresh'
+import { confirmBatchResult, refreshSavedAccounts, updateAccountConfirmed } from './accounts-update'
 
 export { refreshList } from './accounts-refresh'
 
@@ -113,6 +115,11 @@ function putUsage(id: string, entry: UsageEntry, at: number): void {
 export function usageEntryOf(account: AccountRecord): UsageEntry {
   const entry = usageMap.get(account.id)
   if (entry === undefined) return undefined
+  // 访客账号不查余额（见 `supportsUsage` 的说明）：它名下**只可能**是历史失败
+  // 结论 —— 升级前的心跳给它排过期、每次查询都稳定失败。留着就会在余额列
+  // 留一格红字，而那一格本该是「—」（这条账号没有可查的东西）。后端快照出口
+  // 已经不再端出这些行，这里管的是**升级前就已经写进本地缓存**的那些。
+  if (account.isGuest === true) return undefined
   if (!usageFailureOf(entry)) return entry
   const changedAt = Math.max(Number(account.addedAt) || 0, Number(account.updatedAt) || 0)
   return (usageFailureAt.get(account.id) || 0) >= changedAt ? entry : undefined
@@ -516,7 +523,8 @@ export async function syncBalancesSnapshot(): Promise<boolean> {
     // Token 限制器的读数**先于**余额的早退判定应用：余额只在查询到期时变化
     // （`at` 不动说明没有新结论），而 Token 周期消耗随每条请求变化 —— 先判
     // 余额的 `at` 就返回会让 Token 读数停在最后一次余额查询那会儿。
-    const tokenApplied = applyTokenUsage(data)
+    const limiterApplied = adoptLimiterSnapshot(data)
+    const tokenApplied = applyTokenUsage(data) || limiterApplied
     if (tokenApplied) {
       bump()
       // Token 结论会翻转「已限流」归类（isLimitedNow 的口径），顶栏那枚计数
@@ -717,9 +725,10 @@ export async function refreshUsageAfterCheckin(id?: string): Promise<void> {
  */
 export async function setAccountEnabled(id: string, enabled: boolean): Promise<void> {
   try {
-    await shared().workbuddyDesktop?.updateAccount?.(id, { enabled })
-    await shared().wbApp?.refresh?.()
+    await updateAccountConfirmed(id, { enabled })
     toast(enabled ? t('✅ 已启用') : t('✅ 已禁用'))
+    try { await refreshSavedAccounts() }
+    catch (error) { toast(t('账号已保存，但列表刷新失败：{error}', { error: errorMessage(error) }), 'err') }
   } catch (error) {
     toast(t('操作失败：{message}', { message: errorMessage(error) }), 'err')
     // 失败时把开关拨回去：界面上不能留一个「已改」的假象
@@ -758,11 +767,23 @@ export async function reorderQueue(ids: string[], note?: string): Promise<boolea
 export async function setGroupEnabled(ids: string[], enabled: boolean): Promise<void> {
   if (!ids.length) return
   try {
-    await shared().workbuddyDesktop?.batchAccounts?.({ action: enabled ? 'enable' : 'disable', ids })
-    toast(enabled
-      ? t('✅ 已启用 {n} 个账号', { n: ids.length })
-      : t('✅ 已禁用 {n} 个账号', { n: ids.length }))
-    await shared().wbApp?.refresh?.()
+    const bridge = shared().workbuddyDesktop
+    if (!bridge?.batchAccounts) throw new Error(t('批量操作接口不可用，请重新打开页面'))
+    const payload = { action: enabled ? 'enable' : 'disable', ids }
+    const data = confirmBatchResult(await bridge.batchAccounts(payload), payload)
+    const count = data.ok?.length || 0
+    const changed = data.ok?.filter(item => item.changes?.length).length || 0
+    const failed = data.failed?.length || 0
+    if (failed || data.skipped?.length) {
+      toast(t('{verb}完成：成功 {ok} 个，未变更 {unchanged} 个，跳过 {skip} 个，失败 {fail} 个', {
+        verb: enabled ? t('启用') : t('禁用'), ok: changed, unchanged: count - changed,
+        skip: data.skipped?.length || 0, fail: failed,
+      }), failed ? 'err' : 'ok')
+    } else {
+      toast(enabled ? t('✅ 已启用 {n} 个账号', { n: count }) : t('✅ 已禁用 {n} 个账号', { n: count }))
+    }
+    try { await refreshSavedAccounts() }
+    catch (error) { toast(t('批量操作已保存，但列表刷新失败：{error}', { error: errorMessage(error) }), 'err') }
   } catch (error) {
     toast(t('操作失败：{message}', { message: errorMessage(error) }), 'err')
     void shared().wbApp?.refresh?.()
@@ -820,16 +841,14 @@ export async function applyProxyPick(id: string, value: string, fallback: string
     const proxy = value === ''
       ? null
       : { source: 'pool', proxyId: value.slice(POOL_VALUE_PREFIX.length) }
-    const result = await shared().workbuddyDesktop?.updateAccount?.(id, { proxy })
-    const changes = result?.changes
-    // changes[0] 是后端回报的变更说明（后端文案保持一份事实），没有时给前端兜底一句
-    const change = Array.isArray(changes) && changes.length ? changes[0] : t('代理已更新')
-    toast(`✅ ${change}`)
+    await updateAccountConfirmed(id, { proxy })
+    toast(`✅ ${t('代理已更新')}`)
   } catch (error) {
     toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
   } finally {
     // 成败都重拉：成功让这格显示落库后的值，失败把下拉拨回原值
-    await shared().wbApp?.refresh?.()
+    try { await refreshSavedAccounts() }
+    catch (error) { toast(t('刷新账号列表失败：{message}', { message: errorMessage(error) }), 'err') }
   }
 }
 
@@ -838,39 +857,13 @@ export const PROXY_CUSTOM_CURRENT = '__proxy_custom__'
 export const PROXY_CUSTOM_EDIT = '__proxy_custom_edit__'
 
 /**
- * 行上「领套餐」/ 签到中心 ZCode 行：打开**套餐明细**弹窗（zcode-plans-modal.tsx）。
- *
- * ── 为什么是一颗「打开弹窗」的按钮而不是直接开领 ──────────────
- * 一个账号可能同时挂着几份可领套餐，而上游的「已领取过」是**按套餐**判的
- * （同一份再领回 1003，换一份照样能领）—— 所以「这次领哪一份」必须由用户看着
- * 逐份状态来决定。旧版是先探测再弹一个原生确认框，里面既列不出逐份状态、也显示
- * 不了刚领到还没生效的套餐；现在统一进弹窗：上面是可领取（逐份标「今日已领」、
- * 逐份点「领取」），下面是账号名下已有的套餐（含**待生效**与已过期）。
- *
- * 「今天领过哪几份」与余额读数都由弹窗自己从账号页状态里读（判据只有域层的
- * `claimedPlanIdsToday` 一处），这里只传 id 与显示名。
- *
- * ── 收尾（刷新余额 / 重拉账号）为什么在弹窗里 ────────────────
- * 领到的是 token 额度：余额列的读数立刻就变了，领取台账也变了。这两件事都是本页
- * 的 store（弹窗能订阅到，见那边的 `subscribe`），所以由弹窗领完自己刷 ——
- * 这里不替它盯流程。
- */
-export function openZcodePlans(id: string, name?: string): void {
-  const account = findAccount(id)
-  if (!account) { toast(t('账号不存在，请刷新后重试'), 'err'); return }
-  const modal = shared().wbZcodePlans
-  if (!modal?.open) {
-    // 岛还没挂上（构建产物没更新 / 加载失败）：如实说一句，别静默什么都不做
-    toast(t('套餐明细弹窗未加载，请重启应用后重试'), 'err')
-    return
-  }
-  modal.open({ id, name: name || account.name })
-}
-
-/**
  * CodeArts 的「领福利」入口已整体迁到「签到中心」的活动福利卡（checkin-page.tsx
  * 直接调 legacy 脚本 `ui/codearts-welfare.js` 的 `wbCodeArtsWelfare.start`），
  * 账号页不再有这颗按钮 —— 这里不再中转。
+ *
+ * ZCode 的「领套餐」同一场收敛：账号页那颗按钮已撤（套餐明细与逐份领取在
+ * 签到中心的「活动福利」卡，那一行点开的就是同一个 `wbZcodePlans` 弹窗），
+ * 原先只服务它的 `openZcodePlans` 一并删掉。
  */
 
 /* ─── 对外契约（window）────────────────────── */
@@ -962,7 +955,6 @@ type AccountsModelApi = {
   /** 「已限流」的完整口径（isLimitedNow：模型限流或限制器跳过档），余额与 Token 读数由本文件的缓存出 */
   isLimited: (account: AccountRecord | null | undefined) => boolean
   accountEdition: typeof domain.accountEdition
-  supportsClaim: typeof domain.supportsClaim
   matchEnabled: typeof domain.matchEnabled
   matchLimit: typeof domain.matchLimit
   visibleAccounts: typeof domain.visibleAccounts
@@ -1006,7 +998,6 @@ const ACCOUNTS_MODEL_API: AccountsModelApi = {
     tokenUsageOf(account),
   ),
   accountEdition: domain.accountEdition,
-  supportsClaim: domain.supportsClaim,
   matchEnabled: domain.matchEnabled,
   matchLimit: domain.matchLimit,
   visibleAccounts: domain.visibleAccounts,

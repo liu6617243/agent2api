@@ -15,6 +15,9 @@ import {
 import { formatRelative } from '../lib/format'
 import { usePolling } from '../lib/usePolling'
 import { t } from '../i18n'
+import { hasProxyUsage, proxyServiceLabels } from '../../../ui-shared/proxy-usage'
+import { Card, Button } from '@ui'
+import { Switch as UiSwitch } from '@ui'
 
 /**
  * 网络代理。
@@ -108,8 +111,8 @@ export function ProxiesPage() {
       />
 
       <div className='m-section' style={{ marginTop: 0 }}>
-        <div className='m-card'>
-          <button type='button' className='m-row' onClick={() => void sync()} disabled={busy === 'sync'}>
+        <Card className='m-card'>
+          <Button size='default' variant='ghost' type='button' className='m-row h-auto min-h-[52px] w-full justify-start rounded-none border-0 px-3.5 py-3 text-left' onClick={() => void sync()} disabled={busy === 'sync'}>
             <GlyphLogo name='refresh' />
             <div className='m-grow'>
               <div className='m-t1'>{busy === 'sync' ? t('同步中…') : t('同步 Clash Verge 出口')}</div>
@@ -122,8 +125,8 @@ export function ProxiesPage() {
             <span className='m-chev'>
               <Icon name='chev' />
             </span>
-          </button>
-        </div>
+          </Button>
+        </Card>
       </div>
 
       {error ? <ErrorNote text={error} /> : null}
@@ -131,9 +134,9 @@ export function ProxiesPage() {
 
       {data && !items.length ? (
         <div className='m-section'>
-          <div className='m-card'>
+          <Card className='m-card'>
             <Empty text={t('还没有出口。在桌面端「网络代理」页新增，或点上面同步 Clash。')} />
-          </div>
+          </Card>
         </div>
       ) : null}
 
@@ -153,7 +156,7 @@ export function ProxiesPage() {
             : t('未测试')
         return (
           <div key={id} className='m-section' style={{ marginTop: 10 }}>
-            <div className='m-card m-card-pad'>
+            <Card className='m-card m-card-pad'>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <GlyphLogo name='globe' />
                 <div style={{ flex: 1, minWidth: 0 }}>
@@ -197,8 +200,9 @@ export function ProxiesPage() {
                   <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{text}</span>
                 </span>
                 {item.usedBy?.length ? <span style={{ flex: 'none' }}>{t('{n} 个账号引用', { n: item.usedBy.length })}</span> : null}
+                {proxyServiceLabels(item, t).map(service => <span key={service} style={{ flex: 'none' }}>{service}</span>)}
                 {last?.at ? <span style={{ flex: 'none' }}>{formatRelative(last.at)}</span> : null}
-                <button
+                <Button size='touch-sm' variant='outline'
                   type='button'
                   className='m-btn m-sm m-ghost'
                   style={{ marginLeft: 'auto', height: 28, fontSize: 11.5, padding: '0 10px' }}
@@ -206,7 +210,7 @@ export function ProxiesPage() {
                   onClick={() => void test(item)}
                 >
                   {busy === id ? t('测试中…') : t('测试')}
-                </button>
+                </Button>
               </div>
 
               {item.source === 'subscription' ? (
@@ -218,15 +222,15 @@ export function ProxiesPage() {
                   <Badge tone='mute'>{t('Clash 镜像')}</Badge>
                 </div>
               ) : null}
-            </div>
+            </Card>
           </div>
         )
       })}
 
       <div className='m-section' style={{ paddingBottom: 8 }}>
-        <div className='m-card m-card-pad' style={{ fontSize: 11.5, color: 'var(--m-text-3)', lineHeight: 1.7 }}>
+        <Card className='m-card m-card-pad' style={{ fontSize: 11.5, color: 'var(--m-text-3)', lineHeight: 1.7 }}>
           {t('新增出口、编辑地址与订阅管理在桌面端完成；手机端做启停与连通性测试。')}
-        </div>
+        </Card>
       </div>
     </div>
   )
@@ -242,7 +246,7 @@ function addressOf(item: PoolItem, installed?: boolean): string {
     if (installed === false) return t('内核未安装')
     if (item.orphan) return t('订阅已移除')
     if (item.enabled === false) return t('已禁用')
-    return item.usedBy?.length ? t('端口准备中') : t('未被使用')
+    return hasProxyUsage(item) ? t('端口准备中') : t('未被使用')
   }
   return t('地址不完整')
 }
@@ -259,39 +263,6 @@ function SwitchSmall({
   label: string
 }) {
   return (
-    <button
-      type='button'
-      role='switch'
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      style={{
-        width: 40,
-        height: 24,
-        borderRadius: 999,
-        border: checked ? '0' : '1px solid var(--m-line-strong)',
-        background: checked ? 'var(--m-ok)' : 'var(--m-surface-3)',
-        position: 'relative',
-        transition: 'background .18s',
-        padding: 0,
-        flex: 'none',
-        opacity: disabled ? 0.5 : 1,
-      }}
-    >
-      <span
-        style={{
-          position: 'absolute',
-          top: 2,
-          left: checked ? 18 : 2,
-          width: 20,
-          height: 20,
-          borderRadius: '50%',
-          background: '#fff',
-          boxShadow: '0 1px 3px rgba(0,0,0,.25)',
-          transition: 'left .18s cubic-bezier(.3,.9,.4,1)',
-        }}
-      />
-    </button>
+    <UiSwitch size='touch' variant='success' checked={checked} aria-label={label} disabled={disabled} onCheckedChange={onChange} />
   )
 }

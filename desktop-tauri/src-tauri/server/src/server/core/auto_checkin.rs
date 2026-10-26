@@ -56,6 +56,8 @@ use crate::server::core::billing::BillingService;
 use crate::server::core::checkin_schedules::{self, Schedule};
 use crate::server::logging;
 
+mod retry;
+
 /// 轮询间隔：30 秒足够精确到分钟，又不会让计时器显得忙（Node 版 TICK_MS）
 pub const TICK_MS: u64 = 30_000;
 
@@ -590,7 +592,8 @@ impl AutoCheckin {
             .map(|schedule| {
                 let fired_today = schedule.last_fired_date.as_deref() == Some(today.as_str());
                 let next_run_at = if master && schedule.enabled {
-                    next_run_at_ms(&schedule.time, fired_today, now)
+                    retry::next_at(schedule.last_result.as_ref(), &today)
+                        .or_else(|| next_run_at_ms(&schedule.time, fired_today, now))
                 } else {
                     None
                 };
@@ -694,6 +697,17 @@ impl AutoCheckin {
         };
 
         let today = today_key();
+        let schedule = schedule_id.and_then(|id| checkin_schedules::list()
+            .into_iter().find(|schedule| schedule.id == id));
+        let selected = if matches!(source, "schedule" | "startup") {
+            retry::due_accounts(schedule.as_ref().and_then(|schedule| schedule.last_result.as_ref()), logging::now_ms())
+        } else {
+            None
+        };
+        if selected.as_ref().is_some_and(Vec::is_empty) {
+            drop(guard);
+            return None;
+        }
         // 先落日期再执行：即便签到中途进程被杀，也不会在重启后反复补签
         write_state(json!({ "lastFiredDate": today }));
         if let Some(id) = schedule_id {
@@ -703,26 +717,28 @@ impl AutoCheckin {
 
         // 范围：条目轮次用那条自己勾的提供商；手动全量（无条目）= 全部提供商。
         // 条目可能在执行前被删（罕见）：拿不到就按全量兜，不空跑。
-        let providers = match schedule_id {
-            Some(id) => checkin_schedules::list()
-                .into_iter()
-                .find(|schedule| schedule.id == id)
-                .map(|schedule| schedule.providers)
-                .unwrap_or_else(default_providers),
-            None => default_providers(),
-        };
-        let outcome = match checkin::run_checkin(
+        let providers = schedule.as_ref().map(|schedule| schedule.providers.clone())
+            .unwrap_or_else(default_providers);
+        let outcome = match checkin::run_checkin_selected(
             &self.store,
             &self.billing,
             providers.as_slice(),
             None,
             reason,
             source,
+            selected.as_deref(),
         )
         .await
         {
             Ok(result) => {
-                let summary = self.record_success(&result, &today, reason);
+                let summary = retry::merge(
+                    &self.store,
+                    self.record_success(&result, &today, reason),
+                    &result,
+                    schedule.as_ref().and_then(|schedule| schedule.last_result.as_ref()),
+                    selected.as_deref(),
+                );
+                write_state(json!({ "lastResult": summary }));
                 if let Some(id) = schedule_id {
                     checkin_schedules::mark_result(id, Some(summary.clone()));
                 }
@@ -753,25 +769,6 @@ impl AutoCheckin {
         outcome
     }
 
-    /// 本轮是否有「Qoder 国际版账号没领到且不算已签」的行 —— 有则今天保持
-    /// 未落账状态，等窗口开了重试（见 tick 的说明）。
-    fn qoder_intl_pending(result: &Value) -> bool {
-        result
-            .get("results")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items.iter().any(|item| {
-                    item.get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| id.starts_with("qoder-global-"))
-                        && crate::server::core::billing::checkin::claim_pending(
-                            &item.get("claim").cloned().unwrap_or(Value::Null),
-                        )
-                })
-            })
-            .unwrap_or(false)
-    }
-
     /// 成功分支：汇总 + 记录 lastResult + 日志（对应 Node fire 里的 try 主体）
     fn record_success(&self, result: &Value, today: &str, reason: &str) -> Value {
         let number = |key: &str| {
@@ -791,16 +788,7 @@ impl AutoCheckin {
             .map(|items| {
                 items
                     .iter()
-                    .filter_map(|item| {
-                        let error = item.get("error").and_then(Value::as_str)?;
-                        let name = item
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .filter(|text| !text.is_empty())
-                            .or_else(|| item.get("id").and_then(Value::as_str))
-                            .unwrap_or("未知账号");
-                        Some(format!("{name}（{error}）"))
-                    })
+                    .filter_map(checkin::failure_of)
                     .collect()
             })
             .unwrap_or_default();
@@ -834,33 +822,12 @@ impl AutoCheckin {
                 },
             ),
         );
-        // qoderIntlPending 不进 lastResult（那是给界面看的快照），单独放在
-        // fire 的返回值上供 tick 决定今天要不要保持未落账
-        let mut summary = summary;
-        if let Some(object) = summary.as_object_mut() {
-            object.insert(
-                "qoderIntlPending".to_string(),
-                Value::Bool(Self::qoder_intl_pending(result)),
-            );
-        }
         summary
     }
 
     // ─── 调度 ───────────────────────────────────────────────
 
-    /// 轮询回调：每条启用的条目各自「到点 + 今天没跑过」就执行（对应 Node 版
-    /// tick 的多条目版）。
-    ///
-    /// ── Qoder 国际版的窗口补领（2026-10，issue #140）────────────
-    /// 国际版「每日 100 Credits」的官方窗口**每天 10:00（UTC+8）开启**，而
-    /// 缺省触发时刻是 00:01 —— 那时窗口还没开，活动列表里没有积分活动，
-    /// 领取轮次对它只能得到「无活动」。若就此落条目的 `lastFiredDate` 整天
-    /// 不再重试，国际版账号等于永远领不到。所以条目轮次**照常在配置时刻跑**，
-    /// 但当轮次里存在「Qoder 国际版无活动未落账」的行时，**这一条**今天暂不落
-    /// 到点标记：之后每个 tick 会重新进来，直到 10:00 窗口开启领到（或活动行
-    /// 出现 CLAIMED）才落账 —— 与 10router「no-activity 刻意不记忆、下个
-    /// tick 再看」同一语义。窗口判定按条目独立：没勾 qoder-intl 的条目
-    /// 不会有这种行，到点即落账。
+    /// 到点执行整轮；中性未领取只按插件给出的时刻重试对应账号，失败不反复打上游。
     pub async fn tick(&self) {
         if !master_enabled() {
             return;
@@ -872,31 +839,15 @@ impl AutoCheckin {
             if !schedule.enabled {
                 continue;
             }
-            // 未到点直接看下一条（time 在读取时已归一，这里不会解析失败）
-            if due_now(&schedule.time, now).is_none() {
+            let retry_due = retry::due_accounts(schedule.last_result.as_ref(), logging::now_ms());
+            if let Some(accounts) = &retry_due {
+                if accounts.is_empty() { continue; }
+            } else if due_now(&schedule.time, now).is_none()
+                || schedule.last_fired_date.as_deref() == Some(today.as_str()) {
                 continue;
             }
-            // 条目级当天去重
-            if schedule.last_fired_date.as_deref() == Some(today.as_str()) {
-                continue;
-            }
-            let reason =
-                format!("到点触发（{}）", checkin_schedules::display_label(&schedule));
-            match self.fire_for(&reason, Some(&schedule.id), "schedule").await {
-                Some(result) => {
-                    // 领取轮次完成，但里面有「Qoder 国际版无活动」的行 → 这一条
-                    // 不落账，今天窗口开了之后由后续 tick 重试
-                    if result.get("qoderIntlPending").and_then(Value::as_bool) == Some(true) {
-                        checkin_schedules::mark_fired(&schedule.id, None);
-                        logging::log(
-                            "[Checkin]",
-                            "⏳ Qoder 国际版的活动窗口未开（官方每日 10:00 UTC+8），今天会自动重试到领到为止",
-                        );
-                    }
-                }
-                // None = 已有轮次在跑或执行出错：照旧落账（fire 内部已写），行为不变
-                None => {}
-            }
+            let reason = format!("到点触发（{}）", checkin_schedules::display_label(&schedule));
+            self.fire_for(&reason, Some(&schedule.id), "schedule").await;
         }
     }
 
@@ -945,8 +896,10 @@ impl AutoCheckin {
         let pending: Vec<Schedule> = checkin_schedules::list()
             .into_iter()
             .filter(|schedule| {
-                schedule.enabled
-                    && schedule.last_fired_date.as_deref() != Some(today.as_str())
+                schedule.enabled && match retry::due_accounts(schedule.last_result.as_ref(), logging::now_ms()) {
+                    Some(accounts) => !accounts.is_empty(),
+                    None => schedule.last_fired_date.as_deref() != Some(today.as_str()),
+                }
             })
             .collect();
         if pending.is_empty() {

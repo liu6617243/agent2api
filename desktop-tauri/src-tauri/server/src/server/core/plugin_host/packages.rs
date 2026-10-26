@@ -169,6 +169,7 @@ impl PreparedPack {
                     .as_ref()
                     .and_then(|pack| pack.providers.get(&id))
                     .copied()
+                    .or_else(|| super::ownership::migrated_enabled(&registry, &self.manifest.id, &id))
                     .unwrap_or(provider.default_enabled);
                 (id, enabled)
             })

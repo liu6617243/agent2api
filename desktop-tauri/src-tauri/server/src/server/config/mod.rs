@@ -66,12 +66,32 @@ use serde_json::{Map, Value};
 use crate::server::db::Db;
 
 mod assistant_config;
+mod github_access;
 pub(crate) mod parse;
+mod routing_profiles;
+mod sanitize_config;
 pub(crate) mod sql;
 mod types;
+mod update_policy;
 
 pub use assistant_config::*;
+pub use github_access::{
+    github_access, set_github_access, GithubAccessMode, GithubAccessPatch,
+    GithubAccessSettings, DEFAULT_GITHUB_MIRROR,
+};
+pub use sanitize_config::{
+    set_sanitize_settings, SanitizePatch, SanitizeSettings, KEY_SANITIZE_PROVIDERS,
+    KEY_SANITIZE_RULES, MAX_SANITIZE_PROVIDERS,
+};
+pub use routing_profiles::{
+    normalize_model as normalize_routing_model, routing_profiles, save_routing_profile,
+    validate_shape as validate_routing_profile, RoutingProfile, RoutingProfiles,
+};
 pub use types::*;
+pub use update_policy::{
+    set_update_channels, update_beta, update_channels, UpdateChannels, UpdateChannelsPatch,
+    KEY_UPDATE_STABLE,
+};
 
 use parse::*;
 
@@ -125,6 +145,7 @@ pub struct RuntimeConfig {
     /// 与 timeouts 同一理由：转发层**每次选路**都要取它（改完设置下一个
     /// 请求就生效，不重启进程），解析一次存下来最省事。
     routing: RoutingSettings,
+    routing_profiles: std::sync::Arc<RoutingProfiles>,
     /// 事件日志的保存目录（原始配置值；None = 未设置，用配置目录）。
     /// 低频字段（启动 + 设置页读写），不值得为它发明解析层，存原始值即可。
     log_dir: Option<String>,
@@ -138,12 +159,8 @@ pub struct RuntimeConfig {
     /// 就生效，不重启进程），从 `Value` 里翻一次要处理类型判定，解析一次存下来
     /// 最省事 —— 这条判定在转发热路径上。
     debug_mode: bool,
-    /// 出站请求体黑名单指纹脱敏开关（设置页「通用 → 指纹脱敏」）。
-    ///
-    /// 与 `debug_mode` 同一理由：转发层**每次发送前**都要判一次（改完开关下一个
-    /// 请求就生效，不重启进程），从 `Value` 里翻一次要处理类型判定，解析一次存
-    /// 下来最省事 —— 这条判定在转发热路径上。
-    sanitize_fingerprints: bool,
+    /// 规则在配置读取 / 保存时编译，请求间共享，同一次转发使用完整快照。
+    sanitize: SanitizeSettings,
     /// 开发者角色兼容开关（设置页「网关 → 开发者角色兼容」）。
     ///
     /// 与 `sanitize_fingerprints` 同一理由：转发层**每次发送前**都要判一次
@@ -226,16 +243,8 @@ pub struct RuntimeConfig {
     /// `core::proxies::resolve_account_proxy`（同一条路）。低频字段（每次
     /// 检查 / 下载发起时读一次），不值得为它发明解析层，存原始值即可。
     update_proxy: Option<Value>,
-    /// 「加入 beta 版」开关（`updateBeta`：缺省关）。
-    ///
-    /// 开启后更新检查改问 `/releases` 列表、自己挑一版：**当前跑 beta 版的人只看
-    /// 预发布**（同核心号的转正版不算更新，不会自动切回正式版），跑正式版的人
-    /// 预发布一并参与（仓库没有 beta 时照旧收正式版更新）。关闭时走
-    /// `/releases/latest`（GitHub 自己排除预发布）—— 且与当前版本做语义化比较，
-    /// 所以「从 beta 版关掉开关」不会被降级到更低的正式版。与 `update_proxy` 同为
-    /// 低频字段（每次检查发起时读一次），解析一次存下来 —— 判据与代价口径见
-    /// `core::update::check` 的通道分支与 `core::update::version::pick_listed_release`。
-    update_beta: bool,
+    /// 正式版与 beta 的关注策略；与当前安装版本无关。
+    update_channels: UpdateChannels,
     /// 代理内核的存放目录（`kernelDir`：None = 用默认 `{config_dir}/proxy-kernel`）。
     ///
     /// 与 `log_dir` 同形（存原始字符串，解析时要求绝对路径），区别是**它有一个
@@ -292,7 +301,7 @@ impl RuntimeConfig {
 
     /// 出站指纹脱敏是否开启（转发层每次发送前判一次，见字段说明）
     pub fn sanitize_fingerprints(&self) -> bool {
-        self.sanitize_fingerprints
+        self.sanitize.enabled
     }
 
     /// 开发者角色兼容是否开启（转发层每次发送前判一次，见字段说明）
@@ -555,19 +564,14 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         queue,
         captcha_pool,
         routing,
+        routing_profiles: routing_profiles::from_raw(&raw),
         log_dir: string_field(&raw, KEY_LOG_DIR),
         request_stats_dir: string_field(&raw, KEY_REQUEST_STATS_DIR),
         debug_dir: string_field(&raw, KEY_DEBUG_DIR),
         // 只有字面 `true` 算开启（手改文件写 "1" / "yes" 一律当关）：与
         // 「写坏回落」同一取向 —— 这个开关控制是否把凭据落盘，宁可少采
         debug_mode: raw.get(KEY_DEBUG_MODE).and_then(Value::as_bool).unwrap_or(false),
-        // 只有字面 `false` 算关闭：**默认开**（缺失 → true）。这个开关是「要不要
-        // 剥离会被上游误拦的模板句」，默认关会让新用户一上来就撞 400 code=11128
-        // ——与 debug_mode 的「默认关」取向相反，因为两者的默认值代价不同。
-        sanitize_fingerprints: raw
-            .get(KEY_SANITIZE_FINGERPRINTS)
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
+        sanitize: sanitize_config::from_raw(&raw),
         // 只有字面 `false` 算关闭：**默认开**（缺失 → true）。改写语义无损
         // （developer 与 system 在 OpenAI 语义上等价），而默认关会让发 developer
         // 角色的客户端（新版 OpenAI SDK、Claude Code 等）一上来就撞不认识该角色
@@ -638,13 +642,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
             .get(KEY_UPDATE_PROXY)
             .filter(|value| !value.is_null())
             .cloned(),
-        // 只有字面 `true` 算开启：**默认关**。beta 版由 beta 分支构建、可能不稳定，
-        // 默认开的代价落在「用户没要求却被换到 beta 通道」上（与 debug_mode 同一
-        // 取向：默认关只是让功能对没打开的人不存在）。理由见 KEY_UPDATE_BETA。
-        update_beta: raw
-            .get(KEY_UPDATE_BETA)
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        update_channels: UpdateChannels::from_raw(&raw),
         // 内核存放目录：空串 / 相对路径在**读**的时候才判（`kernel_dir()` 的
         // resolve_dir 同一口径），这里只去掉空串
         kernel_dir: string_field(&raw, KEY_KERNEL_DIR),
@@ -842,8 +840,8 @@ fn resolve_choice(
         return ResolvedChoice {
             mode,
             file,
-            inline,
             text: QINGDAO_RULE.to_string(),
+            inline,
             source: PromptSource::Fujiang,
             file_error: None,
         };
@@ -1226,10 +1224,14 @@ pub fn cline_upstream_overrides() -> Vec<(String, String)> {
 ///
 /// 「原子」有两层：内存快照的替换是一次写锁（`CONFIG.write()`），而库那一侧
 /// 由 `sql::write_all` 的一个事务保证（多行 UPSERT + 删除要么全成、要么全不成）。
+static CONFIG_UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn update<F>(mutate: F) -> bool
 where
     F: FnOnce(&mut RuntimeConfig),
 {
+    // 读改写必须串行，否则两个模型的独立配置会互相覆盖。
+    let _update_guard = CONFIG_UPDATE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut next = current();
     let before = synced_fingerprint(&next.raw);
     mutate(&mut next);
@@ -1420,10 +1422,13 @@ pub fn update_raw_field(key: &str, value: Value) -> bool {
         if key == crate::server::core::api_keys::KEY_API_KEY {
             config.api_key = string_field(&config.raw, crate::server::core::api_keys::KEY_API_KEY);
         }
+        if key == routing_profiles::KEY_ROUTING_PROFILES {
+            config.routing_profiles = routing_profiles::from_raw(&config.raw);
+        }
     })
 }
 
-/// 更新三档保留天数（`None` = 该项不动），返回是否写盘成功。
+/// 更新数据保留设置（`None` = 该项不动），返回是否写盘成功。
 ///
 /// 调用方（`stats_api::put_retention`）**必须先校验范围**：本函数按「已合法」
 /// 处理，越界值会被 `days_field` 的回读逻辑丢弃（那会让用户以为设置生效了）。
@@ -1434,19 +1439,24 @@ pub fn update_raw_field(key: &str, value: Value) -> bool {
 pub fn set_retention(patch: RetentionPatch) -> bool {
     update(|config| {
         let mut next = config.retention;
-        // 只写传进来的项：缺省项保持原值，也**不落盘**成默认值 ——
-        // 否则「只改日志天数」会把另外两项一并固化成默认值，抹掉用户设置
+        // 未传的项保持原值，不把默认值固化到配置里。
         let mut apply = |key: &str, value: Option<i64>, slot: &mut i64| {
-            if let Some(days) = value {
-                config.raw.insert(key.to_string(), Value::from(days));
-                *slot = days;
+            if let Some(value) = value {
+                config.raw.insert(key.to_string(), Value::from(value));
+                *slot = value;
             }
         };
         apply(KEY_LOG_RETENTION_DAYS, patch.log_days, &mut next.log_days);
+        apply(KEY_LOG_RETENTION_COUNT, patch.log_count, &mut next.log_count);
         apply(
             KEY_REQUEST_RETENTION_DAYS,
             patch.request_days,
             &mut next.request_days,
+        );
+        apply(
+            KEY_REQUEST_RETENTION_COUNT,
+            patch.request_count,
+            &mut next.request_count,
         );
         apply(KEY_DAILY_RETENTION_DAYS, patch.daily_days, &mut next.daily_days);
         config.retention = next;
@@ -1784,11 +1794,9 @@ pub fn set_debug_mode(enabled: bool) -> bool {
 /// 立刻用新值（转发层逐请求读快照），后者保证写盘时不吃掉 config.json 里的
 /// 其它字段。返回是否落盘成功（失败时内存仍已更新，见调用点）。
 pub fn set_sanitize_fingerprints(enabled: bool) -> bool {
-    update(|config| {
-        config
-            .raw
-            .insert(KEY_SANITIZE_FINGERPRINTS.to_string(), Value::Bool(enabled));
-        config.sanitize_fingerprints = enabled;
+    set_sanitize_settings(SanitizePatch {
+        enabled: Some(enabled),
+        ..Default::default()
     })
 }
 
@@ -2012,8 +2020,8 @@ pub fn update_proxy() -> Option<Value> {
 /// 写入「软件更新」的出网线路（None = 直连）。
 ///
 /// 值由调用方先归一（`api::update` 走 `normalize_account_proxy`），这里不做
-/// 二次校验 —— 解析失败（出口后来被删 / 被禁）由读取方兜底（回退默认出口，
-/// 见 `core::update::client`），与账号转发「代理不可用回退直连」同一取向。
+/// 二次校验 —— 解析失败（出口后来被删 / 被禁）由读取方明确报错，不能静默
+/// 改走直连（见 `core::update::client`）。
 /// 与 `set_sanitize_fingerprints` 同一模式：内存立即生效（下一次检查 / 下载
 /// 就用新线路，含定时任务，不必重启进程），写盘时不吃掉其它字段。
 pub fn set_update_proxy(proxy: Option<Value>) -> bool {
@@ -2030,39 +2038,6 @@ pub fn set_update_proxy(proxy: Option<Value>) -> bool {
                 config.update_proxy = None;
             }
         }
-    })
-}
-
-// ─── 「加入 beta 版」开关（updateBeta）──────────────────────────
-
-/// 只取「加入 beta 版」开关的轻量读取（**不克隆整份 raw**）。
-///
-/// 每次更新检查发起时读一次（低频），未初始化时给 false（正式通道）——
-/// 与缺省一致，理由见 `KEY_UPDATE_BETA`。
-pub fn update_beta() -> bool {
-    if let Ok(guard) = CONFIG.read() {
-        if let Some(config) = guard.as_ref() {
-            return config.update_beta;
-        }
-    }
-    false
-}
-
-/// 写入「加入 beta 版」开关（设置页「更新设置」弹窗里的那一枚）。
-///
-/// 与 `set_sanitize_fingerprints` 同一模式：内存立即生效（下一次检查就换通道，
-/// 含定时任务，不必重启进程），写盘时不吃掉其它字段。
-///
-/// **不动已经缓存的检查结果与排期**：换通道之后要不要立刻重查由调用方决定
-/// （界面拨完开关会主动查一次，见 update-settings.tsx），后端只负责回答
-/// 「下一次检查按哪个通道看」；排期与失败冷却都与通道无关（那条冷却记的是
-/// GitHub 配额桶的恢复时刻，见 core::update::check 的说明）。
-pub fn set_update_beta(enabled: bool) -> bool {
-    update(|config| {
-        config
-            .raw
-            .insert(KEY_UPDATE_BETA.to_string(), Value::Bool(enabled));
-        config.update_beta = enabled;
     })
 }
 

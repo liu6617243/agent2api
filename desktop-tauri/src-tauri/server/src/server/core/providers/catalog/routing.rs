@@ -170,7 +170,8 @@ pub fn default_model_catalog() -> Vec<Value> {
     }) {
         for entry in manifest_for_provider(&provider) {
             let id = model_id(&entry);
-            if !id.is_empty() && rules.default_enabled(&provider, &id)
+            if !id.is_empty() && !super::super::images::model_is_image(&entry)
+                && rules.default_enabled(&provider, &id)
                 && !result.iter().any(|item| model_id(item).eq_ignore_ascii_case(&id))
             {
                 result.push(entry);

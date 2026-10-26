@@ -149,7 +149,7 @@ pub fn pause_reason(provider: &str, id: &str) -> Option<String> {
     if !registry::serves(provider) {
         return Some("未安装或未启用提供商插件".to_string());
     }
-    let Some(host) = super::current() else {
+    let Some(host) = super::host_for_provider(provider) else {
         return Some("提供商插件尚未加载完成".to_string());
     };
     if host.status().disabled {

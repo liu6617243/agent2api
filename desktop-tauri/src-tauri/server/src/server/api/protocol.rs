@@ -58,12 +58,12 @@ fn parse_object(
     started_at: i64,
     path: &str,
     body: &Bytes,
-    client: &str,
+    source: &crate::server::request_stats::RequestSource,
 ) -> Result<Value, Response> {
     let parsed = serde_json::from_slice::<Value>(body).ok();
     let Some(payload) = parsed.filter(Value::is_object) else {
         let error = GatewayError::bad_request("请求体必须是 JSON 对象");
-        record_early_failure(state, started_at, "", "", client, &error);
+        record_early_failure(state, started_at, "", "", source, &error);
         logging::verbose("[Model]", &format!("← POST {path} 请求体不是 JSON 对象"));
         return Err(error.payload_response());
     };
@@ -145,14 +145,15 @@ pub async fn responses_endpoint(
     // `core::key_scope` 模块头）。用 `Option<Extension<_>>` 而不是裸
     // `Extension<_>` —— 后者在免鉴权模式下取不到会直接拒绝请求。
     key_scope: Option<Extension<KeyScope>>,
+    key_identity: Option<Extension<crate::server::request_stats::ApiKeyIdentity>>,
     body: Bytes,
 ) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
     let started_at = logging::now_ms();
     // 请求来源客户端（UA 识别，见 `core::client`）：早失败路径与收尾记账共用
-    let client = crate::server::core::client::classify(&pipeline::user_agent_of(&headers));
+    let source = pipeline::request_source(&headers, key_identity);
     let path = "/v1/responses";
-    let raw = match parse_object(&state, started_at, path, &body, &client) {
+    let raw = match parse_object(&state, started_at, path, &body, &source) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -170,7 +171,7 @@ pub async fn responses_endpoint(
         Ok(body) => body,
         Err(message) => {
             let error = GatewayError::bad_request(message);
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &client, &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &source, &error);
             return error.payload_response();
         }
     };
@@ -180,7 +181,7 @@ pub async fn responses_endpoint(
         .unwrap_or(false)
     {
         let error = GatewayError::bad_request("input 必须能转换成对话消息");
-        record_early_failure(&state, started_at, "", &client_reasoning, &client, &error);
+        record_early_failure(&state, started_at, "", &client_reasoning, &source, &error);
         return error.payload_response();
     }
 
@@ -189,7 +190,7 @@ pub async fn responses_endpoint(
     let requested_model = match pipeline::resolve_model(&state, &mut chat_body, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &client, &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &source, &error);
             return error.payload_response();
         }
     };
@@ -220,7 +221,7 @@ pub async fn responses_endpoint(
         &requested_model,
         &client_model,
         &client_reasoning,
-        &client,
+        &source,
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         false,
     );
@@ -265,7 +266,7 @@ pub async fn responses_endpoint(
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         is_test: false,
         // 来源客户端：入口判好带进来（见 `RecordContext::client`）
-        client: client.clone(),
+        source: source.clone(),
     };
 
     match outcome {
@@ -342,14 +343,15 @@ pub async fn messages_endpoint(
     headers: HeaderMap,
     // R9：同 responses_endpoint（`Option` + 取不到 = 不限制）
     key_scope: Option<Extension<KeyScope>>,
+    key_identity: Option<Extension<crate::server::request_stats::ApiKeyIdentity>>,
     body: Bytes,
 ) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
     let started_at = logging::now_ms();
     // 请求来源客户端（UA 识别，见 `core::client`）：早失败路径与收尾记账共用
-    let client = crate::server::core::client::classify(&pipeline::user_agent_of(&headers));
+    let source = pipeline::request_source(&headers, key_identity);
     let path = "/v1/messages";
-    let raw = match parse_object(&state, started_at, path, &body, &client) {
+    let raw = match parse_object(&state, started_at, path, &body, &source) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -360,7 +362,7 @@ pub async fn messages_endpoint(
         Ok(body) => body,
         Err(message) => {
             let error = GatewayError::bad_request(message);
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), "", &client, &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), "", &source, &error);
             return anthropic_error_response(&error);
         }
     };
@@ -371,7 +373,7 @@ pub async fn messages_endpoint(
     let requested_model = match pipeline::resolve_model(&state, &mut chat_body, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &client, &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &source, &error);
             return anthropic_error_response(&error);
         }
     };
@@ -401,7 +403,7 @@ pub async fn messages_endpoint(
         &requested_model,
         &client_model,
         &client_reasoning,
-        &client,
+        &source,
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         false,
     );
@@ -446,7 +448,7 @@ pub async fn messages_endpoint(
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         is_test: false,
         // 来源客户端：入口判好带进来（见 `RecordContext::client`）
-        client: client.clone(),
+        source: source.clone(),
     };
 
     match outcome {

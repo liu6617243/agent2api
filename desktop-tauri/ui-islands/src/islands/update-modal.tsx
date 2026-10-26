@@ -11,6 +11,8 @@ import {
 } from '@ui'
 import { handleExternalClick, markdownHtml, shared, type UpdateInfo } from './update-shared'
 import { t } from '../i18n'
+import { HtmlContent } from '@ui'
+import { Empty } from '@ui'
 
 /**
  * 「检测到更新」弹窗（按需建、关闭即卸）—— 从 update-panel.tsx 拆出。
@@ -67,6 +69,7 @@ export function showUpdateModal(
   info: UpdateInfo | null | undefined,
   onGoUpdate: (info: UpdateInfo) => Promise<void>,
 ): void {
+  if (info?.channelChanged) { unmountUpdateModal(); return }
   if (!info || info.hasUpdate !== true) return
   // 更新已应用到容器里、只差重启（容器内更新）：此刻弹「去更新」是条死路 ——
   // 面板上的那颗按钮已经换成「立即重启」，重启入口在那里
@@ -134,9 +137,9 @@ function UpdateModal({ info, onGoUpdate, onClose }: UpdateModalProps) {
           {/* 正文限高 + 滚动（旧 .update-modal-notes 的 46vh），长日志不会把弹窗撑出一屏；
               overscroll-contain 拦住滚动链，滚到底不带动外层页面 */}
           <div className='max-h-[46vh] overflow-y-auto overscroll-contain pr-1.5' onClick={handleExternalClick}>
-            {html ? <div className='md-body' dangerouslySetInnerHTML={{ __html: html }} /> : (
+            {html ? <HtmlContent className='md-body' html={html} /> : (
               <div className='md-body'>
-                <p className='md-body-empty'>{t('这个版本没有填写发布说明。')}</p>
+                <Empty className='md-body-empty'>{t('这个版本没有填写发布说明。')}</Empty>
               </div>
             )}
           </div>

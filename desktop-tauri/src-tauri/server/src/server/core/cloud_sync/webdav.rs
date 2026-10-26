@@ -18,6 +18,9 @@
 //! 「连接 30 秒、整次传输 300 秒」这种一次性长任务的口径。建一个不缓存的
 //! Client 的代价（一次连接池）远小于把两套语义挤进一个实例。
 
+mod download;
+
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use reqwest::{Method, StatusCode, Url};
@@ -40,11 +43,16 @@ fn method_mkcol() -> Method {
 }
 
 fn client() -> Result<reqwest::Client, String> {
+    client_with_policy(reqwest::redirect::Policy::limited(10))
+}
+
+fn client_with_policy(policy: reqwest::redirect::Policy) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .redirect(policy)
         // 不设总超时（.timeout），按请求逐个设：PROPFIND 30 秒、传输 300 秒
         .build()
-        .map_err(|error| format!("创建 HTTP 客户端失败: {error}"))
+        .map_err(|error| format!("创建 HTTP 客户端失败: {}", redact_detail(&error.to_string())))
 }
 
 /// 解析并校验 WebDAV 基地址（只认 http / https）。
@@ -110,7 +118,7 @@ pub(crate) fn redact_url(raw: &str) -> String {
             out.push_str(parsed.path());
             out
         }
-        Err(_) => raw.split('?').next().unwrap_or(raw).to_string(),
+        Err(_) => "（无效地址）".to_string(),
     }
 }
 
@@ -150,17 +158,53 @@ fn status_error(op: &str, status: StatusCode, url: &str) -> String {
     message
 }
 
+fn redact_detail(text: &str) -> String {
+    static URLS: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    let Some(urls) = URLS.get_or_init(|| regex::Regex::new(r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s<>\"']+"#).ok()) else {
+        return "底层错误详情不可用".to_string();
+    };
+    urls.replace_all(text, |found: &regex::Captures<'_>| redact_url(&found[0])).into_owned()
+}
+
+fn error_detail(error: &reqwest::Error) -> String {
+    let mut parts = Vec::new();
+    let mut source = std::error::Error::source(error);
+    for _ in 0..8 {
+        let Some(current) = source else { break };
+        let text = redact_detail(&current.to_string());
+        if !text.is_empty() && !parts.contains(&text) {
+            parts.push(text);
+        }
+        source = current.source();
+    }
+    parts.join("；")
+}
+
 fn transport_error(op: &str, url: &str, error: &reqwest::Error) -> String {
+    let detail = error_detail(error);
+    let lower = detail.to_ascii_lowercase();
     let reason = if error.is_timeout() {
         "请求超时"
-    } else if error.is_connect() {
-        "连接失败（地址 / 端口 / 证书，或需要代理）"
-    } else if error.is_request() {
+    } else if error.is_redirect() {
+        "重定向失败"
+    } else if error.is_builder() {
         "请求构造失败"
+    } else if error.is_connect() && (lower.contains("certificate") || lower.contains("cert") || lower.contains("tls")) {
+        "TLS / 证书校验失败"
+    } else if error.is_connect() && (lower.contains("dns") || lower.contains("resolve") || lower.contains("lookup")) {
+        "域名解析失败"
+    } else if error.is_connect() {
+        "连接失败（目标地址 / 端口或代理）"
+    } else if error.is_body() {
+        "响应传输失败"
     } else {
         "网络请求失败"
     };
-    format!("WebDAV {op}失败（{reason}）: {}", redact_url(url))
+    let mut message = format!("WebDAV {op}失败（{reason}）: {}", redact_url(url));
+    if !detail.is_empty() {
+        message.push_str(&format!("。底层原因：{detail}"));
+    }
+    message
 }
 
 /// 测试连接：对基地址发 `PROPFIND Depth: 0`。
@@ -285,55 +329,7 @@ pub(crate) async fn get_bytes(
     auth: &WebDavAuth,
     max_bytes: usize,
 ) -> Result<Option<Vec<u8>>, String> {
-    use futures::StreamExt as _;
-
-    let response = apply_auth(
-        client()?
-            .get(url)
-            .timeout(Duration::from_secs(TRANSFER_TIMEOUT_SECS)),
-        auth,
-    )
-    .send()
-    .await
-    .map_err(|error| transport_error("GET", url, &error))?;
-
-    let status = response.status();
-    if status == StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    if !status.is_success() {
-        return Err(status_error("GET", status, url));
-    }
-    if let Some(length) = response.content_length() {
-        if length > max_bytes as u64 {
-            return Err(format!(
-                "远端文件超过上限（{} 字节 > {} 字节）: {}",
-                length,
-                max_bytes,
-                redact_url(url)
-            ));
-        }
-    }
-
-    let mut bytes = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            format!(
-                "读取 WebDAV 响应失败: {error} ({})",
-                redact_url(url)
-            )
-        })?;
-        if bytes.len().saturating_add(chunk.len()) > max_bytes {
-            return Err(format!(
-                "远端文件超过上限（{} 字节）: {}",
-                max_bytes,
-                redact_url(url)
-            ));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(Some(bytes))
+    download::get_bytes(url, auth, max_bytes).await
 }
 
 /// 删除一个文件（当前只在「上传失败后清理半截数据」之外使用；保留给将来的

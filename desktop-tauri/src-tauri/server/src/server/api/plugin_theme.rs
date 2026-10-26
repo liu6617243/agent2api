@@ -1,7 +1,7 @@
 //! 插件页的运行期资源：设计令牌、组件库产物、提供商图标。
 //!
 //! ```text
-//! GET /plugins/runtime/theme.css        ui/css/tokens.css（设计令牌原文）
+//! GET /plugins/runtime/theme.css        组件库样式与宿主窗口参数
 //! GET /plugins/runtime/islands/ui.js    组件库 + React（跨文档出口）
 //! GET /plugins/runtime/islands/ui.css   Tailwind 产物（组件库样式）
 //! GET /plugins/runtime/providers/<id>.png  提供商图标
@@ -40,7 +40,7 @@ use axum::extract::Path;
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 
-/// 设计令牌原文（编译期从 `desktop-tauri/ui/css/tokens.css` 读入）。
+/// 宿主窗口参数（设计令牌由 ISLANDS_CSS 提供）。
 const TOKENS: &str = include_str!("../../../../../ui/css/tokens.css");
 
 /// 组件库 + React 的 iife 产物（`ui-islands` 构建时落盘）。
@@ -49,26 +49,11 @@ const ISLANDS_JS: &str = include_str!("../../../../../ui/islands/ui.js");
 /// Tailwind 产物（组件库样式）。
 const ISLANDS_CSS: &str = include_str!("../../../../../ui/islands/ui.css");
 
-/// 宿主布局层（`.panel` / `.panel-head` / `.panel-body` / `.head-actions` …）。
-///
-/// 插件页要用宿主的 `.panel` 系列类名才能与其它页长得一样，而那几条规则写在
-/// `layout.css` 里 —— 不是组件库的 Tailwind 产物。整份 30 KB 一起出：它只是
-/// 规则集合，多出来的选择器（`.shell` / `.sidebar` …）在 iframe 里匹配不到
-/// 任何元素，无害；而按段裁剪意味着「宿主改了面板样式、插件页没跟上」，
-/// 那正是这一轮在修的问题。
+/// 保留资源路径兼容；共享布局组件的样式已经包含在 ISLANDS_CSS 中。
 const LAYOUT_CSS: &str = include_str!("../../../../../ui/css/layout.css");
 
-/// 宿主通用组件层（`.badge` / `.progress` / `.table` 这些手写类，插件页的
-/// 表格与页脚会用）。
+/// 保留业务排版与旧资源路径，基础控件样式由组件库提供。
 const COMPONENTS_CSS: &str = include_str!("../../../../../ui/css/components.css");
-
-/// 小问号提示的样式（`.tip-q`）。
-///
-/// 插件页的「定时签到」「猫猫旅行」两块面板标题后面各有一枚问号，承担原来
-/// 常驻的一大段说明 —— 与宿主其它页的 `.tip-q` 是同一个记号。
-/// 气泡本身由宿主的 `tooltip.js` 增强（读 `data-tip`），而那个脚本不进 iframe；
-/// 插件页用原生 `title` 兜底，这里只负责把问号本身画对。
-const TOOLTIP_CSS: &str = include_str!("../../../../../ui/css/tooltip.css");
 
 /// 提供商图标：`(provider id, PNG 字节)`。
 ///
@@ -136,7 +121,11 @@ pub async fn serve(Path(rest): Path<String>) -> Response {
     }
     let path = normalized.join("/");
     match path.as_str() {
-        "theme.css" => reply(StatusCode::OK, "text/css; charset=utf-8", TOKENS.as_bytes().to_vec()),
+        "theme.css" => reply(
+            StatusCode::OK,
+            "text/css; charset=utf-8",
+            format!("{ISLANDS_CSS}\n{TOKENS}").into_bytes(),
+        ),
         "islands/ui.js" => reply(
             StatusCode::OK,
             "text/javascript; charset=utf-8",
@@ -160,7 +149,7 @@ pub async fn serve(Path(rest): Path<String>) -> Response {
         "tooltip.css" => reply(
             StatusCode::OK,
             "text/css; charset=utf-8",
-            TOOLTIP_CSS.as_bytes().to_vec(),
+            ISLANDS_CSS.as_bytes().to_vec(),
         ),
         other => {
             // 提供商图标：`providers/<id>.png`

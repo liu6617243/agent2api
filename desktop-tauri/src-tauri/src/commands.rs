@@ -49,7 +49,8 @@ pub async fn api_request_text(method: String, path: String) -> Result<String, St
 #[tauri::command]
 pub async fn backend_status(app: AppHandle) -> Result<Value, String> {
     let port = gateway::proxy_port();
-    let ready = backend::is_ready(port).await;
+    let phase = crate::startup::phase();
+    let ready = phase == "ready" && backend::is_ready(port).await;
     // 失败详情存在 AppState 里（由 ensure_ready 的失败分支写入）；
     // 端口已被显式指定过（环境变量）时，界面不该再提供「更换端口」——
     // 改设置也不会生效，只会让用户白忙一场
@@ -61,10 +62,17 @@ pub async fn backend_status(app: AppHandle) -> Result<Value, String> {
         .and_then(|guard| guard.failure.clone());
     Ok(json!({
         "ready": ready,
+        "phase": phase,
         "port": port,
         "portFromEnv": gateway::port_from_env().is_some(),
         "failure": failure,
     }))
+}
+
+#[tauri::command]
+pub async fn wait_for_backend() -> Result<Value, String> {
+    crate::startup::wait().await?;
+    Ok(json!({ "ready": true, "port": gateway::proxy_port() }))
 }
 
 /// 重启整个应用。
@@ -237,7 +245,8 @@ pub async fn change_port(app: AppHandle, port: u16) -> Result<Value, String> {
 
 /// 查面板管理员是否已注册（设置页据此决定「开启局域网访问」要不要先走注册步）。
 #[tauri::command]
-pub fn panel_admin_status() -> Result<Value, String> {
+pub async fn panel_admin_status() -> Result<Value, String> {
+    crate::startup::wait().await?;
     Ok(json!({ "registered": crate::server::access::admin_registered() }))
 }
 
@@ -247,6 +256,7 @@ pub fn panel_admin_status() -> Result<Value, String> {
 /// 管理员」，重复注册（两台设备同时走流程之类的竞态）不该让用户看到失败。
 #[tauri::command]
 pub async fn panel_register(username: String, password: String) -> Result<Value, String> {
+    crate::startup::wait().await?;
     let username = username.trim();
     if username.is_empty() || username.chars().count() > 64 {
         return Err("请填写管理员账号（64 字符以内）".to_string());
@@ -300,6 +310,7 @@ pub async fn panel_register(username: String, password: String) -> Result<Value,
 /// 这一次探测就会把新令牌换回来，用户完全无感。
 #[tauri::command]
 pub async fn panel_session_status() -> Result<Value, String> {
+    crate::startup::wait().await?;
     let registered = crate::server::access::admin_registered();
     if !registered {
         return Ok(json!({ "registered": false, "authenticated": false }));
@@ -317,11 +328,12 @@ pub async fn panel_session_status() -> Result<Value, String> {
 /// 续期，而不是等 401 才发现过期（见 `panel_session::refresh_if_expiring`）。
 /// 旧版页面不传（`Option`），按「不知道」处理，行为退回 401 被动续期。
 #[tauri::command]
-pub fn panel_session_store(
+pub async fn panel_session_store(
     access_token: String,
     refresh_token: String,
     expires_in: Option<i64>,
 ) -> Result<Value, String> {
+    crate::startup::wait().await?;
     if access_token.is_empty() || refresh_token.is_empty() {
         return Err("令牌为空".to_string());
     }
@@ -334,7 +346,8 @@ pub fn panel_session_store(
 /// 只清**本机**这份令牌；服务端那条会话链由界面另行调用 `/api/panel/logout`
 /// 撤销（那条请求会带上下面的令牌，所以必须在清之前发）。
 #[tauri::command]
-pub fn panel_session_clear() -> Result<Value, String> {
+pub async fn panel_session_clear() -> Result<Value, String> {
+    crate::startup::wait().await?;
     crate::panel_session::clear();
     Ok(json!({ "cleared": true }))
 }
@@ -356,7 +369,8 @@ pub fn panel_session_clear() -> Result<Value, String> {
 /// 重启用 [`schedule_app_restart`]：监听地址在 bind 之后就改不了，
 /// 与 `change_port` 同一条铁律。
 #[tauri::command]
-pub fn change_lan_access(app: AppHandle, enabled: bool, panel: bool) -> Result<Value, String> {
+pub async fn change_lan_access(app: AppHandle, enabled: bool, panel: bool) -> Result<Value, String> {
+    crate::startup::wait().await?;
     if enabled && !crate::server::access::admin_registered() {
         return Err("尚未注册面板管理员：请先完成注册再开启局域网访问".to_string());
     }
@@ -405,7 +419,9 @@ pub fn change_lan_access(app: AppHandle, enabled: bool, panel: bool) -> Result<V
 /// 面板令牌 / 用户输入的 Key，助手页对两端一视同仁，只负责合并。面板认证
 /// 没开启时多带一个头也不会被拒 —— 中间件的鉴权分支只在开启后才看它。
 #[tauri::command]
-pub fn direct_credentials() -> Result<Value, String> {
+pub async fn direct_credentials() -> Result<Value, String> {
+    crate::startup::wait().await?;
+    crate::panel_session::refresh_if_expiring().await;
     let mut headers = serde_json::Map::new();
     if let Some(key) = crate::gateway::management_key() {
         headers.insert("x-api-key".to_string(), Value::String(key));
@@ -542,8 +558,11 @@ pub async fn cancel_login(app: AppHandle) -> Result<Value, String> {
 
 /// 导出运行日志：拉取 JSONL 原文，弹系统保存框落盘。
 #[tauri::command]
-pub async fn export_logs(app: AppHandle) -> Result<Value, String> {
-    let text = gateway::call_text("GET", "/api/logs/download").await?;
+pub async fn export_logs(app: AppHandle, query: Option<String>) -> Result<Value, String> {
+    let query = query.unwrap_or_default();
+    let query = query.trim_start_matches('?');
+    let path = if query.is_empty() { "/api/logs/download".to_string() } else { format!("/api/logs/download?{query}") };
+    let text = gateway::call_text("GET", &path).await?;
     let count = text.lines().filter(|line| !line.trim().is_empty()).count();
     if count == 0 {
         return Ok(json!({ "count": 0 }));
@@ -603,7 +622,8 @@ pub async fn pick_folder(app: AppHandle, default_dir: Option<String>) -> Result<
 /// 用户可能在任务管理器的「启动」页里单独禁用了本应用，
 /// 那种情况下配置文件仍是 true，界面会显示成「已开启」，与实际不符。
 #[tauri::command]
-pub fn get_app_settings(app: AppHandle) -> AppSettings {
+pub async fn get_app_settings(app: AppHandle) -> Result<AppSettings, String> {
+    crate::startup::wait().await?;
     let mut current = settings::load();
     if let Ok(enabled) = app.autolaunch().is_enabled() {
         current.autostart = enabled;
@@ -611,7 +631,7 @@ pub fn get_app_settings(app: AppHandle) -> AppSettings {
     // 顺手把缓存与磁盘对齐：拦截关窗时要用到最新值
     app.state::<AppState>().window.set_close_to_tray(current.close_to_tray);
     app.state::<AppState>().window.set_lightweight(current.lightweight_mode);
-    current
+    Ok(current)
 }
 
 /// 覆盖保存应用设置，返回保存后的结果。
@@ -626,7 +646,8 @@ pub fn get_app_settings(app: AppHandle) -> AppSettings {
 /// 「更换端口」设过的端口悄悄抹掉，下次开机又回到 3065 上撞冲突。
 /// 端口不归这个命令管，就原样保留磁盘上的值。
 #[tauri::command]
-pub fn save_app_settings(app: AppHandle, patch: AppSettings) -> Result<AppSettings, String> {
+pub async fn save_app_settings(app: AppHandle, patch: AppSettings) -> Result<AppSettings, String> {
+    crate::startup::wait().await?;
     let mut saved = patch;
     // 端口由 change_port 专门负责，这里保持磁盘现值不被覆盖
     saved.proxy_port = settings::load().proxy_port;
@@ -704,8 +725,8 @@ pub async fn export_accounts(app: AppHandle) -> Result<Value, String> {
 
 /// 从文件导入账号（merge 语义：按身份匹配，命中更新、未命中追加）。
 ///
-/// 兼容两种形态：整体导出文件 `{ version, exportedAt, customProviders, accounts }`
-/// 与直接的账号数组 `[...]`。`customProviders` 段（v2 起的自定义提供商定义）
+/// 兼容整体导出文件 `{ version, exportedAt, customProviders, accounts }`、
+/// 单账号对象与直接的账号数组 `[...]`。`customProviders` 段（v2 起的自定义提供商定义）
 /// 原样透传给后端 —— 账号的 provider 字段指向这些定义，丢了它们自定义账号
 /// 就导不回。
 #[tauri::command]
@@ -731,15 +752,15 @@ pub async fn import_accounts(app: AppHandle) -> Result<Value, String> {
         .map_err(|error| format!("文件不是有效 JSON: {error}"))?;
     let document = unwrap_envelope_file(parsed);
     let accounts = match &document {
-        // 整体导出文件
-        Value::Object(map) => map
+        Value::Object(map) if map.contains_key("accounts") => map
             .get("accounts")
             .and_then(Value::as_array)
             .cloned()
-            .ok_or("文件中缺少 accounts 字段")?,
-        // 直接就是账号数组
+            .ok_or("文件中缺少 accounts 数组")?,
+        Value::Object(map) if map.get("id").and_then(Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty()) => vec![document.clone()],
         Value::Array(items) => items.clone(),
-        _ => return Err("文件内容既不是导出文件也不是账号数组".to_string()),
+        _ => return Err("文件内容既不是导出文件、单账号文件，也不是账号数组".to_string()),
     };
 
     let mut payload = json!({ "accounts": accounts, "mode": "merge" });

@@ -1,12 +1,13 @@
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
-import { SegmentedControl, Spinner } from '@ui'
+import { SegmentedControl, Spinner , Button } from '@ui'
 import {
   loadCenter, loadRecords, store, subscribe,
 } from './checkin-store'
 import { CenterTab } from './checkin-center-tab'
 import { ScheduleTab } from './checkin-schedule-tab'
 import { RecordsTab } from './checkin-records-tab'
+import { Badge } from '@ui'
 
 /**
  * Agent2API · 签到中心（页面岛）。
@@ -111,17 +112,17 @@ function CheckinPage(): React.ReactElement {
         />
         <span className="ck-tabs-spacer" />
         <AutoBadge />
-        <button type="button" className="ck-refresh" onClick={() => { void loadCenter(); void loadRecords() }}>
+        <Button size='default' variant='ghost' type="button" className="ck-refresh" onClick={() => { void loadCenter(); void loadRecords() }}>
           刷新
-        </button>
+        </Button>
       </div>
 
       {error ? (
         <div className="ck-page-error">
           <span>{error}</span>
-          <button type="button" className="ck-error-retry" onClick={() => { void loadCenter(); void loadRecords() }}>
+          <Button size='default' variant='ghost' type="button" className="ck-error-retry" onClick={() => { void loadCenter(); void loadRecords() }}>
             重试
-          </button>
+          </Button>
         </div>
       ) : null}
 
@@ -144,18 +145,17 @@ function CheckinPage(): React.ReactElement {
 /**
  * 顶栏的自动签到徽标。
  *
- * 三态：执行中 / 已关闭 / 已开启（再分今日是否已执行）。与旧实现的 `.ck-auto-badge`
- * 同一套判定，只是配色改用组件库的语义色。
+ * 三态：执行中 / 已关闭 / 已开启（再分今日是否已执行）。配色由 Badge 变体统一。
  */
 function AutoBadge(): React.ReactElement | null {
   const auto = store.center?.auto
   if (!auto) return null
-  if (auto.running) return <span className="ck-auto-badge" data-tone="warn">执行中…</span>
-  if (!auto.enabled) return <span className="ck-auto-badge" data-tone="plain">自动签到已关闭</span>
+  if (auto.running) return <Badge variant='warning' shape='tag'>执行中…</Badge>
+  if (!auto.enabled) return <Badge variant='outline' shape='tag'>自动签到已关闭</Badge>
   return (
-    <span className="ck-auto-badge" data-tone="ok">
+    <Badge variant='success' shape='tag'>
       {auto.lastFiredToday ? '今日已执行' : '自动签到已开启'}
-    </span>
+    </Badge>
   )
 }
 

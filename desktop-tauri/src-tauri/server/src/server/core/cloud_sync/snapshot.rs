@@ -55,7 +55,7 @@ pub(crate) const SNAPSHOT_FORMAT: &str = "agent2api-cloud-sync-snapshot";
 pub(crate) const SNAPSHOT_VERSION: u32 = 1;
 
 /// 进快照的表（顺序即插入顺序：账号先于其它，便于失败时一眼看出走到哪一步）
-pub(crate) const SYNCED_TABLES: &[&str] = &["accounts", "account_usage_records", "checkin_records"];
+pub(crate) const SYNCED_TABLES: &[&str] = &["accounts", "account_usage_records", "checkin_records", "account_limiter_events"];
 
 /// 非保留配置键里**不进快照**的项（理由见模块头三类排除）。
 const EXCLUDED_CONFIG_KEYS: &[&str] = &[

@@ -12,7 +12,7 @@
 
 **同样有用的支持**：给仓库点一个 Star · 在 Issues 里反馈问题与建议 · 提交 Pull Request · 把它分享给需要的朋友。
 
-**QQ 群**：Agent2API 交流群 —— **群 1（`1127656296`）即将满员，请优先加群 2（`1130894674`）**；在 QQ 里搜索群号即可加入。
+**QQ 群**：Agent2API 交流群 —— **群 1（`1127656296`）与群 2（`1130894674`）即将满员，请优先加群 3（`1108276647`）**；在 QQ 里搜索群号即可加入。
 
 **Telegram 群**：<https://t.me/+9gM8YPvgRL02NGRl>
 
@@ -28,7 +28,7 @@ Donations are entirely voluntary: they unlock nothing and do not change how the 
 
 Other ways to help just as much: ⭐ star the repository · 🐛 file issues or suggestions · 🔧 send pull requests · 📣 share it with friends.
 
-**QQ groups**: Agent2API chat groups — **group 1 (`1127656296`) is almost full, please join group 2 (`1130894674`) first**; search the number in QQ to join.
+**QQ groups**: Agent2API chat groups — **groups 1 (`1127656296`) and 2 (`1130894674`) are almost full, please join group 3 (`1108276647`) first**; search the number in QQ to join.
 
 **Telegram group**: <https://t.me/+9gM8YPvgRL02NGRl>
 

@@ -81,6 +81,8 @@ const PATHS: Record<string, string> = {
     '<path d="M12 15.4V4M8.4 7.6 12 4l3.6 3.6"/><path d="M5 13v6.4A1.6 1.6 0 0 0 6.6 21h10.8A1.6 1.6 0 0 0 19 19.4V13"/>',
   server:
     '<rect x="3.4" y="4" width="17.2" height="6.4" rx="2"/><rect x="3.4" y="13.6" width="17.2" height="6.4" rx="2"/><path d="M7 7.2h.2M7 16.8h.2"/>',
+  plugin:
+    '<path d="M9 4H4v5a3 3 0 1 0 0 6v5h5a3 3 0 1 1 6 0h5v-5a3 3 0 1 0 0-6V4h-5a3 3 0 1 0-6 0z"/>',
 }
 
 export type IconName = keyof typeof PATHS

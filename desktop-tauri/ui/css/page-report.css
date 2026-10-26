@@ -245,21 +245,6 @@
 }
 
 /* 轨道：定高 + 圆角，与热力图格子同一档观感（都是「一格量化数据」） */
-.rank-row .track {
-  height: 10px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: var(--surface-3);
-}
-
-.rank-row .bar {
-  display: block;
-  height: 100%;
-  min-width: 2px;
-  border-radius: 999px;
-  background: var(--primary);
-  transition: width .18s ease;
-}
 
 /* 请求数与百分比：都走等宽 + 右对齐，各行竖着比对才齐 */
 .rank-row .num,
@@ -311,19 +296,17 @@
 
 .donut-wrap {
   position: relative;
-  flex: 0 0 auto;
+  flex: 0 0 220px;
+  width: 220px;
+  height: 220px;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
-.donut-svg { display: block; }
-
-.donut-slice { transition: opacity .12s ease; }
-
-/* 悬停某一段时其余各段淡出：扇区窄的时候光靠描边看不出选中的是哪一段 */
-.donut-svg:hover .donut-slice { opacity: .45; }
-.donut-svg .donut-slice:hover { opacity: 1; }
+.donut-wrap .recharts-pie-sector { transition: opacity .12s ease; }
+.donut-wrap .recharts-pie:hover .recharts-pie-sector { opacity: .45; }
+.donut-wrap .recharts-pie .recharts-pie-sector:hover { opacity: 1; }
 
 /* 扇区内的百分比：白色字 + 深色描边，保证落在任意一段底色上都读得清
    （浅黄 / 浅绿那些段的对比度单靠白字是不够的）。paint-order 让描边压在字下面，
@@ -502,38 +485,39 @@
 
 .heat-scale-label { color: var(--text-3); font-size: 11px; }
 
-/* ─── 图表容器 ───
-   宽度由面板决定，SVG 按量到的像素宽度绘制；容器本身不设最小宽度，
-   免得 ResizeObserver 把「被压缩的宽度」当成真实宽度反复重算。
-   高度下限与两张图各自的 SVG 高度对齐（折线 230 / 柱状 240）：
-   否则数据没回来时容器只有一行「正在加载…」那么高，数据到了整页会往下跳一截。 */
-.chart-wrap { position: relative; width: 100%; min-height: 230px; overflow: hidden; }
-.chart-wrap.tall { min-height: 240px; }
+/* 固定绘图区高度，数据加载前后不会把下面的面板推移。 */
+.chart-wrap { position: relative; width: 100%; min-width: 0; min-height: 300px; }
+.report-chart-area { position: relative; width: 100%; height: 300px; min-width: 0; }
+.report-chart-empty { display: grid; place-items: center; min-height: 300px; }
 
-/* 网格线：比边框更淡，只做读数辅助，不与柱子抢视觉 */
-.chart-grid {
-  stroke: var(--border);
-  stroke-width: 1;
-  shape-rendering: crispEdges;
+.report-chart-area .recharts-surface { font-family: var(--font-sans); }
+.report-chart-area .recharts-cartesian-axis-tick-value { font-variant-numeric: tabular-nums; }
+.report-chart-area .recharts-wrapper:focus-visible,
+.donut-wrap .recharts-wrapper:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+.report-model-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: 12px;
+  max-height: 100px;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
-/* ─── 命中率折线（左轴）───
-   主色画命中率、琥珀色画用量：两条线在同一张图里，颜色是唯一能把它们与
-   各自那侧刻度连起来的线索（左轴=蓝、右轴=琥珀），所以两处的色值必须同源。 */
-.chart-line {
-  fill: none;
-  stroke: var(--primary);
-  stroke-width: 2;
-  stroke-linejoin: round;
-  stroke-linecap: round;
-}
+.report-model-legend-item { display: inline-flex; align-items: center; gap: 6px; max-width: 240px; color: var(--text-2); font-size: 12px; }
+.report-model-legend-dot { flex: 0 0 10px; width: 10px; height: 10px; border-radius: 2px; }
+.report-model-legend-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.chart-line.tokens { stroke: var(--chart-tokens); }
-
-/* 折线上的点：填充取表面色 + 与所属线同色的描边，悬停那一带不被线吃掉。
-   两条线的点各写一条规则（而不是行内 style）：颜色只在 CSS 里定义一次。 */
-.chart-dot { fill: var(--surface); stroke: var(--primary); stroke-width: 2; }
-.chart-dot.tokens { stroke: var(--chart-tokens); }
+.report-chart-tooltip { width: max-content; max-height: min(360px, calc(100vh - 24px)); overflow-y: auto; }
+.report-chart-tooltip-title { margin-bottom: 6px; font-weight: 600; overflow-wrap: anywhere; }
+.report-chart-tooltip-row { display: flex; align-items: baseline; gap: 8px; margin-top: 3px; min-width: 0; }
+.report-chart-tooltip-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.report-chart-tooltip-value { flex: 0 0 auto; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.report-chart-tooltip-dot { flex: 0 0 8px; width: 8px; height: 8px; border-radius: 2px; }
+.report-chart-tooltip-sep { margin: 0 6px; color: var(--text-3); }
+.report-chart-tooltip-divider { margin: 7px 0 4px; border-top: 1px solid var(--border); }
+.report-chart-tooltip-sub { margin: 4px 0; color: var(--text-3); font-variant-numeric: tabular-nums; }
 
 /* 点上的读数标注：与所属那条线同色，读数字时不必回忆「哪个颜色是哪条线」。
    字号比坐标轴文字大一档（11 vs 10）—— 它是这张图的主要读数，不是辅助刻度。 */
@@ -551,6 +535,7 @@
 
 .chart-label.rate { fill: var(--primary); }
 .chart-label.tokens { fill: var(--chart-tokens); }
+.chart-label.total { fill: var(--text-2); }
 
 /* ─── 折线图图例 ───
    两条线 + 两条轴，图例回答「哪根线是哪根轴」。色块与线、标注共用
@@ -578,30 +563,15 @@
   font-size: 10.5px;
 }
 
-.bar { fill: var(--primary); }
-
-/* 热区层：单独一层 SVG 覆盖在图形之上，指针事件只落在这里。
-   这样柱子 / 折线自身不必承担 hover 语义，零值日也能有读数。
-   也正因为它在最上层，柱子的 hover 反馈要由 .chart-hit:hover 表达（见下），
-   给 .bar 写 :hover 是够不到的 —— 指针永远先被这层接走。 */
-.chart-hit-layer {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-}
-
-.chart-hit {
-  fill: transparent;
-  pointer-events: all;
-  cursor: default;
-}
-
-.chart-hit:hover { fill: color-mix(in srgb, var(--primary) 8%, transparent); }
-
-.chart-empty { fill: var(--text-3); font-size: 12px; }
-
 /* 错误态：与 .empty 同档，但用危险色点明「这些数字现在不可信」 */
 .report-error { color: var(--danger); }
+
+.report-source-panel { min-width: 0; }
+.report-source-table-wrap { overflow-x: auto; max-height: 360px; }
+.report-source-table { width: 100%; white-space: nowrap; }
+.report-source-table thead { position: sticky; top: 0; z-index: 1; background: var(--table-head-bg); }
+.report-source-num { text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; }
+.report-source-note { margin-top: 10px; color: var(--text-3); font-size: 11.5px; }
 
 /* 窄窗口（与侧栏收起同断点）：四个缓存窗口退成两列，页头筛选整行铺开 */
 @media (max-width: 900px) {

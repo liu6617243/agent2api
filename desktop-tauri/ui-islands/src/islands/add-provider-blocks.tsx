@@ -12,18 +12,13 @@
  * 每家的块整块常驻（只有当前选中那家的块可见），块内各段落也只切显隐。
  * 于是「发码 → 切去别的方式 → 切回来 → 提交」时 deviceId 仍在，行为与旧实现一致。
  *
- * 显隐一律切 `hidden` 属性，**不是**行内 `display:none`：这些节点都是组件库的
- * DialogSection / Button，自带带 `!important` 的 `flex` / `inline-flex` 工具类，
- * 行内样式与单类名都压不过它（兜底规则见组件库 globals.css 的 `[hidden][hidden]`）。
+ * 显隐统一使用 `hidden` 属性，切换方式时不卸载表单和登录引擎。
  *
- * ── 引擎的容器契约（一个字都不能改）──────────────────────────
- *   web-login.js：按 id 找按钮 / 取消 / 提示三个节点，自己写 disabled / innerHTML /
- *                hidden —— 这三个节点的 id 与旧实现逐字一致，
- *                且**文本子节点是常量**（React 不会去覆盖引擎写进去的内容）。
- *   sms-login.js：create() 时按 id 绑 click，之后按 id 现读输入框的 .value ——
- *                六个 id 逐字一致，输入框是非受控的（React 从不写回 value）。
- *   autoclaw-oauth.js：create() 时抓两个变体按钮的文案、绑 click，同样按 id 读写。
- * 三个引擎建的 DOM 都不进 React 树，也不试图 React 化。
+ * ── 引擎的容器契约 ─────────────────────────────────────────
+ *   web-login.js：发布按钮文案、禁用态和等待态，表单用 Button / Spinner 渲染。
+ *   sms-login.js：create() 时按 id 绑 click，之后现读非受控输入框的 .value。
+ *   autoclaw-oauth.js：create() 时抓两个变体按钮文案并绑 click，按 id 读写。
+ * 各节点 id 保持稳定，认证请求和取消流程仍由对应引擎维护。
  */
 
 import * as React from 'react'
@@ -36,8 +31,10 @@ import {
   InputGroupButton,
   InputGroupInput,
   SegmentedControl,
+  Spinner,
   Switch,
   Textarea,
+  Label, Field, FieldGroup, FieldLabel,
 } from '@ui'
 
 import {
@@ -73,10 +70,12 @@ import {
   type LoginMode,
   type OauthController,
   type WebLoginController,
+  type WebLoginView,
 } from './add-account-bridge'
 // 二进制文件 → base64 的读取工具（订阅导入在用，同一份足够：FileReader +
 // readAsDataURL）；`add-provider-blocks` 只借这一个函数，不引订阅那边的状态
 import { readFileAsBase64 } from './proxies-sub-state'
+import { accountFilePayload, accountExportEdition, isAccountExport } from './add-account-file'
 import { t } from '../i18n'
 
 /**
@@ -204,10 +203,10 @@ function ManualSection({
         const marker = field.optional ? '' : t('（必填）')
         return (
           <div key={id} className={`field-row${field.rows ? ' stack' : ''}`}>
-            <label htmlFor={id}>
+            <Label htmlFor={id}>
               {field.label}
               {marker}
-            </label>
+            </Label>
             {field.rows ? (
               <Textarea id={id} rows={field.rows} placeholder={field.placeholder} {...draftProps(id)} />
             ) : (
@@ -222,13 +221,13 @@ function ManualSection({
           </div>
         )
       })}
-      <div className='field-row'>
+      <FieldGroup orientation='horizontal' className='field-row'>
         <Button id={`${prefix}-add-button`} onClick={() => { void submit() }} disabled={busy}>
           {busy ? t('添加中…') : addButtonTextOf(config)}
         </Button>
         {/* 引擎不碰这一格：忙态文案在按钮上，这一格只放链接给出的路径与提交失败以外的说明 */}
         <span className='detail' id={`${prefix}-add-hint`}>{hint}</span>
-      </div>
+      </FieldGroup>
     </DialogSection>
   )
 }
@@ -264,7 +263,7 @@ function DesktopSection({
     <DialogSection hidden={!visible}>
       <h3>{t('从本机导入桌面端登录态')}</h3>
       <p>{config.desktopNote}</p>
-      <div className='field-row'>
+      <FieldGroup orientation='horizontal' className='field-row'>
         <Button
           id={`${prefix}-desktop-button`}
           title={config.desktopHint}
@@ -273,7 +272,7 @@ function DesktopSection({
         >
           {busy ? t('导入中…') : t('从本机导入桌面端登录态')}
         </Button>
-      </div>
+      </FieldGroup>
     </DialogSection>
   )
 }
@@ -324,8 +323,8 @@ function GuestSection({
       <h3>{t('访客模式')}</h3>
       {guest.noteHtml ? <Note html={guest.noteHtml} /> : null}
       <div className='form-field'>
-        <label htmlFor={nameId}>{t('备注名')}</label>
-        <input
+        <Label htmlFor={nameId}>{t('备注名')}</Label>
+        <Input
           id={nameId}
           type='text'
           maxLength={MAX_NAME_LENGTH}
@@ -333,11 +332,11 @@ function GuestSection({
           {...draftProps(nameId)}
         />
       </div>
-      <div className='field-row'>
+      <FieldGroup orientation='horizontal' className='field-row'>
         <Button id={`${config.provider}-guest-button`} onClick={() => { void submit() }} disabled={busy}>
           {busy ? guest.busyText || t('正在添加…') : guest.button}
         </Button>
-      </div>
+      </FieldGroup>
     </DialogSection>
   )
 }
@@ -393,7 +392,16 @@ function FileImportSection({
           authFileName: file.name,
         }
         if (fileImport.binary) {
-          payload.authFileB64 = base64BodyOf(await readFileAsBase64(file))
+          const prefix = await file.slice(0, 64).text()
+          if (prefix.trimStart().startsWith('{')) {
+            const parsed: unknown = JSON.parse(await file.text())
+            if (!isAccountExport(parsed)) {
+              throw new Error(t('请选择客户端凭证文件，或本软件导出的单账号 JSON 文件'))
+            }
+            Object.assign(payload, accountFilePayload(parsed, config.provider, remark))
+          } else {
+            payload.authFileB64 = base64BodyOf(await readFileAsBase64(file))
+          }
         } else {
           const text = await file.text()
           // JSON 预检只挡「选错文件」这一层：解析失败 / 不是对象在这里就变成
@@ -409,9 +417,12 @@ function FileImportSection({
             toast(t('不是有效的凭证文件：内容要是一个 JSON 对象'), 'err')
             return
           }
-          // 原始文本整串交出去：各家顶层形状不同（auth.json / settings 文件），
-          // 由后端各自的文件导入分支解析，前端不再裁剪
-          payload.authFileContent = text
+          if (isAccountExport(parsed)) {
+            Object.assign(payload, accountFilePayload(parsed, config.provider, remark))
+          } else {
+            // 原生文件由提供商解析；软件导出文件走统一回流，保留凭证附加字段。
+            payload.authFileContent = text
+          }
         }
         if (remark) payload.name = remark
         const data = (await postAccount(payload)) as { account?: AccountRecord } | null
@@ -429,8 +440,9 @@ function FileImportSection({
     <DialogSection hidden={!visible}>
       <h3>{t('导入凭证文件')}</h3>
       <Note text={spec.note} />
-      <div className='field-row'>
-        <label className='lb-inline' htmlFor={nameId}>{t('备注名')}</label>
+      <p className='detail'>{t('也支持本软件导出的单账号 JSON 文件，保留账号凭证与附加信息。')}</p>
+      <Field orientation='horizontal' className='field-row'>
+        <FieldLabel className='lb-inline' htmlFor={nameId}>{t('备注名')}</FieldLabel>
         <Input
           id={nameId}
           type='text'
@@ -438,9 +450,9 @@ function FileImportSection({
           placeholder={t('可选，留空则用文件里的昵称')}
           {...draftProps(nameId)}
         />
-      </div>
-      <div className='field-row'>
-        <input
+      </Field>
+      <FieldGroup orientation='horizontal' className='field-row'>
+        <Input
           ref={fileInput}
           type='file'
           // 空串 = 选择器不过滤（KukuAI 的 Cookies 没有扩展名，无从按类型筛）
@@ -460,7 +472,7 @@ function FileImportSection({
           {busy ? t('导入中…') : t('选择凭证文件导入')}
         </Button>
         <span className='detail'>{hint}</span>
-      </div>
+      </FieldGroup>
     </DialogSection>
   )
 }
@@ -491,6 +503,12 @@ function WebLoginSection({
   // 一律 window.open 开新标签页（见 web_shim.rs 的 startLogin）。这一级整级
   // 收起，提示换成与实际行为一致的那一句。
   const isWeb = platform() === 'web'
+  const [loginView, setLoginView] = React.useState<WebLoginView>(() => ({
+    label: web?.button || '',
+    hint: isWeb ? (web?.webHint || WEB_LOGIN_HINT) : (web?.hint || web?.modes?.[0]?.hint || ''),
+    disabled: false,
+    waiting: false,
+  }))
 
   React.useEffect(() => {
     const engine = shared().wbWebLogin
@@ -504,6 +522,7 @@ function WebLoginSection({
       cancelId: `${prefix}-web-cancel`,
       hintId: `${prefix}-web-hint`,
       busyText: web.busyText,
+      onStateChange: setLoginView,
       texts: () => {
         const active = modes?.find(item => item.value === modeRef.current)
         return {
@@ -528,6 +547,7 @@ function WebLoginSection({
         else toast(t('✅ {label}账号已添加', { label: config.label }))
       },
     }) ?? null
+    return () => { controllerRef.current?.dispose(); controllerRef.current = null }
   }, [])
 
   // 切换打开方式只影响文案（方法列表与所选方法都不变）
@@ -551,28 +571,20 @@ function WebLoginSection({
           />
         </div>
       ) : null}
-      <div className='field-row'>
-        {/* 按钮与提示的文本子节点必须是常量：引擎会直接改它们的 textContent */}
-        <Button id={`${prefix}-web-button`} onClick={() => controllerRef.current?.start()}>
-          {web.button}
+      <FieldGroup orientation='horizontal' className='field-row'>
+        <Button id={`${prefix}-web-button`} disabled={loginView.disabled} onClick={() => controllerRef.current?.start()}>
+          {loginView.waiting && <Spinner />}{loginView.label}
         </Button>
-        {/* 收起时靠 hidden 属性（不是行内 display）：引擎在 waiting 与空闲之间
-            切的就是它（见 web-login.js 的 applyState）。按钮是组件库的 Button，
-            inline-flex 工具类带 !important，行内样式压不过 */}
         <Button
           id={`${prefix}-web-cancel`}
           variant='outline'
-          hidden
+          hidden={!loginView.waiting}
           onClick={() => controllerRef.current?.cancel()}
         >
           {t('取消等待')}
         </Button>
-        <span className='detail' id={`${prefix}-web-hint`}>
-          {isWeb
-            ? (web.webHint || WEB_LOGIN_HINT)
-            : (web.hint || web.modes?.[0]?.hint || '')}
-        </span>
-      </div>
+        <span className='detail' id={`${prefix}-web-hint`}>{loginView.hint}</span>
+      </FieldGroup>
     </DialogSection>
   )
 }
@@ -620,9 +632,9 @@ function SmsSection({
         {/* 第 1 行：手机号与发码合成一格。按钮内嵌在输入框尾部（组件库的
             InputGroup，就是为「输入框带一个动作」准备的），不再自己占一行 */}
         <div className='sms-field'>
-          <label className='lb' htmlFor={`${prefix}-sms-phone`}>
+          <Label className='lb' htmlFor={`${prefix}-sms-phone`}>
             {t('手机号')}<i className='req'>*</i>
-          </label>
+          </Label>
           <InputGroup>
             <InputGroupInput
               id={`${prefix}-sms-phone`}
@@ -643,9 +655,9 @@ function SmsSection({
 
         {/* 第 2 行：验证码只占 118px（6 个数字），右边并上同样是短字段的备注名 */}
         <div className='sms-field'>
-          <label className='lb' htmlFor={`${prefix}-sms-code`}>
+          <Label className='lb' htmlFor={`${prefix}-sms-code`}>
             {t('验证码')}<i className='req'>*</i>
-          </label>
+          </Label>
           <div className='sms-pair'>
             {/* 验证码**不进草稿**：引擎在登录成功后会把它清掉（codeNode.value = ''），
                 草稿若留着，下次挂载会把这个已经用过的码填回去 —— 手机号与备注名照旧留 */}
@@ -656,7 +668,7 @@ function SmsSection({
               maxLength={6}
               placeholder={t('6 位数字')}
             />
-            <label className='lb-inline' htmlFor={`${prefix}-sms-name`}>{t('备注名')}</label>
+            <Label className='lb-inline' htmlFor={`${prefix}-sms-name`}>{t('备注名')}</Label>
             <Input
               id={`${prefix}-sms-name`}
               className='sms-name'
@@ -740,7 +752,7 @@ function OauthSection({
           />
         </div>
       ) : null}
-      <div className='field-row'>
+      <FieldGroup orientation='horizontal' className='field-row'>
         {/* 两个变体各一颗：上游是两个独立端点、两套账号体系，用下拉会让用户猜。
             点击处理**不在这里**：autoclaw-oauth.js 的 create() 会自己给这三颗绑
             click（旧实现同一分工），这里再绑一次会让 start() 被调两遍 */}
@@ -750,12 +762,12 @@ function OauthSection({
         <Button id={`${prefix}-oauth-cancel`} variant='outline' hidden>
           {t('取消')}
         </Button>
-      </div>
-      <div className='field-row'>
+      </FieldGroup>
+      <FieldGroup orientation='horizontal' className='field-row'>
         <span className='detail' id={`${prefix}-oauth-hint`}>
           {hintOf()}
         </span>
-      </div>
+      </FieldGroup>
     </DialogSection>
   )
 }
@@ -921,7 +933,7 @@ function WorkBuddyFileImportSection({
           toast(t('不是有效的凭证文件：需要包含 accessToken 与 uid'), 'err')
           return
         }
-        const fromFile = editionFromFile(record)
+        const fromFile = accountExportEdition(record) ?? editionFromFile(record)
         const landed = fromFile ?? edition
         if (fromFile && fromFile !== edition) {
           toast(
@@ -932,7 +944,9 @@ function WorkBuddyFileImportSection({
           )
         }
         const remark = readField(WORKBUDDY_FILE_NAME_ID)
-        const payload: Record<string, unknown> = { ...record, provider: workbuddyProviderId(landed) }
+        const payload: Record<string, unknown> = isAccountExport(parsed)
+          ? accountFilePayload(record, workbuddyProviderId(landed), remark)
+          : { ...record, provider: workbuddyProviderId(landed) }
         if (remark) payload.name = remark
         const data = (await postAccount(payload)) as { account?: AccountRecord } | null
         setHint('')
@@ -947,6 +961,7 @@ function WorkBuddyFileImportSection({
     <DialogSection hidden={!visible}>
       <h3>{t('导入凭证文件')}</h3>
       <Note text={t('选择官方客户端的登录态凭证文件（workbuddy-desktop.info / workbuddy-desktop-ai.info）或 wb2api 导出的账号 JSON（嵌套 / 扁平形均可）。')} />
+      <p className='detail'>{t('也支持本软件导出的单账号 JSON 文件，保留账号凭证与附加信息。')}</p>
       <p className='detail'>
         <a
           href='#'
@@ -958,8 +973,8 @@ function WorkBuddyFileImportSection({
           {t('凭证文件在哪？')}
         </a>
       </p>
-      <div className='field-row'>
-        <label className='lb-inline' htmlFor={WORKBUDDY_FILE_NAME_ID}>{t('备注名')}</label>
+      <Field orientation='horizontal' className='field-row'>
+        <FieldLabel className='lb-inline' htmlFor={WORKBUDDY_FILE_NAME_ID}>{t('备注名')}</FieldLabel>
         <Input
           id={WORKBUDDY_FILE_NAME_ID}
           type='text'
@@ -967,9 +982,9 @@ function WorkBuddyFileImportSection({
           placeholder={t('可选，留空则用文件里的昵称')}
           {...draftProps(WORKBUDDY_FILE_NAME_ID)}
         />
-      </div>
-      <div className='field-row'>
-        <input
+      </Field>
+      <FieldGroup orientation='horizontal' className='field-row'>
+        <Input
           ref={fileInput}
           type='file'
           accept='.info,.json,application/json'
@@ -985,7 +1000,7 @@ function WorkBuddyFileImportSection({
           {busy ? t('导入中…') : t('选择凭证文件导入')}
         </Button>
         <span className='detail'>{hint}</span>
-      </div>
+      </FieldGroup>
     </DialogSection>
   )
 }
@@ -1024,11 +1039,11 @@ function WorkBuddyDesktopImportSection({
     <DialogSection hidden={!visible}>
       <h3>{t('从本机导入桌面端登录态')}</h3>
       <Note text={t('读本机官方客户端（Tencent WorkBuddy / WorkBuddy AI）当前登录的账号：自动定位其凭证目录里最新的登录态文件（需已在本机官方客户端登录）。导入后由网关自动续期，无需跟随 2 小时时效手动换令牌。')} />
-      <div className='field-row'>
+      <FieldGroup orientation='horizontal' className='field-row'>
         <Button onClick={() => void importFromDesktop()} disabled={busy}>
           {busy ? t('导入中…') : t('从本机导入桌面端登录态')}
         </Button>
-      </div>
+      </FieldGroup>
     </DialogSection>
   )
 }
@@ -1064,6 +1079,12 @@ export function WorkBuddyBlock({ active }: { active: boolean }): React.ReactElem
   // mode 收下即弃（见 web_shim.rs 的 startLogin）。整行打开方式与第三方入口
   // 开关都收起 —— 后者只在「内嵌窗口」下生效，留着必然是个灰按不动的假选项。
   const webPanel = platform() === 'web'
+  const [loginView, setLoginView] = React.useState<WebLoginView>(() => ({
+    label: t('打开网页登录'),
+    hint: webPanel ? WEB_LOGIN_HINT : t('内嵌窗口打开；完成后自动加入列表，关窗即取消等待'),
+    disabled: false,
+    waiting: false,
+  }))
   // 添加方式（与各家 ProviderBlock 的「添加方式」分段同一形态）：不进 loginPrefs
   // 持久化 —— 通用块的 method 也不持久化，弹窗重开回默认项
   const [method, setMethod] = React.useState<WorkBuddyMethod>('web')
@@ -1090,6 +1111,7 @@ export function WorkBuddyBlock({ active }: { active: boolean }): React.ReactElem
       cancelId: 'web-login-cancel',
       hintId: 'web-login-hint',
       busyText: t('等待网页登录…'),
+      onStateChange: setLoginView,
       texts: () => {
         // 网页端只有一条路：新标签页。模式相关的文案（「内嵌窗口」「关窗即
         // 取消」）在这里都不成立 —— 桥接层的 startLogin 收下 mode 却不使用它
@@ -1117,6 +1139,7 @@ export function WorkBuddyBlock({ active }: { active: boolean }): React.ReactElem
         toast(t('✅ 登录成功，{edition}账号已加入列表', { edition: editionLabel }))
       },
     }) ?? null
+    return () => { controllerRef.current?.dispose(); controllerRef.current = null }
   }, [])
 
   // 打开方式影响登录按钮与提示的文案（等待中不覆盖，交给引擎的 applyState）
@@ -1203,7 +1226,7 @@ export function WorkBuddyBlock({ active }: { active: boolean }): React.ReactElem
             整行收起 —— 连带那个只在「内嵌窗口」下生效的 Google / GitHub 开关 */}
         {webPanel ? null : (
           <>
-            <div className='field-row'>
+            <FieldGroup orientation='horizontal' className='field-row'>
               <span className='text-[12.5px] whitespace-nowrap text-subtle'>{t('打开方式')}</span>
               <SegmentedControl
                 aria-label={t('网页登录的打开方式')}
@@ -1215,7 +1238,7 @@ export function WorkBuddyBlock({ active }: { active: boolean }): React.ReactElem
                 value={loginMode}
                 onValueChange={pickLoginMode}
               />
-              <label className='flex items-center gap-2' title={socialTitle}>
+              <Label className='flex items-center gap-2' title={socialTitle}>
                 <Switch
                   checked={socialRestore}
                   disabled={!socialUsable}
@@ -1226,30 +1249,25 @@ export function WorkBuddyBlock({ active }: { active: boolean }): React.ReactElem
                   }}
                 />
                 <span className='text-[12.5px] text-subtle'>{t('恢复 Google / GitHub 入口')}</span>
-              </label>
-            </div>
+              </Label>
+            </FieldGroup>
             <p>{t('系统浏览器可复用已有登录态（国际版推荐）；内嵌窗口更干净。')}</p>
           </>
         )}
-        <div className='field-row'>
-          {/* 按钮与提示的文本子节点必须是常量：引擎会直接改它们的 textContent */}
-          <Button id='web-login-button' onClick={() => controllerRef.current?.start()}>
-            {t('打开网页登录')}
+        <FieldGroup orientation='horizontal' className='field-row'>
+          <Button id='web-login-button' disabled={loginView.disabled} onClick={() => controllerRef.current?.start()}>
+            {loginView.waiting && <Spinner />}{loginView.label}
           </Button>
           <Button
             id='web-login-cancel'
             variant='outline'
-            hidden
+            hidden={!loginView.waiting}
             onClick={() => controllerRef.current?.cancel()}
           >
             {t('取消等待')}
           </Button>
-          <span className='detail' id='web-login-hint'>
-            {webPanel
-              ? WEB_LOGIN_HINT
-              : t('内嵌窗口打开；完成后自动加入列表，关窗即取消等待')}
-          </span>
-        </div>
+          <span className='detail' id='web-login-hint'>{loginView.hint}</span>
+        </FieldGroup>
       </DialogSection>
 
       <WorkBuddyFileImportSection edition={edition} visible={effectiveMethod === 'file'} />

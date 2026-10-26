@@ -26,7 +26,7 @@
   "复制 Key": "Copy key",
   "客户端请求带上 ": "",
   "客户端请求需带 ": "Client requests must include ",
-  "已删除": "",
+  "已删除": "Deleted",
   "已启用鉴权 · {n} 把 Key 生效": "Auth enabled · {n} keys active",
   "当前不限制：这把 Key 可以用全部提供商与全部对外模型": "No restrictions: this key can use all providers and all public models",
   "提供商：{names}": "Providers: {names}",

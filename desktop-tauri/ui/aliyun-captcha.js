@@ -357,7 +357,7 @@
                 try { instance.destroy?.(); } catch { /* 忽略 */ }
               }
             },
-            slideStyle: { width: 360, height: 40 },
+            slideStyle: { width: Math.max(240, Math.min(360, window.innerWidth - 40)), height: 40 },
             language,
             onError: error => {
               const pending = pendingVerification;
@@ -416,20 +416,29 @@
    * 记着那个坑：前端报「验证码超时」复位，壳与网关却还在等，用户随后真完成
    * 时账号加了、界面毫无反应。长流程要放在 `solve()` **返回之后**。
    */
-  async function solve(config, request) {
+  async function solve(config, request, signal) {
+    const requireActive = () => {
+      if (signal?.aborted) throw new CaptchaCancelledError();
+    };
+    requireActive();
     await initializeAliyunCaptcha(config);
+    requireActive();
     await waitForWarmup();
+    requireActive();
     const button = ensureCaptchaElements();
     const instance = captchaInstance;
     if (!instance) throw new CaptchaError(wbI18n.t('验证码组件不可用，请重试'));
     const generation = initializationGeneration;
     return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        if (pendingVerification === pending) cancel();
+      };
       const pending = {
         generation,
         instance,
         request,
-        resolve,
-        reject,
+        resolve: value => { signal?.removeEventListener('abort', onAbort); resolve(value); },
+        reject: error => { signal?.removeEventListener('abort', onAbort); reject(error); },
         timer: 0,
         settled: false,
       };
@@ -439,6 +448,7 @@
         });
       }, VERIFY_TIMEOUT_MS);
       pendingVerification = pending;
+      signal?.addEventListener('abort', onAbort, { once: true });
       button.click();
     });
   }

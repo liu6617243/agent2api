@@ -4,6 +4,7 @@ import * as React from 'react'
 import {
   Button, Checkbox, Input, Label, MultiSelect, RadioGroup, RadioGroupItem,
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+  Field, FieldGroup, FieldLabel,
 } from '@ui'
 import { t } from '../i18n'
 import {
@@ -299,8 +300,8 @@ export function ProxyForm({
 
       {draft.mode === 'pool' ? (
         <div className='mt-3'>
-          <div className='field-row'>
-            <label htmlFor={`${idPrefix}-pool-exit`}>{t('代理')}</label>
+          <Field orientation='horizontal' className='field-row'>
+            <FieldLabel htmlFor={`${idPrefix}-pool-exit`}>{t('代理')}</FieldLabel>
             {/* value 恒为字符串（空串 = 还没选）：受控值从 undefined 切到字符串会被 Base UI
                 当成「非受控 → 受控」的切换，所以不给 undefined */}
             <Select value={draft.proxyId} disabled={!pool?.length}
@@ -324,7 +325,7 @@ export function ProxyForm({
               </SelectContent>
             </Select>
             <Button variant='outline' size='sm' onClick={() => loadPool(true)}>{t('重新读取')}</Button>
-          </div>
+          </Field>
           <div className='detail mt-1.5'>
             {poolError
               ? t('读取失败：{error}', { error: poolError })
@@ -349,16 +350,16 @@ export function ProxyForm({
             <Checkbox id={`${idPrefix}-rotate-all`} checked={draft.rotateAll}
               aria-label={t('轮询全部代理节点')}
               onCheckedChange={value => set({ rotateAll: value === true })} />
-            <label htmlFor={`${idPrefix}-rotate-all`} className='cursor-pointer text-xs text-subtle'>
+            <Label htmlFor={`${idPrefix}-rotate-all`} className='cursor-pointer text-xs text-subtle'>
               {t('全部代理节点（推荐）')}
-            </label>
+            </Label>
             <span className='detail'>
               {t('「网络代理」页里每个启用的出口轮流使用；之后新加的出口自动加入')}
             </span>
           </div>
           {!draft.rotateAll ? (
-            <div className='field-row mt-2.5'>
-              <label htmlFor={`${idPrefix}-rotate-exits`}>{t('轮询的代理')}</label>
+            <Field orientation='horizontal' className='field-row mt-2.5'>
+              <FieldLabel htmlFor={`${idPrefix}-rotate-exits`}>{t('轮询的代理')}</FieldLabel>
               <MultiSelect id={`${idPrefix}-rotate-exits`}
                 value={draft.rotateIds}
                 onValueChange={values => set({ rotateIds: values.map(String) })}
@@ -372,7 +373,7 @@ export function ProxyForm({
                 placeholder={t('选择要轮询的代理（可多选）')}
                 aria-label={t('轮询的代理')} />
               <Button variant='outline' size='sm' onClick={() => loadPool(true)}>{t('重新读取')}</Button>
-            </div>
+            </Field>
           ) : null}
           <div className='detail mt-1.5'>
             {poolError
@@ -388,8 +389,8 @@ export function ProxyForm({
 
       {draft.mode === 'clash' ? (
         <div className='mt-3'>
-          <div className='field-row'>
-            <label htmlFor={`${idPrefix}-clash-exit`}>{t('出口')}</label>
+          <Field orientation='horizontal' className='field-row'>
+            <FieldLabel htmlFor={`${idPrefix}-clash-exit`}>{t('出口')}</FieldLabel>
             {/* value 恒为字符串（空串 = 还没选）：受控值从 undefined 切到字符串会被 Base UI
                 当成「非受控 → 受控」的切换，所以不给 undefined */}
             <Select value={draft.listenerUid} disabled={!options.length}
@@ -414,7 +415,7 @@ export function ProxyForm({
                 .then(() => toast(t('✅ 已重新读取 Clash Verge 配置')))
                 .catch(error => toast(t('读取失败：{error}', { error: errorMessage(error) }), 'err'))
             }}>{t('重新读取')}</Button>
-          </div>
+          </Field>
           <div className='detail mt-1.5'>
             {clash === null
               ? t('正在读取 Clash Verge 配置…')
@@ -434,41 +435,51 @@ export function ProxyForm({
 
       {draft.mode === 'custom' ? (
         <div className='mt-3'>
-          <div className='field-row'>
-            <label htmlFor={`${idPrefix}-protocol`}>{t('协议')}</label>
-            <Select value={draft.protocol} onValueChange={value => set({ protocol: value as 'http' | 'socks5' })}>
-              <SelectTrigger id={`${idPrefix}-protocol`} className='min-w-[110px]'>
-                <SelectValue>{draft.protocol === 'socks5' ? 'SOCKS5' : 'HTTP'}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value='http'>HTTP</SelectItem>
-                <SelectItem value='socks5'>SOCKS5</SelectItem>
-              </SelectContent>
-            </Select>
-            <label htmlFor={`${idPrefix}-host`} className='ml-2'>{t('主机')}</label>
-            <Input id={`${idPrefix}-host`} className='min-w-[140px]' placeholder='127.0.0.1'
-              value={draft.host} onChange={event => set({ host: event.currentTarget.value })} />
-            <label htmlFor={`${idPrefix}-port`}>{t('端口')}</label>
-            <Input id={`${idPrefix}-port`} type='number' min={1} max={65535} className='max-w-[110px]'
-              placeholder='7890' value={draft.port} onChange={event => set({ port: event.currentTarget.value })} />
-          </div>
-          <div className='field-row mt-2.5'>
-            <label htmlFor={`${idPrefix}-user`}>{t('用户名')}</label>
-            <Input id={`${idPrefix}-user`} placeholder={t('可选')} autoComplete='off'
-              value={draft.username} onChange={event => set({ username: event.currentTarget.value })} />
-            <label htmlFor={`${idPrefix}-pass`}>{t('密码')}</label>
-            <Input id={`${idPrefix}-pass`} type='password' placeholder={t('可选')} autoComplete='new-password'
-              value={draft.password} onChange={event => set({ password: event.currentTarget.value })} />
-          </div>
+          <FieldGroup orientation='horizontal' className='field-row'>
+            <Field className='contents'>
+              <FieldLabel htmlFor={`${idPrefix}-protocol`}>{t('协议')}</FieldLabel>
+              <Select value={draft.protocol} onValueChange={value => set({ protocol: value as 'http' | 'socks5' })}>
+                <SelectTrigger id={`${idPrefix}-protocol`} className='min-w-[110px]'>
+                  <SelectValue>{draft.protocol === 'socks5' ? 'SOCKS5' : 'HTTP'}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value='http'>HTTP</SelectItem>
+                  <SelectItem value='socks5'>SOCKS5</SelectItem>
+                </SelectContent>
+              </Select>
+            </Field>
+            <Field className='contents'>
+              <FieldLabel htmlFor={`${idPrefix}-host`} className='ml-2'>{t('主机')}</FieldLabel>
+              <Input id={`${idPrefix}-host`} className='min-w-[140px]' placeholder='127.0.0.1'
+                value={draft.host} onChange={event => set({ host: event.currentTarget.value })} />
+            </Field>
+            <Field className='contents'>
+              <FieldLabel htmlFor={`${idPrefix}-port`}>{t('端口')}</FieldLabel>
+              <Input id={`${idPrefix}-port`} type='number' min={1} max={65535} className='max-w-[110px]'
+                placeholder='7890' value={draft.port} onChange={event => set({ port: event.currentTarget.value })} />
+            </Field>
+          </FieldGroup>
+          <FieldGroup orientation='horizontal' className='field-row mt-2.5'>
+            <Field className='contents'>
+              <FieldLabel htmlFor={`${idPrefix}-user`}>{t('用户名')}</FieldLabel>
+              <Input id={`${idPrefix}-user`} placeholder={t('可选')} autoComplete='off'
+                value={draft.username} onChange={event => set({ username: event.currentTarget.value })} />
+            </Field>
+            <Field className='contents'>
+              <FieldLabel htmlFor={`${idPrefix}-pass`}>{t('密码')}</FieldLabel>
+              <Input id={`${idPrefix}-pass`} type='password' placeholder={t('可选')} autoComplete='new-password'
+                value={draft.password} onChange={event => set({ password: event.currentTarget.value })} />
+            </Field>
+          </FieldGroup>
         </div>
       ) : null}
 
-      <div className='field-row mt-3'>
+      <FieldGroup orientation='horizontal' className='field-row mt-3'>
         <Button variant='outline' size='sm' disabled={testing} onClick={() => void test()}>
           {testing ? t('测试中…') : t('测试出口')}
         </Button>
         <span className='detail'>{testResult}</span>
-      </div>
+      </FieldGroup>
     </div>
   )
 }

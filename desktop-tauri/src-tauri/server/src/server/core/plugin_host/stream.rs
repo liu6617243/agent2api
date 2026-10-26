@@ -26,7 +26,7 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures::Stream;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use agent2api_provider_protocol as proto;
 
@@ -35,11 +35,99 @@ use crate::server::logging;
 
 use super::{Host, StreamEvent};
 
-/// 判定「插件已经自己收尾」的窗口大小。
-///
-/// 只留尾巴而不是整份响应：`[DONE]` 总是最后几帧之一，而留整份会让每条流
-/// 多占一份与响应体等大的内存（那正是流式要避免的）。
-const TAIL_BYTES: usize = 64;
+/// 标准 Chat SSE 的只读用量旁路；跨分片缓冲有界，不改写下发字节。
+#[derive(Default)]
+struct UsageSniffer {
+    line: Vec<u8>,
+    data: Vec<u8>,
+    line_bytes: usize,
+    event_bytes: usize,
+    skipping_event: bool,
+    skip_lf: bool,
+    first_line_seen: bool,
+    done: bool,
+}
+
+impl UsageSniffer {
+    const MAX_EVENT_BYTES: usize = 1024 * 1024;
+
+    fn feed(&mut self, bytes: &[u8], telemetry: &RequestTelemetry) {
+        for &byte in bytes {
+            if self.skip_lf {
+                self.skip_lf = false;
+                if byte == b'\n' { continue; }
+            }
+            if byte == b'\r' || byte == b'\n' {
+                self.consume_line(telemetry);
+                self.skip_lf = byte == b'\r';
+            } else {
+                self.line_bytes = self.line_bytes.saturating_add(1);
+                self.event_bytes = self.event_bytes.saturating_add(1);
+                if self.event_bytes > Self::MAX_EVENT_BYTES {
+                    self.line.clear();
+                    self.data.clear();
+                    // 超大事件只在下一个空行恢复，余段不能被误认成新事件。
+                    self.skipping_event = true;
+                }
+                if !self.skipping_event { self.line.push(byte); }
+            }
+        }
+    }
+
+    fn finish(&mut self, telemetry: &RequestTelemetry) {
+        if self.line_bytes > 0 { self.consume_line(telemetry); }
+        if !self.skipping_event { self.consume_data(telemetry, false); }
+        self.line.clear();
+        self.data.clear();
+        self.line_bytes = 0;
+        self.event_bytes = 0;
+        self.skipping_event = false;
+        self.skip_lf = false;
+    }
+
+    fn consume_line(&mut self, telemetry: &RequestTelemetry) {
+        if self.line_bytes > 0 {
+            self.event_bytes = self.event_bytes.saturating_add(1);
+            if self.event_bytes > Self::MAX_EVENT_BYTES {
+                self.line.clear();
+                self.data.clear();
+                self.skipping_event = true;
+            }
+        }
+        if self.line_bytes == 0 {
+            if !self.skipping_event { self.consume_data(telemetry, true); }
+            self.data.clear();
+            self.event_bytes = 0;
+            self.skipping_event = false;
+        } else if !self.skipping_event {
+            let line = if !self.first_line_seen {
+                self.line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&self.line)
+            } else { &self.line };
+            let payload = line.strip_prefix(b"data:").or_else(|| (line == b"data").then_some(&[][..]));
+            if let Some(payload) = payload {
+                let payload = payload.strip_prefix(b" ").unwrap_or(payload);
+                self.data.extend_from_slice(payload);
+                self.data.push(b'\n');
+            }
+        }
+        self.first_line_seen = true;
+        self.line.clear();
+        self.line_bytes = 0;
+    }
+
+    fn consume_data(&mut self, telemetry: &RequestTelemetry, complete: bool) {
+        let Ok(text) = std::str::from_utf8(&self.data) else { return };
+        if text.trim() == "[DONE]" {
+            self.done |= complete;
+            return;
+        }
+        if !self.data.windows(5).any(|window| window == b"usage") { return; }
+        let Ok(chunk) = serde_json::from_slice::<Value>(&self.data) else { return };
+        if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
+            telemetry.report_usage(usage);
+        }
+    }
+}
 
 /// 一条插件流在网关侧的形态。
 pub(crate) struct RpcStream {
@@ -53,12 +141,11 @@ pub(crate) struct RpcStream {
     credit: tokio::sync::mpsc::UnboundedSender<usize>,
     /// 待下发的合成帧（错误帧 / 补的 `[DONE]`）。
     pending: VecDeque<Bytes>,
-    /// 已下发字节的尾巴（判「插件是否已经自己收尾」）。
-    tail: Vec<u8>,
     /// 已经排好收尾帧，下一次 poll 直接返回 `None`。
     ended: bool,
     /// usage / 首响旁路槽。
     telemetry: Arc<RequestTelemetry>,
+    usage: UsageSniffer,
 }
 
 impl RpcStream {
@@ -86,7 +173,9 @@ impl RpcStream {
             }
         });
         let mut queue = VecDeque::new();
+        let mut usage = UsageSniffer::default();
         if let Some(bytes) = pending {
+            usage.feed(&bytes, &telemetry);
             queue.push_back(Bytes::from(bytes));
         }
         Self {
@@ -95,32 +184,19 @@ impl RpcStream {
             events,
             credit,
             pending: queue,
-            tail: Vec::new(),
             ended: false,
             telemetry,
+            usage,
         }
-    }
-
-    /// 记下已下发字节的尾巴。
-    fn remember(&mut self, bytes: &[u8]) {
-        self.tail.extend_from_slice(bytes);
-        if self.tail.len() > TAIL_BYTES {
-            let cut = self.tail.len() - TAIL_BYTES;
-            self.tail.drain(..cut);
-        }
-    }
-
-    /// 插件是否已经写过终止帧。
-    fn tail_has_done(&self) -> bool {
-        self.tail.windows(6).any(|window| window == b"[DONE]")
     }
 
     /// 排上「错误帧 + [DONE]」收尾。
     fn finish_with_error(&mut self, message: &str) {
+        self.usage.finish(&self.telemetry);
         self.ended = true;
         logging::console_line("[Model]", &format!("❌ {message}"));
         self.telemetry.note_error(message);
-        if self.tail_has_done() {
+        if self.usage.done {
             // 插件自己已经收尾过了：再写一条会让客户端收到两个终止信号
             return;
         }
@@ -158,7 +234,7 @@ impl Stream for RpcStream {
                     // 归还等量额度：载荷 + 帧开销（与插件侧计费口径逐字一致，
                     // 差一个常量就会让窗口缓慢泄漏或溢出）
                     let _ = this.credit.send(bytes.len() + proto::FRAME_OVERHEAD_BYTES);
-                    this.remember(&bytes);
+                    this.usage.feed(&bytes, &this.telemetry);
                     this.telemetry.note_first_frame();
                     return Poll::Ready(Some(Ok(Bytes::from(bytes))));
                 }
@@ -166,9 +242,10 @@ impl Stream for RpcStream {
                     this.finish_with_error(&message);
                 }
                 Poll::Ready(Some(StreamEvent::Done(Ok(_)))) => {
+                    this.usage.finish(&this.telemetry);
                     // 插件正常结束。它本该自己写 `[DONE]`；漏了就在这里补上
                     // —— 少一个终止帧会让客户端一直等（连接挂着不关）。
-                    if !this.tail_has_done() {
+                    if !this.usage.done {
                         this.pending.push_back(Bytes::from_static(b"data: [DONE]\n\n"));
                     }
                     this.ended = true;

@@ -4,7 +4,7 @@
  * ── 两种运行形态，一套代码 ────────────────────────────────────
  *   · **PWA / 浏览器**：页面由网关出，`/api/*` 是同源相对路径，服务端用
  *     HttpOnly cookie 认会话 —— 与桌面网页端完全一致。
- *   · **APK**：界面打进包里，页面 origin 是 `http://localhost`，请求网关
+ *   · **原生 App**：界面打进包里，页面 origin 是原生壳的本地地址，请求网关
  *     必然跨源。跨源请求浏览器不会带 cookie，所以必须显式把令牌放进请求头
  *     （`x-panel-token` / `x-panel-refresh`），并且登录时要让服务端把令牌
  *     放进响应体（`x-panel-auth-mode: body`，见服务端 `tokens_in_body`）。
@@ -28,6 +28,7 @@ import {
   isPackaged,
   readServerAuth,
   readServerKey,
+  serverIdentity,
   storeServerAuth,
   storeServerKey,
   type PanelAuth,
@@ -130,8 +131,12 @@ function buildHeaders(extra?: Record<string, string>): Record<string, string> {
   return headers
 }
 
-/** 在飞的续期请求：同一时刻最多一个，其余 401 等它（见 tryRefresh） */
-let refreshInFlight: Promise<boolean> | null = null
+/** 续期按服务器隔离；换服务器后不能沿用上一台的在途令牌轮换。 */
+const refreshInFlight = new Map<string, Promise<boolean>>()
+
+function requireCurrentServer(identity: string): void {
+  if (serverIdentity() !== identity) throw new DOMException('服务器已切换', 'AbortError')
+}
 
 /**
  * 静默续期，并发 401 单飞：access 过期那一刻页面会同时收到多个 401，
@@ -141,16 +146,18 @@ let refreshInFlight: Promise<boolean> | null = null
  * 成功返回 true
  */
 async function tryRefresh(): Promise<boolean> {
-  if (refreshInFlight) return refreshInFlight
-  refreshInFlight = doRefresh().finally(() => {
-    refreshInFlight = null
-  })
-  return refreshInFlight
+  const identity = serverIdentity()
+  const pending = refreshInFlight.get(identity)
+  if (pending) return pending
+  const request = doRefresh(identity).finally(() => refreshInFlight.delete(identity))
+  refreshInFlight.set(identity, request)
+  return request
 }
 
-async function doRefresh(): Promise<boolean> {
-  const auth = readPanelAuth()
-  const headers = buildHeaders()
+async function doRefresh(identity: string): Promise<boolean> {
+  const serverId = activeServerId()
+  const auth = readServerAuth(serverId)
+  const headers = buildHeaders({ 'Content-Type': 'application/json' })
   if (auth?.refresh) {
     headers['x-panel-refresh'] = auth.refresh
     // 要求令牌进响应体：APK 下没有可用的 cookie 通道，只认 body
@@ -166,9 +173,10 @@ async function doRefresh(): Promise<boolean> {
     const payload = (await response.json().catch(() => null)) as
       | { data?: { accessToken?: string; refreshToken?: string; expiresIn?: number } }
       | null
+    if (serverIdentity() !== identity) return false
     const data = payload?.data
     if (data?.accessToken && data?.refreshToken) {
-      storePanelTokens(data.accessToken, data.refreshToken, data.expiresIn)
+      storeServerAuth(serverId, data.accessToken, data.refreshToken, data.expiresIn)
     }
     return true
   } catch {
@@ -216,10 +224,15 @@ type RequestInitLite = {
  *
  * 返回值是 `data` 本身；失败一律抛 {@link ApiError}。
  */
-export async function apiCall<T = unknown>(path: string, init: RequestInitLite = {}): Promise<T> {
-  // 到期前先把令牌换掉：这一步让「access 过期 → 401 → 续期」不再发生。
-  // 续期端点自己不走这里（见 doRefresh 直接 fetch），所以不会递归。
+export function apiCall<T = unknown>(path: string, init: RequestInitLite = {}): Promise<T> {
+  return requestApi<T>(path, init, serverIdentity(), true)
+}
+
+async function requestApi<T>(path: string, init: RequestInitLite, identity: string, retry: boolean): Promise<T> {
+  requireCurrentServer(identity)
+  if (init.signal?.aborted) throw new DOMException('请求已取消', 'AbortError')
   await ensureFreshSession()
+  requireCurrentServer(identity)
   const method = init.method || 'GET'
   const headers = buildHeaders()
   const requestInit: RequestInit = { method, headers, signal: init.signal }
@@ -232,10 +245,13 @@ export async function apiCall<T = unknown>(path: string, init: RequestInitLite =
   try {
     response = await fetch(url(path), requestInit)
   } catch (error) {
+    requireCurrentServer(identity)
+    if (init.signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error
     throw new ApiError(`无法连接网关：${error instanceof Error ? error.message : String(error)}`, 0)
   }
 
   const text = await response.text()
+  requireCurrentServer(identity)
   let payload: unknown = null
   try {
     payload = text ? JSON.parse(text) : null
@@ -246,7 +262,9 @@ export async function apiCall<T = unknown>(path: string, init: RequestInitLite =
   if (response.status === 401 && !init.quiet) {
     const type = readErrorType(payload)
     if (type === 'panel_login_required') {
-      if (await tryRefresh()) return apiCall<T>(path, init)
+      const refreshed = retry && !path.startsWith('/api/assistant/images/') && await tryRefresh()
+      requireCurrentServer(identity)
+      if (refreshed) return requestApi<T>(path, init, identity, false)
       clearPanelAuth()
       onAuthLost?.('login')
     } else {

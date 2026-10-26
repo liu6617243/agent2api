@@ -401,14 +401,20 @@ impl StoredAccount {
     /// **原样存取**，归一化（认不出的值怎么落）在 `zcode::normalize_plan` 一处：
     /// 存储层不做取值白名单，否则将来加第三条通道要改两个地方。
     pub fn zcode_plan(&self) -> String {
-        as_text(self.fields.get(crate::server::core::providers::zcode::PLAN_FIELD))
+        let key = crate::server::core::providers::zcode::PLAN_FIELD;
+        let value = as_text(self.fields.get(key));
+        if !value.trim().is_empty() { value }
+        else { as_text(self.fields.get("pluginSecret").and_then(|secret| secret.get(key))) }
     }
 
     pub fn set_zcode_plan(&mut self, value: &str) {
-        self.fields.insert(
-            crate::server::core::providers::zcode::PLAN_FIELD.to_string(),
-            Value::String(value.to_string()),
-        );
+        let key = crate::server::core::providers::zcode::PLAN_FIELD;
+        self.fields.insert(key.to_string(), Value::String(value.to_string()));
+        for field in ["pluginSecret", "pluginPublic"] {
+            if let Some(Value::Object(fields)) = self.fields.get_mut(field) {
+                fields.insert(key.to_string(), Value::String(value.to_string()));
+            }
+        }
     }
 
     /// 是否「有可用凭证」（当前账号派生、凭据查询都以此为准）

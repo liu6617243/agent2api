@@ -30,8 +30,8 @@
 //! 展示。真正会抛错的只有「整个请求都发不出去」那一层（由 HTTP 客户端负责）。
 //!
 //! ── 锁与 panic 的两条硬约束 ─────────────────────────────────
-//!   1. **不持锁跨 await**：账号快照与逐账号的临期判定都是同步的（各自的取数
-//!      函数内部取锁即释放），网络刷新在锁外逐个 await；
+//!   1. **不持锁跨 await**：账号快照取完即释放锁，临期判定与网络刷新
+//!      都在锁外逐个 await；
 //!   2. **不 unwrap/expect**：本模块在后台任务与 HTTP handler 两条路径上跑，
 //!      而 release 是 `panic = "abort"`，任何一处 panic 都会带走整个应用。
 //!
@@ -92,8 +92,8 @@ pub async fn refresh_expiring_accounts(store: &AccountStore) -> Vec<Value> {
         .cloned()
         .unwrap_or_default();
 
-    // 第一遍（同步）：分拣出「待刷新」的清单，其余当场落 skipped 结果。
-    // 账号快照与临期判定都在这一遍做完，下面那一遍只做网络动作。
+    // 第一遍：分拣出「待刷新」的清单，其余当场落 skipped 结果。
+    // 插件临期判定通过异步 RPC 取回，下面那一遍只做网络刷新。
     //
     // 结果按**账号下标**占位（`slots[i]`），刷新那一遍写回各自的位置 ——
     // 于是返回顺序与账号列表一致，而不是「先一堆跳过、后面才是刷新的」。
@@ -137,9 +137,8 @@ pub async fn refresh_expiring_accounts(store: &AccountStore) -> Vec<Value> {
             ));
             continue;
         }
-        // 临期判定的详细理由见 trait 的 `credentials_expiring`：
         // 判不出来（没有过期信息 / 账号不存在 / 没有 refreshToken）一律 false
-        if !adapter.credentials_expiring(store, &id) {
+        if !adapter.credentials_expiring_async(store, &id).await {
             slots[index] = Some(skipped(&id, provider, "凭证未过期或临期"));
             continue;
         }

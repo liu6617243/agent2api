@@ -6,10 +6,9 @@
  *     浏览器里的「新版本」是网关托管的 `ui/m/*` 变了，刷新即可。
  *   · **APK**：界面打在包里，必须换安装包。这条路是这里实现的：
  *       1. 调网关 `GET /api/update/check` 拿最新版本与 `androidAsset`；
- *       2. 用原生插件**直连 GitHub** 下载 APK（手机自己出网）；
+ *       2. 向网关领取下载方案，手机按候选源下载并校验 APK；
  *       3. 调起系统安装器。
- *     下载地址是 GitHub 的 `browser_download_url`，不经过网关中转 ——
- *     手机出不了网时用户自己开代理即可，网关不替它代劳。
+ *     下载字节不经过网关中转，GitHub 令牌也不传给手机或加速站。
  *   · **iOS（IPA）**：苹果不允许 App 自行下载并安装可执行代码，所以这里
  *     **只能跳转** —— 拿 `pageUrl` 打开 GitHub Release 页面，由用户自己走
  *     TestFlight / App Store / AltStore。`downloadApk` / `installApk` 在 iOS
@@ -33,8 +32,9 @@
  * 用于「我不想让手机耗流量」这种纯本地偏好。
  */
 
-import { apiCall } from '../api/client'
-import { nativePlatform } from '../lib/servers'
+import { ApiError, apiCall } from '../api/client'
+import { activeServerId, nativePlatform } from '../lib/servers'
+import { t } from '../i18n'
 
 /** 构建期注入的本工程版本号 */
 declare const __APP_VERSION__: string
@@ -63,6 +63,8 @@ type RawCheckResult = {
   pageUrl?: string | null
   prerelease?: boolean
   androidAsset?: { name?: string; size?: number; url?: string } | null
+  checked?: boolean
+  channelChanged?: boolean
 }
 
 /**
@@ -79,6 +81,7 @@ export async function checkApkUpdate(): Promise<ApkUpdateInfo> {
   const raw = await apiCall<RawCheckResult>(
     `/api/update/check?current=${encodeURIComponent(APP_VERSION)}`,
   )
+  if (raw.channelChanged && raw.checked === false) throw new Error(t('更新通道已改变，请重新检查更新。'))
   const asset = raw.androidAsset && raw.androidAsset.url ? raw.androidAsset : null
   return {
     currentVersion: APP_VERSION,
@@ -149,7 +152,7 @@ export async function autoCheckIntervalMs(): Promise<number> {
 type PluginListenerHandle = { remove: () => Promise<void> }
 
 type ApkUpdaterPlugin = {
-  download(options: { url: string }): Promise<{ path: string; size: number }>
+  download(options: { url: string; sha256?: string; size?: number }): Promise<{ path: string; size: number }>
   cancel(): Promise<void>
   canInstall(): Promise<{ allowed: boolean }>
   openInstallPermissionSettings(): Promise<void>
@@ -187,12 +190,12 @@ export type DownloadProgress = {
   percent: number
 }
 
-/**
- * 下载 APK 到应用缓存。返回下载完成后的本地路径。
- *
- * `url` 必须是 GitHub 的资产地址（由 `checkApkUpdate` 的 `asset.url` 给出）。
- * 手机自己出网 —— 连不上 GitHub 时用户自己开代理，不在这里做中转。
- */
+let downloadCanceled = false
+const successfulDownloads = new Map<string, { url: string; until: number }>()
+
+type DownloadPlan = { urls: string[]; sha256?: string | null; size?: number; mode?: 'auto' | 'official' | 'accelerated' }
+
+/** APK 字节由手机下载；网关只提供候选源和经过官方 API 确认的校验值。 */
 export async function downloadApk(
   url: string,
   onProgress?: (progress: DownloadProgress) => void,
@@ -208,18 +211,49 @@ export async function downloadApk(
   }
   if (!url) throw new Error('缺少下载地址')
 
+  downloadCanceled = false
+  let plan: DownloadPlan
+  try {
+    plan = await apiCall<DownloadPlan>('/api/update/download-plan', { method: 'POST', body: { url } })
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 404) throw error
+    plan = { urls: [url] }
+  }
+  if (!plan.urls?.length) throw new Error('没有可用的下载源')
+  const key = `${activeServerId() || 'local'}:${plan.mode || 'official'}:${JSON.stringify([...plan.urls].sort())}`
+  const remembered = successfulDownloads.get(key)
+  const candidates = [...plan.urls]
+  if (plan.mode === 'auto' && remembered && remembered.until > Date.now()) {
+    candidates.sort((left, right) => Number(right === remembered.url) - Number(left === remembered.url))
+  }
   let handle: PluginListenerHandle | null = null
   if (onProgress) {
     handle = await api.addListener('downloadProgress', data => onProgress(data))
   }
   try {
-    return await api.download({ url })
+    let lastError: unknown = new Error('没有可用的下载源')
+    for (const candidate of candidates) {
+      if (downloadCanceled) throw new Error('已取消下载')
+      try {
+        const result = await api.download({ url: candidate, sha256: plan.sha256 || undefined, size: plan.size })
+        if (!remembered || remembered.until <= Date.now() || remembered.url !== candidate) {
+          successfulDownloads.set(key, { url: candidate, until: Date.now() + 10 * 60_000 })
+        }
+        return result
+      } catch (error) {
+        if (downloadCanceled) throw new Error('已取消下载')
+        if (error instanceof Error && /HTTP (403|429)\b/.test(error.message)) throw error
+        lastError = error
+      }
+    }
+    throw lastError
   } finally {
     if (handle) void handle.remove()
   }
 }
 
 export async function cancelDownload(): Promise<void> {
+  downloadCanceled = true
   await plugin()?.cancel()
 }
 

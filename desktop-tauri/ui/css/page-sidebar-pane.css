@@ -234,7 +234,7 @@
    与表格列设置的 body.colset-dragging 同义：拖过文本会触发原生的拖选，
    拖拽会话就「断」了；光标统一成抓取态，让「正在拖」这件事在指针上也看得见。 */
 body.sc-dragging { user-select: none; cursor: grabbing; }
-body.sc-dragging * { cursor: grabbing !important; }
+body.sc-dragging * { cursor: grabbing; }
 
 /* 窄窗口：动作区会挤，删掉「删除」的文字只留图标级尺寸不合适（按钮是纯文字），
    改为让组头换行 —— 组名一行、动作一行，比把名字截断好读 */

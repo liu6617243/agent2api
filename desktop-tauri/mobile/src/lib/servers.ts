@@ -4,8 +4,7 @@
  * ── 两种运行形态 ──────────────────────────────────────────────
  *   · **PWA / 浏览器**：页面就是网关出的，同源，地址恒为当前 origin。
  *     这时不该让用户填地址 —— 填了也只会把请求打到别处去。
- *   · **APK**：界面打进包里，页面 origin 是 `http://localhost`，与网关
- *     必然跨源。用户要自己填地址，还可能有多台。
+ *   · **原生 App**：界面打进包里，与网关不同源。用户要自己填地址，还可能有多台。
  *
  * 判据是 `isPackaged()`：Capacitor 在原生壳里会往 window 挂 `Capacitor`，
  * 浏览器里没有。不用 UA 判断 —— 桌面浏览器开 `/m` 与手机浏览器开是同一份代码。
@@ -156,6 +155,12 @@ export function activeServerId(): string {
   return activeServer()?.id || ''
 }
 
+/** 在途请求与页面缓存同时绑定服务器 id 和地址，编辑地址也会换代。 */
+export function serverIdentity(): string {
+  const server = activeServer()
+  return server ? `${server.id}:${server.base}` : ''
+}
+
 /**
  * 新增或更新一台服务器。返回它本身（已存在同地址则复用那条记录，
  * 不产生重复项）。
@@ -168,6 +173,10 @@ export function saveServer(input: { id?: string; name?: string; base: string }):
     ? list.find(item => item.id === input.id)
     : list.find(item => item.base === base)
   if (existing) {
+    if (existing.base !== base) {
+      clearServerAuth(existing.id)
+      storeServerKey(existing.id, '')
+    }
     existing.base = base
     existing.name = (input.name || '').trim()
     writeServers(list)
@@ -183,10 +192,12 @@ export function saveServer(input: { id?: string; name?: string; base: string }):
 }
 
 export function removeServer(id: string): void {
+  const current = activeServerId()
   const list = readServers().filter(item => item.id !== id)
   writeServers(list)
   clearServerAuth(id)
-  if (activeServerId() === id) {
+  storeServerKey(id, '')
+  if (current === id) {
     try {
       localStorage.setItem(ACTIVE_KEY, list[0]?.id || '')
     } catch {

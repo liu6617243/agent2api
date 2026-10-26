@@ -108,20 +108,19 @@ pub fn snapshot() -> Value {
 pub async fn install_prepared(prepared: packages::PreparedPack) -> Result<Value, String> {
     let _guard = mutation_guard().await;
     let store = plugin_accounts::shared();
-    if let Some(host) = super::current() {
-        host.shutdown().await;
-    }
-    super::detach();
+    super::shutdown_all().await;
     super::clear_providers();
     let outcome = tokio::task::spawn_blocking(move || prepared.install())
         .await
         .map_err(|error| format!("插件安装任务中断：{error}"))
         .and_then(|result| result);
-    let reloaded = match store {
-        Some(store) => super::reload_host(store).await.is_some(),
-        None => false,
-    };
-    let pack = outcome?;
+    if let Some(store) = store {
+        super::reload_host(store).await;
+    }
+    let installed = outcome?;
+    let pack = super::list_packs().into_iter().find(|pack| pack.id == installed.id)
+        .unwrap_or(installed);
+    let reloaded = super::host_for_pack(&pack.id).is_some_and(|host| host.status().running);
     let mut result = super::management_snapshot();
     result["pack"] = serde_json::to_value(&pack).map_err(|error| error.to_string())?;
     result["hostError"] = if pack.enabled && !reloaded {
@@ -150,6 +149,7 @@ pub fn start_cached(
         url: platform["url"].as_str().unwrap_or("").to_string(),
         size: platform["size"].as_u64().unwrap_or(0),
         page: String::new(),
+        require_signed: automatic || platform["requireSigned"] == true,
     };
     crate::server::core::update::assert_downloadable(&asset.url).map_err(|error| error.message)?;
     let guard = match task_state::claim(
@@ -181,9 +181,9 @@ pub fn start_cached(
         .insert(id.to_string(), operation.clone());
     persist(id);
     let id = id.to_string();
-    let beta = super::settings::current().beta;
+    let channels = super::settings::current().channels();
     crate::spawn_task(async move {
-        let result = run(&id, &asset, automatic, beta).await;
+        let result = run(&id, &asset, automatic, channels).await;
         let mut finish_value = Value::Null;
         let success = result.is_ok();
         mutate(&id, |operation| {
@@ -219,7 +219,7 @@ async fn run(
     id: &str,
     asset: &update::PackAsset,
     automatic: bool,
-    beta: bool,
+    channels: crate::server::config::UpdateChannels,
 ) -> Result<Value, String> {
     let bytes = update::download(asset, |received, total| {
         mutate(id, |task| {
@@ -240,8 +240,9 @@ async fn run(
     persist(id);
     let expected_id = id.to_string();
     let version = asset.version.clone();
+    let require_signed = automatic || asset.require_signed;
     let prepared = tokio::task::spawn_blocking(move || {
-        packages::prepare(&bytes, Some(&expected_id), Some(&version), automatic)
+        packages::prepare(&bytes, Some(&expected_id), Some(&version), require_signed)
     })
     .await
     .map_err(|error| format!("插件校验任务中断：{error}"))??;
@@ -249,10 +250,11 @@ async fn run(
         let settings = super::settings::current();
         let installed = super::list_packs().into_iter().find(|pack| pack.id == id);
         let allowed = match installed {
-            Some(pack) => settings.auto_update && pack.enabled && pack.signed,
+            Some(pack) => settings.auto_update && pack.enabled && pack.signed
+                && crate::server::core::update::compare_versions(&asset.version, &pack.version) == Some(1),
             None => settings.auto_install_official,
         };
-        if !allowed || settings.beta != beta {
+        if !allowed || !settings.auto_check || settings.channels() != channels {
             return Err("自动安装已关闭或通道已改变，本次下载未安装".to_string());
         }
     }

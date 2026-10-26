@@ -19,15 +19,11 @@
 /* ── 总览卡条 ── */
 .ck-stats {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
   margin-bottom: 14px;
 }
 .ck-stat {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  box-shadow: var(--shadow-1);
   padding: 13px 16px;
   min-width: 0;
 }
@@ -90,25 +86,8 @@
 .ck-region-row > .panel { margin-bottom: 0; min-width: 0; }
 
 @media (max-width: 1080px) {
-  .ck-stats { grid-template-columns: repeat(2, 1fr); }
+  .ck-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
-
-/* ── 提供商行（成长任务那一块）──
-   与 `.ck-row` 同一形态，但多了「整行可点展开」与「展开区」两个语义 ——
-   定时条目行是不可展开的，所以两种外壳各留一份。 */
-.ck-prov-row { border-bottom: 1px solid var(--hairline); }
-.ck-prov-row:last-child { border-bottom: 0; }
-.ck-prov-main {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 11px 16px;
-  cursor: default;
-}
-.ck-prov-main[role='button'] { cursor: pointer; user-select: none; }
-.ck-prov-main[role='button']:hover { background: var(--row-hover); }
-.ck-prov-row.open .ck-prov-main { background: var(--row-hover); }
-.ck-prov-detail { padding: 2px 16px 12px 58px; }
 
 /* ── 行内三段文字（定时条目行在用）──
    `.ck-row-*` 与 `.ck-prov-*` 是同一套形态的两个名字：前者给「可展开的行」
@@ -473,31 +452,6 @@ body.ck-chain-dragging { cursor: grabbing; user-select: none; }
 }
 .ck-refresh:hover { background: var(--control-hover); color: var(--text); }
 
-/* 自动签到徽标：三档色由 data-tone 给 */
-.ck-auto-badge {
-  display: inline-flex;
-  align-items: center;
-  height: 19px;
-  padding: 0 8px;
-  border: 1px solid var(--control-border);
-  border-radius: var(--r-xs);
-  background: var(--control-bg);
-  color: var(--text-2);
-  font-size: 11px;
-  font-weight: 600;
-  white-space: nowrap;
-}
-.ck-auto-badge[data-tone='ok'] {
-  border-color: var(--success-bd);
-  background: var(--success-soft);
-  color: var(--success);
-}
-.ck-auto-badge[data-tone='warn'] {
-  border-color: var(--warning-bd);
-  background: var(--warning-soft);
-  color: var(--warning);
-}
-
 /* 错误条里的「重试」：文字按钮，与页面里其它次要动作同一档 */
 .ck-error-retry {
   padding: 0 6px;
@@ -513,16 +467,16 @@ body.ck-chain-dragging { cursor: grabbing; user-select: none; }
 /* ── 可展开的行 ── */
 .ck-row { border-bottom: 1px solid var(--hairline); }
 .ck-row:last-child { border-bottom: 0; }
-.ck-row-main {
+.ck-row-header { display: flex; align-items: center; }
+.ck-row.open > .ck-row-header { background: var(--row-hover); }
+.ck-row-main { flex: 1; min-width: 0; }
+.ck-row-actions {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 11px 16px;
-  cursor: default;
+  gap: 10px;
+  flex: none;
+  padding-right: 16px;
 }
-.ck-row-main[role='button'] { cursor: pointer; user-select: none; }
-.ck-row-main[role='button']:hover { background: var(--row-hover); }
-.ck-row.open > .ck-row-main { background: var(--row-hover); }
 .ck-row-info { flex: 1; min-width: 0; }
 .ck-row-name {
   display: flex;
@@ -545,25 +499,6 @@ body.ck-chain-dragging { cursor: grabbing; user-select: none; }
   transition: transform .15s;
 }
 .ck-chev.open { transform: rotate(90deg); }
-/* 整行可点时的箭头要单独接点击（不能连带切换整行） */
-.ck-chev-hit { display: inline-flex; cursor: pointer; }
-
-/* 提供商徽标：与账号页 `.prov-logo` 同一组取值 */
-.ck-badge {
-  flex: none;
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
-  display: grid;
-  place-items: center;
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--text-2);
-  background: var(--control-bg);
-  overflow: hidden;
-}
-.ck-badge img { width: 100%; height: 100%; object-fit: contain; }
-
 /* ── 设置行（标签 + 内容）── */
 .ck-sub { font-size: 11.5px; color: var(--text-3); }
 .ck-inline { display: inline-flex; align-items: center; gap: 2px; }
@@ -572,31 +507,11 @@ body.ck-chain-dragging { cursor: grabbing; user-select: none; }
 .ck-set-row { display: flex; align-items: center; gap: 8px; }
 /* 卡内正文留白（旧实现用 Tailwind 的 p-4 = 16px） */
 .ck-panel-pad { padding: 16px; }
-
-/* ── 输入类控件的宽度约束 ──
-   组件库的 Input 自带 `w-full`（`!important`），所以只能压 max-width */
 .ck-sched-name { max-width: 220px; }
 .ck-sched-time-input { max-width: 96px; }
 .ck-chain-input { max-width: 260px; }
 .ck-travel-times { max-width: 320px; }
-.ck-input-select { min-width: 118px; width: auto; }
 .ck-input-search { flex: 1; min-width: 140px; max-width: 260px; }
-/* 下拉框是原生 `<select>`（与组件库 Select 的视觉差异很小，且它是非受控的） */
-.ck-input {
-  height: 30px;
-  padding: 0 10px;
-  border: 1px solid var(--control-border);
-  border-radius: var(--r-md);
-  background: var(--control-bg);
-  color: var(--text);
-  font-family: inherit;
-  font-size: 12.5px;
-  min-width: 0;
-  outline: none;
-}
-.ck-input:hover { border-color: var(--control-border-hover); }
-.ck-input:focus { border-color: var(--primary); box-shadow: var(--ring); }
-
 /* ── 记录页的筛选条与分页 ── */
 .ck-filters {
   display: flex;
@@ -634,3 +549,21 @@ body.ck-chain-dragging { cursor: grabbing; user-select: none; }
 /* ── 任务行（新手福利明细）── */
 .ck-task-title { flex: 1; min-width: 0; }
 .ck-task-pts { font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+
+@media (max-width: 767px) {
+  .ck-tabs { flex-wrap: wrap; gap: 8px; }
+  .ck-row-header { flex-wrap: wrap; }
+  .ck-row-actions { flex-wrap: wrap; justify-content: flex-end; width: 100%; padding: 0 16px 10px 58px; }
+  .ck-row-right { flex-direction: column; align-items: flex-end; gap: 4px; }
+  .ck-row-detail { padding-left: 16px; overflow-x: auto; }
+  .ck-task-line { flex-wrap: wrap; }
+  .ck-welfare-row { flex-wrap: wrap; }
+}
+
+@media (max-width: 420px) {
+  .ck-stats { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ck-chev { transition: none; }
+}

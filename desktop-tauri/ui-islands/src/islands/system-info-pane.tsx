@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
-import { Badge, Button, Switch } from '@ui'
+import { Badge, Button, Switch , Card, CardHeader, CardContent } from '@ui'
 import {
   formatBytes,
   formatCount,
@@ -220,7 +220,7 @@ function toPlainText(info: SystemInfo): string {
     [t('开源许可'), text(app.license)],
     [t('源代码'), text(app.sourceUrl)],
     [t('版权声明'), text(app.copyright)],
-    [t('更新通道'), app.channel === 'beta' ? t('beta 版') : t('正式版')],
+    [t('更新通道'), app.channel === 'both' ? t('正式版与 beta 版') : app.channel === 'beta' ? t('仅 beta 版') : t('仅正式版')],
     [t('数据库 schema'), text(app.schemaVersion)],
     [t('库中 schema'), text(app.dbSchemaVersion)],
   ])
@@ -324,18 +324,18 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 function GroupCard({ title, rows }: { title: string; rows: Array<[string, React.ReactNode]> }) {
   if (!rows.length) return null
   return (
-    <section className='panel'>
-      <div className='panel-head'>
+    <Card render={<section />} className='panel'>
+      <CardHeader className='panel-head'>
         <h2>{title}</h2>
-      </div>
-      <div className='panel-body'>
+      </CardHeader>
+      <CardContent className='panel-body'>
         {rows.map(([label, value], index) => (
           <Row key={`${label}-${index}`} label={label}>
             {value}
           </Row>
         ))}
-      </div>
-    </section>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -367,9 +367,11 @@ function SystemInfoPanel() {
       rows: [
         [t('软件版本'), <span className='sysinfo-mono'>{text(app.version)}</span>],
         [t('开源许可'), text(app.license || 'AGPL-3.0-only')],
-        [t('更新通道'), app.channel === 'beta'
-          ? <Badge variant='warning' shape='tag'>{t('beta 版')}</Badge>
-          : <Badge variant='outline' shape='tag'>{t('正式版')}</Badge>],
+        [t('更新通道'), app.channel === 'both'
+          ? <Badge variant='warning' shape='tag'>{t('正式版与 beta 版')}</Badge>
+          : app.channel === 'beta'
+            ? <Badge variant='warning' shape='tag'>{t('仅 beta 版')}</Badge>
+            : <Badge variant='outline' shape='tag'>{t('仅正式版')}</Badge>],
         [t('数据库 schema'), (
           <span className='sysinfo-mono'>
             {text(app.schemaVersion)}
@@ -465,8 +467,8 @@ function SystemInfoPanel() {
     <>
       {/* 头部：环境徽章 + 三个动作。徽章放在最上面是刻意的 —— 截图里
           最该被一眼看到的就是「他跑在什么环境」。 */}
-      <section className='panel'>
-        <div className='panel-head'>
+      <Card render={<section />} className='panel'>
+        <CardHeader className='panel-head'>
           <h2>{t('版本信息')}</h2>
           <div className='head-actions'>
             <Button variant='outline' onClick={() => void load()} disabled={state.status === 'loading'}>
@@ -476,8 +478,8 @@ function SystemInfoPanel() {
               {t('复制全部信息')}
             </Button>
           </div>
-        </div>
-        <div className='panel-body'>
+        </CardHeader>
+        <CardContent className='panel-body'>
           <div className='sysinfo-headline'>
             <Badge variant='brand'>{deploymentLabel}</Badge>
             <span className='sysinfo-headline-version'>
@@ -524,8 +526,8 @@ function SystemInfoPanel() {
               {t('读取失败：{message}', { message: state.error })}
             </div>
           ) : null}
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
       {/* 分组卡片：宽屏左右两栏、窄屏自动退回一栏（见 CSS 的 .sysinfo-groups）。
           单栏时这一页有六张卡片、四十多行，要滚两屏多；两栏之后一屏能扫完，

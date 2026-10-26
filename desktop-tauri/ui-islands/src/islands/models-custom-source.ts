@@ -41,6 +41,10 @@ export type ManageModel = {
   providerLabel: string
   /** 'remote' / 'builtin' / 'manual'；自定义家留空串（那两列按视图隐藏） */
   source: string
+  kind?: string
+  supports_image_generation?: boolean
+  supports_image_editing?: boolean
+  output_modalities?: string[]
   enabled: boolean
   aliases: string[]
   /** 家级字段：这家清单的最近拉取时刻（毫秒，0 = 未知）；自定义家没有 */
@@ -82,6 +86,7 @@ export type ManageModel = {
    * 界面必须把两者分开显示，否则用户会以为「没有判据」是「确认可见」。
    */
   visibility?: unknown
+  upstreamStatus?: 'undeployed' | null
 }
 
 /** 一条映射（含表格现造的默认绑定：alias == target） */
@@ -96,10 +101,19 @@ export type ManageMapping = {
   carried?: boolean
 }
 
+export type ManageProvider = {
+  provider: string
+  providerLabel: string
+  count: number
+  source: 'none' | 'remote' | 'builtin'
+  refreshedAt: number
+}
+
 /** 一份同形数据（内置家来自 /api/models/manage，自定义家由 buildView 适配） */
 export type ManageView = {
   models?: ManageModel[]
   mappings?: ManageMapping[]
+  providers?: ManageProvider[]
   /** 候选思考等级（只有内置家那份响应带；缺了走 models-reasoning.ts 的兜底表） */
   reasoningLevels?: string[]
 }

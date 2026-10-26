@@ -67,6 +67,8 @@ function signatureOf(items: PoolItem[]): string {
       item.enabled === false ? 0 : 1,
       item.port ?? '',
       item.resolveError ?? '',
+      item.usedBy?.length ?? 0,
+      item.usedByServices?.join(',') ?? '',
     ].join(':'))
     .join('|')
 }

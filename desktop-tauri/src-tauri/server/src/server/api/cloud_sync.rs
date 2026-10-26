@@ -149,6 +149,10 @@ pub async fn post_import_key(State(_state): State<ServerState>, body: Bytes) -> 
 /// 模块一致），为它引入一个错误枚举会让 `settings` / `transport` 全部改签名。
 /// 判据只看几条明确的配置类文案，宁可把少数情况归成 502（重试无害）。
 fn is_config_error(message: &str) -> bool {
+    // GET 的重定向目标来自远端；无效 Location 不是本机地址配置错误。
+    if message.starts_with("WebDAV GET") {
+        return false;
+    }
     message.contains("不能为空")
         || message.contains("未启用")
         || message.contains("请先设置同步密码")

@@ -1,8 +1,13 @@
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
-import { Badge, Button, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle, Progress } from '@ui'
+import {
+  Badge, Button, Card, CardFooter, CardHeader, Collapsible, CollapsibleContent,
+  CollapsibleTrigger, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader,
+  DialogTitle, Input, Progress,
+} from '@ui'
 import { InstalledPluginCard, StorePluginCard } from './plugins-cards'
 import { PluginNotesDialog, type PluginNotes } from './plugins-notes'
+import { PluginPackSettingsDialog } from './plugins-pack-settings'
 import { PluginSettingsDialog } from './plugins-settings'
 import { api, bridge, pluginName, readBase64, toast } from './plugins-shared'
 import type { PackSummary, PluginMutation, PluginOperation, PluginUpdate, PluginsPayload, ReleaseState } from './plugins-types'
@@ -14,6 +19,7 @@ function PluginsPage(): React.ReactElement {
   const [syncError, setSyncError] = React.useState('')
   const [busy, setBusy] = React.useState('')
   const [settingsOpen, setSettingsOpen] = React.useState(false)
+  const [settingsPackId, setSettingsPackId] = React.useState<string | null>(null)
   const [confirmRemove, setConfirmRemove] = React.useState<PackSummary | null>(null)
   const [notes, setNotes] = React.useState<PluginNotes | null>(null)
   const fileRef = React.useRef<HTMLInputElement>(null)
@@ -26,7 +32,7 @@ function PluginsPage(): React.ReactElement {
     const app = bridge().wbApp
     const [refreshed] = await Promise.all([app?.refresh?.(), app?.refreshPluginPages?.(result)])
     if (mounted.current) setSyncError(refreshed === true ? ''
-      : t('插件状态已变更，但账号列表同步失败。请回到账号页点击「刷新列表」重试。'))
+      : t('插件状态已变更，但账号列表同步失败。请回到账号页点击「刷新」重试。'))
   }, [])
 
   const load = React.useCallback(async (): Promise<void> => {
@@ -148,10 +154,16 @@ function PluginsPage(): React.ReactElement {
   const active = operations.some(operation => operation.active)
   const target = payload?.target || ''
   const locked = Boolean(busy)
+  const settingsPack = packs.find(pack => pack.id === settingsPackId)
+  const settingsOperation = operations.find(operation => operation.id === settingsPackId)
+
+  React.useEffect(() => {
+    if (settingsPackId && payload && !settingsPack) setSettingsPackId(null)
+  }, [payload, settingsPack, settingsPackId])
 
   return <>
-    <div className='panel'>
-      <div className='panel-head'>
+    <Card className='panel'>
+      <CardHeader className='panel-head'>
         <div>
           <h2>{t('插件')}</h2>
           <p className='muted'>{t('按需安装插件，为 AI 路由网关扩展提供商能力。插件独立于主程序更新，下载完成后自动校验并安装。')}</p>
@@ -169,9 +181,9 @@ function PluginsPage(): React.ReactElement {
           <Button variant='outline' size='sm' onClick={() => setSettingsOpen(true)}>{t('插件设置')}</Button>
           <Button variant='outline' size='sm' disabled={locked || active} onClick={pickFile}>{t('从文件安装…')}</Button>
         </div>
-      </div>
-      <div className='px-4 pb-4'>
-        <input ref={fileRef} type='file' accept='.zip,application/zip' className='hidden' onChange={event => void onFile(event)} />
+      </CardHeader>
+      <div className='p-4'>
+        <Input ref={fileRef} type='file' accept='.zip,application/zip' className='hidden' onChange={event => void onFile(event)} />
         {error || syncError ? <p className='mb-3 text-[12px] text-destructive'>{error || syncError}</p> : null}
         {busy === 'file' ? <div className='mb-3 flex flex-col gap-2'>
           <span className='text-[12px] text-subtle'>{t('正在读取、校验并安装插件包…')}</span>
@@ -189,9 +201,7 @@ function PluginsPage(): React.ReactElement {
             return <InstalledPluginCard key={pack.id} pack={pack} store={store.find(item => item.id === pack.id)}
               host={host || null} update={update} operation={operation} disabled={locked || operation?.active === true}
               onEnabled={enabled => void mutation(`enable:${pack.id}`, '/api/plugins/enable', { id: pack.id, enabled })}
-              onProvider={(provider, enabled) => void mutation(`provider:${provider.id}`, '/api/plugins/provider', {
-                id: pack.id, provider: provider.id, enabled,
-              })}
+              onSettings={() => setSettingsPackId(pack.id)}
               onRemove={() => setConfirmRemove(pack)} onUpdate={() => void start(pack.id, true)}
               onNotes={() => setNotes({ name: pluginName(pack.id, pack.name), version: update?.latest || '',
                 notes: update?.notes, page: update?.page, prerelease: update?.prerelease })} />
@@ -202,20 +212,36 @@ function PluginsPage(): React.ReactElement {
             ? t('正在读取插件列表…') : t('暂无可安装的插件')}</p>
           <p className='mt-2 text-[12px] text-subtle'>{catalog?.reason || t('可以点击「刷新」读取插件仓库，或从本地 zip 安装插件。')}</p>
         </div> : null}
-        {payload ? <details className='mt-3 rounded-md border border-hairline bg-surface-2 px-3 py-2'>
-          <summary className='cursor-pointer select-none text-[12px] text-subtle'>{t('诊断信息')}</summary>
-          <div className='flex flex-col gap-1 pt-2 text-[12px] text-subtle'>
-            <span>{t('插件目录')} <code className='break-all'>{payload.pluginsDir}</code></span>
-            <span>{t('当前平台')} <code>{payload.target}</code></span>
-            <span>{t('协议版本')} {payload.protocol}</span>
-            {catalog?.reason ? <span className='text-destructive'>{catalog.reason}</span> : null}
-            {host?.lastError ? <span className='text-destructive'>{host.lastError}</span> : null}
-          </div>
-        </details> : null}
+        {payload ? <Collapsible className='mt-3 rounded-md border border-hairline bg-surface-2'>
+          <CollapsibleTrigger render={<Button variant='ghost' />}
+            className='group/diagnostics flex h-auto w-full justify-start gap-2 rounded-md px-3 py-3 text-[12px] text-subtle'>
+            <svg viewBox='0 0 24 24' className='size-3.5 transition-transform duration-150 group-aria-expanded/diagnostics:rotate-90 motion-reduce:transition-none'
+              fill='none' stroke='currentColor' strokeWidth='1.8' strokeLinecap='round' strokeLinejoin='round' aria-hidden='true'>
+              <path d='m9 5 7 7-7 7' />
+            </svg>
+            {t('诊断信息')}
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className='flex flex-col gap-1 px-3 pb-3 text-[12px] text-subtle'>
+              <span>{t('插件目录')} <code className='break-all'>{payload.pluginsDir}</code></span>
+              <span>{t('当前平台')} <code>{payload.target}</code></span>
+              <span>{t('协议版本')} {payload.protocol}</span>
+              {catalog?.reason ? <span className='text-destructive'>{catalog.reason}</span> : null}
+              {host?.lastError ? <span className='text-destructive'>{host.lastError}</span> : null}
+            </div>
+          </CollapsibleContent>
+        </Collapsible> : null}
       </div>
-      <div className='panel-foot'>{t('插件包与主程序分开安装、分开升级。卸载插件后账号数据仍然保留，重新装回即可继续使用；但转发与添加账号需要插件在位。')}</div>
-    </div>
+      <CardFooter className='panel-foot'>{t('插件包与主程序分开安装、分开升级。卸载插件后账号数据仍然保留，重新装回即可继续使用；但转发与添加账号需要插件在位。')}</CardFooter>
+    </Card>
     <PluginSettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} onChanged={check} />
+    {settingsPack ? <PluginPackSettingsDialog key={settingsPack.id} pack={settingsPack}
+      name={store.find(item => item.id === settingsPack.id)?.name}
+      disabled={locked || settingsOperation?.active === true} onClose={() => setSettingsPackId(null)}
+      onEnabled={enabled => void mutation(`enable:${settingsPack.id}`, '/api/plugins/enable', { id: settingsPack.id, enabled })}
+      onProvider={(provider, enabled) => void mutation(`provider:${provider.id}`, '/api/plugins/provider', {
+        id: settingsPack.id, provider: provider.id, enabled,
+      })} /> : null}
     <PluginNotesDialog value={notes} onClose={() => setNotes(null)} />
     <Dialog open={confirmRemove !== null} onOpenChange={next => { if (!next) setConfirmRemove(null) }}>
       <DialogContent>

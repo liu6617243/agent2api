@@ -15,6 +15,7 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.security.MessageDigest;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -46,6 +47,8 @@ public class ApkUpdaterPlugin extends Plugin {
 
     /** 下载中的取消标志（`download` 与 `cancel` 之间共享） */
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
+    private volatile HttpURLConnection activeConnection;
+    private static final long MAX_BYTES = 600L * 1024 * 1024;
 
     /** 目标文件：应用缓存目录下的固定名，重下时覆盖 */
     private File targetFile() {
@@ -57,9 +60,13 @@ public class ApkUpdaterPlugin extends Plugin {
         return new File(dir, "agent2api-update.apk");
     }
 
+    private File partialFile() {
+        return new File(targetFile().getParentFile(), "agent2api-update.apk.part");
+    }
+
     /**
-     * 下载 APK。参数 `{ url }`，`url` 是 Release 资产在 GitHub 上的
-     * `browser_download_url`（手机自己出网，不经网关中转）。
+     * 下载 APK。参数 `{ url, sha256, size }`，校验值由网关从官方 API 获取。
+     * 手机自己出网，不经网关中转。
      *
      * 进度通过 `downloadProgress` 事件推送（`{received, total, percent}`），
      * 界面据此画进度条 —— 不用轮询，省一次往返。
@@ -71,47 +78,50 @@ public class ApkUpdaterPlugin extends Plugin {
             call.reject("缺少下载地址");
             return;
         }
+        String expectedHash = call.getString("sha256", "");
+        if (expectedHash == null) expectedHash = "";
+        if (!expectedHash.isEmpty() && !expectedHash.matches("[0-9a-fA-F]{64}")) {
+            call.reject("官方校验值格式无效");
+            return;
+        }
+        final String hash = expectedHash;
+        final long expectedSize = call.getData().optLong("size", 0);
         cancelled.set(false);
 
         executor.execute(() -> {
             FileOutputStream output = null;
+            InputStream input = null;
+            HttpURLConnection connection = null;
             try {
-                File file = targetFile();
-                // 先删旧包：上一次的残留不能当成本次的结果
-                if (file.exists()) {
-                    //noinspection ResultOfMethodCallIgnored
-                    file.delete();
-                }
+                File file = partialFile();
+                if (file.exists() && !file.delete()) throw new Exception("无法清理上次下载的临时文件");
+                File old = targetFile();
+                if (old.exists() && !old.delete()) throw new Exception("无法清理上次下载的安装包");
+                if (cancelled.get()) throw new Exception("已取消下载");
 
-                HttpURLConnection connection = openFollowingRedirects(url);
+                connection = openFollowingRedirects(url, hash);
                 int status = connection.getResponseCode();
                 if (status != HttpURLConnection.HTTP_OK) {
-                    connection.disconnect();
-                    call.reject("下载失败：服务器返回 HTTP " + status);
-                    return;
+                    throw new Exception("服务器返回 HTTP " + status);
                 }
 
-                long total = connection.getContentLengthLong();
-                InputStream input = connection.getInputStream();
+                long declared = connection.getContentLengthLong();
+                long total = expectedSize > 0 ? expectedSize : declared;
+                if (total > MAX_BYTES || declared > MAX_BYTES) throw new Exception("安装包超过体积上限");
+                input = connection.getInputStream();
                 output = new FileOutputStream(file);
+                MessageDigest digest = MessageDigest.getInstance("SHA-256");
                 byte[] buffer = new byte[64 * 1024];
                 long received = 0;
                 long lastEmit = 0;
+                emitProgress(0, total);
                 int read;
                 while ((read = input.read(buffer)) != -1) {
-                    if (cancelled.get()) {
-                        // 取消：删掉半成品，别让它被误当成完整包
-                        input.close();
-                        output.close();
-                        output = null;
-                        //noinspection ResultOfMethodCallIgnored
-                        file.delete();
-                        call.reject("已取消下载");
-                        return;
-                    }
-                    output.write(buffer, 0, read);
+                    if (cancelled.get()) throw new Exception("已取消下载");
                     received += read;
-                    // 每 ~256KB 推一次进度：太频繁会让 WebView 忙于渲染
+                    if (received > MAX_BYTES) throw new Exception("安装包超过体积上限");
+                    output.write(buffer, 0, read);
+                    digest.update(buffer, 0, read);
                     long now = System.currentTimeMillis();
                     if (now - lastEmit > 200) {
                         lastEmit = now;
@@ -122,48 +132,73 @@ public class ApkUpdaterPlugin extends Plugin {
                 output.close();
                 output = null;
                 input.close();
+                input = null;
+                if (cancelled.get()) throw new Exception("已取消下载");
+                if (received == 0 || (declared > 0 && received != declared)
+                    || (expectedSize > 0 && received != expectedSize)) {
+                    throw new Exception("安装包不完整，已拒绝使用");
+                }
+                if (!hash.isEmpty()) {
+                    StringBuilder actual = new StringBuilder();
+                    for (byte value : digest.digest()) {
+                        actual.append(String.format(java.util.Locale.ROOT, "%02x", value & 0xff));
+                    }
+                    if (!hash.equalsIgnoreCase(actual.toString())) {
+                        throw new Exception("安装包 SHA-256 与 GitHub 官方校验值不一致，已拒绝使用");
+                    }
+                }
+                File target = targetFile();
+                if (!file.renameTo(target)) throw new Exception("无法保存校验后的安装包");
                 emitProgress(received, total);
-
                 JSObject result = new JSObject();
-                result.put("path", file.getAbsolutePath());
+                result.put("path", target.getAbsolutePath());
                 result.put("size", received);
                 call.resolve(result);
             } catch (Exception error) {
-                if (output != null) {
-                    try {
-                        output.close();
-                    } catch (Exception ignored) {
-                        // 关闭失败不影响错误上报
-                    }
-                }
-                // 失败时不留半成品
-                File file = targetFile();
-                if (file.exists()) {
-                    //noinspection ResultOfMethodCallIgnored
-                    file.delete();
-                }
-                call.reject("下载失败：" + error.getMessage());
+                partialFile().delete();
+                call.reject(cancelled.get() ? "已取消下载" : "下载失败：" + error.getMessage());
+            } finally {
+                try { if (input != null) input.close(); } catch (Exception ignored) { }
+                try { if (output != null) output.close(); } catch (Exception ignored) { }
+                if (connection != null) connection.disconnect();
+                activeConnection = null;
+                partialFile().delete();
             }
         });
     }
 
-    /**
-     * 打开连接并**手动**跟随重定向。
-     *
-     * GitHub 的 Release 资产地址（`github.com/…/releases/download/…`）会 302 到
-     * `objects.githubusercontent.com`。`setInstanceFollowRedirects(true)` 看似
-     * 能处理，但它在跨协议（https → https 没问题、https → http 会抛）以及
-     * 某些情况下会丢掉请求头 —— 而 GitHub 要求每个请求都带 User-Agent，
-     * 丢了就直接 403。所以这里自己跟，最多 5 跳。
-     */
-    private HttpURLConnection openFollowingRedirects(String startUrl) throws Exception {
+    /** 下载候选源逐跳校验域名，只有官方校验值存在时才接受第三方源。 */
+    private boolean isGithubAsset(URL url) {
+        String host = url.getHost().toLowerCase(java.util.Locale.ROOT);
+        return "https".equals(url.getProtocol()) && (url.getPort() == -1 || url.getPort() == 443)
+            && (host.endsWith(".githubusercontent.com")
+                || ((host.equals("github.com") || host.equals("www.github.com"))
+                    && url.getPath().contains("/releases/download/")));
+    }
+
+    private HttpURLConnection openFollowingRedirects(String startUrl, String hash) throws Exception {
+        URL origin = new URL(startUrl);
+        if (!"https".equals(origin.getProtocol()) || origin.getUserInfo() != null) {
+            throw new Exception("安装包下载必须使用无凭证的 HTTPS 地址");
+        }
+        if (!isGithubAsset(origin) && hash.isEmpty()) {
+            throw new Exception("加速下载缺少 GitHub 官方校验值");
+        }
         String current = startUrl;
         for (int hop = 0; hop < 5; hop++) {
-            HttpURLConnection connection = (HttpURLConnection) new URL(current).openConnection();
+            if (cancelled.get()) throw new Exception("已取消下载");
+            URL target = new URL(current);
+            boolean sameOrigin = target.getHost().equalsIgnoreCase(origin.getHost())
+                && target.getPort() == origin.getPort();
+            if (!"https".equals(target.getProtocol()) || target.getUserInfo() != null
+                || (!sameOrigin && !isGithubAsset(target))) {
+                throw new Exception("下载源重定向到未允许的地址");
+            }
+            HttpURLConnection connection = (HttpURLConnection) target.openConnection();
+            activeConnection = connection;
             connection.setRequestMethod("GET");
-            connection.setConnectTimeout(30_000);
-            // 读超时给足：几十 MB 的包在慢网下也要能下完
-            connection.setReadTimeout(60_000);
+            connection.setConnectTimeout(8_000);
+            connection.setReadTimeout(hop == 0 ? 8_000 : 30_000);
             connection.setInstanceFollowRedirects(false);
             // GitHub 对没有 User-Agent 的请求直接 403
             connection.setRequestProperty("User-Agent", "agent2api-mobile");
@@ -184,6 +219,7 @@ public class ApkUpdaterPlugin extends Plugin {
                 current = new URL(new URL(current), location).toString();
                 continue;
             }
+            connection.setReadTimeout(30_000);
             return connection;
         }
         throw new Exception("重定向次数过多");
@@ -201,6 +237,8 @@ public class ApkUpdaterPlugin extends Plugin {
     @PluginMethod
     public void cancel(PluginCall call) {
         cancelled.set(true);
+        HttpURLConnection connection = activeConnection;
+        if (connection != null) connection.disconnect();
         call.resolve();
     }
 
@@ -277,6 +315,8 @@ public class ApkUpdaterPlugin extends Plugin {
     @Override
     protected void handleOnDestroy() {
         cancelled.set(true);
+        HttpURLConnection connection = activeConnection;
+        if (connection != null) connection.disconnect();
         executor.shutdownNow();
         super.handleOnDestroy();
     }

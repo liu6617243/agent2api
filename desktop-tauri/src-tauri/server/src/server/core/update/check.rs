@@ -27,15 +27,10 @@
 //! [`UpdateManager::clear_check_cooldown`] 把 `retry_at` 清掉，让用户立刻验证
 //! 新配置；排期不动，定时任务照旧（细节见该方法的说明）。
 //!
-//! ── 两个通道：正式 / beta（`config::KEY_UPDATE_BETA`）──────────
-//! 默认走正式通道（`/releases/latest`，GitHub 自己排除预发布）。「加入 beta 版」
-//! 打开后改问 `/releases` 列表，由 `pick_listed_release` 挑一版 —— **当前跑 beta
-//! 版的人只看预发布**（转正版不算更新，不会自动切回正式版），跑正式版的人预发布
-//! 一并参与（仓库没有 beta 时照旧收正式版更新）。
-//! 拨完开关**下一次检查**就换路（通道每次检查现读），排期与冷却都沿用同一条记录
-//! （它们与通道无关，见上一节）。缓存里那份 Release 是**上一次检查的结论**，
-//! 换通道不会自动作废：界面拨完开关会主动查一次，让面板当场反映新通道的结果。
-//! 两个通道共用同一段字段归一（[`release_json`]），下游不感知差异。
+//! ── 关注通道：正式版 / beta / 同时关注两者 ────────────────────
+//! 正式版默认开启，beta 默认关闭；筛选不再取决于当前安装的是哪个通道。
+//! 同时关注时从列表挑语义化版本最高的一版，只有高于当前版本才提示更新。
+//! 通道变更使旧检查结果失效，但保留请求间隔和 GitHub 限流冷却。
 //!
 //! ── 下载状态为什么仍留在内存 ─────────────────────────────────
 //! 下载任务（`Inner::task`）是「这一次进程正在写哪个文件」的观察值，跨重启
@@ -44,13 +39,13 @@
 
 use serde_json::{json, Value};
 
-use crate::server::config;
+use crate::server::config::{self, UpdateChannels};
 use crate::server::core::task_state::{self, Claim, TaskState};
 use crate::server::logging;
 
 use super::{
     api_base, client, pick_android_apk, pick_asset_by_name, pick_installer, server_bundle_name,
-    version, UpdateError, UpdateManager, CURRENT_VERSION,
+    source, version, UpdateError, UpdateManager, CURRENT_VERSION,
 };
 
 /// GitHub API 探测请求的总超时（下载走 `None`，见 `mod.rs` 的同名说明）。
@@ -102,14 +97,32 @@ impl UpdateManager {
         task_state::read(&self.check_key())
     }
 
+    fn current_channel_result(&self, state: &TaskState) -> bool {
+        state.value.as_ref().is_some_and(|value| {
+            value.get("invalidated").and_then(Value::as_bool) != Some(true)
+                && value.get("channels") == Some(&json!(config::update_channels()))
+        })
+    }
+
     /// 把落盘的那份 Release 装回内存缓存（版本比较与响应组装都读它）。
     fn restore_release(&self, state: &TaskState) {
         self.lock().latest = state
             .value
             .as_ref()
+            .filter(|_| self.current_channel_result(state))
             .and_then(|value| value.get("release"))
             .filter(|value| !value.is_null())
             .cloned();
+    }
+
+    pub fn invalidate_channel(&self) {
+        self.lock().latest = None;
+        if let Err(error) = task_state::store_value(&self.check_key(), json!({ "invalidated": true })) {
+            logging::log("[Update]", &format!("更新通道缓存失效失败：{error}"));
+        }
+        if let Err(error) = task_state::schedule_now(&self.check_key()) {
+            logging::log("[Update]", &format!("更新通道重新排期失败：{error}"));
+        }
     }
 
     /// 把状态组装成给界面看的检查结果。
@@ -120,7 +133,10 @@ impl UpdateManager {
     fn checked_result(&self, current_version: &str, state: &TaskState) -> Value {
         self.restore_release(state);
         let mut result = self.build_check_result(current_version);
-        result["checked"] = json!(state.last_success_at > 0);
+        let channel_current = self.current_channel_result(state);
+        result["checked"] = json!(state.last_success_at > 0 && channel_current);
+        result["channelChanged"] = json!(state.value.is_some() && !channel_current);
+        result["channels"] = json!(config::update_channels());
         result["checkedAt"] = json!(state.last_success_at);
         result["lastAttemptAt"] = json!(state.last_attempt_at);
         result["lastError"] = json!(state.last_error);
@@ -187,13 +203,14 @@ impl UpdateManager {
                 if state.running() || (state.last_error.is_some() && state.retry_at > logging::now_ms()) {
                     return Err(UpdateError::new(waiting_message(&state)));
                 }
-                if state.last_success_at > 0 {
+                if state.last_success_at > 0 && self.current_channel_result(&state) {
                     return Ok(self.checked_result(current_version, &state));
                 }
                 return Err(UpdateError::new(waiting_message(&state)));
             }
         };
-        let outcome = self.fetch_release(current_version).await;
+        let channels = config::update_channels();
+        let outcome = self.fetch_release(channels).await;
         let interval = config::scheduled_settings().update_check.interval * 60_000;
         match outcome {
             Ok((release, retry_at)) => {
@@ -204,8 +221,11 @@ impl UpdateManager {
                 } else {
                     "已完成版本检查".to_string()
                 };
-                let state = guard.finish(true, summary, Some(json!({ "release": release })), retry_at, interval)
+                let state = guard.finish(true, summary, Some(json!({ "release": release, "channels": channels })), retry_at, interval)
                     .map_err(|error| UpdateError::new(error))?;
+                if channels != config::update_channels() {
+                    task_state::schedule_now(&key).map_err(|error| UpdateError::new(error))?;
+                }
                 Ok(self.checked_result(current_version, &state))
             }
             Err((error, retry_at)) => {
@@ -216,39 +236,17 @@ impl UpdateManager {
         }
     }
 
-    /// 拉一次最新 Release，并把**上游给的冷却截止**一并带回。
+    /// 拉取所关注通道的最高版本，并保留上游限流冷却。
     ///
-    /// ── 两个通道 ────────────────────────────────────────────
-    /// 正式通道（默认）问 `/releases/latest`：GitHub 自己排除预发布与草稿。
-    /// 「加入 beta 版」打开后改问 `/releases` 列表，由 [`pick_listed_release`]
-    /// 按版本号挑一版 —— 挑法看**当前跑的是不是 beta 版**（`current_version`
-    /// 带不带预发布段）：跑正式版的人预发布一并参与（没有 beta 时照旧收正式版
-    /// 更新），跑 beta 版的人只看预发布（转正版不算更新，不会把人从 beta 频道
-    /// 拽回正式版）—— 见 `config::KEY_UPDATE_BETA` 与 [`pick_listed_release`]。
-    /// 两条路的返回体**元素同形**，之后共用同一段字段归一（[`release_json`]），
-    /// 所以面板、徽标、下载安装包三条下游都不感知通道差异。
-    ///
-    /// 返回值里的 `Ok(None)` 表示这次没有可更新的一版（404、beta 列表为空、
-    /// 或 beta 通道里当前没有可用 beta）：那不是错误，按「无更新」处理
-    /// （与 Node 版一致）。`Err` 的第二项是冷却截止时刻 —— 失败也要带上它，
-    /// 否则 403 的 `Retry-After` 会被丢掉，下一轮又贴着限额打。
-    ///
-    /// 为什么不用条件请求（`If-None-Match`）：GitHub 的 304 免计限额**要求请求
-    /// 已用 `Authorization` 正确鉴权**（官方文档：a 304 response ... while
-    /// correctly authorized with an Authorization header）。本项目默认是匿名
-    /// 请求，带 ETag 也照样计入限额，反而多一层状态要维护。真正省额度的是
-    /// 排期（本模块）与「带上 GITHUB_TOKEN」（`client::github_headers`）。
-    async fn fetch_release(&self, current_version: &str) -> Result<(Option<Value>, i64), (UpdateError, i64)> {
+    /// 正式版走 `/releases/latest`；包含 beta 时从列表按语义化版本筛选。
+    /// 404 或当前通道没有候选版本视为无更新。
+    async fn fetch_release(
+        &self,
+        channels: UpdateChannels,
+    ) -> Result<(Option<Value>, i64), (UpdateError, i64)> {
         let repository = self.resolve_repository().await;
-        // 通道在**每次检查**时现读（拨完开关下一次检查就换路，不重启进程）
-        let beta = config::update_beta();
-        // 「留在 beta 频道」的判据：开关开着 **且** 当前跑的就是 beta 版。
-        // 跑正式版的人打开开关时仍按全表取最高（仓库没有 beta 时照旧收正式版
-        // 更新 —— 打开开关不该让人反而收不到更新）；已经在 beta 版上的人只看
-        // 预发布，同核心号的转正版不会把人拽回正式版。
-        let prerelease_only = beta && version::is_prerelease_version(current_version);
-        // 更新源根地址：默认 GitHub，`WORKBUDDY_UPDATE_API_BASE` 可指向自建源
-        // （返回体与 GitHub 同形：tag_name / name / body / assets[]…）
+        let beta = channels.beta;
+        // 自建更新源与 GitHub 使用同形的 Release 接口。
         let url = if beta {
             format!(
                 "{}/repos/{repository}/releases?per_page={RELEASE_LIST_PER_PAGE}",
@@ -257,10 +255,22 @@ impl UpdateManager {
         } else {
             format!("{}/repos/{repository}/releases/latest", api_base())
         };
-        let response = client::fetch_with_egress(&url, &client::github_headers(), Some(REQUEST_TIMEOUT_MS))
-            .await.map_err(|error| (error, 0))?;
-        let status = response.status().as_u16();
-        let retry_at = retry_deadline(response.headers(), status);
+        let response = client::fetch_json(
+            &url,
+            &client::github_headers(),
+            REQUEST_TIMEOUT_MS,
+            |payload| {
+                if beta {
+                    payload.is_array()
+                } else {
+                    payload.get("tag_name").and_then(Value::as_str).is_some()
+                }
+            },
+        )
+        .await
+        .map_err(|error| (error, 0))?;
+        let status = response.status.as_u16();
+        let retry_at = retry_deadline(&response.headers, status);
         if status == 404 {
             // 404 有两种来源：正式通道的「仓库还没有任何 Release」（GitHub 官方
             // 行为）、自建更新源没实现被请求的那条路径（`WORKBUDDY_UPDATE_API_BASE`
@@ -274,18 +284,26 @@ impl UpdateManager {
                 "GitHub 接口访问受限，已暂停检查并保留上次结果；也可自行配置 GITHUB_TOKEN 提高限额"
             ), retry_at));
         }
-        if !response.status().is_success() {
-            return Err((UpdateError::new(format!("GitHub 返回 HTTP {status}")), retry_at));
+        if !response.status.is_success() {
+            return Err((
+                UpdateError::new(format!("GitHub 返回 HTTP {status}")),
+                retry_at,
+            ));
         }
-        let payload: Value = response.json().await
-            .map_err(|error| (UpdateError::new(format!("解析 GitHub 响应失败: {error}")), retry_at))?;
-        // beta 通道拿到的是列表，先挑出「这次该更新到的一版」；挑不出来（列表空、
-        // 或只看预发布时一个 beta 都没有）= 无更新，交给 build_check_result 处理
+        let from_official = response.official && source::is_official_api(&url);
+        let payload = response.value;
         let raw = if beta {
-            version::pick_listed_release(&payload, prerelease_only).cloned()
+            version::pick_listed_release(&payload, channels).cloned()
         } else {
-            Some(payload)
+            let prerelease = payload.get("prerelease").and_then(Value::as_bool) == Some(true)
+                || version::is_prerelease_version(payload["tag_name"].as_str().unwrap_or(""));
+            (payload["draft"] != true && channels.accepts(prerelease)).then_some(payload)
         };
+        if from_official {
+            if let Some(release) = raw.as_ref() {
+                super::integrity::remember_release(release, &repository);
+            }
+        }
         Ok((raw.map(|item| release_json(&item, &repository)), retry_at))
     }
 }
@@ -302,34 +320,69 @@ const RELEASE_LIST_PER_PAGE: u32 = 30;
 /// 两个通道共用：正式通道拿到的是单个对象（`/releases/latest`），beta 通道是
 /// 列表里挑出来的一个元素 —— 字段口径按 Node 版逐条对齐，**只在这里出现一次**。
 fn release_json(payload: &Value, repository: &str) -> Value {
-    let text = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+    let text = |key: &str| {
+        payload
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
     let raw_tag = text("tag_name");
-    let tag = raw_tag.strip_prefix('v').or_else(|| raw_tag.strip_prefix('V'))
-        .unwrap_or(&raw_tag).to_string();
+    let tag = raw_tag
+        .strip_prefix('v')
+        .or_else(|| raw_tag.strip_prefix('V'))
+        .unwrap_or(&raw_tag)
+        .to_string();
     let name = text("name");
     let page_url = text("html_url");
     let published_at = text("published_at");
     // 容器内更新的两件套：本机架构的更新包 + 它的 `.sha256` 伴随文件。
     // 包名先算一次（`server_bundle_name()` 在非 Linux 是 None，两个字段
     // 于是都为空 —— 桌面端根本用不到这条链路）。
+    let assets = payload
+        .get("assets")
+        .and_then(Value::as_array)
+        .map(|items| {
+            Value::Array(
+                items
+                    .iter()
+                    .filter(|asset| {
+                        let Some(url) = asset.get("browser_download_url").and_then(Value::as_str)
+                        else {
+                            return false;
+                        };
+                        if source::is_resource(url) {
+                            return url.starts_with(&format!(
+                                "https://github.com/{repository}/releases/download/{raw_tag}/"
+                            ));
+                        }
+                        super::custom_api_base().is_some()
+                            && super::assert_downloadable(url).is_ok()
+                    })
+                    .cloned()
+                    .collect(),
+            )
+        });
+    let assets = assets.as_ref();
     let bundle = server_bundle_name();
     let bundle_asset = bundle
         .as_deref()
-        .and_then(|name| pick_asset_by_name(payload.get("assets"), name));
+        .and_then(|name| pick_asset_by_name(assets, name));
     let bundle_checksums = bundle
         .as_deref()
-        .and_then(|name| pick_asset_by_name(payload.get("assets"), &format!("{name}.sha256")));
+        .and_then(|name| pick_asset_by_name(assets, &format!("{name}.sha256")));
     json!({
         "tag": tag,
         "name": if name.is_empty() { raw_tag } else { name },
         "notes": text("body").chars().take(4000).collect::<String>(),
         "publishedAt": if published_at.is_empty() { text("created_at") } else { published_at },
         "pageUrl": if page_url.is_empty() { format!("https://github.com/{repository}/releases") } else { page_url },
-        "prerelease": payload.get("prerelease").and_then(Value::as_bool) == Some(true),
-        "asset": pick_installer(payload.get("assets")),
+        "prerelease": payload.get("prerelease").and_then(Value::as_bool) == Some(true)
+            || version::is_prerelease_version(&tag),
+        "asset": pick_installer(assets),
         // 手机端（APK）的安装包。与 `asset` 并列而不是二选一：网关可能同时被
         // 电脑和手机访问，两边各自挑自己那份，谁都不该把对方的那条藏起来。
-        "androidAsset": pick_android_apk(payload.get("assets")),
+        "androidAsset": pick_android_apk(assets),
         "serverBundle": bundle_asset.unwrap_or(Value::Null),
         "serverChecksums": bundle_checksums.unwrap_or(Value::Null),
     })

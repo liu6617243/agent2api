@@ -10,6 +10,8 @@
 //!   POST /api/update/token                 保存 / 清除 GitHub 令牌 { token: string | null }
 //!   GET  /api/update/beta                  「加入 beta 版」开关 { enabled }
 //!   POST /api/update/beta                  写「加入 beta 版」{ enabled: bool }
+//!   GET  /api/update/channels              关注通道 { stable, beta }
+//!   POST /api/update/channels              部分更新关注通道 { stable?, beta? }
 //!
 //! ── 容器内更新的三条（Linux headless / Docker 专有）──────────
 //!   POST /api/update/install               校验并应用已下载的更新包（替换二进制与 ui）
@@ -42,6 +44,7 @@ use serde_json::{json, Value};
 
 use crate::server::config;
 use crate::server::core::proxies::{describe_account_proxy, normalize_account_proxy};
+use crate::server::core::{proxy_pool, sub_kernel};
 use crate::server::core::update::{set_token, status_json, UpdateError};
 use crate::server::errors::{management_error, GatewayError};
 use crate::server::http::{ok_json, parse_body};
@@ -104,6 +107,47 @@ async fn dispatch(
         return ok_json(state.update().last_check());
     }
 
+    if method == Method::GET && full_path == "/api/update/github" {
+        return ok_json(json!(config::github_access()));
+    }
+
+    if method == Method::POST && full_path == "/api/update/github" {
+        let payload = match parse_body(body) {
+            Ok(value) => value,
+            Err(error) => return GatewayError::bad_request(error.message).into_response(),
+        };
+        let patch = match serde_json::from_value::<config::GithubAccessPatch>(payload) {
+            Ok(patch) => patch,
+            Err(error) => return GatewayError::bad_request(format!("GitHub 访问设置无效：{error}")).into_response(),
+        };
+        return match config::set_github_access(patch) {
+            Ok((settings, saved, changed)) => {
+                if changed {
+                    state.update().reset_source_preference();
+                    crate::server::core::plugin_host::catalog::schedule_now();
+                }
+                let mut value = json!(settings);
+                value["saved"] = json!(saved);
+                ok_json(value)
+            }
+            Err(message) => GatewayError::bad_request(message).into_response(),
+        };
+    }
+
+    if method == Method::POST && full_path == "/api/update/download-plan" {
+        let payload = match parse_body(body) {
+            Ok(value) => value,
+            Err(error) => return GatewayError::bad_request(error.message).into_response(),
+        };
+        let Some(url) = payload.get("url").and_then(Value::as_str) else {
+            return GatewayError::bad_request("下载方案缺少 url").into_response();
+        };
+        return match crate::server::core::update::download_plan(url).await {
+            Ok(value) => ok_json(value),
+            Err(error) => update_error(error),
+        };
+    }
+
     if method == Method::GET && full_path == "/api/update/proxy" {
         // 「软件更新」的出网线路（设置页更新面板里「检查更新」左侧的下拉读它）。
         // 返回与账号代理**同一个描述形态**（label / config / error）：
@@ -142,13 +186,22 @@ async fn dispatch(
                 let saved = config::set_update_proxy(normalized);
                 if changed {
                     state.update().clear_check_cooldown();
+                    state.update().reset_source_preference();
                     crate::server::core::plugin_host::update::clear_cooldown();
                 }
+                let rebuilding = sub_kernel::installed() && super::proxies::reconcile_listeners(state);
+                let current = config::update_proxy();
+                let referenced = proxy_pool::usage::referenced_pool_ids(Some(state.store()));
+                let borrowed = referenced.iter().map(String::as_str).collect();
+                let opening = rebuilding && current.as_ref()
+                    .and_then(proxy_pool::usage::pool_reference_id)
+                    .is_some_and(|id| proxy_pool::needs_listener(id, &borrowed));
                 // 落库失败仍返回新值（内存快照已生效，本次运行照走新线路），
                 // saved 字段如实带上，调用方要提醒就用它
                 ok_json(json!({
-                    "proxy": describe_account_proxy(config::update_proxy().as_ref()),
+                    "proxy": describe_account_proxy(current.as_ref()),
                     "saved": saved,
+                    "listener": if opening { "opening" } else { "none" },
                 }))
             }
             Err(error) => {
@@ -187,6 +240,7 @@ async fn dispatch(
                 // 令牌不作数（token::stored_token 逐字比较，见 TokenUpdate 说明）
                 if update.changed {
                     state.update().clear_check_cooldown();
+                    state.update().reset_source_preference();
                     crate::server::core::plugin_host::update::clear_cooldown();
                 }
                 // 落库失败仍返回新状态（内存已生效，本次运行照用），saved 如实带
@@ -201,32 +255,41 @@ async fn dispatch(
         };
     }
 
+    if method == Method::GET && full_path == "/api/update/channels" {
+        return ok_json(json!(config::update_channels()));
+    }
+
+    if method == Method::POST && full_path == "/api/update/channels" {
+        let payload = match parse_body(body) {
+            Ok(value) => value,
+            Err(error) => return GatewayError::bad_request(error.message).into_response(),
+        };
+        let patch = match serde_json::from_value::<config::UpdateChannelsPatch>(payload) {
+            Ok(patch) => patch,
+            Err(error) => return GatewayError::bad_request(format!("更新通道设置无效：{error}")).into_response(),
+        };
+        return save_channels(state, patch, false);
+    }
+
     if method == Method::GET && full_path == "/api/update/beta" {
-        // 「加入 beta 版」开关（设置页「更新设置」弹窗里那一枚的读数）。
-        // 只报当前值：开关的效果体现在**下一次检查**上（后端每次检查现读这个键），
-        // 这里不做任何事，也不动缓存里那份上次检查结果。
         return ok_json(json!({ "enabled": config::update_beta() }));
     }
 
     if method == Method::POST && full_path == "/api/update/beta" {
-        // 写：`{enabled: true|false}`。缺字段 / 非布尔一律 400 —— 与 token 那条
-        // 同一纪律（开关就该显式给值，免得某个调用方手滑发个 `{}` 把它关掉）。
         let payload = match parse_body(body) {
             Ok(value) => value,
-            Err(error) => return GatewayError::new(error.message).into_response(),
+            Err(error) => return GatewayError::bad_request(error.message).into_response(),
         };
         let Some(enabled) = payload.get("enabled").and_then(Value::as_bool) else {
             return GatewayError::bad_request("请求体缺少 enabled 字段（须为 true / false）")
                 .into_response();
         };
-        let saved = config::set_update_beta(enabled);
-        // 不做 clear_check_cooldown：那条冷却记的是 GitHub **配额桶**的恢复时刻，
-        // 换通道既没换出口也没换身份，桶还是同一个（与换线路 / 换令牌不同）。
-        // 落库失败仍返回新值（内存已生效，本次运行照走新通道），saved 如实带上。
-        return ok_json(json!({
-            "enabled": config::update_beta(),
-            "saved": saved,
-        }));
+        // 旧界面关闭 beta 时仍表示切回正式版，不能留下两个通道都关闭的状态。
+        let patch = config::UpdateChannelsPatch {
+            beta: Some(enabled),
+            stable: if enabled { None } else { Some(true) },
+        };
+        return save_channels(state, patch, true);
     }
 
     if method == Method::POST && full_path == "/api/update/download" {
@@ -289,6 +352,26 @@ async fn dispatch(
     // 未命中任何一条 → 全局 404 的文案（Node 落到最外层 `sendJson(res, 404, …)`），
     // 注意这个 body **没有 success 字段**
     crate::server::errors::not_found_response(method.as_str(), full_path)
+}
+
+fn save_channels(
+    state: &ServerState,
+    patch: config::UpdateChannelsPatch,
+    legacy: bool,
+) -> Response {
+    let plugins_before = crate::server::core::plugin_host::settings::current();
+    match config::set_update_channels(patch) {
+        Ok((channels, saved, changed)) => {
+            if changed {
+                state.update().invalidate_channel();
+                crate::server::core::plugin_host::settings::notify_changed(plugins_before);
+            }
+            let mut result = if legacy { json!({ "enabled": channels.beta }) } else { json!(channels) };
+            result["saved"] = json!(saved);
+            ok_json(result)
+        }
+        Err(message) => GatewayError::bad_request(message).into_response(),
+    }
 }
 
 /// JS `String(value)`：非字符串也照转（手改的请求体里 name 可能是数字）。

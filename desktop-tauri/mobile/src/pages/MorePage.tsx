@@ -5,6 +5,7 @@ import { apiBase, baseLabel } from '../lib/servers'
 import { isRateLimited } from '../lib/format'
 import { usePullToRefresh, PullIndicator } from '../components/PullToRefresh'
 import { t } from '../i18n'
+import { Card, Button, SegmentedControl } from '@ui'
 
 /**
  * 更多。
@@ -17,33 +18,20 @@ import { t } from '../i18n'
 type Entry = { id: string; label: string; icon: IconName; badge?: string }
 
 export function MorePage() {
-  const { session, pluginPages } = useStore()
+  const { session } = useStore()
   const accounts = session?.accounts?.accounts || []
   const limited = accounts.filter(item => item.enabled && isRateLimited(item)).length
 
   // 本页没有自己的列表请求：下拉只需重拉会话（角标与网关状态都来自它）
   const pull = usePullToRefresh({ onRefresh: () => store.refresh(true) })
 
-  /**
-   * 「签到中心」这一格的来源。
-   *
-   * 插件申报了同名页面就用插件页（`plugin:<pack>:checkin`）—— 页面由插件包
-   * 提供、网关托管，两端看到的是同一份实现。没申报时**整格不出现**：
-   * 页面本身就不存在（签到能力全部来自插件），跳过去只会是空白。
-   */
-  const checkinEntry: Entry | null = (() => {
-    const plugin = pluginPages.find(page => page.key.endsWith(':checkin'))
-    if (!plugin) return null
-    return { id: plugin.key, label: plugin.title, icon: 'checkin' }
-  })()
-
   const groups: Array<{ title: string; entries: Entry[] }> = [
     {
       title: t('转发链路'),
       entries: [
-        ...(checkinEntry ? [checkinEntry] : []),
+        { id: 'checkin', label: t('签到中心'), icon: 'checkin' },
         { id: 'models', label: t('模型管理'), icon: 'model' },
-        { id: 'agent', label: t('Agent 接管'), icon: 'agent' },
+        { id: 'agent', label: t('Agent 配置'), icon: 'agent' },
         { id: 'proxies', label: t('网络代理'), icon: 'proxy' },
         { id: 'keys', label: t('网关 Key'), icon: 'key' },
         { id: 'docs', label: t('接口文档'), icon: 'doc' },
@@ -60,6 +48,7 @@ export function MorePage() {
     {
       title: t('系统'),
       entries: [
+        { id: 'plugins', label: t('网关插件'), icon: 'plugin', badge: session?.accounts?.hiddenAccounts?.total ? String(session.accounts.hiddenAccounts.total) : undefined },
         { id: 'settings', label: t('设置'), icon: 'settings' },
         { id: 'report', label: t('报表'), icon: 'chart' },
       ],
@@ -76,7 +65,7 @@ export function MorePage() {
       />
 
       <div className='m-section' style={{ marginTop: 0 }}>
-        <div className='m-card' style={{ padding: '10px 0' }}>
+        <Card className='m-card' style={{ padding: '10px 0' }}>
           {groups.map((group, index) => (
             <div key={group.title} style={{ padding: index ? '8px 0 4px' : '0 0 4px' }}>
               <div style={{ padding: '0 20px 4px', fontSize: 11.5, fontWeight: 600, color: 'var(--m-text-3)', letterSpacing: '.02em' }}>
@@ -84,7 +73,7 @@ export function MorePage() {
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 4, padding: '4px 10px 10px' }}>
                 {group.entries.map(entry => (
-                  <button
+                  <Button size='default' variant='ghost'
                     key={entry.id}
                     type='button'
                     onClick={() => store.push(entry.id)}
@@ -140,17 +129,17 @@ export function MorePage() {
                         {entry.badge}
                       </span>
                     ) : null}
-                  </button>
+                  </Button>
                 ))}
               </div>
             </div>
           ))}
-        </div>
+        </Card>
       </div>
 
       <div className='m-section'>
         <SectionHead title={t('外观')} />
-        <div className='m-card'>
+        <Card className='m-card'>
           <div className='m-row' style={{ flexWrap: 'wrap', gap: 8 }}>
             <span className='m-logo'>
               <Icon name='moon' />
@@ -161,12 +150,12 @@ export function MorePage() {
             </div>
             <ThemeSwitch />
           </div>
-        </div>
+        </Card>
       </div>
 
       <div className='m-section'>
-        <div className='m-card'>
-          <button type='button' className='m-row' onClick={() => store.push('settings')}>
+        <Card className='m-card'>
+          <Button size='default' variant='ghost' type='button' className='m-row h-auto min-h-[52px] w-full justify-start rounded-none border-0 px-3.5 py-3 text-left' onClick={() => store.push('settings')}>
             <span className='m-logo'>
               <Icon name='server' />
             </span>
@@ -179,8 +168,8 @@ export function MorePage() {
             <span className='m-chev'>
               <Icon name='chev' />
             </span>
-          </button>
-          <button type='button' className='m-row' onClick={() => store.push('docs')}>
+          </Button>
+          <Button size='default' variant='ghost' type='button' className='m-row h-auto min-h-[52px] w-full justify-start rounded-none border-0 px-3.5 py-3 text-left' onClick={() => store.push('docs')}>
             <span className='m-logo'>
               <Icon name='doc' />
             </span>
@@ -191,14 +180,14 @@ export function MorePage() {
             <span className='m-chev'>
               <Icon name='chev' />
             </span>
-          </button>
-        </div>
+          </Button>
+        </Card>
       </div>
 
       <div className='m-section' style={{ paddingBottom: 8 }}>
-        <div className='m-card m-card-pad' style={{ fontSize: 11.5, color: 'var(--m-text-3)', lineHeight: 1.7 }}>
-          {t('手机端只做查看与高频操作；添加账号、编辑凭证、改写客户端配置仍需桌面端。')}
-        </div>
+        <Card className='m-card m-card-pad' style={{ fontSize: 11.5, color: 'var(--m-text-3)', lineHeight: 1.7 }}>
+          {t('手机端可管理所连接网关的账号、签到与插件；添加账号、编辑凭证、改写客户端配置仍需桌面端。')}
+        </Card>
       </div>
     </div>
   )
@@ -212,36 +201,6 @@ export function ThemeSwitch() {
     { value: 'light', label: t('浅色') },
     { value: 'dark', label: t('深色') },
   ]
-  return (
-    <div
-      style={{
-        display: 'flex',
-        gap: 2,
-        padding: 3,
-        borderRadius: 10,
-        background: 'var(--m-surface-3)',
-        flex: 'none',
-      }}
-    >
-      {options.map(option => (
-        <button
-          key={option.value}
-          type='button'
-          onClick={() => store.setTheme(option.value)}
-          style={{
-            padding: '5px 10px',
-            borderRadius: 8,
-            border: 0,
-            fontSize: 11.5,
-            background: theme === option.value ? 'var(--m-surface)' : 'transparent',
-            color: theme === option.value ? 'var(--m-text)' : 'var(--m-text-2)',
-            fontWeight: theme === option.value ? 600 : 400,
-            boxShadow: theme === option.value ? 'var(--m-shadow-1)' : 'none',
-          }}
-        >
-          {option.label}
-        </button>
-      ))}
-    </div>
-  )
+  return <SegmentedControl options={options} value={theme} aria-label={t('主题')}
+    onValueChange={value => store.setTheme(value as 'system' | 'light' | 'dark')} />
 }

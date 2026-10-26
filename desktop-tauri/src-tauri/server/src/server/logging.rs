@@ -23,38 +23,7 @@ use chrono::{TimeZone, Utc};
 use serde_json::Value;
 
 use crate::server::db::Db;
-use crate::server::logs_store::{LogEntry, LogStore, NewEntry};
-
-/// 标签 → 日志分类，与桌面端筛选下拉一致（照抄 Node 版 TAG_CATEGORY）。
-/// 后续切片使用新标签时必须在这里登记，否则会落到默认分类 server。
-///
-/// 定时任务三分类（自动签到 / 凭证自动维护 / 软件版本检查）是**新增**的分类：
-/// 登记前 `[Checkin]` / `[Maintenance]` / `[Update]` 都落到 server —— 历史条目
-/// 保持原分类不动，分类筛选只对今后落库的条目生效。
-const TAG_CATEGORY: &[(&str, &str)] = &[
-    ("[Server]", "server"),
-    ("[Init]", "server"),
-    ("[Config]", "config"),
-    ("[Security]", "config"),
-    ("[Login]", "auth"),
-    ("[Auth]", "auth"),
-    ("[Accounts]", "account"),
-    ("[Models]", "model"),
-    ("[Model]", "model"),
-    ("[Upstream]", "upstream"),
-    // 遗留映射：`[Desensitize]` 已无生产者（那个模块随规则集换成硬编码指纹脱敏
-    // 而删除），留着是为了让**历史日志条目**重放分类时仍落到「脱敏」而不是
-    // 默认的 server —— 与 `logs_store::CATEGORIES` 保留该项同理。
-    ("[Desensitize]", "desensitize"),
-    ("[Logs]", "server"),
-    ("[Billing]", "upstream"),
-    ("[Activity]", "upstream"),
-    ("[Checkin]", "checkin"),
-    ("[Maintenance]", "maintenance"),
-    ("[Update]", "update"),
-    // [HTTP] 为每个入站请求的 verbose 日志，类别与服务日志相同
-    ("[HTTP]", "server"),
-];
+use crate::server::logs_store::{category_for_tag, LogEntry, LogStore, NewEntry};
 
 /// 进程内唯一的日志库实例。启动时由 `init_store` 装入。
 static STORE: OnceLock<LogStore> = OnceLock::new();
@@ -121,9 +90,11 @@ pub fn init_store(db: Option<Db>, verbose: bool) -> bool {
     if STORE.get().is_some() {
         return false;
     }
-    let _ = STORE.set(LogStore::with_db(db, || {
+    let store = LogStore::with_db(db, || {
         crate::server::config::retention_settings().log_days
-    }));
+    });
+    store.prune();
+    let _ = STORE.set(store);
     true
 }
 
@@ -135,6 +106,7 @@ fn store() -> Option<&'static LogStore> {
 /// 是否开启 verbose（默认关闭，与 Node 版一致）
 pub fn is_verbose() -> bool {
     *VERBOSE.get().unwrap_or(&false)
+        || crate::server::config::with_raw(|raw| raw.get("debugMode").and_then(Value::as_bool) == Some(true)).unwrap_or(false)
 }
 
 /// 当前毫秒 Unix 时间戳（对应 Node 版 `Date.now()`）。
@@ -166,11 +138,7 @@ fn timestamp_prefix() -> String {
 
 /// 标签 → 分类；未登记的标签落到 server（对应 Node 版 `TAG_CATEGORY[tag] || 'server'`）
 fn category_of(tag: &str) -> &'static str {
-    TAG_CATEGORY
-        .iter()
-        .find(|(name, _)| *name == tag)
-        .map(|(_, category)| *category)
-        .unwrap_or("server")
+    category_for_tag(tag).unwrap_or("server")
 }
 
 /// 从标签与消息推断级别，照抄 Node 版 inferLevel 的正则语义，但不引入 regex 依赖：
@@ -286,6 +254,9 @@ pub fn log(tag: &str, text: &str) {
 /// 调用方手里就有失败数，按它选 `"info"` / `"error"` 即可。
 pub fn log_with_level(tag: &str, text: &str, level: &str) {
     console_line(tag, text);
+    if matches!(level, "debug" | "verbose" | "trace") && !is_verbose() {
+        return;
+    }
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return;
@@ -340,6 +311,9 @@ pub fn log_event(
     message: &str,
     data: Option<Value>,
 ) -> Option<LogEntry> {
+    if matches!(level, "debug" | "verbose" | "trace") && !is_verbose() {
+        return None;
+    }
     let store = store()?;
     store.append(NewEntry {
         level,

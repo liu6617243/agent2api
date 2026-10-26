@@ -49,12 +49,14 @@ pub mod aggregate;
 pub mod cancellation;
 pub mod connections;
 pub mod continuation;
+mod images;
 pub mod refusal;
 pub mod request;
 mod payload;
 mod provider_loop;
 mod rotate;
 mod route_state;
+mod route_sticky;
 pub mod sse;
 pub mod stall;
 pub mod translate;
@@ -314,6 +316,16 @@ impl UpstreamService {
         (snapshot.sunk, snapshot.resting, snapshot.open)
     }
 
+    pub fn route_sticky_sessions(&self, model: Option<&str>, now: i64) -> Vec<Value> {
+        self.route.sticky_list(model, now, crate::server::core::routing::sticky_ttl_ms(
+            crate::server::config::routing_settings().sticky,
+        ))
+    }
+
+    pub fn clear_route_sticky(&self, id: Option<&str>, model: Option<&str>) -> usize {
+        self.route.sticky_clear(id, model)
+    }
+
     /// 账号级活跃连接计数句柄（`api::accounts` 的 `/api/accounts/connections` 读它）。
     ///
     /// 返回克隆（内部 `Arc`）而不是引用：`ServerState` 的 handler 各持一份克隆，
@@ -332,6 +344,22 @@ impl UpstreamService {
     ///     一个卡住的前序请求被无限期挂住。
     ///   - **槽位一直占到大半个响应结束**（流式请求也一样，见 InFlightGuard）。
     pub async fn forward(&self, request: ForwardRequest) -> Result<ForwardOutcome, GatewayError> {
+        self.forward_request(request, None, false).await
+    }
+
+    pub async fn forward_assistant(&self, request: ForwardRequest) -> Result<ForwardOutcome, GatewayError> {
+        self.forward_request(request, None, true).await
+    }
+
+    pub async fn generate_images(&self, request: ForwardRequest) -> Result<ForwardOutcome, GatewayError> {
+        self.forward_request(request, Some(crate::server::core::providers::images::ImageOperation::Generate), false).await
+    }
+
+    pub async fn edit_images(&self, request: ForwardRequest) -> Result<ForwardOutcome, GatewayError> {
+        self.forward_request(request, Some(crate::server::core::providers::images::ImageOperation::Edit), false).await
+    }
+
+    async fn forward_request(&self, request: ForwardRequest, images: Option<crate::server::core::providers::images::ImageOperation>, preserve_system_prompt: bool) -> Result<ForwardOutcome, GatewayError> {
         // ── 调试模式：为本次请求装一个原始报文采集器 ─────────────────
         // 装在这里（转发入口）而不是各家适配器里：四条路径（流式 / 非流式 ×
         // 无状态 / 有状态）都要采，装一次全都覆盖到。开关关着时**不创建**
@@ -359,10 +387,12 @@ impl UpstreamService {
         // `handoff()` 把归属移进响应流，非流式路径随本函数返回而析构释放。
         // 于是「连接数」与去重槽位共享同一条生命周期，不会有第二条释放路径。
         let mut connections = ConnectionGuard::new(self.connections.clone());
-        // 无论客户端要不要流式，上游都必须以 stream:true 请求
+        // 对话统一向上游请求流式；Images 保留独立的请求形态。
         let mut upstream_body = request.body.clone();
-        if let Some(object) = upstream_body.as_object_mut() {
-            object.insert("stream".to_string(), Value::Bool(true));
+        if images.is_none() {
+            if let Some(object) = upstream_body.as_object_mut() {
+                object.insert("stream".to_string(), Value::Bool(true));
+            }
         }
         // ── 历史 sanitize（客户端带来的畸形工具历史）─────────────────
         // 客户端会把上游偶发产出的畸形工具调用（空 name、丢配对、把别的消息
@@ -386,7 +416,7 @@ impl UpstreamService {
         // `ProviderContext` 传下去的（见 `ProviderContext::prompt`），提前释放
         // 会让它悬空 —— 所以先取一份快照、再从它取两个读数值。
         let config = crate::server::config::current();
-        let sanitize_fingerprints = config.sanitize_fingerprints();
+        let sanitize = config.sanitize_settings();
         let developer_role_compat = config.developer_role_compat();
         let prompt = config.prompt_plan();
         // Key 的提供商白名单随请求带进转发上下文：它要活过整条转发链
@@ -403,11 +433,13 @@ impl UpstreamService {
         let context = payload::ProviderContext {
             body: &upstream_body,
             stream: request.stream,
+            images,
             client_headers: &request.client_headers,
             telemetry: &request.telemetry,
-            sanitize_fingerprints,
+            sanitize,
             developer_role_compat,
             prompt,
+            preserve_system_prompt,
             key_scope: key_scope.as_ref(),
             pinned_account: pinned_account.as_deref(),
             // bool 是 Copy，直接读：不存在上面那两条的借用问题

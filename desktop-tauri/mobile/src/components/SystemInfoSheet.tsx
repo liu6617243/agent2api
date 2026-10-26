@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Sheet, SheetContent, SheetHeader, SheetBody, SheetTitle, SheetFooter } from '@ui'
+import { Sheet, SheetContent, SheetHeader, SheetBody, SheetTitle, SheetFooter , Card, Button } from '@ui'
 import { apiCall } from '../api/client'
 import { APP_VERSION } from '../lib/appUpdate'
 import { isPackaged, nativePlatform } from '../lib/servers'
@@ -201,7 +201,7 @@ export function SystemInfoSheet({ open, onClose }: { open: boolean; onClose: () 
       '',
       `[${t('网关')}]`,
       `${t('版本')}: ${text(app.version)}`,
-      `${t('更新通道')}: ${app.channel === 'beta' ? t('beta 版') : t('正式版')}`,
+      `${t('更新通道')}: ${app.channel === 'both' ? t('正式版与 beta 版') : app.channel === 'beta' ? t('仅 beta 版') : t('仅正式版')}`,
       `${t('运行形态')}: ${deploymentLabel}`,
       `${t('操作系统')}: ${osFull} (${text(runtime.arch)})`,
       `${t('监听地址')}: ${text(deployment.host)}:${text(deployment.port)}`,
@@ -226,26 +226,26 @@ export function SystemInfoSheet({ open, onClose }: { open: boolean; onClose: () 
           <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--m-text-3)', padding: '2px 2px 6px' }}>
             {t('本机')}
           </div>
-          <div className='m-card'>
+          <Card className='m-card'>
             <Row label={localLabel} value={`v${APP_VERSION}`} mono />
             <Row
               label={t('运行形态')}
               value={formLabel}
             />
-          </div>
+          </Card>
 
           {/* 网关：连的那台服务器的读数 */}
           <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--m-text-3)', padding: '14px 2px 6px' }}>
             {t('网关')}
           </div>
           {error ? (
-            <div className='m-card' style={{ padding: '12px 14px', color: 'var(--m-danger)', fontSize: 12.5, lineHeight: 1.6 }}>
+            <Card className='m-card' style={{ padding: '12px 14px', color: 'var(--m-danger)', fontSize: 12.5, lineHeight: 1.6 }}>
               {t('读取网关信息失败：{message}', { message: error })}
-            </div>
+            </Card>
           ) : (
-            <div className='m-card'>
+            <Card className='m-card'>
               <Row label={t('软件版本')} value={text(app.version)} mono />
-              <Row label={t('更新通道')} value={app.channel === 'beta' ? t('beta 版') : t('正式版')} />
+              <Row label={t('更新通道')} value={app.channel === 'both' ? t('正式版与 beta 版') : app.channel === 'beta' ? t('仅 beta 版') : t('仅正式版')} />
               <Row label={t('运行形态')} value={deploymentLabel} />
               <Row
                 label={t('操作系统')}
@@ -264,7 +264,7 @@ export function SystemInfoSheet({ open, onClose }: { open: boolean; onClose: () 
               />
               <Row label={t('模型')} value={text(stats.models)} mono />
               <Row label={t('网关 Key 数量')} value={text(security.apiKeyCount)} mono />
-            </div>
+            </Card>
           )}
 
           {/* 路径：只在拿得到时显示（读不到就不占版面） */}
@@ -273,7 +273,7 @@ export function SystemInfoSheet({ open, onClose }: { open: boolean; onClose: () 
               <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--m-text-3)', padding: '14px 2px 6px' }}>
                 {t('位置')}
               </div>
-              <div className='m-card'>
+              <Card className='m-card'>
                 {deployment.configDir ? (
                   <Row label={t('数据目录')} value={text(deployment.configDir)} mono />
                 ) : null}
@@ -287,14 +287,14 @@ export function SystemInfoSheet({ open, onClose }: { open: boolean; onClose: () 
                 {deployment.logFile ? (
                   <Row label={t('日志文件')} value={text(deployment.logFile)} mono />
                 ) : null}
-              </div>
+              </Card>
             </>
           ) : null}
 
           {/* 隐藏用户名：与桌面端同一个后端参数 */}
-          <button
+          <Button size='default' variant='ghost'
             type='button'
-            className='m-row'
+            className='m-row h-auto min-h-[52px] w-full justify-start rounded-none border-0 px-3.5 py-3 text-left'
             onClick={toggleHide}
             style={{ marginTop: 14, borderTop: '1px solid var(--m-line)' }}
           >
@@ -310,7 +310,7 @@ export function SystemInfoSheet({ open, onClose }: { open: boolean; onClose: () 
             <Badge tone={hideUsername ? 'ok' : 'mute'}>
               {hideUsername ? t('已隐藏') : t('显示')}
             </Badge>
-          </button>
+          </Button>
 
           {loading ? (
             <div style={{ fontSize: 12, color: 'var(--m-text-3)', padding: '10px 2px' }}>
@@ -319,10 +319,10 @@ export function SystemInfoSheet({ open, onClose }: { open: boolean; onClose: () 
           ) : null}
         </SheetBody>
         <SheetFooter>
-          <button type='button' className='m-btn' onClick={copyAll}>
+          <Button size='touch' variant='default' type='button' className='m-btn w-full' onClick={copyAll}>
             <Icon name='copy' />
             {t('复制全部信息')}
-          </button>
+          </Button>
         </SheetFooter>
       </SheetContent>
     </Sheet>

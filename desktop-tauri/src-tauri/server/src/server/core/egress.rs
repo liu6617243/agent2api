@@ -312,6 +312,70 @@ pub fn client_without_redirects(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::C
     }
 }
 
+pub fn image_download_client(
+    proxy: Option<&ResolvedProxy>,
+    system_proxy_when_unset: bool,
+    host: &str,
+    addresses: &[std::net::SocketAddr],
+) -> Result<reqwest::Client, String> {
+    let timeouts = crate::server::config::timeout_settings();
+    let mut builder = base_builder(&timeouts)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, addresses);
+    if let Some(proxy) = proxy {
+        let parsed = reqwest::Proxy::all(build_proxy_url(proxy))
+            .map_err(|_| "图片下载代理无效".to_string())?;
+        builder = builder.proxy(parsed);
+    } else if !system_proxy_when_unset {
+        builder = builder.no_proxy();
+    }
+    builder.build().map_err(|_| "无法创建图片下载连接".to_string())
+}
+
+pub fn client_for_github(proxy: Option<&ResolvedProxy>) -> Result<Arc<reqwest::Client>, String> {
+    let timeouts = crate::server::config::timeout_settings();
+    let key = format!("github|{}", cache_key(proxy, &timeouts));
+    {
+        let mut guard = lock_clients();
+        let cache = guard.get_or_insert_with(ClientCache::default);
+        cache.clock += 1;
+        let now = cache.clock;
+        if let Some(entry) = cache.entries.get_mut(&key) {
+            entry.used_at = now;
+            return Ok(entry.client.clone());
+        }
+    }
+    // 跳转逐跳检查域名和凭证，客户端构造失败不能回落到自动跟转的客户端。
+    let client = Arc::new(build_client_with(proxy, &timeouts, true)?);
+    let mut guard = lock_clients();
+    let cache = guard.get_or_insert_with(ClientCache::default);
+    cache.clock += 1;
+    let now = cache.clock;
+    if let Some(entry) = cache.entries.get_mut(&key) {
+        entry.used_at = now;
+        return Ok(entry.client.clone());
+    }
+    while cache.entries.len() >= MAX_CLIENTS {
+        let Some(oldest) = cache
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.used_at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.entries.remove(&oldest);
+    }
+    cache.entries.insert(
+        key,
+        CacheEntry {
+            used_at: now,
+            client: client.clone(),
+        },
+    );
+    Ok(client)
+}
+
 /// 跟随系统代理的 Client（进程级缓存一份）。
 ///
 /// 与 `client_for` 不同**不进 LRU**：它没有「出口参数」这一维，进程内一份

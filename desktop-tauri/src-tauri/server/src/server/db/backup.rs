@@ -649,7 +649,7 @@ fn format_sql_blob(bytes: &[u8]) -> String {
 
 /// 快照里各业务表的行数（导出统计；只数被导出的表）。
 fn table_row_counts(conn: &Connection, skip: &[&str]) -> Vec<Value> {
-    let known = ["kv", "accounts", "logs", "requests", "request_daily", "debug_traffic", "request_raw", "account_usage_records"];
+    let known = ["kv", "accounts", "logs", "requests", "request_daily", "debug_traffic", "request_raw", "account_usage_records", "account_limiter_events"];
     known
         .iter()
         .filter(|table| !skip.contains(table))

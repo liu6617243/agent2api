@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Badge, Button, Checkbox, Input, Switch } from '@ui'
+import { Badge, Button, Checkbox, Input, Switch , Label, Card, CardHeader } from '@ui'
 import {
   patch, removeScheduleEntry, runScheduleEntry, saveKeepaliveModels,
   saveScheduleEntry, saveTravel, runTravelNow, store, toggleMaster,
@@ -9,6 +9,8 @@ import {
   type CheckinCenter, type CheckinResult, type ScheduleEntry,
 } from './checkin-types'
 import { t } from '../i18n'
+import { confirmDialog } from '@ui'
+import { Empty } from '@ui'
 
 /**
  * 「定时签到」标签页：总开关 + 条目列表 + 保活模型链 + 猫猫旅行。
@@ -93,33 +95,33 @@ function EditorForm({ entry, options }: {
             <span className="ck-mini-note">
               到点时逐个签到，已勾 {providers.length} / {options.length} 家
             </span>
-            <button
+            <Button size='default' variant='ghost'
               type="button"
               className="ck-mini-btn"
               disabled={store.saving}
               onClick={() => setProviders(options.map(item => item.id))}
             >
               全选
-            </button>
-            <button
+            </Button>
+            <Button size='default' variant='ghost'
               type="button"
               className="ck-mini-btn"
               disabled={store.saving || providers.length === 0}
               onClick={() => setProviders([])}
             >
               清空
-            </button>
+            </Button>
           </div>
           <div className="ck-range">
             {options.map(option => (
-              <label className="ck-range-item" key={option.id}>
+              <Label className="ck-range-item" key={option.id}>
                 <Checkbox
                   checked={providers.includes(option.id)}
                   disabled={store.saving}
                   onCheckedChange={checked => toggleProvider(option.id, checked === true)}
                 />
                 <span className="ck-range-name" title={option.label}>{option.label}</span>
-              </label>
+              </Label>
             ))}
           </div>
           {providers.length === 0
@@ -228,9 +230,9 @@ function EntryRow({ entry, options, masterOn }: {
             variant="ghost"
             className="text-destructive"
             disabled={store.saving}
-            onClick={() => {
+            onClick={async () => {
               const name = entry.displayLabel || entry.time || entry.id
-              if (!window.confirm(`确定删除「${name}」？删除后到点不再执行。`)) return
+              if (!await confirmDialog(`确定删除「${name}」？删除后到点不再执行。`)) return
               void removeScheduleEntry(entry.id)
             }}
           >
@@ -346,8 +348,8 @@ function KeepalivePanel({ center }: { center: CheckinCenter }): React.ReactEleme
   }
 
   return (
-    <section className="panel ck-chain-panel">
-      <div className="panel-head">
+    <Card render={<section />} className="panel ck-chain-panel">
+      <CardHeader className="panel-head">
         <h2>保活模型链</h2>
         <span className="panel-sub">WorkBuddy 国际版日活任务的免费模型 · 全局一份，与条目无关</span>
         <Button
@@ -359,14 +361,14 @@ function KeepalivePanel({ center }: { center: CheckinCenter }): React.ReactEleme
         >
           {store.saving ? '保存中…' : '保存'}
         </Button>
-      </div>
+      </CardHeader>
       <div className="ck-panel-pad">
         <div className="ck-set-line ck-set-line-top">
           <span className="ck-set-k">模型清单</span>
           <span className="ck-set-v">
             <div className="ck-mini-row">
               <span className="ck-mini-note">按序逐个尝试，共 {models.length} 个</span>
-              <button
+              <Button size='default' variant='ghost'
                 type="button"
                 className="ck-mini-btn"
                 disabled={store.saving || defaults.length === 0}
@@ -374,7 +376,7 @@ function KeepalivePanel({ center }: { center: CheckinCenter }): React.ReactEleme
                 onClick={() => setDraft([...defaults])}
               >
                 填入缺省链
-              </button>
+              </Button>
             </div>
             <div className="ck-chain">
               {models.map((model, index) => (
@@ -390,7 +392,7 @@ function KeepalivePanel({ center }: { center: CheckinCenter }): React.ReactEleme
                   </span>
                   <span className="ck-chain-name" title={model}>{model}</span>
                   <span className="ck-chain-index">#{index + 1}</span>
-                  <button
+                  <Button size='default' variant='ghost'
                     type="button"
                     className="ck-chain-del"
                     disabled={store.saving}
@@ -399,11 +401,11 @@ function KeepalivePanel({ center }: { center: CheckinCenter }): React.ReactEleme
                     onClick={() => setDraft(models.filter((_, keep) => keep !== index))}
                   >
                     ×
-                  </button>
+                  </Button>
                 </div>
               ))}
               {models.length === 0
-                ? <div className="ck-chain-empty">清单为空 —— 保存后恢复缺省链</div>
+                ? <Empty className="ck-chain-empty">清单为空 —— 保存后恢复缺省链</Empty>
                 : null}
             </div>
             <div className="ck-chain-add">
@@ -434,7 +436,7 @@ function KeepalivePanel({ center }: { center: CheckinCenter }): React.ReactEleme
           当天去重 + 幂等领取：重复执行只会拿到「已领取」，不会重复加分。
         </div>
       </div>
-    </section>
+    </Card>
   )
 }
 
@@ -465,10 +467,10 @@ function TravelPanel({ center }: { center: CheckinCenter }): React.ReactElement 
   }
 
   return (
-    <section className="panel">
-      <div className="panel-head">
+    <Card render={<section />} className="panel">
+      <CardHeader className="panel-head">
         <h2>猫猫旅行定时排程</h2>
-        {/* 问号提示：宿主有 tooltip.js，`data-tip` 是它的契约 —— 迁到宿主后
+        {/* 问号提示：宿主有 desktop-tooltip.tsx，`data-tip` 是它的契约 —— 迁到宿主后
             这条提示才真正长得和别的页一样（iframe 里拿不到那个脚本） */}
         <span className="tip-q" data-tip={TRAVEL_TIP} />
         <span className="panel-sub">每天定点巡检 · 一趟推进一步 · 与签到排程互相独立</span>
@@ -481,7 +483,7 @@ function TravelPanel({ center }: { center: CheckinCenter }): React.ReactElement 
         >
           {travel.running ? '巡检中…' : '立即巡检全部'}
         </Button>
-      </div>
+      </CardHeader>
       <div className="ck-panel-pad">
         {isPaused ? (
           <div className="ck-note">
@@ -533,7 +535,7 @@ function TravelPanel({ center }: { center: CheckinCenter }): React.ReactElement 
           </div>
         ) : null}
       </div>
-    </section>
+    </Card>
   )
 }
 
@@ -553,8 +555,8 @@ export function ScheduleTab({ center }: { center: CheckinCenter }): React.ReactE
 
   return (
     <div className="ck-main">
-      <section className="panel">
-        <div className="panel-head">
+      <Card render={<section />} className="panel">
+        <CardHeader className="panel-head">
           <h2>定时签到</h2>
           <span className="tip-q" data-tip={SCHEDULE_TIP} />
           <span className="panel-sub">每条条目各有时刻与范围 · 各自当天去重 · 错过时点开机自动补签</span>
@@ -567,7 +569,7 @@ export function ScheduleTab({ center }: { center: CheckinCenter }): React.ReactE
           >
             {store.editingId === 'new' ? '收起新建' : '添加条目'}
           </Button>
-        </div>
+        </CardHeader>
         <div className="ck-panel-pad">
           <div className="ck-set-line">
             <span className="ck-set-k">总开关</span>
@@ -604,12 +606,12 @@ export function ScheduleTab({ center }: { center: CheckinCenter }): React.ReactE
             <EntryRow key={entry.id} entry={entry} options={options} masterOn={auto?.enabled === true} />
           ))}
           {entries.length === 0 && store.editingId !== 'new' ? (
-            <div className="ck-empty">
+            <Empty className="ck-empty">
               还没有定时条目 —— 点「添加条目」建一条，或到「签到中心」手动签到。
-            </div>
+            </Empty>
           ) : null}
         </div>
-      </section>
+      </Card>
 
       {/* 两块地区专属面板：由插件申报的 adminPanels 决定。
           国内版与国际版默认都启用，所以两块**会同时出现** —— 那种情况收进

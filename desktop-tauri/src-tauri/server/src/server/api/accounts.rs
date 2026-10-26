@@ -4,6 +4,7 @@
 //!                                       provider 与顶层 providers 摘要）
 //!   POST   /api/accounts                手动添加账号（accessToken/refreshToken JSON）
 //!   GET    /api/accounts/export         导出全部账号（含 token，换机器后导入继续用）
+//!   POST   /api/accounts/export-files   导出单账号或本组的逐账号文件 { id? / provider? }
 //!   POST   /api/accounts/import         导入账号（merge：按 uid 匹配，命中更新、未命中追加）
 //!   POST   /api/accounts/current        把账号置顶（仅调整全局优先级）{ id }
 //!   POST   /api/accounts/batch          批量操作（见 accounts_batch.rs）
@@ -358,6 +359,7 @@ pub async fn dispatch(
     // ② 固定子路径（Node 版把它们放在 `<id>` 通配之前的原因）
     match (method.as_str(), rest) {
         ("GET", "export") => return export_accounts(&state),
+        ("POST", "export-files") => return super::accounts_export::account_files(&state, body).await,
         ("POST", "import") => return import_accounts(&state, body).await,
         ("POST", "current") => return set_current(&state, body).await,
         ("POST", "batch") => return batch_accounts(&state, body).await,
@@ -560,6 +562,9 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         .and_then(Value::as_str)
         .map(str::to_string);
     let import_name = name.as_deref();
+    if let Some(response) = super::accounts_export::import_account_file(state, provider, &payload, import_name) {
+        return response;
+    }
     // ── 「文件导入」三字段（均为可选；文件导入契约）─────────────
     // 用户在界面上**手选**桌面客户端的凭证文件时，前端把文件内容放进这些字段：
     //   - `authFileContent`：文件文本内容（JSON 类文件，前端已读过整个文件）；

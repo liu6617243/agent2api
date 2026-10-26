@@ -93,22 +93,6 @@ pub const SCOPE_ATOMCODE: &str = "atomcode";
 /// LobsterAI（网易有道「有道龙虾」）的模型目录缓存槽
 pub const SCOPE_LOBSTERAI: &str = "lobsterai";
 
-/// 全部 scope（事实来源：`cached_scopes` 按它遍历；新增一家时加在这里）。
-pub const ALL_SCOPES: &[&str] = &[
-    SCOPE_WORKBUDDY,
-    SCOPE_WORKBUDDY_INTL,
-    SCOPE_CATPAW,
-    SCOPE_AUTOCLAW_CN,
-    SCOPE_AUTOCLAW_INTL,
-    SCOPE_CODEARTS,
-    SCOPE_LOOMY,
-    SCOPE_MONKEYCODE_CN,
-    SCOPE_MONKEYCODE_INTL,
-    SCOPE_ANTIGRAVITY,
-    SCOPE_ATOMCODE,
-    SCOPE_LOBSTERAI,
-];
-
 /// 一份清单缓存
 pub struct CachedCatalog {
     /// 落地后的清单（各家内存状态的形态）
@@ -178,16 +162,41 @@ pub fn save(scope: &str, models: &[Value], fetched_at: i64) {
     }
 }
 
-/// 库里有缓存的 scope 及各自的拉取时刻（启动日志用）。
-///
-/// 让「这次启动的清单是从缓存恢复的、是什么时候拉的」在日志里留痕 ——
-/// 没有它，排障时「清单是刚拉的还是上次的」只能靠翻数据库回答。
-/// 一次读库（不是逐 scope 调 [`load`]）：整份缓存本来就在一行里。
+pub fn load_legacy(provider: &str) -> Option<CachedCatalog> {
+    super::catalog_legacy::load(provider)
+}
+
+pub fn save_migrated(scope: &str, cached: CachedCatalog) -> Option<CachedCatalog> {
+    let Some(db) = db() else { return Some(cached) };
+    let (catalog, written) = db.with(|conn| {
+        let mut all = read_all(conn).unwrap_or_default();
+        if let Some(entry) = all.get(scope) {
+            if let Some(models) = entry.get("models").and_then(Value::as_array) {
+                if models.iter().any(|model| model.get("id").and_then(Value::as_str)
+                    .is_some_and(|id| !id.trim().is_empty()))
+                {
+                    return (CachedCatalog {
+                        models: models.clone(),
+                        fetched_at: entry.get("fetchedAt").and_then(Value::as_i64).unwrap_or(0),
+                    }, true);
+                }
+            }
+        }
+        all.insert(scope.to_string(), json!({ "models": cached.models, "fetchedAt": cached.fetched_at }));
+        let written = write_all(conn, &all);
+        (cached, written)
+    })?;
+    if !written {
+        logging::verbose("[Models]", &format!("旧模型清单迁移写入失败（{scope}）：本次仍沿用旧缓存"));
+    }
+    Some(catalog)
+}
+
+/// 库里存在的非空缓存及拉取时刻；不代表该目录已装入当前插件。
 pub fn cached_scopes() -> Vec<(String, i64)> {
     let Some(db) = db() else { return Vec::new() };
     let Some(all) = db.with(read_all).flatten() else { return Vec::new() };
     all.iter()
-        .filter(|(scope, _)| scope.starts_with("plugin:") || ALL_SCOPES.contains(&scope.as_str()))
         .filter_map(|(scope, entry)| {
             let models = entry.get("models").and_then(Value::as_array)?;
             if models.is_empty() {

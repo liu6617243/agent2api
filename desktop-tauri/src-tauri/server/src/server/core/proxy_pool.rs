@@ -46,11 +46,9 @@
 //!     禁用只影响本端的取用。
 //!
 //! ── 端口跟随引用（双向对账，`api::proxies::reconcile_listeners`）────
-//! 专用端口只为账号转发而存在（测试走统一测试口，见下节），于是「引用 ⇄
-//! 端口」两个方向都自动收敛：新增引用补监听器，**失去引用（删账号 / 改走
-//! 别的代理）回收端口**。账号每次写操作后对账一次，缺口非空就投一次内核
-//! 重建（重建按最新引用全量重算，一次同时补缺与回收）。「无引用却还挂着
-//! 端口」因此只是两次重建之间的瞬时态，不是需要用户手动清理的状态。
+//! 专用端口服务账号转发与更新、下载等服务线路（引用合集见 `usage`）。新增
+//! 引用补监听器，失去全部引用则回收端口；账号或更新线路保存后对账，缺口
+//! 非空才投内核重建。测试走统一测试口，不参与引用统计。
 //!
 //! ── 测试走统一测试口（不占节点端口）────────────────────────
 //! 内核里有一个固定的「测试口」监听器，背后是 select 策略组（成员 = 全部
@@ -58,7 +56,7 @@
 //! `sub_kernel::runtime::select_test_node`），**不为被测节点开专用端口**。
 //! 于是「先测一个节点、测通了再决定给哪个账号用」这条最自然的用法零成本 ——
 //! 曾经为此存在的 `pinned`（测试前把条目钉住、请内核补建、等端口写回）
-//! 整套机制随之退役。专用端口只服务真正在用的节点（账号引用，lazy listeners）；
+//! 整套机制随之退役。专用端口只服务被账号或服务线路引用的节点（lazy listeners）；
 //! 未引用的节点条目端口为 null（「未分配端口」），这是正常状态而不是待补建的缺口。
 
 //! ── 同步（`sync_clash`，对标 OmniProxy 的 syncClashVergeListeners）──
@@ -98,6 +96,8 @@ use serde_json::{json, Map, Value};
 use crate::server::core::proxies::{resolve_account_proxy, ProxyResolution};
 use crate::server::db::Db;
 use crate::server::logging;
+
+pub mod usage;
 
 /// `kv` 表里的键名（保留键，见 `db::schema::RESERVED_KV_KEYS`）
 pub const KV_KEY: &str = "proxyPool";
@@ -334,9 +334,7 @@ pub fn resolve_item(item: &Value) -> Option<ProxyResolution> {
         json!({ "source": "clash", "listenerUid": text_of(item, "listenerUid") })
     } else if source == "subscription" {
         let Some(port) = valid_port(item.get("port")) else {
-            // 两种「没有端口」要分开说：节点还在但还没有账号引用它（lazy
-            // listeners 只给引用中的节点开监听器；刚保存引用的话，内核可能
-            // 还在重建），与节点已被订阅移除 —— 处置动作完全不同。
+            // 无引用或内核重建中的节点没有端口，与所属订阅已移除分开报错
             //
             // 「没有端口」是未引用节点的**正常状态**而不是待补建的缺口：
             // 测试走统一测试口（见模块头），不再需要端口；地址只在「真在用」
@@ -344,7 +342,7 @@ pub fn resolve_item(item: &Value) -> Option<ProxyResolution> {
             let node_alive = crate::server::core::subscriptions::ids()
                 .contains(&text_of(item, "providerId"));
             return Some(ProxyResolution::Failed(if node_alive {
-                "该节点还没有监听端口（还没有账号引用它 —— 在账号里选它并保存后，内核会自动开端口）".to_string()
+                "该节点的监听端口尚未就绪（在账号或更新设置中选中并保存后，内核会自动分配端口；已保存的请稍等或检查内核状态）".to_string()
             } else {
                 "订阅节点已不存在（订阅更新后节点被移除，等下一次同步或重新订阅）".to_string()
             }));
@@ -887,7 +885,7 @@ pub struct SubscriptionNodeTarget {
     pub sub_name: String,
     /// 节点名（条目名的后半段；同时是内核配置里监听器绑定的出口名）
     pub node: String,
-    /// 内核监听端口；**None = 未分配**（lazy listeners：内核只为被账号引用的
+    /// 内核监听端口；**None = 未分配**（lazy listeners：只为账号或服务线路引用的
     /// 节点开监听器，未引用的节点仍镜像进池供浏览选择，端口为空 —— 引用后
     /// 由对账链路触发内核重启补上，见 `api::proxies::reconcile_listeners`）
     pub port: Option<u16>,
@@ -1022,7 +1020,7 @@ pub fn unprovision_subscription_nodes() -> Result<usize, String> {
 
 /// 被引用的订阅节点键集合（`<订阅id>::<节点名>`，与内核端口注册表的键同一形态）。
 ///
-/// `pool_ids` 是账号 proxy 指向的池条目 id（调用方从账号存储收集）。id 不在池里
+/// `pool_ids` 是账号与服务线路的池引用合集（`usage::referenced_pool_ids`）。id 不在池里
 /// 的引用（条目已被删）查不出节点、自然跳过 —— 那类引用解析时本来就会报「不存在」。
 /// 内核的 `allocate_listeners` 用它决定「哪些节点开监听器」（lazy listeners）。
 ///
@@ -1047,7 +1045,7 @@ pub fn subscription_node_keys(pool_ids: &std::collections::HashSet<&str>) -> std
         .collect()
 }
 
-/// 内核该给哪些节点开监听器：**账号引用中的条目**（禁用中的不算）。
+/// 内核该给哪些节点开监听器：**账号或服务线路引用中的条目**（禁用中的不算）。
 ///
 /// 内核侧（`runtime::listener_node_keys`）与对账判定
 /// （`api::proxies::reconcile_listeners`）都从这一处取，必须同一口径
@@ -1085,9 +1083,8 @@ pub fn test_target(id: &str) -> Result<TestTarget, String> {
 
 /// 这条订阅条目现在**需要监听器却没有端口**吗（启用后要不要补建的判据）。
 ///
-/// 判据与 `listener_node_keys` 完全同口径（账号引用，禁用中的不算），只是限定
-/// 到一条：条目自身已启用（禁用中的节点不要监听器）、是订阅节点、端口还空着，
-/// 且确实被引用。`referenced` 是账号引用中的池条目 id 集合（调用方从账号存储取）。
+/// 判据与 `listener_node_keys` 完全同口径（账号或服务线路引用，禁用中的不算），
+/// 只是限定到一条：订阅条目已启用、端口还空着，并且在 `referenced` 引用合集里。
 ///
 /// 与内核侧同口径是硬要求：口径不一致就会出现「判定说没有缺口、内核却不建」
 /// 这类谁也解释不清的状态（补建那条链的注释里也写着同一句话）。
@@ -1101,7 +1098,6 @@ pub fn needs_listener(id: &str, referenced: &std::collections::HashSet<&str>) ->
     if valid_port(item.get("port")).is_some() {
         return false;
     }
-    // `listener_node_keys` 的唯一来源是账号引用；条目已启用，引用即算数
     referenced.contains(id)
 }
 

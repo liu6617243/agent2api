@@ -1,6 +1,7 @@
 //! 管理 API 的 HTTP 客户端。
 //!
 //! 职责：
+//!   - 等待本进程后端就绪，再读取凭证并发送管理请求
 //!   - 从配置目录读 API Key 并自动带上（网关开启鉴权时否则全是 401）
 //!   - 统一解包 `{ success, data }` 信封，只把 data 交给前端
 //!   - 超时保护：签到、批量查询这类接口本身较慢，给足 60 秒
@@ -123,7 +124,11 @@ fn unwrap_envelope(text: &str, status: u16) -> Result<Value, String> {
                     text.trim().to_string()
                 });
             }
-            return Err(text.trim().to_string());
+            return Err(if text.trim().is_empty() {
+                format!("本地代理返回 HTTP {status}，响应内容为空")
+            } else {
+                text.trim().to_string()
+            });
         }
     };
 
@@ -134,6 +139,7 @@ fn unwrap_envelope(text: &str, status: u16) -> Result<Value, String> {
             .get("error")
             .or_else(|| payload.get("message"))
             .map(describe_error)
+            .filter(|message| !message.trim().is_empty())
             .unwrap_or_else(|| format!("HTTP {status}"));
         return Err(detail);
     }
@@ -184,9 +190,8 @@ pub fn config_dir() -> PathBuf {
 /// 请求就生效」这条性质不变，且壳侧不再依赖 `config.json` 文件存在。
 ///
 /// ── 未初始化时的行为 ────────────────────────────────────────
-/// `config::current()` 在快照未装入时按「空配置 + 环境变量」临时构造一份
-/// （见它的说明），所以启动极早期（`config::init` 之前）调用本函数不会 panic，
-/// 只是可能拿不到 Key —— 而那段窗口里还没有管理 API 请求要发。
+/// `config::current()` 在快照未装入时按「空配置 + 环境变量」临时构造一份。
+/// 管理请求和直连凭证出口必须先等待本进程启动完成，不能把临时空值带进页面缓存。
 fn read_api_key() -> Option<String> {
     crate::server::config::current()
         .active_api_keys()
@@ -296,6 +301,7 @@ pub async fn call_with_timeout(
     body: Option<&Value>,
     timeout_ms: u64,
 ) -> Result<Value, String> {
+    crate::startup::wait().await?;
     // 到期前先把令牌换掉：这一步让「access 过期 → 401 → 续期」不再发生。
     // 只靠下面那个 401 分支的话，每次过期都必然产生一条 401（壳里后台轮询
     // 每 20 秒一轮，服务端每 2 小时准时记一条）。失败静默，交给 401 分支兜底。
@@ -308,7 +314,8 @@ pub async fn call_with_timeout(
             .and_then(Value::as_str)
             == Some("panel_login_required");
         if needs_login && crate::panel_session::refresh().await {
-            return Ok(send_once(method, path, body, timeout_ms).await?.payload);
+            let retried = send_once(method, path, body, timeout_ms).await?;
+            return unwrap_envelope(&retried.text, retried.status);
         }
     }
     unwrap_envelope(&first.text, first.status)
@@ -350,20 +357,25 @@ async fn send_once(
 /// 401 同样先续期再重试一次（与 [`call`] 同一取向）—— 导出日志的请求也走
 /// 管理面鉴权，access 过期时不该让用户看到一条莫名其妙的失败。
 pub async fn call_text(method: &str, path: &str) -> Result<String, String> {
+    crate::startup::wait().await?;
     // 与 call_with_timeout 同一取向：到期前先续期，别让这条请求去撞 401
     crate::panel_session::refresh_if_expiring().await;
     let first = send_text_once(method, path).await?;
     if first.status == 401 && crate::panel_session::refresh().await {
         let retried = send_text_once(method, path).await?;
-        if retried.status == 401 {
-            return Err("HTTP 401".to_string());
-        }
-        return Ok(retried.text);
+        return checked_text(retried);
     }
-    if first.status == 401 {
-        return Err("HTTP 401".to_string());
+    checked_text(first)
+}
+
+fn checked_text(response: TextResponse) -> Result<String, String> {
+    if !(200..300).contains(&response.status) {
+        return match unwrap_envelope(&response.text, response.status) {
+            Err(message) => Err(message),
+            Ok(_) => Err(format!("HTTP {}", response.status)),
+        };
     }
-    Ok(first.text)
+    Ok(response.text)
 }
 
 /// 一次文本请求的原始结果（保留状态码供 401 判定）。

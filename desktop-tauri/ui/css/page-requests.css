@@ -5,17 +5,6 @@
    页脚分页栏是通用件（islands/table-shell.tsx），样式在 layout.css。
    颜色一律取 tokens.css 的语义变量，浅色深色共用同一组声明。
    ───────────────────────────────────────────── */
-
-/* ── 提供商 / 模型两个维度筛选（本次新增）─────────────────────
-   宽度由 page-logs.css 的 `.log-filters select { width: auto }
-
-` 定成「按内容」，
-   这里只加上限：模型名可以很长（claude-sonnet-4-5-20250929 之类），
-   不设上限时它会按最长选项把触发器撑得很宽、把时间档位挤到换行。
-   截断只发生在**触发器**上（显示省略号）；选项完整文案在浮层里
-   （select.js 的浮层宽度独立算：至少与触发器同宽、最长 320px）。
-   两个上限按各自的内容量级取：提供商名最长是「AutoClaw 国内版」（约 110px），
-   模型名普遍再长一档。 */
 .log-filters #req-provider { max-width: 168px; }
 .log-filters #req-model { max-width: 200px; }
 
@@ -39,7 +28,7 @@
 .req-head {
   display: grid;
   grid-template-columns: var(--req-cols,
-    92px minmax(0, 1.1fr) 52px 96px minmax(0, 1.3fr) 110px 96px minmax(0, 1.6fr) minmax(0, 1.2fr) 60px);
+    92px minmax(0, 1.1fr) 52px 96px minmax(0, 1.3fr) 110px 140px 96px minmax(0, 1.6fr) minmax(0, 1.2fr) 60px);
   gap: 12px;
   align-items: center;
   padding: 10px 14px;
@@ -119,56 +108,11 @@
 /* 没有阶段可读的在途行（旧数据、更早版本写入的行，见 request-phase.js 的
    FALLBACK_CLS）回落成改造前那枚「进行中」：info 蓝，与下面「连接中」同色
    —— 它们本来就是同一档语义，只是这枚说不出「卡在哪一步」。 */
-.badge.tag.running {
-  background: var(--info-soft);
-  border: 1px solid var(--info-bd);
-  color: var(--info);
-}
-
-.badge.tag.phase-connecting {
-  background: var(--info-soft);
-  border-color: var(--info-bd);
-  color: var(--info);
-}
-
-.badge.tag.phase-waiting {
-  background: oklch(0.62 0.12 200 / 12%);
-  border-color: oklch(0.62 0.12 200 / 32%);
-  color: oklch(0.5 0.13 205);
-}
-
-.badge.tag.phase-streaming {
-  background: var(--ok-soft);
-  border-color: var(--ok-bd);
-  color: var(--ok);
-}
-
-.badge.tag.phase-retrying {
-  background: var(--warn-soft);
-  border-color: var(--warn-bd);
-  color: var(--warn);
-}
 
 /* 排队中：既不是失败（不取 warn）也不是正常推进（不取 ok），
    用「信息」档的紫蓝，与「等待响应」的青蓝区分开 */
-.badge.tag.phase-queued {
-  background: oklch(0.62 0.14 285 / 12%);
-  border-color: oklch(0.62 0.14 285 / 32%);
-  color: oklch(0.5 0.16 290);
-}
 
 @media (prefers-color-scheme: dark) {
-  .badge.tag.phase-waiting {
-    background: oklch(0.72 0.11 200 / 15%);
-    border-color: oklch(0.72 0.11 200 / 34%);
-    color: oklch(0.8 0.1 200);
-  }
-
-  .badge.tag.phase-queued {
-    background: oklch(0.72 0.13 285 / 15%);
-    border-color: oklch(0.72 0.13 285 / 34%);
-    color: oklch(0.82 0.12 288);
-  }
 }
 
 /* 状态列两行（徽章 + 阶段计时）——只在进行中的行上出现。
@@ -200,28 +144,6 @@
   font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-/* 徽章里的呼吸圆点：1.2s 一拍的不透明度脉动 —— 不用进度条，
-   状态列那点宽度塞不下，圆点的「活着」感刚好。currentColor 跟随
-   徽章文字色，深浅主题都由 --info 一处决定。 */
-.req-live-dot {
-  flex: 0 0 auto;
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: currentColor;
-  animation: req-live-pulse 1.2s ease-in-out infinite;
-}
-
-@keyframes req-live-pulse {
-  0%, 100% { opacity: .3; transform: scale(.75); }
-  50% { opacity: 1; transform: scale(1); }
-}
-
-/* 系统开了「减少动态效果」就停在常亮：信息还在，动效退场 */
-@media (prefers-reduced-motion: reduce) {
-  .req-live-dot { animation: none; opacity: .8; }
 }
 
 /* ─── 导航徽标的「进行中」态 ──────────────────────────────────
@@ -307,7 +229,8 @@
 
 /* 客户端：产品名（Codex / Claude Code …），普通文本 + 尾部省略。
    与提供商 / 账号同档字号，不用等宽（它不是标识符）。 */
-.req-row .req-client {
+.req-row .req-client,
+.req-row .req-api-key {
   min-width: 0;
   overflow: hidden;
   color: var(--text-2);
@@ -421,6 +344,7 @@
   .req-head .req-retry { grid-row: 1; grid-column: 4 / 5; }
   .req-head .req-target,
   .req-head .req-client,
+  .req-head .req-api-key,
   .req-head .req-dur,
   .req-head .req-usage,
   .req-head .req-error-cell { display: none; }
@@ -438,6 +362,7 @@
   /* 第四行：客户端（左，跨到详情按钮之前）+ 详情（贴右）。
      客户端不挤进第二行 —— 那一行右侧已经给了用时，96px 装不下「GitHub Copilot」 */
   .req-row .req-client { grid-row: 4; grid-column: 1 / 4; }
+  .req-row .req-api-key { grid-row: 5; grid-column: 1 / 4; }
   .req-row .req-detail { grid-row: 4; grid-column: 4 / 5; justify-self: end; }
   /* 「-」占位不再独占一行：窄窗口下空行比省略号更难解释 */
   .req-row .req-error-cell { display: none; }
@@ -549,16 +474,14 @@
    浅深两套各写一份：同一组紫在浅底与深底上需要的明度不同。
    .badge.tag.sensitive 是详情弹窗「请求详情」网格里的展开形态（词 × 次数），
    与列表的悬停标签共用同一套紫（见 islands/request-detail.tsx 的 sensitiveHtml）。 */
-.req-hover-tag.sensitive,
-.badge.tag.sensitive {
+.req-hover-tag.sensitive {
   background: oklch(0.55 0.18 305 / 14%);
   border: 1px solid oklch(0.55 0.18 305 / 32%);
   color: oklch(0.45 0.18 305);
 }
 
 @media (prefers-color-scheme: dark) {
-  .req-hover-tag.sensitive,
-  .badge.tag.sensitive {
+  .req-hover-tag.sensitive {
     background: oklch(0.7 0.16 305 / 16%);
     border-color: oklch(0.7 0.16 305 / 34%);
     color: oklch(0.82 0.12 305);
@@ -749,17 +672,16 @@
 
 /* 折叠块：思考过程 / 工具结果 / 解析降级的原文 */
 .cv-details { margin-top: 6px; min-width: 0; }
-.cv-details > summary {
-  cursor: pointer;
+.cv-details > [data-slot="collapsible-trigger"] {
   color: var(--text-3);
   font-size: 11.5px;
   user-select: none;
 }
-.cv-details[open] > summary { margin-bottom: 4px; }
+.cv-details > [data-slot="collapsible-trigger"][data-panel-open] { margin-bottom: 4px; }
 .cv-reasoning { color: var(--text-2); font-size: 12px; }
 
 /* 工具结果：全宽虚线框，与对话气泡在视觉上区分开 */
-details.cv-tool {
+.cv-tool {
   max-width: 88%;
   padding: 6px 10px;
   border: 1px dashed var(--border-strong);
@@ -769,7 +691,7 @@ details.cv-tool {
   font-size: 12px;
 }
 
-details.cv-tool > summary { cursor: pointer; color: var(--text-3); }
+.cv-tool > [data-slot="collapsible-trigger"] { color: var(--text-3); }
 
 /* 工具调用块（助手气泡内）：标题 + 参数原文 */
 .cv-toolcall { margin-top: 8px; }

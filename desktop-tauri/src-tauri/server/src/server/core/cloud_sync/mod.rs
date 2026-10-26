@@ -349,6 +349,8 @@ pub(crate) async fn download_locked(
         crate::server::config::reload();
         // 余额事实表重读：选路依赖它（账号可能被换掉了一半）
         crate::server::core::usage_records::reload_facts();
+        crate::server::core::limiter::sources::reload();
+        crate::server::core::limiter::counter::invalidate();
         applied
     };
 

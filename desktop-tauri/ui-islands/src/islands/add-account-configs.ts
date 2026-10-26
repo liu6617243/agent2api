@@ -138,6 +138,11 @@ export const maxLengthOf = (field: FieldSpec): number =>
 
 /* ─── 各家配置 ─────────────────────────────── */
 
+const JSON_CREDENTIAL_FILE: NonNullable<ProviderConfig['fileImport']> = {
+  accept: '.json,application/json',
+  note: t('选择包含该提供商凭证的 JSON 文件，或本软件导出的单账号 JSON 文件。导入后凭证保存在网关，可独立使用。'),
+}
+
 const RACCOON: ProviderConfig = {
   // raccoon_accounts::add_raccoon_account：token / access_token、refreshToken / refresh_token、name
   provider: 'raccoon',
@@ -217,6 +222,7 @@ const CATPAW: ProviderConfig = {
 const AUTOCLAW: ProviderConfig = {
   provider: 'autoclaw',
   label: t('AutoClaw 国内版'),
+  fileImport: JSON_CREDENTIAL_FILE,
   manualNote: t('token 支持 enc: 前缀（Windows 上自动解密）。未填 refreshToken 无法自动续期。'),
   // 国内版**唯一**的官方登录方式（它的登录页不渲染 OAuth 按钮，已核对构建产物）
   smsLogin: {
@@ -240,6 +246,7 @@ const AUTOCLAW_INTL: ProviderConfig = {
   // （appId/appKey 两地逐字相同，已实测），只有站点不同。
   provider: 'autoclaw-intl',
   label: t('AutoClaw 国际版'),
+  fileImport: JSON_CREDENTIAL_FILE,
   manualNote: t('国际版与国内版账号体系独立，请填国际版的凭证。未填 refreshToken 无法自动续期。'),
   // OAuth 网页登录：国际版**唯一**的登录方式（登录页只渲染 Zai / Google 两个按钮）。
   // 与另外五家的差别：授权地址前有一次强制风控验证码（阿里云滑块），
@@ -392,6 +399,7 @@ function zcodeForm(spec: { provider: string; label: string; site: string; planNo
   return {
     provider,
     label,
+    fileImport: JSON_CREDENTIAL_FILE,
     // 本家没有「桌面端实时登录态」可导入：凭证在它自己的加密存储里，
     // 没有 auth.json 那种稳定可读的形态（与 Accio 同一处境）
     desktop: false,
@@ -559,6 +567,7 @@ const TRAE: ProviderConfig = {
 const LOOMY: ProviderConfig = {
   provider: 'loomy',
   label: 'Loomy',
+  fileImport: JSON_CREDENTIAL_FILE,
   smsLogin: {
     noteHtml: t('用 Loomy 账号绑定的手机号登录：点「获取验证码」后填入即可。这是本家最省事的入口。'),
   },
@@ -618,7 +627,7 @@ const KUKU: ProviderConfig = {
   desktopHint: t('读取本机 KukuAI 客户端登录态（%APPDATA%\\baidugenflowpro\\Network\\Cookies），需已在 KukuAI 客户端登录'),
   desktopNote: t('读本机客户端当前登录态（明文 Cookie，无需解密）。客户端运行时 Cookies 文件被独占占用，导入前请先关闭 KukuAI 客户端。'),
   // 「导入凭证文件」：**二进制** SQLite（文件名就叫 Cookies、没有后缀），
-  // 前端读 base64 传 authFileB64（文本字段对这家明确 400）。
+  // 原生文件读 base64 传 authFileB64；软件导出的 JSON 走统一单账号回流。
   // 与 desktop 那条的关键差别：网关读的是用户选中文件的**副本**（先解成临时
   // 文件再解析），不碰客户端正在用的那份 —— 因此这里无需先关闭客户端，
   // 文案要把这一点说清，否则用户会以为与上面那条同一个坑。
@@ -711,6 +720,7 @@ const MONKEYCODE_INTL = monkeycodeForm({
 const COMMANDCODE: ProviderConfig = {
   provider: 'commandcode',
   label: t('Command Code'),
+  fileImport: JSON_CREDENTIAL_FILE,
   desktop: false,
   manualTitle: t('粘贴 API Key'),
   manualNote: t('粘贴 Command Code 的 API Key（user_ 开头；从官方 CLI 的 ~/.commandcode/auth.json 或网页 studio 获取）。整行 / 带引号 / 带 Bearer 前缀地粘都行，网关会自己剥成裸 key。key 不过期、也没有续期接口，失效后重新获取即可；添加时网关会做一次轻量探活，失败不影响添加。'),
@@ -795,6 +805,7 @@ const ANTIGRAVITY: ProviderConfig = {
 const OFFICEACE: ProviderConfig = {
   provider: 'officeace',
   label: t('OfficeAce 果办'),
+  fileImport: JSON_CREDENTIAL_FILE,
   desktop: false,
   webLogin: {
     // 整段是一个 t() 键：扫描器只认字符串字面量（拼接串提不到键），所以不拆行
@@ -855,6 +866,7 @@ const OFFICEACE: ProviderConfig = {
 const ORCATERM: ProviderConfig = {
   provider: 'orcaterm',
   label: 'OrcaTerm',
+  fileImport: { ...JSON_CREDENTIAL_FILE, accept: '.json,.bin,application/json' },
   // 网页登录（后端 providers::orcaterm::login）：打开**官方 OAuth 授权页**，
   // 它直接跳到微信二维码；扫完上游把浏览器带回自定义协议
   // `orcaterm://oauth_callback?session_id=…`，壳侧截下这一跳交回网关换令牌。
@@ -901,6 +913,7 @@ const ORCATERM: ProviderConfig = {
 const CHATGLM: ProviderConfig = {
   provider: 'chatglm',
   label: '智谱清言',
+  fileImport: JSON_CREDENTIAL_FILE,
   guestLogin: {
     noteHtml: t('不需要登录：点下面的按钮，网关会直接在智谱清言换发一份<strong>访客凭证</strong>并加入账号列表（也可以先填个备注名）。访客凭证可以直接用来对话，免费额度由上游按设备发放。<br><br><strong>注意</strong>：访客账号<strong>没有积分体系</strong> —— 它与「会员积分」「每日登录积分」「活动领取」相关的接口一律需要登录，因此那些能力对访客会如实跳过（账号页的积分、签到中心都不显示读数）。想要积分就用「填写凭证」粘一个已登录账号的令牌，或「导入桌面端登录态」。'),
     button: t('添加访客账号'),
@@ -954,6 +967,7 @@ function modelscopeForm(spec: {
   return {
     provider,
     label,
+    fileImport: JSON_CREDENTIAL_FILE,
     // 没有桌面客户端，也就没有可导入的登录态文件（理由见上方注释）
     desktop: false,
     manualTitle: t('粘贴 API 令牌'),
@@ -999,6 +1013,7 @@ const MODELSCOPE_INTL = modelscopeForm({
 const ATOMCODE: ProviderConfig = {
   provider: 'atomcode',
   label: t('AtomCode'),
+  fileImport: JSON_CREDENTIAL_FILE,
   desktop: false,
   webLogin: {
     // 整段是一个 t() 键：扫描器只认字符串字面量（拼接串提不到键），所以不拆行

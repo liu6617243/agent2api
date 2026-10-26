@@ -3,13 +3,14 @@
 import * as React from 'react'
 import {
   Button, Checkbox, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader,
-  DialogSection, DialogTitle, Input, Label, NavItem, Select, SelectContent,
+  DialogSection, DialogTitle, Input, Label, NavList, NavItem, Select, SelectContent,
   SelectItem, SelectTrigger, SelectValue, Switch,
+  Field, FieldGroup, FieldLabel,
 } from '@ui'
 import { t } from '../i18n'
 import {
   ACCOUNT_CONCURRENCY_MAX as CONC_MAX, errorMessage, shared, toast,
-  type AccountRecord, type LimiterRule,
+  type AccountRecord, type LimiterGroup,
 } from './accounts-shared'
 import {
   displayNameOf, providerFeatures, providerOf, supportsPlanChannel, supportsUsage,
@@ -24,8 +25,10 @@ import {
   balanceSpecOf, readBalanceQueryChanges, type BalanceFieldKey,
 } from './balance-query'
 import { limiterDraftOf, LimiterSection, readLimiterChanges } from './accounts-dialog-limiter'
-import { allAccounts, findAccount } from './accounts-data'
+import { allAccounts, findAccount, syncBalancesSnapshot } from './accounts-data'
+import { refreshSavedAccounts, updateAccountConfirmed } from './accounts-update'
 import { draftOfProxy, ProxyForm, readProxyDraft, type ProxyDraft, type ProxyPayload } from './accounts-proxy-form'
+import { Sidebar } from '@ui'
 
 /** 与后端 custom_providers::MAX_NAME_CHARS 一致。 */
 const MAX_PROVIDER_NAME_CHARS = 64
@@ -55,8 +58,8 @@ function BalanceTokenField({
   clearBusy: boolean
 }) {
   return (
-    <div className='field-row mt-2.5'>
-      <label htmlFor='account-balance-token-input'>{t('余额查询凭证')}</label>
+    <Field orientation='horizontal' className='field-row mt-2.5'>
+      <FieldLabel htmlFor='account-balance-token-input'>{t('余额查询凭证')}</FieldLabel>
       <Input id='account-balance-token-input' className='min-w-[220px]'
         placeholder={configured ? t('已配置，留空则不修改') : t('一般不用填')}
         title={t('积分查询已复用转发用的登录凭证，这里通常留空即可。只有旧版本填过、或从旧代理导入过凭证时才有值')}
@@ -65,7 +68,7 @@ function BalanceTokenField({
         <Button variant='outline' size='sm' disabled={clearBusy} onClick={onClear}
           title={t('清除已配置的余额查询凭证')}>{t('清除')}</Button>
       ) : null}
-    </div>
+    </Field>
   )
 }
 
@@ -97,8 +100,8 @@ function CustomCredentialFields({
 }) {
   return (
     <>
-      <div className='field-row mt-2.5'>
-        <label htmlFor='account-api-key-input'>{t('API Key')}</label>
+      <Field orientation='horizontal' className='field-row mt-2.5'>
+        <FieldLabel htmlFor='account-api-key-input'>{t('API Key')}</FieldLabel>
         <Input id='account-api-key-input' type='password' autoComplete='new-password'
           className='min-w-[220px]' disabled={noAuth}
           placeholder={hasApiKey ? t('已配置，留空则不修改') : 'sk-…'}
@@ -108,14 +111,14 @@ function CustomCredentialFields({
           <Button variant='outline' size='sm' disabled={clearBusy} onClick={onClear}
             title={t('清除已配置的 API Key（转发时会因缺少凭证被跳过）')}>{t('清除')}</Button>
         ) : null}
-      </div>
-      <div className='field-row mt-2.5'>
-        <Label className='inline-flex cursor-pointer items-center gap-2.5 font-normal'>
+      </Field>
+      <Field orientation='horizontal' className='field-row mt-2.5'>
+        <FieldLabel className='inline-flex cursor-pointer items-center gap-2.5 font-normal'>
           <Checkbox checked={noAuth} aria-label={t('该上游无需鉴权')}
             onCheckedChange={next => onToggleNoAuth(next === true)} />
           <span className='text-xs text-subtle'>{t('该上游无需鉴权（转发与拉取模型都不发送鉴权头）')}</span>
-        </Label>
-      </div>
+        </FieldLabel>
+      </Field>
       <p className='detail'>
         {t('上游本来不要凭证时（本地 Ollama、OpenCode Zen 的免费档）勾上这一项：账号会被正常选路；只把 Key 留空')}
         <strong>{t('又不勾')}</strong>
@@ -156,14 +159,14 @@ function ProviderSection({
         {t('（名下 {count} 个账号共用）', { count })}
         {t('改协议 / Base URL 会改变它们的转发方式，正在进行的请求可能失败；模型清单与映射在「模型管理」页。')}
       </p>
-      <div className='field-row'>
-        <label htmlFor='account-provider-name'>{t('名称')}</label>
+      <Field orientation='horizontal' className='field-row'>
+        <FieldLabel htmlFor='account-provider-name'>{t('名称')}</FieldLabel>
         <Input id='account-provider-name' maxLength={MAX_PROVIDER_NAME_CHARS} className='min-w-[220px]'
           placeholder={t('提供商显示名，1~{max} 个字符', { max: MAX_PROVIDER_NAME_CHARS })}
           value={name} onChange={event => onName(event.currentTarget.value)} />
-      </div>
-      <div className='field-row mt-2.5'>
-        <label htmlFor='account-provider-protocol'>{t('协议')}</label>
+      </Field>
+      <Field orientation='horizontal' className='field-row mt-2.5'>
+        <FieldLabel htmlFor='account-provider-protocol'>{t('协议')}</FieldLabel>
         <Select value={protocol} onValueChange={value => onProtocol(String(value))}>
           <SelectTrigger id='account-provider-protocol' className='min-w-[180px]'>
             <SelectValue>{current}</SelectValue>
@@ -174,20 +177,20 @@ function ProviderSection({
             ))}
           </SelectContent>
         </Select>
-      </div>
-      <div className='field-row mt-2.5'>
-        <label htmlFor='account-provider-baseurl'>{t('Base URL')}</label>
+      </Field>
+      <Field orientation='horizontal' className='field-row mt-2.5'>
+        <FieldLabel htmlFor='account-provider-baseurl'>{t('Base URL')}</FieldLabel>
         <Input id='account-provider-baseurl' className='min-w-[260px]'
           placeholder={t('OpenAI 兼容填到 /v1；Anthropic 填根地址')}
           value={baseUrl} onChange={event => onBaseUrl(event.currentTarget.value)} />
-      </div>
-      <div className='field-row mt-2.5'>
-        <Label className='inline-flex cursor-pointer items-center gap-2.5 font-normal'>
+      </Field>
+      <Field orientation='horizontal' className='field-row mt-2.5'>
+        <FieldLabel className='inline-flex cursor-pointer items-center gap-2.5 font-normal'>
           <Checkbox checked={emulation === 'opencode'} aria-label={t('伪装 OpenCode 官方客户端')}
             onCheckedChange={next => onEmulation(next === true ? 'opencode' : '')} />
           <span className='text-xs text-subtle'>{t('伪装 OpenCode 官方客户端（OpenCode Zen 免费档要它才放行）')}</span>
-        </Label>
-      </div>
+        </FieldLabel>
+      </Field>
       <p className='detail'>
         {t('开启后，网关按 OpenCode 官方 CLI 的形状发请求：没填 Key 的账号用匿名凭证')}
         <code>{'public'}</code>
@@ -195,17 +198,23 @@ function ProviderSection({
         <strong>{t('它会改写请求体')}</strong>
         {t('，只对 OpenCode Zen 这类上游有意义，别的家请关掉。')}
       </p>
-      <div className='field-row mt-3'>
+      <FieldGroup orientation='horizontal' className='field-row mt-3'>
         <Button variant='destructive' onClick={onRemove}>{t('删除提供商')}</Button>
         <span className='detail'>{t('级联删除名下全部账号，不可恢复')}</span>
-      </div>
+      </FieldGroup>
     </DialogSection>
   )
 }
 
-export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: () => void }) {
-  const account = findAccount(id)
+export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane = 'basic', routeContext }: {
+  id: string; onClose: () => void
+  initialAccount?: AccountRecord
+  initialPane?: PaneId
+  routeContext?: React.ReactNode
+}) {
+  const account = initialAccount || findAccount(id)
   const [enabled, setEnabled] = React.useState(account?.enabled !== false)
+  const [allowRouteSkip, setAllowRouteSkip] = React.useState(account?.allowRouteSkip !== false)
   const [name, setName] = React.useState(account?.name || '')
   const [proxyDraft, setProxyDraft] = React.useState<ProxyDraft>(() => draftOfProxy(account?.proxy))
   const [balanceToken, setBalanceToken] = React.useState('')
@@ -233,9 +242,9 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
     () => balanceQueryDraftOf(account?.balanceQuery),
   )
   // 「限制器」段的草稿（余额 / Token 规则列表）：与查询设置同一 gating
-  const [limiterDraft, setLimiterDraft] = React.useState<LimiterRule[]>(() => limiterDraftOf(account))
+  const [limiterDraft, setLimiterDraft] = React.useState<LimiterGroup[]>(() => limiterDraftOf(account))
   // 分组导航的当前页（弹窗按账号 id 挂载，切账号自然回到「基本」）
-  const [pane, setPane] = React.useState<PaneId>('basic')
+  const [pane, setPane] = React.useState<PaneId>(initialPane)
   // 并发上限草稿（原列表 ⋯ 菜单的 conc-dialog 迁入「基本」分组）：0~999，0 = 不限
   const [concDraft, setConcDraft] = React.useState(() => String(Number(account?.maxConcurrent) || 0))
 
@@ -245,7 +254,7 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
   React.useEffect(() => {
     let alive = true
     setProvider(null)
-    const account = findAccount(id)
+    const account = initialAccount || findAccount(id)
     if (!account) return () => { alive = false }
     void Promise.resolve(shared().wbCustomProvidersUi?.find?.(providerOf(account))).then(found => {
       if (!alive || !found) return
@@ -304,10 +313,14 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
     if (busy) return
     setBusy(true)
     try {
-      await shared().workbuddyDesktop?.updateAccount?.(id, { balanceToken: null })
+      await updateAccountConfirmed(id, { balanceToken: null })
       setBalanceToken('')
       toast(t('✅ 已清除余额查询凭证'))
-      await shared().wbApp?.refresh?.()
+      try {
+        await refreshSavedAccounts()
+      } catch (error) {
+        toast(t('账号已保存，但列表刷新失败：{error}', { error: errorMessage(error) }), 'err')
+      }
     } catch (error) {
       toast(t('清除失败：{error}', { error: errorMessage(error) }), 'err')
     } finally {
@@ -324,10 +337,14 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
     if (busy) return
     setBusy(true)
     try {
-      await shared().workbuddyDesktop?.updateAccount?.(id, { apiKey: null })
+      await updateAccountConfirmed(id, { apiKey: null })
       setApiKeyDraft('')
       toast(t('✅ 已清除 API Key（该账号现在没有凭证，转发会被跳过）'))
-      await shared().wbApp?.refresh?.()
+      try {
+        await refreshSavedAccounts()
+      } catch (error) {
+        toast(t('账号已保存，但列表刷新失败：{error}', { error: errorMessage(error) }), 'err')
+      }
     } catch (error) {
       toast(t('清除失败：{error}', { error: errorMessage(error) }), 'err')
     } finally {
@@ -348,10 +365,14 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
     if (busy) return
     setBusy(true)
     try {
-      await shared().workbuddyDesktop?.updateAccount?.(id, { balanceQuery: { [key]: null } })
+      await updateAccountConfirmed(id, { balanceQuery: { [key]: null } })
       setBalanceQueryDraft(prev => ({ ...prev, [key]: '' }))
       toast(t('✅ 已清除查询凭证'))
-      await shared().wbApp?.refresh?.()
+      try {
+        await refreshSavedAccounts()
+      } catch (error) {
+        toast(t('账号已保存，但列表刷新失败：{error}', { error: errorMessage(error) }), 'err')
+      }
     } catch (error) {
       toast(t('清除失败：{error}', { error: errorMessage(error) }), 'err')
     } finally {
@@ -454,9 +475,11 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
       // 顺序（priority）**不在这张表单里**：分组模式下它由拖拽整队写（见
       // accounts-data 的 reorderQueue）。设置弹窗只改「账号自身」的属性，
       // 一次「改备注名」不该顺手把顺序也提交一遍
-      await shared().workbuddyDesktop?.updateAccount?.(id, {
-        name: name.trim() || target.name,
+      const nextName = name.trim() || target.name
+      const saved = await updateAccountConfirmed(id, {
+        ...(nextName !== target.name ? { name: nextName } : {}),
         enabled,
+        allowRouteSkip,
         proxy,
         ...balancePatch,
         ...planPatch,
@@ -466,14 +489,20 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
         ...(usageChanges && 'patch' in usageChanges ? usageChanges.patch : {}),
         ...(limiterChanges && 'patch' in limiterChanges ? limiterChanges.patch : {}),
       })
+      if ((nextName !== target.name || target.nameCustom === true) && saved.nameCustom !== true) {
+        throw new Error(t('账号更新结果未确认，请刷新后核对设置'))
+      }
       // 提供商那一段排在账号之后（账号是本弹窗的主角，先落库）。它失败时账号已经存下了，
       // 所以留在弹窗里把那句话说清楚 —— 笼统报成「保存失败」会把两件事混成一件
       if (providerPatch) {
         try {
-          await shared().wbCustomProvidersUi?.update?.(providerPatch)
+          const updateProvider = shared().wbCustomProvidersUi?.update
+          if (!updateProvider) throw new Error(t('账号更新接口不可用，请重新打开页面'))
+          await updateProvider(providerPatch)
         } catch (error) {
           setStatus(<span className='text-destructive'>{t('账号已保存，但提供商未更新：{error}', { error: errorMessage(error) })}</span>)
-          await shared().wbApp?.refresh?.()
+          try { await refreshSavedAccounts() }
+          catch (refreshError) { toast(t('账号已保存，但列表刷新失败：{error}', { error: errorMessage(refreshError) }), 'err') }
           setBusy(false)
           return
         }
@@ -487,8 +516,11 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
       // 单独兜一层错：刷新失败只影响本次界面同步（后续轮询会自愈），不能掉进下面的
       // catch 被报成「保存失败」（保存其实已经成功了）
       try {
-        await shared().wbApp?.refresh?.()
-      } catch { /* 交给下一次轮询 */ }
+        await refreshSavedAccounts()
+        await syncBalancesSnapshot()
+      } catch (error) {
+        toast(t('账号已保存，但列表刷新失败：{error}', { error: errorMessage(error) }), 'err')
+      }
     } catch (error) {
       // 后端校验失败（如优先级冲突）：留在弹窗里显示原因，方便直接改
       setStatus(<span className='text-destructive'>{errorMessage(error)}</span>)
@@ -515,8 +547,8 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
           <div className='acct-dlg'>
             {/* 分组导航复用模型管理左栏的形态（.prov-rail 容器 + NavItem，见 page-gateway.css）：
                 选中态 / 悬浮态 / 字重都在组件里，这里只给弹窗内的栏宽 */}
-            <aside className='prov-rail acct-dlg-rail' aria-label={t('账号设置分组')}>
-              <div className='rail-scroll'>
+            <Sidebar className='prov-rail acct-dlg-rail' aria-label={t('账号设置分组')}>
+              <NavList className='rail-scroll'>
                 <div className='rail-label'>{t('账号设置')}</div>
                 {([['basic', t('基本')], ...(hasCredentialPane ? [['credential', t('凭证与套餐')] as const] : []),
                   ...(supportsUsage(target) ? [['query', t('查询设置')] as const] : []),
@@ -524,8 +556,8 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
                     <NavItem key={id} active={pane === id} title={label} className='shadow-none'
                       onClick={() => setPane(id)}>{label}</NavItem>
                   ))}
-              </div>
-            </aside>
+              </NavList>
+            </Sidebar>
             <div className='acct-dlg-main'>
               {pane === 'basic' ? (
                 <div>
@@ -533,29 +565,34 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
                     <h3>{t('基本')}</h3>
                     <p>{t('这条账号是谁、排第几、能不能接请求。')}</p>
                   </div>
-                  <div className='field-row'>
-                    <label>{t('启用')}</label>
+                  <Field orientation='horizontal' className='field-row'>
+                    <FieldLabel>{t('启用')}</FieldLabel>
                     <Switch checked={enabled} onCheckedChange={setEnabled} aria-label={t('启用该账号')} />
                     <span className='detail'>{t('关闭则不参与转发（余额查询照常，见「查询设置」）')}</span>
-                  </div>
-                  <div className='field-row'>
-                    <label htmlFor='account-name-input'>{t('备注名')}</label>
+                  </Field>
+                  <Field orientation='horizontal' className='field-row'>
+                    <FieldLabel htmlFor='account-name-input'>{t('备注名')}</FieldLabel>
                     <Input id='account-name-input' maxLength={100} placeholder={t('账号显示名称')} className='max-w-[280px]'
                       value={name} onChange={event => setName(event.currentTarget.value)} />
-                  </div>
-                  <div className='field-row'>
-                    <label>{t('转发顺序')}</label>
+                  </Field>
+                  {routeContext || <FieldGroup orientation='horizontal' className='field-row'>
+                    <Label>{t('转发顺序')}</Label>
                     <span className='detail'>
                       {t('在列表里拖：拖分组带调整整组顺位，拖行首把手调整组内先后（顺序由拖拽表达，不再填数字）')}
                     </span>
-                  </div>
-                  <div className='field-row'>
-                    <label htmlFor='account-conc-input'>{t('并发上限')}</label>
+                  </FieldGroup>}
+                  <Field orientation='horizontal' className='field-row'>
+                    <FieldLabel htmlFor='account-route-skip'>{t('失败后允许换号')}</FieldLabel>
+                    <Switch id='account-route-skip' checked={allowRouteSkip} onCheckedChange={setAllowRouteSkip} />
+                  </Field>
+                  <p className='detail'>{t('关闭后，该账号转发失败时返回本次错误，不再顺延其他账号。禁用、无凭证和限制器等保护仍生效。')}</p>
+                  <Field orientation='horizontal' className='field-row'>
+                    <FieldLabel htmlFor='account-conc-input'>{t('并发上限')}</FieldLabel>
                     <Input id='account-conc-input' type='number' min={0} max={CONC_MAX} step={1}
                       className='max-w-[110px]' value={concDraft}
                       onChange={event => setConcDraft(event.currentTarget.value)} />
                     <span className='detail'>{concDefault > 0 ? t('0 = 按本家默认 {default}', { default: concDefault }) : t('0 = 不限')}</span>
-                  </div>
+                  </Field>
                   <p className='detail acct-dlg-hint'>
                     {concDefault > 0
                       ? t('并发上限 填 0 即按本家默认 {default}；填 1 或 2 就按填的算，更大的数会被本家上限截断（原列表 ⋯ 菜单的「并发上限」入口已并入这里）', { default: concDefault })
@@ -642,7 +679,7 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
                       {t('按规则限制该账号参与转发：没有规则（或全部停用）= 不限制；跳过档自动恢复，禁用档需手动启用。')}
                     </p>
                   </div>
-                  <LimiterSection account={target} draft={limiterDraft} onChange={setLimiterDraft} />
+                  <LimiterSection account={target} draft={limiterDraft} onChange={setLimiterDraft} allowBalance={supportsUsage(target)} />
                 </div>
               ) : null}
 

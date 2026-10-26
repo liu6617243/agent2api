@@ -7,6 +7,14 @@
  */
 
 import { apiCall } from './client'
+import type { ProxyUsage } from '../../../ui-shared/proxy-usage'
+import type { CheckinCenter } from '../../../ui-shared/checkin'
+import type { HiddenAccountsSummary } from '../../../ui-shared/plugins'
+import { logQueryString, type LogPage, type LogQuery } from '../../../ui-shared/logs'
+
+export type { LogEntry, LogPage } from '../../../ui-shared/logs'
+
+export type { CheckinAccount, CheckinCenter, ProviderGroup as CheckinProviderRow } from '../../../ui-shared/checkin'
 
 /* ─── 会话 / 账号 ─────────────────────────────── */
 
@@ -23,6 +31,8 @@ export type Account = {
   id: string
   provider?: string
   name?: string
+  displayName?: string
+  nameCustom?: boolean
   nickname?: string
   email?: string
   enabled?: boolean
@@ -35,6 +45,8 @@ export type Account = {
   expiresAt?: number
   needsRelogin?: boolean
   needsReloginReason?: string
+  /** 智谱清言：这条账号是不是访客（后端只对本家注入；访客没有积分体系，不查余额） */
+  isGuest?: boolean
   /** 按模型记的限流记录 */
   rateLimits?: Record<string, RateLimitInfo>
   [key: string]: unknown
@@ -53,7 +65,9 @@ export type SessionPayload = {
     currentAccountIds?: Record<string, string | null>
     accounts?: Account[]
     providers?: ProviderSummary[]
+    hiddenAccounts?: HiddenAccountsSummary
   }
+  accountFeatures?: Record<string, unknown>
   lastRequestModel?: string | null
   routedAccountId?: string | null
   defaultModel?: string | null
@@ -69,6 +83,7 @@ export function fetchSession(signal?: AbortSignal): Promise<SessionPayload> {
 export function fetchAccounts(signal?: AbortSignal): Promise<{
   accounts?: Account[]
   providers?: ProviderSummary[]
+  hiddenAccounts?: HiddenAccountsSummary
   currentAccountId?: string | null
   currentAccountIds?: Record<string, string | null>
 }> {
@@ -111,6 +126,22 @@ export type StatsDimension = {
   totalTokens?: number
   tokens?: number
   percentage?: number
+  model?: string
+  successRate?: number | null
+  promptTokens?: number | null
+  completionTokens?: number | null
+  cacheReadTokens?: number | null
+  cacheRate?: number | null
+  lastUsedAt?: number | null
+  tokenDetailsComplete?: boolean
+  source?: string
+  filterValue?: string
+  state?: 'enabled' | 'disabled' | 'deleted'
+}
+
+export type StatsDay = {
+  date?: string; tokens?: number; requests?: number
+  models?: StatsDimension[]; clients?: StatsDimension[]; apiKeys?: StatsDimension[]
 }
 
 export type StatsSummary = {
@@ -121,15 +152,22 @@ export type StatsSummary = {
   providers?: StatsDimension[]
   accounts?: StatsDimension[]
   models?: StatsDimension[]
-  cacheRates?: Record<string, number | null>
-  dailyTrend?: Array<{ date?: string; tokens?: number; requests?: number }>
+  clients?: StatsDimension[]
+  apiKeys?: StatsDimension[]
+  apiKeyDetail?: { filterValue?: string; label?: string; requests?: number; totalTokens?: number; detailsComplete?: boolean; clients?: StatsDimension[]; models?: StatsDimension[] } | null
+  cacheRates?: Record<string, { rate?: number; inputTokens?: number; hitTokens?: number } | number | null>
+  dailyTrend?: StatsDay[]
   cacheTrend24h?: unknown
 }
 
-export type StatsRange = 'today' | 'yesterday' | '7' | '30' | 'month' | 'all'
+export type StatsRange = 'today' | 'yesterday' | '7' | '30' | 'month' | 'all' | 'custom'
 
-export function fetchStatsSummary(range: StatsRange, signal?: AbortSignal): Promise<StatsSummary> {
-  return apiCall<StatsSummary>(`/api/stats/summary?range=${encodeURIComponent(range)}`, { signal })
+export function fetchStatsSummary(range: StatsRange, signal?: AbortSignal, options?: {
+  apiKey?: string; startDate?: string; endDate?: string
+}): Promise<StatsSummary> {
+  const query = new URLSearchParams({ range })
+  for (const [key, value] of Object.entries(options || {})) if (value) query.set(key, value)
+  return apiCall<StatsSummary>(`/api/stats/summary?${query}`, { signal })
 }
 
 /* ─── 请求日志 ─────────────────────────────────── */
@@ -158,6 +196,8 @@ export type RequestRow = {
   attemptDetails?: AttemptDetail[]
   sensitiveHits?: Array<{ word?: string; count?: number }>
   route?: unknown
+  client?: string
+  apiKeyId?: string; apiKeyName?: string; apiKeySource?: string
 }
 
 export type RequestPage = {
@@ -175,6 +215,12 @@ export function fetchRequests(
     status?: 'ok' | 'error' | 'running'
     model?: string
     provider?: string
+    client?: string
+    apiKey?: string
+    startDate?: string
+    endDate?: string
+    productionOnly?: string
+    completedOnly?: string
   },
   signal?: AbortSignal,
 ): Promise<RequestPage> {
@@ -184,89 +230,21 @@ export function fetchRequests(
   if (params.status) query.set('status', params.status)
   if (params.model) query.set('model', params.model)
   if (params.provider) query.set('provider', params.provider)
+  if (params.client !== undefined) query.set('client', params.client)
+  for (const key of ['apiKey', 'startDate', 'endDate', 'productionOnly', 'completedOnly'] as const) {
+    if (params[key] !== undefined) query.set(key, params[key] as string)
+  }
   const suffix = query.toString()
   return apiCall<RequestPage>(`/api/stats/requests${suffix ? `?${suffix}` : ''}`, { signal })
 }
 
 /* ─── 运行日志 ─────────────────────────────────── */
 
-export type LogEntry = {
-  id?: number
-  ts?: number
-  level?: string
-  category?: string
-  message?: string
-  data?: unknown
-}
-
-export type LogPage = {
-  entries?: LogEntry[]
-  total?: number
-  stats?: unknown
-}
-
-export function fetchLogs(
-  params: { level?: string; category?: string; keyword?: string; start?: number; limit?: number },
-  signal?: AbortSignal,
-): Promise<LogPage> {
-  const query = new URLSearchParams()
-  if (params.level) query.set('level', params.level)
-  if (params.category) query.set('category', params.category)
-  if (params.keyword) query.set('keyword', params.keyword)
-  if (params.start) query.set('start', String(params.start))
-  query.set('limit', String(params.limit ?? 60))
-  return apiCall<LogPage>(`/api/logs?${query.toString()}`, { signal })
+export function fetchLogs(params: LogQuery, signal?: AbortSignal): Promise<LogPage> {
+  return apiCall<LogPage>(`/api/logs?${logQueryString({ limit: 60, ...params })}`, { signal })
 }
 
 /* ─── 签到中心 ─────────────────────────────────── */
-
-export type CheckinAccount = {
-  id?: string
-  name?: string
-  available?: boolean
-  checkinAt?: number
-  checkedInToday?: boolean
-}
-
-export type CheckinProviderRow = {
-  id?: string
-  label?: string
-  accounts?: CheckinAccount[]
-  doneCount?: number
-  totalCount?: number
-}
-
-export type CheckinCenter = {
-  daily?: {
-    providers?: CheckinProviderRow[]
-    outOfScope?: Array<{ label?: string; reason?: string; count?: number }>
-    todayDone?: number
-    todayEligible?: number
-  }
-  extras?: {
-    /** 新手福利：`settled` 非空 = 一次性福利已结清（零上游即可渲染） */
-    onboarding?: Array<{ id?: string; name?: string; provider?: string; settled?: unknown }>
-    /** ZCode 活动套餐：`claimPlans` 是本地领取台账 `{planId: 毫秒}` */
-    plans?: Array<{
-      id?: string
-      name?: string
-      provider?: string
-      claimAt?: number | null
-      claimPlans?: Record<string, number> | null
-    }>
-  }
-  auto?: { enabled?: boolean; time?: string; providers?: string[] }
-  history?: Array<{
-    at?: number
-    date?: string
-    reason?: string
-    succeeded?: number
-    total?: number
-    skipped?: number
-    failed?: number
-    failedCount?: number
-  }>
-}
 
 export function fetchCheckinCenter(signal?: AbortSignal): Promise<CheckinCenter> {
   return apiCall<CheckinCenter>('/api/checkin-center', { signal })
@@ -280,9 +258,13 @@ export type ManageModel = {
   provider?: string
   providerLabel?: string
   source?: string
+  kind?: string
+  supports_image_generation?: boolean
+  supports_image_editing?: boolean
   enabled?: boolean
   aliases?: string[]
   visibility?: string | null
+  upstreamStatus?: 'undeployed' | null
   capabilities?: unknown
   reasoningLevels?: unknown
   refreshedAt?: unknown
@@ -340,7 +322,7 @@ export function deleteKey(id: string): Promise<KeysPayload> {
 
 /* ─── 网络代理 ─────────────────────────────────── */
 
-export type PoolItem = {
+export type PoolItem = ProxyUsage & {
   id?: string
   name?: string
   source?: string
@@ -350,8 +332,6 @@ export type PoolItem = {
   port?: number
   address?: string
   lastTest?: { at?: number; success?: boolean; ip?: string; error?: string } | null
-  /** 引用它的账号（后端带的是**数组**，桌面端同一字段也是这个形状） */
-  usedBy?: Array<{ id?: string; name?: string; enabled?: boolean }>
   /** 孤儿订阅节点：所属订阅已不存在（后端标注） */
   orphan?: boolean
   [key: string]: unknown
@@ -409,7 +389,7 @@ export function fetchScheduledTasks(signal?: AbortSignal): Promise<{ tasks?: Sch
 export function patchScheduledTask(
   id: string,
   patch: { enabled?: boolean; interval?: number },
-): Promise<{ tasks?: ScheduledTask[] }> {
+): Promise<ScheduledTask> {
   return apiCall(`/api/scheduled-tasks/${encodeURIComponent(id)}`, { method: 'PATCH', body: patch })
 }
 
@@ -422,18 +402,35 @@ export function runScheduledTask(id: string): Promise<unknown> {
 export type AgentClient = {
   id?: string
   name?: string
-  path?: string
-  applied?: boolean
-  mode?: string
+  resolvedPath?: string
+  configPath?: string
+  viaGateway?: boolean
+  configMode?: string
+  installed?: boolean
+  readError?: string | null
+  needsRestart?: boolean
+  detectionState?: string
+  supportNote?: string
+  applied?: { canUndo?: boolean; canDisconnect?: boolean; modifiedExternally?: boolean }
   [key: string]: unknown
+}
+
+export type AgentRestorePreview = {
+  token: string
+  warnings: string[]
+  files: Array<{ path: string; diff: Array<{ kind: 'same' | 'added' | 'removed'; text: string }> }>
 }
 
 export function fetchAgents(signal?: AbortSignal): Promise<{ clients?: AgentClient[] }> {
   return apiCall<{ clients?: AgentClient[] }>('/api/agents', { signal })
 }
 
-export function restoreAgentClient(id: string): Promise<unknown> {
-  return apiCall('/api/agents/restore', { method: 'POST', body: { id } })
+export function previewAgentRestore(clientId: string): Promise<AgentRestorePreview> {
+  return apiCall('/api/agents/preview', { method: 'POST', body: { clientId, operation: 'restore' } })
+}
+
+export function restoreAgentClient(clientId: string, token: string): Promise<unknown> {
+  return apiCall('/api/agents/restore', { method: 'POST', body: { clientId, operation: 'restore', token } })
 }
 
 /* ─── 账号余额 ─────────────────────────────── */

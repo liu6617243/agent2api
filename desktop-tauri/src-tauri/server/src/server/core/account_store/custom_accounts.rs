@@ -29,14 +29,14 @@
 //! ```
 //!
 //! ── 为什么 id 是派生 + 随机的两段式 ─────────────────────────
-//! `apiKey` 非空时用它的 SHA-256 前 12 位：**同一把 key 重复添加会合并更新
-//! 同一条记录** —— 与各家「同标识合并」（workbuddy 的 `user-<uid>`、Qoder 的
-//! `qoder-<region>-<hash>`）语义一致，用户粘错重试不会堆出重复账号。
+//! `apiKey` 非空时用「提供商 ID + Key」的 SHA-256 前 12 位：同一家内重复
+//! 添加才合并更新，不同站点可使用相同的 Key。既有账号按实际凭证匹配，
+//! 更新时保留原 ID，避免升级或导入后改变账号引用。
 //! 没有 key 时（显式声明无需鉴权，或凭证还没配）退化为随机 12 位
 //! （`getrandom`）：没有稳定标识可派生，而且**同一家并存多条无需鉴权账号是
 //! 刻意的**（各自可配不同的出网代理，转发按优先级轮着走），重复添加就该是
 //! 新的一条 —— id 的唯一性靠随机段保证（并发/重装都要安全，理由同
-//! `custom_providers` 的 id）。派生规则见 [`account_id_for`]。
+//! `custom_providers` 的 id）。派生规则见 `identity`。
 //! 前缀 `custom-acct-` 与 provider id 的 `custom-` **刻意不同形**：
 //! `is_custom_provider_id` 按 provider 前缀判定，账号 id 若同形会被误认成
 //! 提供商 id（两套 id 空间混淆是难查的静默错配）。
@@ -45,8 +45,9 @@
 //! 本文件全是「读-改-写」文件操作，**没有任何网络请求**（持锁不做网络）。
 //! 绝不 unwrap/expect（release 是 panic=abort）。
 
+mod identity;
+
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 
 use crate::server::core::account_store::priority::next_free_priority;
 use crate::server::core::account_store::sql;
@@ -69,7 +70,7 @@ const MAX_API_KEY_LENGTH: usize = 8192;
 
 /// `add_custom_account` 的返回：落盘记录的公开形态 + 这次是新建还是更新。
 ///
-/// 幂等口径（见 [`account_id_for`]）会让「同一把 key 的重复添加」合并进既有
+/// 幂等口径（见 `identity`）会让「同一家、同一把 Key 的重复添加」合并进既有
 /// 记录。这次提交到底落在哪一边只有存储层
 /// 知道（日志里有 🔄 / ✅ 之分），把它作为返回值交给 API 层带出去，前端才能
 /// 把提示说成「已更新」而不是「已添加」（照搬「已添加」会让人以为列表会多
@@ -104,8 +105,8 @@ impl AccountStore {
     ///     baseUrl）。校验与提供商侧同一套（`normalize_base_url`）；
     ///   - `name` 由 `name` 参数决定（调用方已从请求体取好，与各家一致）。
     ///
-    /// 幂等口径：`apiKey` 非空时同 key 重复添加 = **更新**既有记录（备注名 /
-    /// baseUrl 覆盖项随之更新，优先级与启用状态沿用）。没有 key（无需鉴权 /
+    /// 幂等口径：`apiKey` 非空时同一家、同 Key 重复添加 = 更新既有记录（备注名 /
+    /// baseUrl 覆盖项随之更新，ID、优先级与启用状态沿用）。没有 key（无需鉴权 /
     /// 凭证未配）则每次都是新建 —— 同一家并存多条无需鉴权账号是刻意的（各自
     /// 可配不同的出网代理）。撞到**其它 provider** 的账号 id（hash 空间巧合）
     /// 时报 409 而不是覆写。落在哪一边由返回值的
@@ -167,22 +168,21 @@ impl AccountStore {
         };
 
         let _guard = self.guard();
-        let id = account_id_for(&api_key)
-            .map_err(|error| AccountStoreError::new(error, 500))?;
-        // 撞 id 保护（与 cline 同一考虑）：hash 空间巧合或手改数据都会撞上
-        // 别家的记录，覆写会把那条记录的凭证一起弄丢
-        let existing = self.record_by_id(&_guard, &id);
-        if let Some(existing) = existing.as_ref() {
-            if existing.provider() != provider_id {
-                return Err(AccountStoreError::new(
-                    format!(
-                        "账号 id「{id}」已被{}账号占用，请先处理那条记录",
-                        existing.provider()
-                    ),
-                    409,
-                ));
+        let existing = self.with_conn(&_guard, |conn| identity::existing(conn, provider_id, &api_key))?;
+        let id = match existing.as_ref() {
+            Some(record) => record.id().to_string(),
+            None => {
+                let id = identity::new_id(provider_id, &api_key)
+                    .map_err(|error| AccountStoreError::new(error, 500))?;
+                if self.with_conn(&_guard, |conn| sql::load_by_id(conn, &id))?.is_some() {
+                    return Err(AccountStoreError::new(
+                        format!("账号 id「{id}」已被占用，请重试或检查已有记录"),
+                        409,
+                    ));
+                }
+                id
             }
-        }
+        };
 
         // 备注名兜底链：显式传入 → 记录里原有的 → 「账号 + apiKey 尾号」。
         // 尾号对人有参考价值（哪把 key）；无鉴权账号没有尾号可展示，退化成
@@ -852,33 +852,4 @@ fn credential_of_record(record: &StoredAccount) -> CustomCredential {
             .filter(|text| !text.is_empty()),
         proxy,
     }
-}
-
-/// 账号 id：`custom-acct-` + 12 位 hex。两条派生链，按凭证形态分派：
-///
-///   - `apiKey` 非空 → 它的 SHA-256 前 12 位：**同一把 key 重复添加合并更新
-///     同一条记录**（同 key 就是同一条上游线路，堆两条没有意义；用户粘错
-///     重试也不会堆出重复账号，见模块头）；
-///   - 没有 key（显式声明无需鉴权，或凭证还没配）→ 随机 12 位（`getrandom`）：
-///     **每次添加都是一条新账号**。同一家允许并存多条无需鉴权账号是刻意的
-///     （各自可配不同的出网代理、备注名，转发按优先级轮着走），它们没有任何
-///     可派生 id 的稳定标识 —— 随机段保 id 唯一，不把「重复添加」误当合并。
-///
-/// 随机源失败时如实报错（本函数返回 Err）：本模块硬约束「绝不 panic」，
-/// 宁可让用户重试一次，也不落一条 id 可靠性没保证的记录。
-fn account_id_for(api_key: &str) -> Result<String, String> {
-    if !api_key.is_empty() {
-        return Ok(format!("{CUSTOM_ACCOUNT_ID_PREFIX}{}", short_hash(api_key)));
-    }
-    let mut bytes = [0u8; 6];
-    getrandom::getrandom(&mut bytes)
-        .map_err(|_| "无法生成安全的随机账号 id（系统随机源不可用），请重试".to_string())?;
-    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    Ok(format!("{CUSTOM_ACCOUNT_ID_PREFIX}{hex}"))
-}
-
-/// SHA-256 前 12 位小写 hex（账号 id 的稳定派生段）
-fn short_hash(seed: &str) -> String {
-    let digest = Sha256::digest(seed.as_bytes());
-    format!("{digest:x}").chars().take(12).collect()
 }

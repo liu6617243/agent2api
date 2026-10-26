@@ -80,7 +80,7 @@ type SheetContentProps = DialogPrimitive.Popup.Props & {
    *
    * 默认 `bottom` —— 这份组件的存在理由就是移动端。
    */
-  side?: 'bottom' | 'center' | 'right'
+  side?: 'bottom' | 'center' | 'right' | 'left'
   /**
    * 关闭后是否把 Portal 留在 DOM 里（内容保留、只是隐藏），默认 false。
    * 语义与 DialogContent 的 keepMounted 相同：内容里挂着有状态的第三方 DOM
@@ -100,6 +100,7 @@ function SheetContent({
 }: SheetContentProps) {
   const centered = side === 'center'
   const right = side === 'right'
+  const left = side === 'left'
   return (
     <SheetPortal keepMounted={keepMounted}>
       <SheetOverlay />
@@ -117,12 +118,18 @@ function SheetContent({
               ]
             : right
               ? [
-                  // 右侧抽屉：贴满高度，宽度按内容（上限 86vw，窄屏也不会盖死整页）
+                  // 侧边抽屉最多占 86vw，保留关闭与上下文区域。
                   'top-0 right-0 bottom-0 h-full w-[min(340px,86vw)] rounded-l-xl',
                   'data-open:animate-in data-open:slide-in-from-right data-open:fade-in-0',
                   'data-closed:animate-out data-closed:slide-out-to-right data-closed:fade-out-0 data-closed:fill-mode-forwards',
                 ]
-              : [
+              : left
+                ? [
+                    'top-0 left-0 bottom-0 h-full w-[min(340px,86vw)] rounded-r-xl',
+                    'data-open:animate-in data-open:slide-in-from-left data-open:fade-in-0',
+                    'data-closed:animate-out data-closed:slide-out-to-left data-closed:fade-out-0 data-closed:fill-mode-forwards',
+                  ]
+                : [
                   'inset-x-0 bottom-0 max-h-[85svh] rounded-t-xl',
                   'data-open:animate-in data-open:slide-in-from-bottom data-open:fade-in-0',
                   'data-closed:animate-out data-closed:slide-out-to-bottom data-closed:fade-out-0 data-closed:fill-mode-forwards',
@@ -131,7 +138,7 @@ function SheetContent({
         )}
         {...props}
       >
-        {showHandle && !centered && !right && (
+        {showHandle && !centered && !right && !left && (
           <div
             aria-hidden='true'
             className='mx-auto mt-2 mb-1 h-1 w-9.5 shrink-0 rounded-pill bg-border-strong'

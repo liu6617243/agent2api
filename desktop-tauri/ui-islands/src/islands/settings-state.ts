@@ -61,7 +61,11 @@ import {
   type NumberField,
   type PromptPatch,
 } from './settings-model'
+import {
+  INITIAL_SANITIZE, sanitizeStateFrom, type SanitizePatch, type SanitizeState,
+} from './settings-sanitize-model'
 import { t } from '../i18n'
+import { retentionSavedMessage, retentionShrinkHead, type RetentionField } from './settings-retention-model'
 
 /* ─── 快照类型 ─────────────────────────────── */
 
@@ -151,9 +155,7 @@ export type DebugState = {
   limit: number | null
 }
 
-export type SanitizeState = { status: LoadStatus; on: boolean }
-
-/** 开发者角色兼容开关；与 SanitizeState 同形 */
+/** 开发者角色兼容开关 */
 export type DeveloperRoleCompatState = { status: LoadStatus; on: boolean }
 
 /** Cline 伪装头：三份表（默认 / 覆盖 / 生效）都来自后端，界面据此渲染与判断改动 */
@@ -164,7 +166,7 @@ export type ClineHeadersState = {
   effective: Record<string, string>
 }
 
-/** 网关面（/v1/*）跨域访问开关；与 SanitizeState 同形 */
+/** 网关面（/v1/*）跨域访问开关 */
 export type CorsState = { status: LoadStatus; on: boolean }
 
 /**
@@ -229,16 +231,14 @@ export type ProviderPromptState = {
   fileError: string
   /** 这一家的**网关自带提示词**是否装上（缺省 true；只有带 `gatewayNote` 的家有意义） */
   gateway: boolean
-  /** 是否**单独配过**（false = 这一行是按「有网关自带提示词」补出来的，各项跟随全局） */
+  /** 是否配过模式 / 文件 / 正文；只有网关开关覆盖时，客户端提示词仍跟随全局。 */
   configured: boolean
 }
 
 /**
  * 可配置的家。
  *
- * `gatewayNote` 非空 = 这家有一段**网关自带**的提示词（ZCode 活动套餐通道的
- * 官方三段）。它同时决定这一家**默认就出现在列表里** —— 有开关可拨的家不该
- * 藏在一个「添加提供商…」后面。
+ * `gatewayNote` 非空 = 这家有网关提示词装配；手动添加或已有覆盖时显示其开关。
  * `gatewayChars` 是那段装配的字符数（只读子行的「约 N 字符」；0 / 缺失不显示）。
  * `gatewayBlocks` 是那段装配的**正文模板**（三段，Environment 段带占位符）：
  * 编辑器拿它当初始值，也是「恢复官方原文」的目标 —— 资源坏了时是 null，
@@ -421,7 +421,7 @@ const INITIAL: SettingsSnapshot = {
   captchaPool: { status: 'loading', values: null },
   routing: { status: 'loading', strategy: 'order', sticky: 'auto', failoverBackoff: true, sink: true, breakerEnabled: false },
   debug: { status: 'loading', on: false, count: null, limit: null },
-  sanitize: { status: 'loading', on: false },
+  sanitize: INITIAL_SANITIZE,
   developerRoleCompat: { status: 'loading', on: false },
   clineHeaders: { status: 'loading', defaults: {}, overrides: {}, effective: {} },
   zcodeVersion: { status: 'loading', version: '', envOverride: '' },
@@ -1203,7 +1203,7 @@ export function dismissDbRestore(): void {
   publish({ dbRestore: null })
 }
 
-/* ─── 数据保留（事件日志保留天数） ─────────────── */
+/* ─── 数据保留 ──────────────────────────── */
 
 export function renderRetention(data?: unknown): void {
   if (data === undefined) return
@@ -1242,27 +1242,18 @@ function askRetentionShrink(head: string): Promise<boolean> {
   })
 }
 
-/** 改小保留期会立即删数据，文案必须点名「删的是哪一档」（泛化：选项来自 RETENTION_FIELDS） */
-function shrinkPromptHead(field: NumberField, previous: number | null, days: number): string {
-  return previous === null
-    ? t('没能读到「{label}」的当前值，改为 {days} 天可能会删除超出的历史数据。', {
-      label: field.label, days,
-    })
-    : t('「{label}」将从 {previous} 天改为 {days} 天。', { label: field.label, previous, days })
-}
-
 /**
  * 单个输入框的提交流程：校验 → （改小时）确认 → 提交。任一步失败都不写快照，
  * 视图层把草稿收掉，显示回到生效值（旧实现是显式 revert）。
  */
-export async function saveRetentionField(field: NumberField, raw: string): Promise<void> {
+export async function saveRetentionField(field: RetentionField, raw: string): Promise<void> {
   if (busyScope) return
   // 确认框开着时不再受理新的编辑：一次只问一个问题，否则第二个问题会把第一个顶掉
   // （resolver 只能存一个），那个输入框就会在没人点过「取消」的情况下被回滚。
   // 遮罩已经挡住了页面，走到这里只剩键盘 Tab 之类的少数路径，挡一下成本极低。
   if (snapshot.retentionConfirm) return
 
-  const parsed = parseInteger(raw, field.min, field.max, t('天数'))
+  const parsed = parseInteger(raw, field.min, field.max, field.kind === 'count' ? t('条数') : t('天数'))
   if (!parsed.ok) { toast(parsed.message, 'err'); return }
 
   const known = snapshot.retention.values?.[field.key]
@@ -1273,17 +1264,13 @@ export async function saveRetentionField(field: NumberField, raw: string): Promi
   // 读不到旧值时无从判断是否改小 —— 只有改小才会删数据，所以这里宁可多问一次：
   // 白弹一次确认的代价，远小于静默删掉用户的历史数据
   const shrinking = previous === null || parsed.value < previous
-  if (shrinking && !await askRetentionShrink(shrinkPromptHead(field, previous, parsed.value))) return
+  if (shrinking && !await askRetentionShrink(retentionShrinkHead(field, previous, parsed.value))) return
 
   await commitRetention(field, parsed.value, shrinking)
 }
 
-/**
- * 提交一项保留期：只传变化的那一个字段 —— 后端支持部分字段（未出现的项保持原值），
- * 整份回传会把另外两项也卷进「是否改小」的确认范围，白白多弹一次窗。
- * shrinking 表示这次是改小（后端会顺手清理），决定提示语要不要提「已清理」。
- */
-async function commitRetention(field: NumberField, days: number, shrinking: boolean): Promise<void> {
+/** 只提交变化的字段，避免覆盖其他保留设置。 */
+async function commitRetention(field: RetentionField, value: number, shrinking: boolean): Promise<void> {
   if (busyScope) return
   beginBusy('retention')
   // 乐观写入待保存的值，再禁用输入框（视图按 busy === 'retention' 禁用）。理由：Chromium 里
@@ -1291,26 +1278,18 @@ async function commitRetention(field: NumberField, days: number, shrinking: bool
   // 提交会走忙碌分支早退；不先记新值，用户就会看到「刚改的数字闪回旧值、过一下又变回来」。
   // 真失败了下面的 catch 会重读后端覆盖，所以这个乐观值不会被留在界面上。
   const optimistic = snapshot.retention.values
-  if (optimistic) publish({ retention: { status: 'ready', values: { ...optimistic, [field.key]: days } } })
+  if (optimistic) publish({ retention: { status: 'ready', values: { ...optimistic, [field.key]: value } } })
   try {
-    const saved = await shared().workbuddyDesktop?.saveRetention({ [field.key]: days })
-    // PUT 契约上返回生效后的**三项**值，正常情况下用响应刷新即可，不必再跑一趟 GET
+    const saved = await shared().workbuddyDesktop?.saveRetention({ [field.key]: value })
     renderRetention(saved)
     const values = snapshot.retention.values
     if (RETENTION_FIELDS.every(item => Number.isInteger(values?.[item.key]))) {
-      const applied = values?.[field.key] ?? days
-      toast(shrinking
-        ? t('✅ 已保留 {days} 天，超出部分已清理', { days: applied })
-        : t('✅ 已保留 {days} 天', { days: applied }))
+      toast(retentionSavedMessage(field, values?.[field.key] ?? value, shrinking))
       return
     }
-    // 响应里三项没齐（换壳后接口形状变了之类）：退回一次 GET 补齐，
-    // 宁可多跑一趟，也不能停在「界面说改了、其实没读到真值」的状态
+    // 响应不完整时重新读取，避免把未确认的值当成已生效设置。
     await loadRetention()
-    // 这里提示用户填的值：GET 也没读到真值时，报后端返回的值反而更让人困惑
-    toast(shrinking
-      ? t('✅ 已保留 {days} 天，超出部分已清理', { days })
-      : t('✅ 已保留 {days} 天', { days }))
+    toast(retentionSavedMessage(field, snapshot.retention.values?.[field.key] ?? value, shrinking))
   } catch (error) {
     // 400 的 message（点名哪个字段、超出多少）比自造一句更指向具体问题
     toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
@@ -1640,7 +1619,7 @@ export async function saveTimeoutField(field: NumberField, raw: string): Promise
   await saveNumericField(timeoutsPanel, field, raw)
 }
 
-/* ─── 调试模式 / 指纹脱敏（两个同构的全局布尔开关）── */
+/* ─── 调试模式 / 指纹脱敏 ── */
 
 export function renderDebug(data?: unknown): void {
   if (data === undefined) return
@@ -1689,12 +1668,7 @@ export async function saveDebug(next: boolean): Promise<void> {
 
 export function renderSanitize(data?: unknown): void {
   if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ sanitize: { status: 'unavailable', on: false } })
-    return
-  }
-  const record = data as Record<string, unknown>
-  publish({ sanitize: { status: 'ready', on: record.sanitizeBlacklistFingerprints === true } })
+  publish({ sanitize: sanitizeStateFrom(data, snapshot.sanitize) })
 }
 
 async function loadSanitize(): Promise<void> {
@@ -1707,16 +1681,32 @@ async function loadSanitize(): Promise<void> {
 }
 
 export async function saveSanitize(next: boolean): Promise<void> {
-  if (busyScope) { repaint(); return }
+  await saveSanitizeConfig({ sanitizeBlacklistFingerprints: next }, next
+    ? t('✅ 出站指纹脱敏已开启') : t('已关闭出站指纹脱敏'))
+}
+
+export async function saveSanitizeConfig(patch: SanitizePatch, message?: string): Promise<boolean> {
+  if (busyScope) { repaint(); return false }
   beginBusy('sanitize')
-  publish({ sanitize: { status: 'ready', on: next } })
   try {
-    const saved = await shared().workbuddyDesktop?.saveSanitize(next)
-    renderSanitize(saved)
-    toast(next ? t('✅ 出站指纹脱敏已开启') : t('已关闭出站指纹脱敏'))
+    const api = shared().workbuddyDesktop
+    if (!api?.saveSanitize) throw new Error(t('主进程桥不可用'))
+    const request = !snapshot.sanitize.editable && typeof patch.sanitizeBlacklistFingerprints === 'boolean'
+      ? patch.sanitizeBlacklistFingerprints : patch
+    const data = await api.saveSanitize(request)
+    const state = sanitizeStateFrom(data, snapshot.sanitize)
+    if (state.status !== 'ready') throw new Error(t('未能读取保存后的指纹脱敏设置'))
+    publish({ sanitize: state })
+    toast(
+      state.saved
+        ? message ?? t('✅ 指纹脱敏设置已保存')
+        : t('指纹脱敏设置仅本次运行生效，写入数据库失败，请检查配置目录'),
+      state.saved ? 'ok' : 'err',
+    )
+    return true
   } catch (error) {
     toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadSanitize() // 回滚到后端的真实值
+    return false
   } finally {
     endBusy()
   }
@@ -2338,11 +2328,8 @@ async function saveProviderPrompt(
  * 一个值时，另一个若不带就落到「内置默认」—— 一次改动，两个后果，第二个还看不见
  * （`saveProviderPromptMode` 早先就为这件事这么做了）。
  *
- * **正文**只在一种情况下一起落：这一行原本跟随全局、且全局那份正文本身就是
- * 「界面里编辑的」。否则给空串（= 这一家没有自己的正文）：它自己的文件 / 内置默认
- * 接管，渲染出来的仍是屏幕上那段文本（文件路径刚被一起落下来了）。反过来，若无条件
- * 把屏幕上的文本落成这一家的正文，就会把**文件内容复制进配置** —— 之后改文件不再生效，
- * 而配置里多出几百行看不出缘由的文本。
+ * 正文保留已有的界面覆盖（含透传模式下存着但未生效的文本）；跟随全局时同理。
+ * 文件内容与内置默认不复制进配置，否则后续改文件会被这份副本遮住。
  */
 function providerPatch(
   prompt: PromptState,
@@ -2352,7 +2339,8 @@ function providerPatch(
   return {
     promptMode: item.mode,
     promptFile: item.file,
-    promptText: followGlobal && prompt.source === 'inline' ? prompt.text : '',
+    promptText: item.source === 'inline' || item.mode === 'passthrough' ? item.text
+      : followGlobal && (prompt.source === 'inline' || prompt.mode === 'passthrough') ? prompt.text : '',
   }
 }
 
@@ -2601,6 +2589,7 @@ export async function load(): Promise<void> {
   restoreCategory()
   renderUnits()
   publish({ panelLogin: readPanelLogin() })
+  window.dispatchEvent(new Event('wb:settings-load'))
   await Promise.all([
     loadSettings(),
     loadLanExtras(),
@@ -2609,7 +2598,6 @@ export async function load(): Promise<void> {
     loadTimeouts(),
     loadQueue(),
     loadCaptchaPool(),
-    loadRouting(),
     loadDebug(),
     loadSanitize(),
     loadDeveloperRoleCompat(),
@@ -2633,7 +2621,7 @@ export async function load(): Promise<void> {
 
 export async function refreshRetention(): Promise<void> {
   await loadRetention()
-  toast(t('保留天数已刷新'))
+  toast(t('数据保留设置已刷新'))
 }
 
 export async function refreshRetry(): Promise<void> {

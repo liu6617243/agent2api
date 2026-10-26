@@ -15,7 +15,7 @@ import {
   MultiSelect,
   Switch,
   type MultiSelectOption,
-} from '@ui'
+  Card, CardHeader, Table, TableHeader, TableRow, TableHead, TableBody, TableCell } from '@ui'
 import { TableFooter, useClientPaging } from './table-shell'
 import { t } from '../i18n'
 
@@ -800,8 +800,8 @@ function KeysPage() {
   }
 
   return (
-    <section className='panel'>
-      <div className='panel-head'>
+    <Card render={<section />} className='panel'>
+      <CardHeader className='panel-head'>
         <h2>{t('API Key 列表')}</h2>
         {/* id 与 data-tone 保留：app.js 的 renderTopbarStatus 按 id 镜像这枚徽标的文案
             与配色（data-tone 有值走它，不去拆组件库 Badge 那串 Tailwind 类名） */}
@@ -816,10 +816,10 @@ function KeysPage() {
             {t('＋ 新建 Key')}
           </Button>
         </div>
-      </div>
+      </CardHeader>
 
       <div className='models-table-wrap'>
-        <table className='models-table keys-table'>
+        <Table container={false} className='models-table keys-table'>
           {/* colgroup / thead 由本文件渲染，但 data-col 一个不少：列设置的就地重排
               （syncStaticHead）与列宽层（table-columns.js）都按它定位列 */}
           <colgroup>
@@ -829,39 +829,39 @@ function KeysPage() {
             <col className='k-state' data-col='state' />
             <col className='k-act' data-col='act' />
           </colgroup>
-          <thead>
-            <tr>
-              <th data-col='name'>{t('名称')}</th>
+          <TableHeader>
+            <TableRow>
+              <TableHead data-col='name'>{t('名称')}</TableHead>
               {/* 「Key」是产品固定叫法（无中文），不进词典 */}
-              <th data-col='key'>Key</th>
-              <th data-col='time'>{t('创建时间')}</th>
-              <th data-col='state'>{t('启用')}</th>
-              <th className='r' data-col='act'>{t('操作')}</th>
-            </tr>
-          </thead>
-          <tbody>
+              <TableHead data-col='key'>Key</TableHead>
+              <TableHead data-col='time'>{t('创建时间')}</TableHead>
+              <TableHead data-col='state'>{t('启用')}</TableHead>
+              <TableHead className='r' data-col='act'>{t('操作')}</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
             {list.length ? list.map(k => {
               const busyRow = pending.has(k.id)
               return (
-                <tr key={k.id} className={k.enabled ? '' : 'off'} data-id={k.id}>
+                <TableRow key={k.id} className={k.enabled ? '' : 'off'} data-id={k.id}>
                   {columns.map(column => (
-                    <td key={column.key} className={`${CELL_CLASS[column.key] ?? ''} ta-${column.align}`}>
+                    <TableCell key={column.key} className={`${CELL_CLASS[column.key] ?? ''} ta-${column.align}`}>
                       {cell(column.key, k, busyRow)}
-                    </td>
+                    </TableCell>
                   ))}
-                </tr>
+                </TableRow>
               )
             }) : (
               // 空态的 colspan 跟着可见列数走：写死 5 之后藏起两列，这一格会比表体宽出
               // 两格，把整张表顶出横向滚动
-              <tr>
-                <td colSpan={columns.length} className='empty'>
+              <TableRow>
+                <TableCell colSpan={columns.length} className='empty'>
                   {data ? t('还没有 Key，当前不鉴权') : t('加载中…')}
-                </td>
-              </tr>
+                </TableCell>
+              </TableRow>
             )}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
       </div>
 
       <TableFooter
@@ -901,7 +901,7 @@ function KeysPage() {
           }}
         />
       ) : null}
-    </section>
+    </Card>
   )
 }
 

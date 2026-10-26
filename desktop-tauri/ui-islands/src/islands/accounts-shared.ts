@@ -1,5 +1,8 @@
 import { t } from '../i18n'
+import { hasProxyUsage, type ProxyUsage } from '../../../ui-shared/proxy-usage'
 import type { BalanceQueryPublic } from './balance-query'
+import type { LimiterGroup, LimiterSnapshot } from './accounts-limiter-types'
+export type { LimiterGroup } from './accounts-limiter-types'
 
 /**
  * 账号页各文件共用的**类型与全局桥读取**（非岛：`.ts` 不被 import.meta.glob 当岛加载）。
@@ -99,15 +102,23 @@ export type BatchAccountsPayload = {
   proxy?: unknown
   maxConcurrent?: number
   usageQuery?: { enabled: boolean; interval: number }
+  limiterGroups?: LimiterGroup[]
   limiters?: LimiterRule[]
   limiterMode?: BatchLimiterMode
 }
 
 export type BatchAccountsResult = {
   ok?: Array<{ id?: string; name?: string; changes?: string[] }>
-  removed?: unknown[]
+  removed?: Array<{ id?: string }>
   failed?: Array<{ id?: string; error?: string }>
   skipped?: Array<{ id?: string; name?: string; reason?: string }>
+  list?: AccountsSnapshot
+}
+
+export type AccountUpdateResult = {
+  account?: AccountRecord
+  changes?: string[]
+  list?: AccountsSnapshot
 }
 
 /** 与后端 MAX_CONCURRENT_LIMIT 一致。 */
@@ -173,6 +184,14 @@ export type AccountRecord = {
   needsRelogin?: boolean
   /** 与 `needsRelogin` 成对：后端给出的原因文案（为空表示没有标记）。 */
   needsReloginReason?: string
+  /**
+   * 智谱清言：这条账号是不是**访客**（后端只对本家注入这个键，见
+   * `store_view::public_account` 与 `chatglm_accounts::guest_of_record`）。
+   *
+   * 消费方是余额列与签到范围：访客没有积分体系（上游接口一律 401），
+   * 所以它既不参与余额查询，也不在签到范围内 —— 两处读的是同一份事实。
+   */
+  isGuest?: boolean
   hasBalanceToken?: boolean
   /**
    * 自定义账号：记录里有没有非空 `apiKey`（设置弹窗据此决定输入框的提示文案与
@@ -198,6 +217,7 @@ export type AccountRecord = {
    */
   balanceQuery?: BalanceQueryPublic
   maxConcurrent?: number
+  allowRouteSkip?: boolean
   checkinAt?: number
   /**
    * 每账号自动余额查询设置（后端公开形态恒为对象；**缺省 = 开启、1 分钟**，
@@ -215,6 +235,7 @@ export type AccountRecord = {
    * 限制器规则列表（后端公开形态恒为数组，未显式配置 = 由旧 lowBalance /
    * provider 缺省推导的有效规则；形状见 `LimiterRule`）。
    */
+  limiterGroups?: LimiterGroup[]
   limiters?: LimiterRule[]
   addedAt?: number
   updatedAt?: number
@@ -278,9 +299,23 @@ type ConfirmOptions = {
   bodyClass?: string
 }
 
+export type AccountExportSelection = { id: string; provider?: never } | { provider: string; id?: never }
+
+export type AccountExportResult = {
+  canceled?: boolean
+  total?: number
+  count?: number
+  failed?: Array<{ id?: string; name?: string; error?: string }>
+  file?: string
+  saved?: boolean
+  downloadStarted?: boolean
+}
+
 export type AccountsBridge = {
+  platform?: string
+  exportAccountFiles(selection: AccountExportSelection): Promise<AccountExportResult | null | undefined>
   getAccountConnections(): Promise<{ counts?: Record<string, unknown> } | null | undefined>
-  updateAccount(id: string, patch: Record<string, unknown>): Promise<{ changes?: string[] } | null | undefined>
+  updateAccount(id: string, patch: Record<string, unknown>): Promise<AccountUpdateResult | null | undefined>
   /** 整队重排（分组模式）：把新队列整条交上去（从队首到队尾的 id 数组） */
   reorderAccounts(queue: string[]): Promise<unknown>
   moveAccount(id: string, direction: 'up' | 'down'): Promise<unknown>
@@ -311,7 +346,7 @@ export type AccountsBridge = {
    * 按它判断要不要应用），`tokenUsage` 按账号给启用中的每个 Token 周期一条
    * `{period, windowStart, used}`（没配规则的账号不出现）。
    */
-  getBalancesSnapshot(): Promise<{
+  getBalancesSnapshot(): Promise<LimiterSnapshot & {
     at?: number
     results?: Array<Record<string, unknown>>
     tokenAt?: number
@@ -381,7 +416,7 @@ export type ClashSnapshot = {
  * 完整形态见 ui-islands/src/islands/proxies-page.tsx 的 PoolItem。
  * 账号的 proxy 可以按 id 引用它（`{source:'pool', proxyId}`）。
  */
-export type PoolItem = {
+export type PoolItem = ProxyUsage & {
   id: string
   name?: string
   /** manual | clash（表单里按它标「手动 / Clash Verge」） */
@@ -393,8 +428,6 @@ export type PoolItem = {
   resolved?: { protocol?: string; host?: string; port?: number | null; label?: string } | null
   /** 解析失败的原因（引用了已删除的 Clash 监听器等） */
   resolveError?: string | null
-  /** 引用它的账号（后端在池列表里带的） */
-  usedBy?: Array<{ id?: string; name?: string; enabled?: boolean }>
   /** 孤儿订阅节点：所属订阅已不存在（后端标注） */
   orphan?: boolean
 }
@@ -402,9 +435,8 @@ export type PoolItem = {
 /**
  * 订阅节点还没有监听端口 —— lazy listeners 下的**正常状态**，不是解析失败。
  *
- * 端口只在有账号引用（并保存）之后才由内核分配，所以「没有端口」通常就是
- * 「没有账号在用这条」。下拉与网络代理页的地址列都按这个状态显示，别把它
- * 报成红色失败：那会让用户以为节点坏了，去查订阅而不是去选它。
+ * 端口在账号或服务线路引用并保存后由内核分配；无引用或重建尚未完成时没有
+ * 端口。下拉与网络代理页都按引用状态展示，不把这个中间态当成解析失败。
  */
 export function isPortlessSubscription(item: PoolItem): boolean {
   return item.source === 'subscription' && (item.port === null || item.port === undefined)
@@ -435,8 +467,8 @@ export function kernelInstalled(): boolean | null {
  *   · 内核没装 → 内核未安装（全局前提都没有，先下载内核）
  *   · 所属订阅已删（孤儿）→ 订阅已移除（不会再分配了，只能删条目）
  *   · 本页禁用中 → 已禁用（端口随禁用一起收掉，启用才会回来）
- *   · 有账号引用、端口还没就位 → 端口准备中（内核正在重建，等一会儿）
- *   · 没有账号引用它 → 未被使用（端口只在被引用时才开，选中它就会开）
+ *   · 有账号或服务线路引用、端口还没就位 → 端口准备中
+ *   · 没有任何引用 → 未被使用
  *
  * `installed` 传 `null`/`undefined` = 还不知道（池列表没读到），此时
  * 不把「内核没装」当结论 —— 误报成「未安装」比不说更糟。
@@ -451,7 +483,7 @@ export function portlessSubscriptionLabel(
   if (installed === false) return t('内核未安装')
   if (item.orphan) return t('订阅已移除')
   if (item.enabled === false) return t('已禁用')
-  if (item.usedBy?.length) return t('端口准备中')
+  if (hasProxyUsage(item)) return t('端口准备中')
   return t('未被使用')
 }
 
@@ -467,9 +499,7 @@ export function portlessSubscriptionLabel(
  * 取不到（解析失败 / 字段缺失）时回落 `resolved.label`，再没有就是空串。
  */
 export function poolItemAddress(item: PoolItem, installed: boolean | null = kernelInstalledCache): string {
-  // lazy listeners：没有账号引用它，内核就不给开监听端口。这里写的是**状态**
-  // 而不是「未分配端口」—— 后者会引出「怎么才能分配」的疑问，而答案（去账号
-  // 里选它）恰恰藏在这个状态里
+  // 没有端口不等于解析失败：按账号与服务线路的引用状态说明原因
   if (isPortlessSubscription(item)) {
     return portlessSubscriptionLabel(item, installed)
   }

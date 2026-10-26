@@ -10,7 +10,7 @@ import {
   DialogTitle,
   RadioGroup,
   RadioGroupItem,
-} from '@ui'
+  Label } from '@ui'
 import { t } from '../i18n'
 
 /**
@@ -445,7 +445,7 @@ function RequestClearModal({ onClose }: RequestClearModalProps) {
             {MODE_ORDER.map(key => {
               const checked = mode === key
               return (
-                <label
+                <Label
                   key={key}
                   // 选中态由受控 value 推出来，交给 data-checked 变体表达
                   // （卡片底与描边走 data-checked:，卡内文字走 group-data-checked/card:）。
@@ -462,7 +462,7 @@ function RequestClearModal({ onClose }: RequestClearModalProps) {
                     {MODES[key].title}
                   </span>
                   <span className='text-[11.5px] leading-[1.55] text-subtle'>{MODES[key].desc}</span>
-                </label>
+                </Label>
               )
             })}
           </RadioGroup>

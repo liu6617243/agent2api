@@ -11,15 +11,11 @@ use crate::server::core::task_state::{self, Claim, ManualBackoff};
 use crate::server::logging;
 
 fn key() -> String {
-    format!(
-        "pluginCatalog:{}:{}",
-        update::INDEX_REPO,
-        if settings::current().beta {
-            "beta"
-        } else {
-            "stable"
-        }
-    )
+    key_for(settings::current().channels())
+}
+
+fn key_for(channels: crate::server::config::UpdateChannels) -> String {
+    format!("pluginCatalog:{}:{}", update::INDEX_REPO, channels.key())
 }
 
 fn signal() -> &'static Notify {
@@ -32,7 +28,7 @@ pub fn wake() {
 }
 
 pub fn clear_cooldown() {
-    for channel in ["stable", "beta"] {
+    for channel in ["stable", "beta", "both"] {
         let _ =
             task_state::clear_cooldown(&format!("pluginCatalog:{}:{channel}", update::INDEX_REPO));
     }
@@ -49,7 +45,7 @@ pub fn schedule_now() {
 }
 
 pub fn reschedule(interval_ms: i64) {
-    for channel in ["stable", "beta"] {
+    for channel in ["stable", "beta", "both"] {
         let _ = task_state::reschedule(
             &format!("pluginCatalog:{}:{channel}", update::INDEX_REPO),
             interval_ms,
@@ -59,12 +55,20 @@ pub fn reschedule(interval_ms: i64) {
 }
 
 pub fn snapshot() -> Value {
-    let state = task_state::read(&key()).unwrap_or_default();
+    snapshot_for(settings::current().channels())
+}
+
+fn snapshot_for(channels: crate::server::config::UpdateChannels) -> Value {
+    let state = task_state::read(&key_for(channels)).unwrap_or_default();
     let mut result = state
         .value
         .clone()
         .unwrap_or_else(|| json!({ "plugins": [] }));
-    let invalidated = result["invalidated"] == true;
+    let invalidated = result["invalidated"] == true || result.get("channels") != Some(&json!(channels));
+    if invalidated {
+        result["plugins"] = json!([]);
+    }
+    result["channels"] = json!(channels);
     let stale = state.last_error.is_some() || invalidated;
     result["checked"] = json!(state.last_success_at > 0 && !invalidated);
     result["checkedAt"] = json!(state.last_success_at);
@@ -93,8 +97,10 @@ pub fn snapshot() -> Value {
 }
 
 pub async fn refresh(manual: bool) -> Result<Value, String> {
-    let channel_key = key();
-    let interval = settings::current().interval * 60_000;
+    let settings = settings::current();
+    let channels = settings.channels();
+    let channel_key = key_for(channels);
+    let interval = settings.interval * 60_000;
     let guard = match task_state::claim(
         &channel_key,
         interval,
@@ -110,20 +116,16 @@ pub async fn refresh(manual: bool) -> Result<Value, String> {
             return Err(state.waiting_message());
         }
     };
-    let outcome = fetch_catalog().await;
+    let outcome = fetch_catalog(channels).await;
+    let interval = settings::current().interval * 60_000;
     if channel_key != key() {
-        guard.finish(
-            false,
-            "更新通道已改变，本轮结果已忽略".to_string(),
-            None,
-            0,
-            interval,
-        )?;
-        wake();
+        drop(guard);
+        schedule_now();
         return Ok(snapshot());
     }
     match outcome {
-        Ok(value) => {
+        Ok(mut value) => {
+            value["channels"] = json!(channels);
             guard.finish(true, "插件检查完成".to_string(), Some(value), 0, interval)?;
             Ok(snapshot())
         }
@@ -134,10 +136,10 @@ pub async fn refresh(manual: bool) -> Result<Value, String> {
     }
 }
 
-async fn fetch_catalog() -> Result<Value, String> {
+async fn fetch_catalog(channels: crate::server::config::UpdateChannels) -> Result<Value, String> {
     let entries = update::read_index_result().await?;
     let packs = super::list_packs();
-    let cached = snapshot();
+    let cached = snapshot_for(channels);
     let current = super::host_target();
     let mut plugins = Vec::new();
     for entry in entries {
@@ -168,25 +170,29 @@ async fn fetch_catalog() -> Result<Value, String> {
             "id": entry.id, "name": entry.name, "description": entry.description,
             "official": entry.official, "homepage": detail.as_ref().map(|detail| &detail.homepage),
             "protocol": detail.as_ref().map(|detail| detail.protocol), "icon": icon,
+            "requireSigned": entry.require_signed || detail.as_ref().is_some_and(|detail| detail.require_signed),
             "version": Value::Null, "page": Value::Null, "notes": "", "prerelease": false,
             "platforms": [], "error": false, "reason": Value::Null,
         });
-        match update::release_for(
+        match update::release_for_channels(
             repo,
             &entry.id,
             detail.as_ref(),
             installed.map(|pack| pack.version.as_str()),
+            channels,
         )
         .await
         {
             Ok(Some(release)) => {
+                let require_signed = value["requireSigned"] == true || release.require_signed;
+                value["requireSigned"] = json!(require_signed);
                 value["version"] = json!(release.version);
                 value["page"] = json!(release.page);
                 value["notes"] = json!(release.notes);
                 value["publishedAt"] = json!(release.published_at);
                 value["prerelease"] = json!(release.prerelease);
                 value["platforms"] = json!(release.platforms.into_iter().map(|(target, url, size)| {
-                    json!({ "current": target == current, "target": target, "url": url, "size": size })
+                    json!({ "current": target == current, "target": target, "url": url, "size": size, "requireSigned": require_signed })
                 }).collect::<Vec<_>>());
             }
             Ok(None) => value["reason"] = json!("当前通道暂无可安装的版本"),
@@ -259,11 +265,12 @@ pub fn updates() -> Value {
 
 async fn apply_automatic() {
     let settings = settings::current();
-    if !settings.auto_update && !settings.auto_install_official {
+    if !settings.auto_check || (!settings.auto_update && !settings.auto_install_official) {
         return;
     }
+    let channels = settings.channels();
     let catalog = snapshot();
-    if catalog["stale"] == true {
+    if catalog["stale"] == true || catalog["checked"] != true {
         return;
     }
     let Some(items) = catalog["plugins"].as_array() else {
@@ -271,6 +278,9 @@ async fn apply_automatic() {
     };
     for entry in items {
         let settings = settings::current();
+        if !settings.auto_check || settings.channels() != channels {
+            return;
+        }
         let Some(id) = entry["id"].as_str() else {
             continue;
         };
@@ -333,8 +343,7 @@ pub fn spawn() {
         loop {
             let settings = settings::current();
             let state = task_state::read(&key()).unwrap_or_default();
-            let network_enabled =
-                settings.auto_check || settings.auto_update || settings.auto_install_official;
+            let network_enabled = settings.auto_check;
             if network_enabled && !state.running() && logging::now_ms() >= state.due_at() {
                 if let Err(error) = refresh(false).await {
                     logging::verbose("[Plugin]", &format!("插件自动检查：{error}"));

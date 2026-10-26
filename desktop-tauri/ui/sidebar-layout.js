@@ -80,8 +80,9 @@
     // /旅行这类专属面板，都由插件申报）。没装插件时页面显示空态并指路，比一个
     // 凭空消失的菜单项清楚得多。
     { key: 'checkin', label: wbI18n.t('签到中心'), icon: 'checkin' },
+    { key: 'routing', label: wbI18n.t('路由'), icon: 'route' },
     { key: 'gateway', label: wbI18n.t('模型管理'), icon: 'gateway' },
-    { key: 'agent', label: wbI18n.t('Agent'), icon: 'agent' },
+    { key: 'agent', label: wbI18n.t('Agent 配置'), icon: 'agent' },
     { key: 'proxies', label: wbI18n.t('网络代理'), icon: 'proxies' },
     { key: 'keys', label: wbI18n.t('网关 Key'), icon: 'key' },
     { key: 'docs', label: wbI18n.t('文档'), icon: 'logs' },
@@ -227,7 +228,7 @@
         { id: 'g-overview', label: '概览', custom: false, hidden: false,
           items: ['assistant', 'overview', 'accounts', 'checkin'] },
         { id: 'g-forward', label: '转发链路', custom: false, hidden: false,
-          items: ['gateway', 'agent', 'proxies', 'keys', 'docs'] },
+          items: ['routing', 'gateway', 'agent', 'proxies', 'keys', 'docs'] },
         { id: 'g-diag', label: '诊断', custom: false, hidden: false,
           items: ['requests', 'logs', 'tasks'] },
         { id: 'g-system', label: '系统', custom: false, hidden: false,
@@ -316,7 +317,9 @@
       const defaults = defaultLayout().groups;
       for (const key of missing) {
         const home = defaults.find(group => group.items.includes(key));
-        const target = home ? groups.find(group => group.id === home.id) : null;
+        const target = key === 'routing'
+          ? groups.find(group => group.items.includes('gateway')) || (home ? groups.find(group => group.id === home.id) : null)
+          : home ? groups.find(group => group.id === home.id) : null;
         if (!target) {
           groups[0].items.push(key);
           continue;

@@ -74,6 +74,9 @@ pub async fn batch_accounts(state: &ServerState, body: &Bytes) -> Response {
             };
             let mut patch = Map::new();
             patch.insert("limiterMode".to_string(), mode.clone());
+            if let Some(groups) = payload.get("limiterGroups") {
+                patch.insert("limiterGroups".to_string(), groups.clone());
+            }
             if let Some(rules) = payload.get("limiters") {
                 patch.insert("limiters".to_string(), rules.clone());
             }

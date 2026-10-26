@@ -3,7 +3,7 @@
 //! ── 这一步在整个架构里的位置 ────────────────────────────────
 //! `bootstrap()` 之前，插件只是一个躺在磁盘上的二进制。这一步做四件事：
 //!   1. 读 `plugins.json`（装了什么、哪个版本、启停状态）；
-//!   2. 对第一个启用的包 spawn 宿主进程并握手（单宿主跑全部家，见 `mod.rs`）；
+//!   2. 对每个启用的包分别 spawn 宿主进程并握手；
 //!   3. 为握手回来的每个 provider 建一个 [`RpcAdapter`]；
 //!   4. 塞进运行时注册表 —— 之后 `adapter_by_id(id)` 就能查到它们。
 //!
@@ -129,6 +129,33 @@ impl GatewayCallbacks for StoreCallbacks {
         })
     }
 
+    fn store_update_with_public(
+        &self,
+        account: String,
+        expect: serde_json::Value,
+        secret: serde_json::Value,
+        public: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<serde_json::Value, proto::WireError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let view = if public.is_object() {
+                Some(public)
+            } else if let Some(provider) = self.store.account_provider_of(&account) {
+                if let Some(adapter) = registry::lookup(&provider) {
+                    adapter.plugin_account_view(&secret).await.ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            self.store.plugin_update_account(&account, &expect, &secret, view.as_ref())
+                .map(|updated| serde_json::json!({ "updated": updated }))
+                .map_err(|message| proto::WireError::with_code(message, proto::WireError::INTERNAL))
+        })
+    }
+
     fn store_mark_limited(
         &self,
         account: String,
@@ -236,32 +263,18 @@ impl GatewayCallbacks for StoreCallbacks {
     }
 
     fn log(&self, level: String, message: String) {
-        // ── 级别要跟着走，不能一律当 error ────────────────────────
-        // 早先这里三个分支全落 `logging::log`，而它的级别是**从文案推断**的
-        // （`infer_level`，看有没有「失败」「错误」这类词）。插件侧那句
-        // 「套餐令牌通道没有额度桶，监控通道也没读到读数（…当前用户不存在
-        // coding plan）」是 `logging::verbose` 打的**正常路径**说明（billing
-        // 通道成功、只是活动套餐本来就没有额度桶），文案里带「失败」二字就
-        // 被渲染成红色「错误」，用户在运行日志里看到四条假报错。
-        //
-        // 插件声明的级别才是权威：`log_info!` / `log_warn!` / `log_error!`
-        // 在协议里各自带 level，这里照它落库。
-        let tag = "[Plugin]";
-        let level = match level.as_str() {
-            "error" => "error",
-            "warn" => "warn",
-            // `debug` 是插件的 verbose 档（SDK 里 `verbose` 降级成 `log_info!`，
-            // 见插件的 `logging.rs` —— 它们目前都走 info，这一支留给协议将来
-            // 恢复分档）。
-            "debug" | "verbose" | "trace" => "debug",
-            _ => "info",
-        };
-        logging::log_with_level(tag, &message, level);
+        super::logs::receive(&self.store, &level, &message, serde_json::Value::Null);
+    }
+
+    fn log_context(&self, level: String, message: String, context: serde_json::Value) {
+        super::logs::receive(&self.store, &level, &message, context);
     }
 
     fn notify(&self, kind: String, payload: serde_json::Value) {
-        // 界面通过轮询 `HostStatus` 拿状态，这里只把通知落日志 —— 主动推给
-        // 前端需要一条事件总线，而目前没有跨平台的那条通道（P6 再补）。
+        if kind == "models_changed" {
+            super::model_sync::notify(&payload);
+            return;
+        }
         logging::log("Plugin", &format!("通知 {kind}: {payload}"));
     }
 }
@@ -281,10 +294,27 @@ fn plugin_settings_key(provider: &str, key: &str) -> String {
 /// 什么都不用做。
 pub async fn start(store: AccountStore) -> Option<Arc<Host>> {
     let registry_file = PackRegistry::load();
-    let Some(pack) = registry_file.enabled().cloned() else {
-        return None;
-    };
+    let owners = super::ownership::owners(&registry_file);
+    let mut first = None;
+    for pack in registry_file.packs.iter().filter(|pack| pack.enabled) {
+        if let Some(host) = start_pack(store.clone(), pack, &owners).await {
+            if first.is_none() {
+                first = Some(host);
+            }
+        }
+    }
+    if first.is_some() {
+        crate::server::core::providers::adapter::restore_cached_catalogs();
+        super::schedules::wake();
+    }
+    first
+}
 
+async fn start_pack(
+    store: AccountStore,
+    pack: &install::InstalledPack,
+    owners: &std::collections::BTreeMap<String, String>,
+) -> Option<Arc<Host>> {
     // 入口路径与清单都在版本目录里。清单读不出来不致命 —— 入口路径注册表里
     // 也有一份（`InstalledPack::entry`），但**必须**复核协议版本，否则一个
     // 旧版插件会在握手时被当成新版用。
@@ -332,11 +362,17 @@ pub async fn start(store: AccountStore) -> Option<Arc<Host>> {
         ..HostOptions::new(exe)
     };
     let host = Arc::new(Host::new(options, Arc::new(StoreCallbacks::new(store))));
+    super::runtime::install_pack(&pack.id, super::ownership::category(&dir), host.clone());
     match host.ensure().await {
         Ok(providers) => {
-            let mut count = 0usize;
+            let mut loaded = Vec::new();
+            let mut restored = Vec::new();
             for info in providers {
                 let id = info.id.0.clone();
+                if owners.get(&id).map(String::as_str) != Some(pack.id.as_str()) {
+                    logging::log("Plugin", &format!("提供商 {id} 不归插件包「{}」接管，跳过", pack.id));
+                    continue;
+                }
                 // 逐 provider 的启停（用户可以只关掉包里的一家）
                 if !pack.providers.get(&id).copied().unwrap_or(true) {
                     logging::log("Plugin", &format!("提供商 {id} 已被用户停用，跳过"));
@@ -346,18 +382,26 @@ pub async fn start(store: AccountStore) -> Option<Arc<Host>> {
                     super::schedules::load(&host, &id).await;
                 }
                 let kind = plugin_kind(&id);
-                super::rpc_cache::set_defaults(&id, info.default_models.clone());
-                let adapter = RpcAdapter::new(id.clone(), kind, host.clone(), info);
-                registry::install(id, Arc::new(adapter));
-                count += 1;
+                if let Some((models, at)) = super::rpc_cache::set_defaults(&id, info.default_models.clone()) {
+                    restored.push(format!("{id}（{models} 个，{}）", crate::server::core::providers::catalog_cache::age_text(at)));
+                }
+                let mut adapter = RpcAdapter::new(id.clone(), kind, host.clone(), info);
+                adapter.load_image_capability().await;
+                registry::install(id.clone(), Arc::new(adapter));
+                loaded.push(id);
             }
+            let count = loaded.len();
+            super::runtime::set_providers(&pack.id, loaded);
             logging::log(
                 "Plugin",
                 &format!("插件包「{}」v{} 已加载，{} 家提供商可用", pack.id, pack.version, count),
             );
-            super::install(host.clone());
-            crate::server::core::providers::adapter::seed_hidden_visibility_defaults();
-            super::schedules::wake();
+            if !restored.is_empty() {
+                logging::log("[Models]", &format!(
+                    "📦 已从缓存恢复 {} 份插件模型清单（{}）——刷新成功后覆盖",
+                    restored.len(), restored.join("、"),
+                ));
+            }
             Some(host)
         }
         Err(reason) => {
@@ -382,10 +426,7 @@ pub async fn start(store: AccountStore) -> Option<Arc<Host>> {
 ///
 /// 关闭失败不阻断：拿不到宿主就是「本来就没在跑」，照样往下走。
 pub async fn reload(store: AccountStore) -> Option<Arc<Host>> {
-    if let Some(host) = super::current() {
-        host.shutdown().await;
-    }
-    super::detach();
+    super::shutdown_all().await;
     registry::clear();
     start(store).await
 }

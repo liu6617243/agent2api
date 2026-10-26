@@ -145,22 +145,22 @@ function RuleRow({ rule, priority, isLast, state, onChange }: {
         </span>
       )}
       <span className='flex flex-col gap-px'>
-        <button type='button' disabled={priority <= 1}
+        <Button size='default' variant='ghost' type='button' disabled={priority <= 1}
           className='h-3 w-4 rounded-[3px] text-subtle hover:bg-nav-hover hover:text-foreground disabled:cursor-default disabled:opacity-30'
           title={t('提高优先级')} aria-label={t('提高优先级')}
           onClick={() => onChange({ __move: 'up' } as unknown as Partial<GroupSortRule>)}>
           <svg viewBox='0 0 24 24' width='10' height='10' className='mx-auto block'>
             <path fill='none' stroke='currentColor' strokeWidth='2.4' strokeLinecap='round' strokeLinejoin='round' d='m6 14 6-6 6 6' />
           </svg>
-        </button>
-        <button type='button' disabled={isLast}
+        </Button>
+        <Button size='default' variant='ghost' type='button' disabled={isLast}
           className='h-3 w-4 rounded-[3px] text-subtle hover:bg-nav-hover hover:text-foreground disabled:cursor-default disabled:opacity-30'
           title={t('降低优先级')} aria-label={t('降低优先级')}
           onClick={() => onChange({ __move: 'down' } as unknown as Partial<GroupSortRule>)}>
           <svg viewBox='0 0 24 24' width='10' height='10' className='mx-auto block'>
             <path fill='none' stroke='currentColor' strokeWidth='2.4' strokeLinecap='round' strokeLinejoin='round' d='m6 10 6 6 6-6' />
           </svg>
-        </button>
+        </Button>
       </span>
     </div>
   )

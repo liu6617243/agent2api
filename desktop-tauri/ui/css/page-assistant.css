@@ -46,7 +46,7 @@
   margin-right: 16px;
 }
 .asst-side-head { flex: none; padding-bottom: 8px; }
-.asst-side .asst-new { width: 100%; justify-content: flex-start; gap: 7px; }
+.asst-new { width: 100%; justify-content: flex-start; gap: 7px; }
 .asst-side-list {
   flex: 1 1 auto;
   min-height: 0;
@@ -72,7 +72,7 @@
   font-size: 12.5px;
   cursor: pointer;
 }
-.asst-side-item:hover { background: var(--nav-hover); color: var(--text); }
+.asst-side-item:hover:not(:has([data-active])) { background: var(--nav-hover); color: var(--text); }
 .asst-side-item.active { background: var(--surface-2); color: var(--text); font-weight: 600; }
 .asst-side-item .title {
   flex: 1 1 auto;
@@ -113,8 +113,6 @@
 }
 .asst-side-foot .link:hover { background: transparent; border-color: transparent; color: var(--danger); text-decoration: underline; }
 
-.asst-side-mask { display: none; }
-
 /* ─── 右栏：对话本体（顶栏 / 消息区 / 输入区）─── */
 .asst-main {
   flex: 1 1 auto;
@@ -122,8 +120,6 @@
   min-height: 0;
   display: flex;
   flex-direction: column;
-  /* 内容区外框的 padding-bottom 是 0（见 layout.css 的 .content），
-     而输入区底部的说明行就在最下面 —— 不留这一条会被窗口下沿切掉半行 */
   padding-bottom: 10px;
 }
 
@@ -163,7 +159,7 @@
 }
 .asst-top .spacer { flex: 1 1 auto; }
 .asst-top .asst-top-hint { color: var(--text-3); font-size: 11.5px; }
-.asst-settings-btn { gap: 6px; color: var(--text-2); }
+.asst-settings-btn { gap: 6px; background: var(--control-hover); color: var(--text-2); }
 .asst-settings-btn svg { color: var(--text-3); }
 
 /* ─── 消息区 ─── */
@@ -285,41 +281,17 @@
 }
 @keyframes asst-caret { 50% { opacity: 0; } }
 
-/* 「正在思考」三点 */
-.asst-typing { display: inline-flex; align-items: center; gap: 4px; height: 18px; }
-.asst-typing i {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--text-3);
-  animation: asst-typing 1.2s ease-in-out infinite;
-}
-.asst-typing i:nth-child(2) { animation-delay: .15s; }
-.asst-typing i:nth-child(3) { animation-delay: .3s; }
-@keyframes asst-typing { 0%, 60%, 100% { opacity: .3; } 30% { opacity: 1; } }
-
 /* 提示 / 出错 */
 .asst-notice {
   margin-left: 34px;
-  padding: 8px 12px;
-  border: 1px solid var(--warn-bd);
-  border-radius: var(--r-sm);
-  background: var(--warn-soft);
-  color: var(--text-2);
-  font-size: 11.5px;
-  line-height: 1.7;
 }
-.asst-notice.bad { border-color: var(--danger-bd); background: var(--danger-soft); }
 
 /* ─── 工具卡 ───
    默认只有一行摘要（头），点开才看参数 / 结果。待确认的卡是唯一常驻展开的
    形态 —— 用户要在这张卡上做决定。 */
 .asst-tool {
   margin-left: 34px;
-  border: 1px solid var(--border);
   border-left: 3px solid var(--border-strong);
-  border-radius: var(--r-md);
-  background: var(--surface);
   overflow: hidden;
   transition: border-color .15s ease;
 }
@@ -368,30 +340,13 @@
 }
 .asst-tool-state {
   margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  color: var(--text-3);
-  font-size: 11.5px;
-  white-space: nowrap;
 }
-.asst-tool-state.ok { color: var(--ok); }
-.asst-tool-state.bad { color: var(--danger); }
 .asst-tool-chev { flex: none; color: var(--text-3); transition: transform .15s ease; }
 .asst-tool-chev.open { transform: rotate(180deg); }
 
 .asst-tool-plan { padding: 2px 12px 6px; color: var(--text-2); font-size: 12px; line-height: 1.75; }
 .asst-tool-plan .lead { margin-bottom: 2px; }
 .asst-tool-plan .hint { color: var(--text-3); font-size: 11px; line-height: 1.65; }
-
-.asst-tool-error {
-  padding: 9px 12px;
-  border-top: 1px solid var(--hairline);
-  background: var(--danger-soft);
-  color: var(--text-2);
-  font-size: 11.5px;
-  line-height: 1.7;
-}
 .asst-tool-json {
   margin: 0;
   padding: 9px 12px;
@@ -434,18 +389,6 @@
 .asst-mini-table .mono { font-family: var(--font-mono); font-size: 11.5px; color: var(--text); }
 .asst-mini-table .hl { color: var(--primary-fg); font-weight: 600; }
 
-/* 转圈（工具执行中） */
-.spin {
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  border: 2px solid var(--primary-bd);
-  border-top-color: var(--primary);
-  animation: asst-spin .8s linear infinite;
-  display: block;
-}
-@keyframes asst-spin { to { transform: rotate(360deg); } }
-
 /* ─── 空态 ─── */
 .asst-empty {
   flex: 1;
@@ -486,16 +429,8 @@
 .asst-suggests button:hover:not(:disabled) { border-color: var(--primary-bd); color: var(--text); }
 .asst-empty .asst-empty-warn {
   margin-top: 4px;
-  padding: 8px 12px;
-  border: 1px solid var(--warn-bd);
-  border-radius: var(--r-sm);
-  background: var(--warn-soft);
-  color: var(--text-2);
-  font-size: 11.5px;
-  line-height: 1.7;
   max-width: 460px;
 }
-.asst-empty .asst-empty-warn.bad { border-color: var(--danger-bd); background: var(--danger-soft); }
 
 /* ─── 输入区 ───
    结构：附件行 / 文本域 / 底部工具条（+ · 权限胶囊 … 模型胶囊 · 发送）。
@@ -665,15 +600,6 @@
 .asst-send.stop { background: var(--danger-soft); border-color: var(--danger-bd); color: var(--danger); }
 .asst-send.stop:hover:not(:disabled) { background: var(--danger); border-color: var(--danger); color: #fff; }
 
-.asst-footline {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 4px 0;
-  color: var(--text-3);
-  font-size: 10.5px;
-}
-
 /* ─── 弹层：模型 / 推理等级 / 权限模式 ───
    基础外观由组件库的 PopoverContent 提供（浮层底 + 强描边 + 大投影），
    这里只排内容。 */
@@ -761,7 +687,6 @@
 .asst-search input:focus { box-shadow: none; }
 
 .asst-sub-list { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 1px; }
-.asst-sub-group { padding: 6px 8px 3px; color: var(--text-3); font-size: 10.5px; font-weight: 650; letter-spacing: .05em; }
 .asst-sub-empty { padding: 12px 8px; color: var(--text-3); font-size: 11.5px; text-align: center; }
 .asst-sub-item {
   display: flex;
@@ -783,7 +708,6 @@
 .asst-sub-item.selected { background: var(--primary-soft); color: var(--text); }
 .asst-sub-item .mono { font-family: var(--font-mono); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .asst-sub-tail { display: inline-flex; align-items: center; gap: 6px; flex: none; color: var(--primary-fg); }
-.asst-sub-tail em { color: var(--text-3); font-size: 10px; font-style: normal; }
 
 /* 权限模式选项 */
 .asst-mode-opt {
@@ -947,37 +871,7 @@
 .asst-tool-row .tt { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .asst-tool-row .tt-name { display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 11.5px; font-weight: 600; }
 .asst-tool-row .tt-desc { color: var(--text-3); font-size: 10.5px; line-height: 1.5; }
-
-/* ─── 窄屏：左栏收成抽屉 ───
-   断点与 mobile.css 的其余页面同一档（900px）：低于它时左栏绝对定位覆盖在
-   对话之上，靠 .asst-layout.side-open 控制显隐，点遮罩收起。 */
 @media (max-width: 900px) {
-  .asst-side {
-    position: absolute;
-    z-index: 30;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    width: 240px;
-    padding: 0 10px 10px;
-    margin-right: 0;
-    background: var(--surface);
-    border-right: 1px solid var(--border);
-    box-shadow: var(--shadow-2);
-    /* 收起态用 100vw 而非 -102%：百分比按**抽屉自身宽度**（240px）算，
-       而抽屉的 left:0 是相对 .asst-layout 定位的 —— 布局容器比 240px 宽时，
-       -244.8px 只把抽屉推到容器左缘之外，仍有宽度露在可视区内。 */
-    transform: translateX(-100vw);
-    transition: transform .18s ease;
-  }
-  .asst-layout.side-open .asst-side { transform: translateX(0); }
-  .asst-side-mask {
-    display: block;
-    position: absolute;
-    inset: 0;
-    z-index: 20;
-    background: rgba(0, 0, 0, .28);
-  }
   .asst-menu { display: inline-flex; align-items: center; justify-content: center; }
   /* 窄屏下窄屏字号 16px：iOS Safari 在输入框字号 < 16px 时聚焦会自动放大整页 */
   .asst-composer textarea { font-size: 16px; }

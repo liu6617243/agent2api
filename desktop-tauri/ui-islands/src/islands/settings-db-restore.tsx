@@ -2,6 +2,7 @@ import * as React from 'react'
 import { Button, Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, Progress } from '@ui'
 import { dismissDbRestore, useSettings, type DbRestoreProgress } from './settings-state'
 import { t } from '../i18n'
+import { Alert } from '@ui'
 
 /**
  * 整库恢复的进度弹窗 —— **不可关闭**，直到恢复收口。
@@ -78,22 +79,22 @@ export function DbRestoreDialog(): React.ReactElement | null {
                 </p>
               ) : null}
               {progress.warning ? (
-                <div className='danger-zone'>
+                <Alert variant='destructive' className='danger-zone'>
                   <strong>{t('⚠️ 密钥警告')}</strong>
                   <br />
                   {progress.warning}
-                </div>
+                </Alert>
               ) : null}
             </div>
           ) : null}
 
           {failed ? (
             <div className='db-restore-result'>
-              <div className='danger-zone'>
+              <Alert variant='destructive' className='danger-zone'>
                 <strong>{t('恢复没有完成')}</strong>
                 <br />
                 {progress.error || t('原因未知')}
-              </div>
+              </Alert>
               <p className='hint'>
                 {t('如果主库已被替换到一半，替换前的数据在 backups/ 目录里仍可整文件拷回。')}
               </p>

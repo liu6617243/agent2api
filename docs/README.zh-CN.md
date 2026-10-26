@@ -12,7 +12,7 @@
 [![stars](https://img.shields.io/github/stars/aimod-cc/Agent2API?style=flat&color=yellow)](https://github.com/aimod-cc/Agent2API/stargazers)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/aimod-cc/Agent2API/releases/latest)
 
-[✨ 核心特性](#-核心特性) • [💬 社区与支持](#-社区与支持) • [🧩 插件扩展](#-插件扩展) • [🚀 快速开始](#-快速开始) • [📦 安装与部署](./install.md) • [📸 界面预览](#-界面预览) • [🔧 开发与构建](#-开发与构建) • [📜 使用声明](#-使用声明)
+[✨ 核心特性](#-核心特性) • [💬 社区与支持](#-社区与支持) • [🚀 快速开始](#-快速开始) • [📦 安装与部署](./install.md) • [📸 界面预览](#-界面预览) • [🔧 开发与构建](#-开发与构建) • [📜 使用声明](#-使用声明)
 
 </div>
 
@@ -24,7 +24,7 @@ Agent2API 是一个 **AI 路由网关 + Agent 客户端接管**项目。它将�
 
 ## ✨ 核心特性
 
-- 🔌 **统一模型接口** —— 支持 OpenAI Chat / Responses 与 Anthropic Messages 协议，以及统一的模型列表
+- 🔌 **统一模型接口** —— 支持 OpenAI Chat / Responses / Images 与 Anthropic Messages 协议，以及统一的模型列表；小浣熊、Loomy、Antigravity 提供文生图，Loomy 与 Antigravity 还支持参考图编辑；生图与编辑也可由 AI 助手工具调用
 - 🧭 **AI 路由** —— 模型映射、账号优先级、负载均衡、会话粘性与失败切换集中配置
 - 🤖 **Agent 客户端接管** —— 管理本机客户端的多套连接配置，导入现有配置、预览写入内容并切换网关或自定义服务
 - 🧩 **插件扩展** —— 提供商实现独立安装和更新，不随主程序打包；无需这些能力时可只使用路由网关
@@ -49,20 +49,11 @@ Agent2API 是一个 **AI 路由网关 + Agent 客户端接管**项目。它将�
 
 ## 💬 社区与支持
 
-- **QQ 群**：Agent2API 交流群 —— **群 1（`1127656296`）即将满员，请优先加群 2（`1130894674`）**；在 QQ 里搜索群号即可加入。
+- **QQ 群**：Agent2API 交流群 —— **群 1（`1127656296`）与群 2（`1130894674`）都即将满员，请加群 3（`1108276647`）**；在 QQ 里搜索群号即可加入。
 - **Telegram 群**：<https://t.me/+9gM8YPvgRL02NGRl>
 - **Discord 群**：<https://discord.gg/z9GzSJMWp>
 - **💖 赞赏**：如果 Agent2API 帮到了你，欢迎[请作者喝杯咖啡](./SPONSOR.md)；赞赏完全自愿，不解锁任何功能。
 - **🤝 赞助 / 商务合作**：想赞助本项目，或想让你的产品出现在这里？发邮件到 [541675139@qq.com](mailto:541675139@qq.com)。
-
-## 🧩 插件扩展
-
-主程序负责路由网关、Agent 客户端配置与插件管理，不内置提供商专属实现。需要更多提供商能力时，可以在「插件」页安装「提供商增强」，或安装其他兼容插件。
-
-- [提供商插件源码与支持情况](https://github.com/ProvidersPlugin/Agent2Providers)
-- [插件索引](https://github.com/Agent2plugin/Agent2plugin)
-
-插件由用户按需选择，安装、启停与更新独立于主程序。具体提供商及功能以插件清单和插件仓库说明为准。
 
 ## 🚀 快速开始
 
@@ -146,10 +137,6 @@ npm run build:icon         # 生成图标源图（改图标设计后执行，再
 macOS 的 `.dmg` **只能在 macOS 上构建**（`npm --prefix desktop-tauri run build -- --target universal-apple-darwin`），无法从 Windows 交叉编译，所以正式产物由 CI 的 `build` 工作流产（`macos-latest` + 双目标合并）；Docker 镜像与容器内更新用的服务端包由同一工作流的 `linux-server` job 出（复用 Dockerfile 的编译路径，包内可执行文件与镜像同源同工具链）。
 
 ## 📜 使用声明
-
-### 项目范围
-
-本项目提供 AI 路由网关与本机 Agent 客户端配置管理，不是任何模型服务或客户端厂商的官方产品，也不代表其授权、认可或赞助。提供商专属功能由独立插件维护，使用前请确认相应服务条款、账号权限与插件来源。
 
 ### 凭证与数据安全
 

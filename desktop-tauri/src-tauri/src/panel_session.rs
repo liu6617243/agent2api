@@ -75,6 +75,9 @@ fn load_tokens() -> TokenPair {
         expires_at: stored.expires_at,
     };
     if let Ok(mut guard) = CACHE.lock() {
+        if let Some(cached) = guard.as_ref() {
+            return cached.clone();
+        }
         *guard = Some(pair.clone());
     }
     pair
@@ -159,7 +162,21 @@ pub fn attach(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
 /// 响应体（桌面窗口没有 cookie 通道，只能走 body）。新令牌**必须**落盘 ——
 /// 服务端的轮换会让旧 refresh 立即作废，不保存就等于下次续期必然失败。
 pub async fn refresh() -> bool {
+    if crate::startup::wait().await.is_err() {
+        return false;
+    }
     let pair = load_tokens();
+    refresh_pair(pair).await
+}
+
+/// 同一进程的并发接口共用一次令牌轮换，不能让晚到的失败清掉新会话。
+async fn refresh_pair(expected: TokenPair) -> bool {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = LOCK.lock().await;
+    let pair = load_tokens();
+    if pair.access != expected.access || pair.refresh != expected.refresh {
+        return !pair.is_empty();
+    }
     if pair.refresh.is_empty() {
         return false;
     }
@@ -181,10 +198,14 @@ pub async fn refresh() -> bool {
         .send()
         .await;
     let Ok(response) = response else { return false };
+    if response.status().as_u16() == 401 {
+        let current = load_tokens();
+        if current.access == pair.access && current.refresh == pair.refresh {
+            clear();
+        }
+        return false;
+    }
     if !response.status().is_success() {
-        // 续期失败 = 会话链真没了（过期 / 重放 / 被改密码撤销）：清掉死令牌，
-        // 界面下一次 `panel_session_status` 会发现「没有会话」并回到登录页
-        clear();
         return false;
     }
     let Ok(text) = response.text().await else { return false };
@@ -196,6 +217,10 @@ pub async fn refresh() -> bool {
         return false;
     }
     let expires_in = data.get("expiresIn").and_then(Value::as_i64).unwrap_or(0);
+    let current = load_tokens();
+    if current.access != pair.access || current.refresh != pair.refresh {
+        return !current.is_empty();
+    }
     store(access, refresh, expires_in).is_ok()
 }
 
@@ -215,6 +240,9 @@ const REFRESH_AHEAD_MS: i64 = 2 * 60 * 1000;
 /// 失败一律静默放行：可能只是网络抖动，真正的判据（会话还有效吗）只有服务端
 /// 知道，交回给 `gateway::call` 里既有的 401 分支处理。
 pub async fn refresh_if_expiring() {
+    if crate::startup::wait().await.is_err() {
+        return;
+    }
     let pair = load_tokens();
     if pair.expires_at <= 0 || pair.refresh.is_empty() {
         return;
@@ -222,7 +250,7 @@ pub async fn refresh_if_expiring() {
     if now_ms() < pair.expires_at.saturating_sub(REFRESH_AHEAD_MS) {
         return;
     }
-    refresh().await;
+    refresh_pair(pair).await;
 }
 
 // ── 加解密（账号域密钥；失败一律当作「没有」）────────────────

@@ -41,6 +41,7 @@ import {
   SelectItem,
   SelectTrigger,
   SelectValue,
+  Field, FieldLabel,
 } from '@ui'
 import { isCustom, type ManageModel } from './models-custom-source'
 import { CUSTOM_LEVEL, commonLevels } from './models-reasoning'
@@ -189,8 +190,8 @@ export function ModelBatchDialog({ models, onClose, onDone }: {
             </RadioGroup>
             {action === 'reasoning' ? (
               <div className='mt-2.5'>
-                <div className='field-row'>
-                  <label htmlFor='batch-model-reasoning'>{t('思考等级')}</label>
+                <Field orientation='horizontal' className='field-row'>
+                  <FieldLabel htmlFor='batch-model-reasoning'>{t('思考等级')}</FieldLabel>
                   <Select value={reasoning.select} onValueChange={next => setReasoning(prev => ({ ...prev, select: String(next) }))}>
                     <SelectTrigger id='batch-model-reasoning' className='min-w-[220px]'>
                       <SelectValue>
@@ -206,13 +207,13 @@ export function ModelBatchDialog({ models, onClose, onDone }: {
                       <SelectItem value={CUSTOM_LEVEL}>{t('自定义等级…')}</SelectItem>
                     </SelectContent>
                   </Select>
-                </div>
+                </Field>
                 {reasoning.select === CUSTOM_LEVEL ? (
-                  <div className='field-row mt-2'>
-                    <label htmlFor='batch-model-reasoning-custom'>{t('自定义等级')}</label>
+                  <Field orientation='horizontal' className='field-row mt-2'>
+                    <FieldLabel htmlFor='batch-model-reasoning-custom'>{t('自定义等级')}</FieldLabel>
                     <Input id='batch-model-reasoning-custom' maxLength={32} value={reasoning.custom}
                       onChange={event => setReasoning(prev => ({ ...prev, custom: event.currentTarget.value }))} />
-                  </div>
+                  </Field>
                 ) : null}
                 <p className='detail mt-1.5'>
                   {t('设置 / 清除会应用到选中模型的')}<b>{t('全部映射')}</b>{t('（默认绑定与别名 chips）；「清除」= 不给这些映射指定等级（选「不覆盖」的口径与映射弹窗一致）')}

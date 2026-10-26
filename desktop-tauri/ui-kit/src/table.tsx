@@ -17,19 +17,15 @@ import { cn } from './lib/cn'
  * 不冲突：组件不写 col 宽度，谁也不覆盖谁。
  */
 
-function Table({ className, containerClassName, ...props }: React.ComponentProps<'table'> & {
-  /** 外层滚动容器的类名（需要自定义高度上限时用，如弹窗里的表） */
+function Table({ className, containerClassName, container = true, ...props }: React.ComponentProps<'table'> & {
   containerClassName?: string
+  /** 已有滚动宿主或表头拖拽依赖直接子节点时，不再增加滚动层。 */
+  container?: boolean
 }) {
-  return (
-    <div data-slot='table-container' className={cn('relative w-full overflow-auto', containerClassName)}>
-      <table
-        data-slot='table'
-        className={cn('w-full caption-bottom border-collapse text-[12.5px]', className)}
-        {...props}
-      />
-    </div>
-  )
+  const table = <table data-slot='table' className={cn('w-full caption-bottom border-collapse text-[12.5px]', className)} {...props} />
+  return container
+    ? <div data-slot='table-container' className={cn('relative w-full overflow-auto', containerClassName)}>{table}</div>
+    : table
 }
 
 function TableHeader({ className, ...props }: React.ComponentProps<'thead'>) {
@@ -69,7 +65,7 @@ function TableHead({ className, ...props }: React.ComponentProps<'th'>) {
     <th
       data-slot='table-head'
       className={cn(
-        'sticky top-0 z-[2] whitespace-nowrap border-b border-border bg-surface-2 px-3.5 py-2',
+        'sticky top-0 z-[2] whitespace-nowrap border-b border-border bg-[var(--ui-table-head-bg)] px-2 py-2',
         'text-left text-[10.5px] font-semibold tracking-[.05em] text-muted-foreground',
         className
       )}
@@ -82,7 +78,7 @@ function TableCell({ className, ...props }: React.ComponentProps<'td'>) {
   return (
     <td
       data-slot='table-cell'
-      className={cn('border-b border-hairline px-3.5 py-2 align-middle', className)}
+      className={cn('border-b border-hairline px-2 py-2 align-middle', className)}
       {...props}
     />
   )

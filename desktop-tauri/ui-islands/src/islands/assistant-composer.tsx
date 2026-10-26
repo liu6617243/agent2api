@@ -18,7 +18,7 @@
  */
 
 import * as React from 'react'
-import { Popover, PopoverContent, PopoverTrigger, cn } from '@ui'
+import { Popover, PopoverContent, PopoverTrigger, cn, Button, Textarea, Input, InputGroup, InputGroupAddon, InputGroupInput, StatusDot, RadioGroup, RadioGroupItem } from '@ui'
 import { t } from '../i18n'
 import { selectedModel, type ModelOption } from './assistant-models'
 import type { PermissionMode } from './assistant-state'
@@ -36,6 +36,7 @@ import {
   SlidersIcon,
   StopIcon,
 } from './assistant-icons'
+import { Empty } from '@ui'
 
 /** 思考等级候选（与后端 `model_rules::REASONING_LEVELS` 逐字一致，弱 → 强）。
  *  **只在这一处写死**，加档位时与后端一起改（见 assistant-page 的旧注释）。 */
@@ -65,6 +66,7 @@ type Props = {
   onRemoveImage: (index: number) => void
   /** 当前模型是否收图（未声明 = 不收）。附件不全时发送前给提示。 */
   modelSupportsImages: boolean
+  imageToolsEnabled: boolean
   modelAvailable: boolean
   modelsReady: boolean
   modelsLoading: boolean
@@ -83,21 +85,10 @@ type Props = {
   onStop: () => void
 }
 
-/** 按提供商分组（保持后端返回的原始顺序：同一家的模型挨着） */
-function groupModels(models: ModelOption[]): Array<{ provider: string; items: ModelOption[] }> {
-  const groups: Array<{ provider: string; items: ModelOption[] }> = []
-  for (const item of models) {
-    const last = groups[groups.length - 1]
-    if (last && last.provider === item.provider) last.items.push(item)
-    else groups.push({ provider: item.provider, items: [item] })
-  }
-  return groups
-}
-
 export function AssistantComposer(props: Props) {
   const {
     draft, onDraftChange, images, onAddFiles, onRemoveImage,
-    modelSupportsImages, modelAvailable, modelsReady, modelsLoading, modelWarning, onRefreshModels,
+    modelSupportsImages, imageToolsEnabled, modelAvailable, modelsReady, modelsLoading, modelWarning, onRefreshModels,
     models, model, onPickModel,
     reasoning, onPickReasoning, mode, onModeChange,
     busy, awaiting, onSend, onStop,
@@ -153,12 +144,9 @@ export function AssistantComposer(props: Props) {
     }
   }
 
-  const groups = React.useMemo(() => {
+  const filteredModels = React.useMemo(() => {
     const key = keyword.trim().toLowerCase()
-    const filtered = key
-      ? models.filter(item => item.name.toLowerCase().includes(key) || item.provider.toLowerCase().includes(key))
-      : models
-    return groupModels(filtered)
+    return key ? models.filter(item => item.name.toLowerCase().includes(key)) : models
   }, [models, keyword])
 
   return (
@@ -185,14 +173,15 @@ export function AssistantComposer(props: Props) {
             {images.map((url, index) => (
               <div className='asst-att' key={index}>
                 <img className='asst-att-img' src={url} alt={t('图片 {n}', { n: index + 1 })} />
-                <button type='button' className='asst-att-x' title={t('移除')} aria-label={t('移除')}
-                  onClick={() => onRemoveImage(index)}>✕</button>
+                <Button size='icon-2xs' variant='outline' type='button' className='asst-att-x rounded-full' title={t('移除')} aria-label={t('移除')}
+                  onClick={() => onRemoveImage(index)}>✕</Button>
               </div>
             ))}
           </div>
         )}
 
-        <textarea
+        <Textarea
+          className='min-h-[26px] max-h-[168px] resize-none rounded-none border-0 bg-transparent px-1 py-[3px] font-sans text-[13px] leading-[1.7] shadow-none focus:border-0 focus:shadow-none'
           ref={taRef}
           rows={1}
           value={draft}
@@ -213,13 +202,13 @@ export function AssistantComposer(props: Props) {
         {imageWarning && (
           <div className='asst-composer-warn'>
             <ImageIcon size={13} />
-            {t('当前模型没有声明图片能力，图可能发不上去。')}
+            {imageToolsEnabled ? t('参考图会交给图片编辑工具，当前对话模型不会读取图片。') : t('当前模型没有声明图片能力，图可能发不上去。')}
           </div>
         )}
 
         <div className='asst-bar'>
           {/* 左：添加图片 + 权限模式 */}
-          <input
+          <Input
             ref={fileRef}
             type='file'
             accept='image/*'
@@ -230,17 +219,17 @@ export function AssistantComposer(props: Props) {
               event.currentTarget.value = ''
             }}
           />
-          <button type='button' className='asst-round' title={t('添加图片（也可粘贴或拖入）')}
+          <Button size='icon-sm' variant='outline' type='button' className='asst-round rounded-full' title={t('添加图片（也可粘贴或拖入）')}
             aria-label={t('添加图片')} onClick={() => fileRef.current?.click()}>
             <PlusIcon size={17} />
-          </button>
+          </Button>
 
           <Popover>
             {/* children 挂在 Trigger 上而不是塞进 render 元素里：Base UI 的 useRender
                 会用 Trigger 的 children 覆盖 render 元素的子节点，两边都写会只剩一份。 */}
             <PopoverTrigger
               render={
-                <button type='button' className={cn('asst-pill asst-mode-pill', mode === 'full' && 'full')} />
+                <Button size='default' variant='ghost' type='button' className={cn('asst-pill asst-mode-pill', mode === 'full' && 'full')} />
               }
             >
               <span className='asst-pill-ico'>{mode === 'full' ? <BoltIcon size={14} /> : <ShieldIcon size={14} />}</span>
@@ -248,12 +237,11 @@ export function AssistantComposer(props: Props) {
               <ChevronIcon size={11} className='asst-pill-chev' />
             </PopoverTrigger>
             <PopoverContent side='top' align='start' className='asst-mode-pop w-[276px] p-1.5'>
+              <RadioGroup value={mode} onValueChange={value => onModeChange(value as PermissionMode)}>
               {(['confirm', 'full'] as const).map(value => (
-                <button
-                  key={value}
-                  type='button'
-                  className={cn('asst-mode-opt', value === 'full' && 'warn', mode === value && 'selected')}
-                  onClick={() => onModeChange(value)}
+                <RadioGroupItem
+                  key={value} value={value}
+                  className='h-auto w-full justify-start gap-2 whitespace-normal rounded-sm border-0 bg-transparent px-2 py-2 text-left data-checked:bg-primary-soft data-checked:text-primary-fg'
                 >
                   <span className='asst-mo-ico'>{value === 'full' ? <BoltIcon size={15} /> : <ShieldIcon size={15} />}</span>
                   <span className='asst-mo-text'>
@@ -262,9 +250,9 @@ export function AssistantComposer(props: Props) {
                       ? t('改动类工具直接执行，不再询问')
                       : t('改动类工具先列清单，等你点「执行」')}</small>
                   </span>
-                  <span className={cn('asst-radio', mode === value && 'on')} />
-                </button>
+                </RadioGroupItem>
               ))}
+              </RadioGroup>
               <p className='asst-pop-note'>
                 {t('只跳过确认，不扩大工具权限；每次执行仍会记录在对话里。')}
               </p>
@@ -276,9 +264,9 @@ export function AssistantComposer(props: Props) {
           {/* 右：模型 · 等级 + 发送 */}
           <Popover open={pickerOpen} onOpenChange={setPickerOpen}>
             <PopoverTrigger
-              render={<button type='button' className='asst-pill asst-model-pill' title={modelWarning || displayModel} />}
+              render={<Button size='default' variant='ghost' type='button' className='asst-pill asst-model-pill' title={modelWarning || displayModel} />}
             >
-              <span className={cn('asst-dot', modelAvailable && 'ok')} />
+              <StatusDot variant={modelAvailable ? 'success' : 'muted'} />
               <span className='asst-pill-model'>{displayModel}</span>
               <span className='asst-pill-sep'>·</span>
               <span className='asst-pill-level'>{displayLevel}</span>
@@ -287,60 +275,49 @@ export function AssistantComposer(props: Props) {
             <PopoverContent side='top' align='end' className='asst-picker-pop w-[288px] p-1.5'>
               {pane === 'root' && (
                 <>
-                  <button type='button' className='asst-pick-row' onClick={() => { setPane('model'); onRefreshModels() }}>
+                  <Button size='default' variant='ghost' type='button' className='asst-pick-row' onClick={() => { setPane('model'); onRefreshModels() }}>
                     <span className='asst-pr-ico'><LayersIcon size={14} /></span>
                     <span className='asst-pr-k'>{t('模型')}</span>
                     <span className='asst-pr-v'><span className='mono'>{displayModel}</span><MiniChevronIcon size={11} /></span>
-                  </button>
-                  <button type='button' className='asst-pick-row' onClick={() => setPane('reason')}>
+                  </Button>
+                  <Button size='default' variant='ghost' type='button' className='asst-pick-row' onClick={() => setPane('reason')}>
                     <span className='asst-pr-ico'><SlidersIcon size={14} /></span>
                     <span className='asst-pr-k'>{t('推理等级')}</span>
                     <span className='asst-pr-v'><span>{levelLabel(reasoning)}</span><MiniChevronIcon size={11} /></span>
-                  </button>
+                  </Button>
                 </>
               )}
 
               {pane === 'model' && (
                 <>
                   <div className='asst-sub-head'>
-                    <button type='button' className='asst-back' onClick={() => setPane('root')}>
+                    <Button size='default' variant='ghost' type='button' className='asst-back' onClick={() => setPane('root')}>
                       <ChevronIcon size={11} className='flip' />
-                    </button>
+                    </Button>
                     <span>{t('模型')}</span>
-                    <button type='button' className='asst-back ml-auto' disabled={modelsLoading}
-                      title={t('刷新列表')} aria-label={t('刷新列表')} onClick={onRefreshModels}>↻</button>
+                    <Button size='default' variant='ghost' type='button' className='asst-back ml-auto' disabled={modelsLoading}
+                      title={t('刷新列表')} aria-label={t('刷新列表')} onClick={onRefreshModels}>↻</Button>
                   </div>
-                  <label className='asst-search'>
-                    <SearchIcon size={13} />
-                    <input
-                      autoFocus
-                      value={keyword}
-                      placeholder={t('搜索模型…')}
-                      onChange={event => setKeyword(event.currentTarget.value)}
-                    />
-                  </label>
+                  <InputGroup className='mb-1.5'>
+                    <InputGroupInput autoFocus value={keyword} placeholder={t('搜索模型…')}
+                      onChange={event => setKeyword(event.currentTarget.value)} />
+                    <InputGroupAddon><SearchIcon size={13} /></InputGroupAddon>
+                  </InputGroup>
                   <div className='asst-sub-list'>
-                    {groups.length === 0 && <div className='asst-sub-empty'>
-                      {modelsLoading ? t('正在读取可用模型…') : t('没有可用的模型')}
-                    </div>}
-                    {groups.map(group => (
-                      <div key={group.provider}>
-                        <div className='asst-sub-group'>{group.provider}</div>
-                        {group.items.map(item => (
-                          <button
-                            key={`${group.provider}-${item.name}`}
-                            type='button'
-                            className={cn('asst-sub-item', item.name === selected?.name && 'selected')}
-                            onClick={() => { onPickModel(item.name); setPickerOpen(false) }}
-                          >
-                            <span className='mono'>{item.name}</span>
-                            <span className='asst-sub-tail'>
-                              {item.viaMapping && <em>{t('映射')}</em>}
-                              {item.name === selected?.name && <CheckIcon size={12} />}
-                            </span>
-                          </button>
-                        ))}
-                      </div>
+                    {filteredModels.length === 0 && <Empty className='asst-sub-empty'>
+                      {modelsLoading ? t('正在读取可用模型…') : keyword.trim() ? t('没有匹配的模型') : t('没有可用的模型')}
+                    </Empty>}
+                    {filteredModels.map(item => (
+                      <Button aria-pressed={item.name === selected?.name} size='default' variant='ghost'
+                        key={item.name}
+                        type='button'
+                        disabled={!modelsReady}
+                        className={cn('h-auto w-full justify-start whitespace-normal text-left asst-sub-item', item.name === selected?.name && 'selected')}
+                        onClick={() => { onPickModel(item.name); setPickerOpen(false) }}
+                      >
+                        <span className='mono'>{item.name}</span>
+                        {item.name === selected?.name && <span className='asst-sub-tail'><CheckIcon size={12} /></span>}
+                      </Button>
                     ))}
                   </div>
                 </>
@@ -349,31 +326,31 @@ export function AssistantComposer(props: Props) {
               {pane === 'reason' && (
                 <>
                   <div className='asst-sub-head'>
-                    <button type='button' className='asst-back' onClick={() => setPane('root')}>
+                    <Button size='default' variant='ghost' type='button' className='asst-back' onClick={() => setPane('root')}>
                       <ChevronIcon size={11} className='flip' />
-                    </button>
+                    </Button>
                     <span>{t('推理等级')}</span>
                     <small>{t('模型不支持时会自动忽略')}</small>
                   </div>
                   <div className='asst-sub-list'>
-                    <button
+                    <Button aria-pressed={!reasoning} size='default' variant='ghost'
                       type='button'
-                      className={cn('asst-sub-item', !reasoning && 'selected')}
+                      className={cn('h-auto w-full justify-start whitespace-normal text-left asst-sub-item', !reasoning && 'selected')}
                       onClick={() => { onPickReasoning(null); setPickerOpen(false) }}
                     >
                       <span>{t('跟随模型')}</span>
                       <span className='asst-sub-tail'>{!reasoning && <CheckIcon size={12} />}</span>
-                    </button>
+                    </Button>
                     {REASONING_LEVELS.map(level => (
-                      <button
+                      <Button aria-pressed={reasoning === level} size='default' variant='ghost'
                         key={level}
                         type='button'
-                        className={cn('asst-sub-item', reasoning === level && 'selected')}
+                        className={cn('h-auto w-full justify-start whitespace-normal text-left asst-sub-item', reasoning === level && 'selected')}
                         onClick={() => { onPickReasoning(level); setPickerOpen(false) }}
                       >
                         <span className='mono'>{level}</span>
                         <span className='asst-sub-tail'>{reasoning === level && <CheckIcon size={12} />}</span>
-                      </button>
+                      </Button>
                     ))}
                   </div>
                 </>
@@ -382,14 +359,14 @@ export function AssistantComposer(props: Props) {
           </Popover>
 
           {busy ? (
-            <button type='button' className='asst-send stop' title={t('停止')} aria-label={t('停止')} onClick={onStop}>
+            <Button size='icon' variant='destructive' type='button' className='asst-send stop rounded-full' title={t('停止')} aria-label={t('停止')} onClick={onStop}>
               <StopIcon size={13} />
-            </button>
+            </Button>
           ) : (
-            <button type='button' className='asst-send' title={t('发送')} aria-label={t('发送')}
+            <Button size='icon' variant='default' type='button' className='asst-send rounded-full' title={t('发送')} aria-label={t('发送')}
               disabled={!canSend} onClick={onSend}>
               <SendIcon size={16} />
-            </button>
+            </Button>
           )}
         </div>
       </div>
@@ -397,9 +374,6 @@ export function AssistantComposer(props: Props) {
       {modelWarning && (
         <p className='asst-composer-warn' role='status'>{modelWarning}</p>
       )}
-      <div className='asst-footline'>
-        <span>{t('Enter 发送 · Shift+Enter 换行')}</span>
-      </div>
     </div>
   )
 }

@@ -2,10 +2,17 @@ import * as React from 'react'
 import { createRoot } from 'react-dom/client'
 import {
   Badge, BadgeDot, Button, Dialog, DialogBody, DialogContent, DialogFooter,
-  DialogHeader, DialogTitle, SegmentedControl, Spinner, Table, TableBody,
+  DialogHeader, DialogTitle, SegmentedControl, StatusDot, Table, TableBody,
   TableCell, TableHead, TableHeader, TableRow, type SegmentedControlOption,
 } from '@ui'
 import { t } from '../i18n'
+import { HtmlContent } from '@ui'
+import {
+  PreviewPane, RawPane, RequestEmpty as Empty, hasDebugTraffic,
+  type RawState, type DebugState, type DebugTraffic,
+} from './request-raw-panes'
+import { RouteReplayFacts } from './routing-replay'
+import type { ReplayRow, RouteDecision } from './routing-types'
 
 /**
  * 「请求日志」页的**详情弹窗**（请求详情 / 预览对话 / 原始报文 · 三标签）。
@@ -109,6 +116,7 @@ type RequestRow = {
   upstreamModel?: unknown
   clientReasoning?: unknown
   upstreamReasoning?: unknown
+  accountId?: unknown
   accountName?: unknown
   attemptDetails?: AttemptDetail[]
   sensitiveHits?: SensitiveHit[]
@@ -117,25 +125,6 @@ type RequestRow = {
   /** 模型测试发起的请求（后端 `is_test` 透传到列表行；老行没有这个键） */
   isTest?: boolean
 } & ProviderFields
-
-/** 下游原文响应（预览对话）与上游调试报文（四段 + meta）：字段都按 unknown 收，用前归一 */
-type RawBody = Record<string, unknown>
-type DebugTraffic = Record<string, unknown>
-
-/**
- * 预览对话的数据状态：
- *   null      = 还在路上（并行拉取未回）
- *   'gone'    = 确认没有（404 / 形状不对 / 两侧全空）
- *   { body }  = 已到（truncated 是读取侧的启发式标记：任一侧到上限就置位，
- *               恰好等于上限而没截断的会被误标，代价只是多一行提示）
- */
-type RawState = null | 'gone' | { body: RawBody; truncated: boolean }
-
-/**
- * 原始报文的数据状态：null = 还在路上（此时**不渲染标签**，先别许诺）；
- * 'gone' = 确认没有（404 / 四段全空）→ 整个标签隐藏；{ data } = 已到。
- */
-type DebugState = null | 'gone' | { data: DebugTraffic }
 
 /** 终止按钮的三态：可点 / 在途（禁用）/ 已受理（禁用且不再放开） */
 type TerminateState = 'idle' | 'pending' | 'accepted'
@@ -289,48 +278,17 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-/** 对象 → 缩进 JSON 文本；失败时给空串（不让展示层抛错） */
-function jsonText(value: unknown): string {
-  if (value === null || value === undefined) return ''
-  if (typeof value === 'string') return value
-  try { return JSON.stringify(value, null, 2) } catch { return '' }
-}
-
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-/** 调试报文的四段（顺序即阅读顺序：请求 → 响应，头 → 体；键名是后端契约） */
-const DEBUG_SEGS: readonly { label: string; pick: (data: DebugTraffic) => string }[] = [
-  { label: t('请求头'), pick: data => jsonText(data.requestHeaders) },
-  { label: t('请求体'), pick: data => jsonText(data.requestBody) },
-  { label: t('响应头'), pick: data => jsonText(data.responseHeaders) },
-  // 响应体是原始文本（SSE），不是 JSON —— 不经过 jsonText 的序列化
-  { label: t('响应体'), pick: data => (data.responseBody ? String(data.responseBody) : '') },
-]
-/* ─── 小零件 ─────────────────────────────────── */
-
-/** 空态块（请求详情 / 预览对话的兜底文案共用同一形制） */
-function Empty({ text, loading = false }: { text: string; loading?: boolean }) {
-  return (
-    <div className='flex items-center justify-center gap-2 py-6 text-center text-[12.5px] text-muted-foreground'>
-      {loading ? <Spinner className='size-3.5' /> : null}
-      {text}
-    </div>
-  )
-}
-
-/**
- * 详情网格的一行：label 列 + value 列。用组件库的 Table 承载（自带横向滚动容器），
- * label 用原生 `<th scope="row">` —— 组件库的 TableHead 是**表头**语义（sticky +
- * 表头底色 + 小号加字距），这里要的是行首标签，硬套它反而要覆盖一堆默认类。
- */
+/** 详情行使用行表头语义，尺寸与普通数据单元格一致。 */
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <TableRow className={NO_HOVER}>
-      <th scope='row' className={`w-[76px] whitespace-nowrap text-left text-[12.5px] font-semibold text-muted-foreground ${GRID_CELL}`}>
+      <TableHead scope='row' className={`w-[76px] whitespace-nowrap text-left text-[12.5px] font-semibold text-muted-foreground ${GRID_CELL}`}>
         {label}
-      </th>
+      </TableHead>
       <TableCell className={GRID_CELL}>{children}</TableCell>
     </TableRow>
   )
@@ -351,7 +309,7 @@ function StatusCell({ row }: { row: RequestRow }) {
     if (!phase?.badgeHtml) {
       return (
         <Badge variant='info' shape='tag' title={t('请求正在转发中，用时列显示的是已用时')}>
-          <BadgeDot className='req-live-dot' />
+          <StatusDot pulse className='size-[5px] bg-current' />
           {t('进行中')}
         </Badge>
       )
@@ -361,9 +319,9 @@ function StatusCell({ row }: { row: RequestRow }) {
       <span className='inline-flex flex-wrap items-center gap-1.5'>
         {/* 徽章与阶段计时都由 request-phase.js 产出 HTML（同一套阶段要在三处逐字
             一致，见那边的模块头），这里原样注入、不重写 */}
-        <span dangerouslySetInnerHTML={{ __html: phase.badgeHtml(row) }} />
+        <HtmlContent html={phase.badgeHtml(row)} render={<span />} />
         {elapsed ? (
-          <span className='text-[11.5px] text-muted-foreground' dangerouslySetInnerHTML={{ __html: elapsed }} />
+          <HtmlContent className='text-[11.5px] text-muted-foreground' html={elapsed} render={<span />} />
         ) : null}
       </span>
     )
@@ -451,7 +409,6 @@ function AttemptsTable({ row }: { row: RequestRow }) {
           }).join('\n')
           const notice = String(item?.notice ?? '').trim()
           // 体积：上游那两道墙都按请求体字节判（413 / PARSE_REQUEST_DATA_EXCEPTION），
-          // 「这次到底多大」是排查它们时第一个要问的数，库里那份原文却在 128 KB 处截断。
           const bodyRaw = Number(item?.bodyBytes)
           const bodyText = Number.isFinite(bodyRaw) && bodyRaw > 0
             ? bodyRaw >= 1024 * 1024
@@ -501,59 +458,19 @@ function AttemptsTable({ row }: { row: RequestRow }) {
  * 请求没有快照（null），不渲染这一段。
  */
 function RouteReplay({ row }: { row: RequestRow }) {
-  const route = row.route && typeof row.route === 'object' && !Array.isArray(row.route)
-    ? row.route as Record<string, unknown>
-    : null
-  if (!route) return null
-  const strategy = String(route.strategy || '')
-  const sticky = String(route.sticky || '')
-  // 三档（顺序优先 / 负载均衡 / 家内轮询）；历史记录里可能留着已下线的 'usage'，
-  // 按它的替代者「负载均衡」显示（后端 RouteStrategy::from_id 也是这么归的）。
-  // 认不出的取值原样显示 —— 那是「后端有、前端还没跟上」的信号，藏起来更难查。
-  const strategyLabel = strategy === 'rotate' || strategy === 'usage' ? t('负载均衡')
-    : strategy === 'order' ? t('顺序优先')
-      : strategy === 'provider' ? t('家内轮询') : strategy
-  const stickyLabel = sticky === 'auto' ? t('自动') : sticky === 'session' ? t('会话内')
-    : sticky === 'turn' ? t('每轮') : sticky === 'off' ? t('关闭') : sticky
-  const ordered = Array.isArray(route.ordered) ? route.ordered as Array<Record<string, unknown>> : []
-  const blocked = Array.isArray(route.blocked) ? route.blocked as Array<Record<string, unknown>> : []
-  const picked = String(route.picked || '')
-  return (
-    <div className='text-[11.5px] leading-relaxed'>
-      <div className='mb-1 text-muted-foreground'>
-        {t('策略 {strategy} · 会话粘性 {sticky}{hit}', {
-          strategy: strategyLabel, sticky: stickyLabel,
-          hit: route.stickyHit === true ? t(' · 会话粘住') : '',
-        })}
-      </div>
-      {ordered.length ? (
-        <ol className='m-0 list-none p-0'>
-          {ordered.map((entry, index) => (
-            <li key={String(entry.id ?? index)} className='py-0.5'>
-              <b>{index + 1}. {String(entry.name || entry.id || '—')}</b>
-              <span className='text-muted-foreground'>　{String(entry.reason || '')}</span>
-            </li>
-          ))}
-        </ol>
-      ) : null}
-      {blocked.length ? (
-        <div className='mt-1 text-muted-foreground'>
-          {t('被跳过：')}
-          {blocked.map(entry => String(entry.name || entry.id || '')).join('、')}
-        </div>
-      ) : null}
-      {picked ? (
-        <div className='mt-1'>
-          {t('最终承载：{picked}', { picked: picked })}
-        </div>
-      ) : null}
-    </div>
-  )
+  if (!row.route || typeof row.route !== 'object' || Array.isArray(row.route)) return null
+  return <>
+    <RouteReplayFacts route={row.route as RouteDecision} compact
+      accountId={String(row.accountId || '')} accountName={String(row.accountName || '')} />
+    <Button variant='outline' size='sm' className='mt-2' onClick={() => {
+      void window.wbRoutingPanel?.openReplay(row as unknown as ReplayRow)
+    }}>{t('在路由页查看')}</Button>
+  </>
 }
 
 /* ─── 标签 ①：请求详情（数据全部来自 row）────── */
 
-function DetailPane({ row }: { row: RequestRow | null }) {
+export function RequestDetailPane({ row }: { row: RequestRow | null }) {
   // 列表在点开前恰好刷新过：行对象按 id 反查不到。详情标签只吃 row，
   // 没有可显示的数据 —— 说清原因让用户关掉重开，比一片空字段诚实
   if (!row) return <Empty text={t('列表数据已刷新，请重试（关闭后重新打开这条详情）')} />
@@ -606,7 +523,12 @@ function DetailPane({ row }: { row: RequestRow | null }) {
           </Field>
         ) : null}
         <Field label={t('错误')}>
-          {row.error ? <span className='text-destructive'>{String(row.error)}</span> : '—'}
+          {row.error ? (
+            <div className='flex items-center gap-2'>
+              <span className='max-h-40 min-w-0 flex-1 overflow-auto whitespace-pre-wrap text-destructive [overflow-wrap:anywhere]'>{String(row.error)}</span>
+              <Button variant='outline' size='xs' data-copy={String(row.error)}>{t('复制')}</Button>
+            </div>
+          ) : '—'}
         </Field>
         <Field label={t('尝试明细')}><AttemptsTable row={row} /></Field>
         {row.route ? <Field label={t('路由回放')}><RouteReplay row={row} /></Field> : null}
@@ -624,70 +546,6 @@ function DetailPane({ row }: { row: RequestRow | null }) {
         </Field>
       </TableBody>
     </Table>
-  )
-}
-/* ─── 标签 ②：预览对话 ──────────────────────── */
-
-/**
- * 预览对话面板。数据三种状态：null = 正在读取（并行拉取还在路上）；'gone' = 确认没有
- *（404 / 桥接返回形状不对 / 两侧都空）→ 空态；body 到了 → conversation-preview 的渲染
- * 结果（内部自带各层降级）。
- */
-function PreviewPane({ state }: { state: RawState }) {
-  if (!state) return <Empty text={t('正在读取…')} loading />
-  const body = state === 'gone' ? null : state.body
-  // 气泡 HTML 由 conversation-preview.js 产出（纯函数，内部已对原文转义），
-  // 这里原样注入 —— 迁移只换外壳，不重写渲染
-  const html = body
-    ? shared().wbConversationPreview?.render?.(body.requestBody, body.responseBody) || ''
-    : ''
-  if (!html) return <Empty text={t('无报文原文（未开启「调试模式」，或已被清理）')} />
-  return (
-    <div>
-      {state !== 'gone' && state.truncated ? (
-        <div className='mb-2 text-[11.5px] text-warning'>{t('正文超过单条上限，可能已被截断')}</div>
-      ) : null}
-      <div dangerouslySetInnerHTML={{ __html: html }} />
-    </div>
-  )
-}
-/* ─── 标签 ③：原始报文（调试模式的四段）─────── */
-
-/**
- * 原始报文面板：四段竖排（每段一个 pre，等宽字体 + 内部滚动 —— 原分段切换的「一块的
- * 高度」诉求由 pre 的 max-height 承接，四段之间用标题分隔）。顶部保留原来的 meta 行
- *（URL / 提供商 / 上游状态码，来自调试报文自身）。
- */
-function RawPane({ data }: { data: DebugTraffic }) {
-  const status = data.status === null || data.status === undefined ? '-' : String(data.status)
-  const meta = [
-    data.url ? `URL: ${data.url}` : '',
-    data.provider ? t('提供商: {provider}', { provider: String(data.provider) }) : '',
-    t('上游状态码: {status}', { status }),
-  ].filter(Boolean)
-  return (
-    <div className='flex flex-col gap-4'>
-      {meta.length ? (
-        <div className='border-b border-hairline pb-2.5 text-xs leading-[1.7] break-all text-subtle'>
-          {meta.map((line, index) => <div key={index}>{line}</div>)}
-        </div>
-      ) : null}
-      {DEBUG_SEGS.map(seg => {
-        const text = seg.pick(data) || ''
-        return (
-          <div key={seg.label} className='flex flex-col gap-1.5'>
-            <h3 className='text-[11.5px] font-semibold tracking-[.02em] text-muted-foreground'>{seg.label}</h3>
-            {text ? (
-              <pre className='max-h-80 overflow-auto rounded-md border border-border bg-surface-2 p-[10px_12px] font-mono text-[11.5px] leading-[1.6] break-words whitespace-pre-wrap text-subtle'>
-                {text}
-              </pre>
-            ) : (
-              <Empty text={t('这条请求没有保存这一段报文')} />
-            )}
-          </div>
-        )
-      })}
-    </div>
   )
 }
 /* ─── 弹窗本体 ───────────────────────────────── */
@@ -742,13 +600,13 @@ function RequestDetail({ id, row, token, onClose }: RequestDetailProps) {
       if (isStale()) return
       const data: DebugTraffic = isPlainObject(response) ? response : {}
       // 四段全空与 404 是同一件事：没有可看的报文，标签不出现，也不写 hint
-      if (!DEBUG_SEGS.some(seg => (seg.pick(data) || '').trim())) {
+      if (!hasDebugTraffic(data)) {
         setDebug('gone')
         return
       }
       setDebug({ data })
       setHint(data.truncated
-        ? t('报文超过单条上限，请求体 / 响应体已按上限截断')
+        ? t('这条报文由旧版本截断保存，缺失内容无法恢复')
         : t('内容按原样保存，请求头中的凭据字段已替换为 [redacted]'))
     } catch (error) {
       if (isStale()) return
@@ -843,7 +701,7 @@ function RequestDetail({ id, row, token, onClose }: RequestDetailProps) {
           {/* 三个 pane 常驻（用 hidden 切显示，不卸载）：切换标签时 pane 的 DOM 与展开态
               原样保留，滚动位置由上面的 layout effect 还原。pane 不标 role="tabpanel" ——
               分段控件是 radiogroup 语义（不是 tablist），孤立的 tabpanel 是残缺结构 */}
-          <section hidden={active !== 'detail'}><DetailPane row={row} /></section>
+          <section hidden={active !== 'detail'}><RequestDetailPane row={row} /></section>
           <section hidden={active !== 'preview'}><PreviewPane state={raw} /></section>
           {showRaw ? (
             <section hidden={active !== 'raw'}>

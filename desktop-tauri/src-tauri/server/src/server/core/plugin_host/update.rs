@@ -2,8 +2,10 @@
 
 use serde_json::{json, Value};
 
-use crate::server::core::update::client::{fetch_public, github_headers};
-use crate::server::core::update::compare_versions;
+use crate::server::core::update::client::{
+    fetch_candidate, fetch_json, fetch_public, github_headers,
+};
+use crate::server::core::update::{compare_versions, is_prerelease_version, source};
 
 pub const INDEX_REPO: &str = "Agent2plugin/Agent2plugin";
 pub const FALLBACK_REPO: &str = "Agent2Builder/agent2api-providers-releases";
@@ -18,6 +20,7 @@ pub struct PackAsset {
     pub url: String,
     pub size: u64,
     pub page: String,
+    pub require_signed: bool,
 }
 
 pub fn asset_name(pack_id: &str, version: &str, target: &str) -> String {
@@ -30,6 +33,7 @@ pub struct IndexEntry {
     pub name: String,
     pub description: String,
     pub official: bool,
+    pub require_signed: bool,
     pub manifest: String,
     pub icon: String,
     pub repo: String,
@@ -42,6 +46,7 @@ pub struct PluginDetail {
     pub tag_template: String,
     pub asset_template: String,
     pub homepage: String,
+    pub require_signed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +57,7 @@ pub struct ReleaseAssets {
     pub published_at: String,
     pub prerelease: bool,
     pub platforms: Vec<(String, String, u64)>,
+    pub require_signed: bool,
 }
 
 impl ReleaseAssets {
@@ -66,6 +72,7 @@ impl ReleaseAssets {
             url: url.clone(),
             size: *size,
             page: self.page.clone(),
+            require_signed: self.require_signed,
         })
     }
 }
@@ -91,12 +98,12 @@ pub fn clear_cooldown() {
 
 async fn fetch(url: &str) -> Result<reqwest::Response, String> {
     let state = crate::server::core::task_state::read(&retry_key())?;
-    if state.retry_at > crate::server::logging::now_ms() {
+    if source::is_official_api(url) && state.retry_at > crate::server::logging::now_ms() {
         return Err(state.waiting_message());
     }
     let response = fetch_public(url, &github_headers(), Some(QUERY_TIMEOUT_MS)).await?;
     let status = response.status().as_u16();
-    if status == 403 || status == 429 {
+    if source::is_official_api(url) && (status == 403 || status == 429) {
         let now = crate::server::logging::now_ms();
         let header = |name: &str| {
             response
@@ -149,17 +156,19 @@ async fn fetch(url: &str) -> Result<reqwest::Response, String> {
 
 pub async fn read_index_result() -> Result<Vec<IndexEntry>, String> {
     let url = format!("https://raw.githubusercontent.com/{INDEX_REPO}/main/index.json");
-    let response = fetch(&url).await?;
-    if !response.status().is_success() {
+    let response = fetch_json(&url, &github_headers(), QUERY_TIMEOUT_MS, |value| {
+        value.get("plugins").and_then(Value::as_array).is_some()
+    })
+    .await
+    .map_err(|error| error.message)?;
+    if !response.status.is_success() {
         return Err(format!(
             "读取插件索引失败：HTTP {}",
-            response.status().as_u16()
+            response.status.as_u16()
         ));
     }
-    let document: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("插件索引不是合法 JSON：{error}"))?;
+    let require_signed = !response.official;
+    let document = response.value;
     let items = document
         .get("plugins")
         .and_then(Value::as_array)
@@ -181,6 +190,7 @@ pub async fn read_index_result() -> Result<Vec<IndexEntry>, String> {
                 id,
                 description: text(item, "description"),
                 official: item.get("official").and_then(Value::as_bool) == Some(true),
+                require_signed,
                 manifest: text(item, "manifest"),
                 icon: text(item, "icon"),
                 repo: item
@@ -211,11 +221,18 @@ fn index_path(path: &str) -> Option<String> {
 }
 
 pub async fn read_detail(path: &str) -> Option<PluginDetail> {
-    let response = fetch(&index_path(path)?).await.ok()?;
-    if !response.status().is_success() {
+    let response = fetch_json(
+        &index_path(path)?,
+        &github_headers(),
+        QUERY_TIMEOUT_MS,
+        |value| value.is_object() && value.get("release").is_some_and(Value::is_object),
+    )
+    .await
+    .ok()?;
+    if !response.status.is_success() {
         return None;
     }
-    let document: Value = response.json().await.ok()?;
+    let document = response.value;
     let release = document.get("release");
     Some(PluginDetail {
         protocol: document
@@ -232,6 +249,7 @@ pub async fn read_detail(path: &str) -> Option<PluginDetail> {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "{id}-{version}-{target}.zip".to_string()),
         homepage: text(&document, "homepage"),
+        require_signed: !response.official,
     })
 }
 
@@ -322,12 +340,13 @@ fn pick_release_assets(
     }
     Some(ReleaseAssets {
         prerelease: release.get("prerelease").and_then(Value::as_bool) == Some(true)
-            || version.contains('-'),
+            || is_prerelease_version(&version),
         version,
         page: text(release, "html_url"),
         notes: text(release, "body").chars().take(32_000).collect(),
         published_at: text(release, "published_at"),
         platforms,
+        require_signed: false,
     })
 }
 
@@ -337,32 +356,50 @@ pub async fn release_for(
     detail: Option<&PluginDetail>,
     current: Option<&str>,
 ) -> Result<Option<ReleaseAssets>, String> {
+    release_for_channels(repo, id, detail, current, super::settings::current().channels()).await
+}
+
+pub(super) async fn release_for_channels(
+    repo: &str,
+    id: &str,
+    detail: Option<&PluginDetail>,
+    current: Option<&str>,
+    channels: crate::server::config::UpdateChannels,
+) -> Result<Option<ReleaseAssets>, String> {
     if !valid_repo(repo) {
         return Err("插件发布仓库必须是 owner/repo".to_string());
     }
-    let beta = super::settings::current().beta;
     let custom_tag = detail
         .map(|detail| detail.tag_template != "v{version}")
         .unwrap_or(false);
-    let listed = beta || custom_tag;
+    let listed = channels.beta || custom_tag;
     let url = format!(
         "{GITHUB_API}/repos/{repo}/releases{}",
         if listed { "?per_page=100" } else { "/latest" }
     );
-    let response = fetch(&url).await?;
-    if response.status().as_u16() == 404 {
+    let state = crate::server::core::task_state::read(&retry_key())?;
+    if state.retry_at > crate::server::logging::now_ms() {
+        return Err(state.waiting_message());
+    }
+    let response = fetch_json(&url, &github_headers(), QUERY_TIMEOUT_MS, |value| {
+        if listed {
+            value.is_array()
+        } else {
+            value.get("tag_name").and_then(Value::as_str).is_some()
+        }
+    })
+    .await
+    .map_err(|error| error.message)?;
+    if response.status.as_u16() == 404 {
         return Ok(None);
     }
-    if !response.status().is_success() {
+    if !response.status.is_success() {
         return Err(format!(
             "查询插件更新失败：GitHub 返回 HTTP {}",
-            response.status().as_u16()
+            response.status.as_u16()
         ));
     }
-    let document: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("插件 Release 不是合法 JSON：{error}"))?;
+    let document = response.value;
     let list: Vec<&Value> = if listed {
         document
             .as_array()
@@ -372,19 +409,17 @@ pub async fn release_for(
     } else {
         vec![&document]
     };
-    let only_beta = beta
-        && current
-            .map(|version| version.contains('-'))
-            .unwrap_or(false);
     let mut best: Option<ReleaseAssets> = None;
     for release in list {
         if release.get("draft").and_then(Value::as_bool) == Some(true) {
             continue;
         }
-        let Some(assets) = pick_release_assets(release, id, detail) else {
+        let Some(mut assets) = pick_release_assets(release, id, detail) else {
             continue;
         };
-        if (!beta && assets.prerelease) || (only_beta && !assets.prerelease) {
+        assets.require_signed =
+            !response.official || detail.is_some_and(|detail| detail.require_signed);
+        if !channels.accepts(assets.prerelease) {
             continue;
         }
         if current.is_some()
@@ -432,22 +467,86 @@ pub async fn download(
     if asset.size > MAX_DOWNLOAD_BYTES as u64 {
         return Err("插件包超过 24 MB 上限".to_string());
     }
-    let response = fetch_public(&asset.url, &github_headers(), None).await?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "下载插件包失败：HTTP {}",
-            response.status().as_u16()
-        ));
+    let headers = vec![
+        ("User-Agent".to_string(), "agent2api-plugin".to_string()),
+        ("Accept".to_string(), "application/octet-stream".to_string()),
+    ];
+    let version_marker = format!("-{}-", asset.version);
+    let pack_id = asset.name.strip_suffix(".zip").and_then(|name| {
+        name.split_once(version_marker.as_str())
+            .map(|(id, _)| id.to_string())
+    });
+    let mut last_error = "没有可用的插件下载源".to_string();
+    for candidate in source::candidates(&asset.url, pack_id.is_some()) {
+        let response = match fetch_candidate(&candidate, &headers, None).await {
+            Ok(response) => response,
+            Err(error) => {
+                candidate.forget();
+                last_error = error;
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            last_error = format!(
+                "下载插件包失败：{}返回 HTTP {}",
+                candidate.label(),
+                response.status().as_u16()
+            );
+            if source::should_switch(&candidate, response.status()) {
+                candidate.forget();
+                continue;
+            }
+            return Err(last_error);
+        }
+        match read_download(response, asset, &mut progress).await {
+            Ok(buffer) => {
+                if asset.require_signed || candidate.source == source::Source::Mirror {
+                    let verify = buffer.clone();
+                    let id = pack_id.clone();
+                    let version = asset.version.clone();
+                    let prepared = tokio::task::spawn_blocking(move || {
+                        super::packages::prepare(&verify, id.as_deref(), Some(&version), true)
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    if let Err(error) = prepared {
+                        candidate.forget();
+                        last_error = format!("加速下载的插件未通过官方签名校验：{error}");
+                        continue;
+                    }
+                }
+                candidate.remember();
+                return Ok(buffer);
+            }
+            Err(error) => {
+                candidate.forget();
+                last_error = error;
+            }
+        }
     }
-    let total = response.content_length().unwrap_or(asset.size);
-    if total > MAX_DOWNLOAD_BYTES as u64 {
+    Err(last_error)
+}
+
+async fn read_download(
+    response: reqwest::Response,
+    asset: &PackAsset,
+    progress: &mut impl FnMut(u64, u64),
+) -> Result<Vec<u8>, String> {
+    let declared = response.content_length().unwrap_or(0);
+    let total = if asset.size > 0 { asset.size } else { declared };
+    if total > MAX_DOWNLOAD_BYTES as u64 || declared > MAX_DOWNLOAD_BYTES as u64 {
         return Err("插件包超过 24 MB 上限".to_string());
     }
     use futures::StreamExt;
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
     progress(0, total);
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(30), stream.next())
+            .await
+            .map_err(|_| "插件下载长时间没有数据".to_string())?;
+        let Some(chunk) = chunk else { break };
         let chunk = chunk.map_err(|error| format!("下载中断：{error}"))?;
         if buffer.len() + chunk.len() > MAX_DOWNLOAD_BYTES {
             return Err("插件包超过 24 MB 上限".to_string());
@@ -455,8 +554,12 @@ pub async fn download(
         buffer.extend_from_slice(&chunk);
         progress(buffer.len() as u64, total);
     }
-    if buffer.is_empty() {
-        return Err("下载到的插件包是空的".to_string());
+    let received = buffer.len() as u64;
+    if received == 0
+        || (declared > 0 && received != declared)
+        || (asset.size > 0 && received != asset.size)
+    {
+        return Err("下载到的插件包不完整，已拒绝使用".to_string());
     }
     Ok(buffer)
 }

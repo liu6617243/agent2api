@@ -1,8 +1,9 @@
-import { Sheet, SheetContent, SheetHeader, SheetBody, SheetFooter, SheetTitle } from '@ui'
+import { Sheet, SheetContent, SheetHeader, SheetBody, SheetFooter, SheetTitle , Button } from '@ui'
 import { Icon } from './Icon'
 import { ProviderLogo } from './ProviderLogo'
 import { providerLabel } from '../lib/providers'
 import { t } from '../i18n'
+import { Toggle as UiToggle } from '@ui'
 
 /**
  * 账号筛选面板（账号页右上角那颗「筛选」按钮打开）。
@@ -130,17 +131,17 @@ export function AccountsFilterSheet({
           {providers.length > 1 ? (
             <Section title={t('提供商')}>
               {providers.map(item => (
-                <button
+                <UiToggle size='default' variant='outline'
                   key={item.id}
                   type='button'
-                  className='m-chip'
-                  data-on={filters.providers.includes(item.id)}
+                  className='m-chip rounded-pill'
+                  pressed={filters.providers.includes(item.id)}
                   onClick={() => toggleProvider(item.id)}
                   style={{ gap: 6 }}
                 >
                   <ProviderLogo id={item.id} label={item.label} />
                   {item.label}
-                </button>
+                </UiToggle>
               ))}
             </Section>
           ) : null}
@@ -204,18 +205,18 @@ export function AccountsFilterSheet({
           </p>
         </SheetBody>
         <SheetFooter>
-          <button
+          <Button size='touch' variant='outline'
             type='button'
-            className='m-btn m-ghost'
+            className='m-btn m-ghost w-full'
             style={{ flex: 1 }}
             onClick={() => onChange(DEFAULT_FILTERS)}
           >
             <Icon name='refresh' />
             {t('重置')}
-          </button>
-          <button type='button' className='m-btn' style={{ flex: 1 }} onClick={onClose}>
+          </Button>
+          <Button size='touch' variant='default' type='button' className='m-btn w-full' style={{ flex: 1 }} onClick={onClose}>
             {t('完成')}
-          </button>
+          </Button>
         </SheetFooter>
       </SheetContent>
     </Sheet>
@@ -245,9 +246,9 @@ function Chip({
   onClick: () => void
 }) {
   return (
-    <button type='button' className='m-chip' data-on={on} onClick={onClick}>
+    <UiToggle size='default' variant='outline' type='button' className='m-chip rounded-pill' pressed={on} onClick={onClick}>
       {label}
       <span className='m-n'>{count}</span>
-    </button>
+    </UiToggle>
   )
 }
