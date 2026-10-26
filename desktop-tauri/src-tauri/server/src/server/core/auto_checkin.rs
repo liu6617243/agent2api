@@ -273,12 +273,21 @@ pub fn providers_added_after(version: i64) -> Vec<String> {
 /// 不在标签里堆字。Qoder 拆家（2026-10）后注册名就是「Qoder 中国版 /
 /// 国际版」，不再需要这里的覆盖。其余几家不需要后缀：小浣熊没有版本区分，
 /// AutoClaw 两地的签到链路都存在且同形 —— 展示名已带「国内版 / 国际版」。
-pub fn provider_label(id: &str) -> &str {
+pub fn provider_label(id: &str) -> String {
+    // ── 先问插件，再问内置表（顺序不能反）──────────────────────
+    // 3.3.0 起绝大多数家由插件服务，它们的名字只存在于 `pack.json` 的
+    // `label` 里（`core::plugin_host::provider_label` 就是读那个）。只查下面
+    // 那张编译期常量表的话，插件家会一路回退成**裸 id** —— 签到中心那一行
+    // 标题、范围复选框、报错文案里全是 `minimax` 这种内部标识，与账号页
+    // 显示的名字对不上（用户会以为这是两个不同的提供商）。
+    if let Some(label) = crate::server::core::plugin_host::provider_label(id) {
+        return label;
+    }
     crate::server::core::providers::PROVIDERS
         .iter()
         .find(|meta| meta.id == id)
-        .map(|meta| meta.label)
-        .unwrap_or(id)
+        .map(|meta| meta.label.to_string())
+        .unwrap_or_else(|| id.to_string())
 }
 
 /// 归一化配置里的提供商清单：只认 CHECKIN_PROVIDERS 里的 id（去重、保持顺序），
