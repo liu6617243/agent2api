@@ -172,7 +172,7 @@ pub fn registry() -> Vec<BoxProvider> {
     list.push(Box::new(antigravity::adapter::ANTIGRAVITY));
     // 本地新增（非上游）：MiniMax 国内站，只做账号 / 登录续期 / 签到
     #[cfg(feature = "minimax")]
-    list.push(Box::new(minimax::adapter::MINIMAX));
+    list.push(Box::new(minimax::MiniMaxProvider));
 
     list
 }
