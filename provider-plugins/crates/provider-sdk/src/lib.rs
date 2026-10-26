@@ -32,13 +32,16 @@
 //! 读循环只做「分类 + 投递」，一次 await 都不带业务语义。
 
 pub mod ctx;
+mod errors;
 pub mod provider;
 pub mod serve;
 
 pub use ctx::{PluginCtx, StoreAccount, StoreError};
+pub use errors::control_error;
 pub use provider::{
-    local_precondition, split_local_precondition, BoxProvider, ChatPlan, ConversationSink,
-    Provider, ProviderMeta, SendFuture, LOCAL_PRECONDITION_PREFIX,
+    local_precondition, split_local_precondition, split_unsupported, unsupported, BoxProvider,
+    ChatPlan, ConversationSink, Provider, ProviderMeta, SendFuture, LOCAL_PRECONDITION_PREFIX,
+    SCHEDULES_LIST_METHOD, UNSUPPORTED_PREFIX,
 };
 pub use serve::{serve, serve_blocking};
 

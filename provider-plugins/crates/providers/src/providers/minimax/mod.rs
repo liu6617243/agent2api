@@ -94,6 +94,11 @@ impl Provider for MiniMaxProvider {
                     "MiniMax 每日签到（signin/status → signin/claim，Bearer 登录态）".to_string(),
                 ),
                 modes: vec![proto::CheckinMode::Checkin],
+                // 显式写 true，不靠 `Default`：protocol 0.2.1 的 `derive(Default)`
+                // 把 `daily` 建成 false（与 serde 缺省相反），照 Default 走的话
+                // 这家签到了也不会出现在签到中心里。0.2.2 手写了 Default 修掉，
+                // 这里再显式一遍，两个版本的协议都能工作。
+                daily: true,
                 ..Default::default()
             })
     }

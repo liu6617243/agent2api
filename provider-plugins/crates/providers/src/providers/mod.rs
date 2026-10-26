@@ -170,10 +170,9 @@ pub fn registry() -> Vec<BoxProvider> {
     list.push(Box::new(codearts::adapter::CODEARTS));
     #[cfg(feature = "antigravity")]
     list.push(Box::new(antigravity::adapter::ANTIGRAVITY));
-
-    // MiniMax：只接账号 + 签到（转发/余额未实现，能力位 false，见模块头）
+    // 本地新增（非上游）：MiniMax 国内站，只做账号 / 登录续期 / 签到
     #[cfg(feature = "minimax")]
-    list.push(Box::new(minimax::MiniMaxProvider));
+    list.push(Box::new(minimax::adapter::MINIMAX));
 
     list
 }
