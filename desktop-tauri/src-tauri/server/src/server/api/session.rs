@@ -1,0 +1,1368 @@
+//! 会话相关路由（对照 Node 版 server.mjs 776-869、963-974 行逐条实现）。
+//!
+//!   GET    /api/session                 前端首屏状态（**免鉴权**）
+//!   POST   /api/session/login/start     发起无头登录，最多等 15 秒拿 authUrl
+//!   GET    /api/session/login/wait      轮询登录结果 ?state=
+//!   POST   /api/session/login/cancel    取消登录（关弹窗/用户放弃）
+//!   POST   /api/session/login/callback  提交网页登录回调（壳侧捕获或远程面板粘贴）
+//!   GET    /api/session/login/remote-callback   远程网页登录回调中转（网页端）
+//!   POST   /api/session/refresh         刷新当前账号 token
+//!   POST   /api/session/logout          清除登录态（删掉当前账号）
+//!   POST   /auth/login                  同步登录（等完成才响应）
+//!   POST   /auth/logout                 清除登录态
+//!
+//! ── 鉴权分组（务必与 Node 版一致）────────────────────────────
+//! 只有 `GET /api/session` 是免鉴权的（前端首屏拿不到 key 时也要能显示状态）；
+//! 其余全部 checkApiKey。在 http.rs 里它们分别挂在 public / protected 组。
+//!
+//! ── 字段来源（/api/session）────────────────────────────────
+//!   health          ← auth.get_config_summary()（纯本地：只查凭证是否存在）
+//!   session         ← auth.get_status()（含临期自动刷新）
+//!   accounts        ← store.list_accounts()
+//!   lastRequestModel← config.json 的 lastRequestModel
+//!   routedAccountId ← 按 lastRequestModel 派生的「下一个请求会先用谁」（见其函数注释）
+//!   defaultModel    ← config.json 的 defaultModel
+//!   proxies         ← Clash 摘要（切片 3 起为实时读取的真实值）
+//!   models          ← 模型目录（切片 4 起为真实清单，含远程刷新结果）
+//!   sanitizeBlacklistFingerprints ← 出站指纹脱敏开关（与 GET /api/sanitize 同源）
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use axum::body::Bytes;
+use axum::extract::{Json, Query, State};
+use axum::response::Response;
+use serde_json::{json, Value};
+
+use crate::server::api::health::UNCONFIGURED_REASON;
+use crate::server::config;
+use crate::server::core::login::LOGIN_TIMEOUT_MS;
+use crate::server::core::providers::router;
+use crate::server::core::routing;
+use crate::server::errors::management_error;
+use crate::server::http::{ok_json, parse_body};
+use crate::server::logging;
+use crate::server::ServerState;
+
+/// GET /api/session —— 免鉴权（前端首屏在配置 API Key 之前也要能读）
+pub async fn get_session(State(state): State<ServerState>) -> Response {
+    let snapshot = config::current();
+    // 账号快照取一次：`accounts` 字段与下面的 routedAccountId 读的是同一份数据，
+    // 分两次取会各读一遍盘，还可能出现「两次读之间账号被改」的撕裂。
+    // 用**界面视图**：插件不在的家不出现（账号仍在库里，装上插件原样回来）。
+    let accounts = state.store().list_visible_accounts();
+    // 在途请求计数：★ 的推算口径要与真实选路一致 —— 转发选路会跳过已达并发
+    // 上限的账号（`routing::pick_account_by_priority` 的并发过滤），★ 也要剔除
+    // 它们，否则界面上标的「下一个请求会先用谁」在实际都忙时是错的。取快照的
+    // 方式与选路层同源（`UpstreamService::connections()`）。
+    let counts: HashMap<String, usize> = state
+        .upstream()
+        .connections()
+        .snapshot()
+        .into_iter()
+        .collect();
+    let routed = routed_account_id(&accounts, snapshot.last_request_model(), &counts);
+    let summary = state.auth().get_config_summary();
+    let configured = summary
+        .get("configured")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    ok_json(json!({
+        "health": {
+            "upstreamConfigured": configured,
+            "upstreamBaseUrl": summary.get("baseUrl").cloned().unwrap_or(Value::Null),
+            "authSource": summary.get("authSource").cloned().unwrap_or(Value::Null),
+            "unavailableReason": if configured {
+                Value::Null
+            } else {
+                summary
+                    .get("unavailableReason")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(UNCONFIGURED_REASON.to_string()))
+            },
+        },
+        "session": state.auth().get_status(),
+        // accounts.currentAccountId = **不限模型**的队首（判据 = 启用 + 有可用凭证 +
+        // 优先级序，见 core::account_store）。它回答「队列第一位是谁」，别的地方
+        // （凭证来源、刷新目标）读的也一直是它，语义不变。
+        // 账号页的 ★ / 「首选」要读的是**下一个请求会先用谁** —— 那是按最近一次
+        // 请求的模型派生的 `routedAccountId`（见下），两者在队首正被限流时会不同。
+        "accounts": accounts,
+        // 最近一次实际请求用的模型：账号页的「模型」筛选默认选它
+        "lastRequestModel": snapshot.last_request_model(),
+        // 按 lastRequestModel 派生的「下一个请求会先用谁」（账号页 ★ / 「首选」）。
+        // 判据与转发层同一套（候选 = 提供该模型的那些家的账号，再按全局优先级取
+        // 第一个「启用 + 有凭证 + 对该模型未限流」的）；模型未知或该模型下没有
+        // 可用账号时为 null，界面回落到上面的 currentAccountId。
+        "routedAccountId": routed,
+        "defaultModel": snapshot.default_model(),
+        "proxies": proxies_summary(),
+        // 模型目录真值（对照 server.mjs 802-804 的字段形状 {id, name, isDefault, credits}）。
+        // 来源是**聚合目录**（`providers::catalog::session_models`），与 `GET /v1/models`
+        // 同一份合并结果：界面上的模型清单必须等于客户端能拿到的清单，否则用户会照着一个
+        // 路由不到的模型名去调（改造前这里只读 workbuddy 单家，另三家在界面上不可见）。
+        // 每条另带 provider / providerLabel，供网关页按家分组。
+        "models": crate::server::core::providers::catalog::session_models(state.store()),
+        // 指纹脱敏开关（与 GET /api/sanitize 同一个键、同一个值）
+        config::KEY_SANITIZE_FINGERPRINTS: snapshot.sanitize_fingerprints(),
+        // 插件申报的**账号行渲染参数**（`{provider: AccountFeatures}`）。
+        //
+        // ── 为什么挂在 /api/session ──────────────────────────────
+        // 账号页的首屏数据就来自这里，而它每一列都要用这些参数（标识读哪个
+        // 键、有效期读哪个键、要不要给余额入口）。放在同一次响应里，界面
+        // 不必再发一次请求，也不会出现「账号已经画出来了、参数还没到」的
+        // 中间态（那会让整列闪一下）。
+        //
+        // 没申报的家不在表里 —— 界面走自己的兜底表，旧插件照常工作。
+        "accountFeatures": crate::server::core::plugin_host::account_features(),
+    }))
+}
+
+/// 按「最近一次请求的模型」派生**下一个请求实际会先用谁**的账号 id
+/// （账号页的 ★ / 「首选」读它）。
+///
+/// ── 为什么由后端派生，而不是界面拿 currentAccountId 自己推 ────────
+/// 1. `accounts.currentAccountId` 是**不限模型**的队首（只判「启用 + 有凭证」），
+///    不看按模型记的限额。队首正被限流时，界面标 ★ 的是那个必被跳过的账号，
+///    请求却落到下一个 —— 两边说的不是一件事。
+/// 2. 候选集合还要先收窄到「清单里有这个模型的家」（`route_for_forward`），
+///    而 `/api/session` 的 `models` 是跨家**去重后**的聚合视图（同名模型只留
+///    认领的那一家，见 `catalog::merged_items`），界面据此还原会漏掉并发提供
+///    该模型的其它家。
+///
+/// 直接复用转发层的 `routing::pick_for_model`，界面标 ★ 的账号便与转发会先试的
+/// 那个同判据；不做「取不到会话就继续往后找」那层运行时探测（要读客户端登录态
+/// 文件，属转发编排的职责），改用 `hasCredentials` 这个静态事实近似。
+///
+/// 模型未知 / 该模型下确实没有可用账号时给 null —— 界面回落到
+/// `currentAccountId`，宁可让它标一个「队列第一位」，也不要整列 ★ 凭空消失。
+fn routed_account_id(accounts: &Value, model: Option<&str>, counts: &HashMap<String, usize>) -> Value {
+    let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Value::Null;
+    };
+    // 候选链是 id 空间（内置家 + 自定义家同列，见 `router` 的模块头）；
+    // 自定义家的账号同样在全局队列里，`pick_for_model` 按 provider 字符串
+    // 过滤候选，两种 id 天然可比。
+    let provider_chain = router::route_for_forward(model);
+    let providers: Vec<&str> = provider_chain.iter().map(String::as_str).collect();
+    // 被限制器软跳过的账号先剔除（余额不足 / Token 限额，与转发选路同一判据，
+    // 见 `upstream::rotate::filter_limiter_blocked`）：★ 标的是「下一个请求会先用
+    // 谁」，被拦的账号不该标 ★ —— 否则两边说的又不是一件事了。
+    let facts = crate::server::core::usage_records::balance_facts();
+    let token_facts = crate::server::core::limiter::token_facts();
+    let now = crate::server::logging::now_ms();
+    let candidate_accounts: Vec<Value> = routing::accounts_of(accounts)
+        .into_iter()
+        .filter(|account| {
+            !crate::server::core::usage_records::balance_blocked(account, &facts)
+                && !crate::server::core::limiter::token_skip_blocked(account, &token_facts, now)
+        })
+        .collect();
+    routing::pick_for_model(
+        &candidate_accounts,
+        model,
+        &providers,
+        counts,
+        logging::now_ms(),
+    )
+    .and_then(|account| routing::account_id(&account).map(str::to_string))
+    .map(Value::String)
+    .unwrap_or(Value::Null)
+}
+
+/// Clash 摘要（Node 版这里只带三项，完整形态在 /api/proxies）。
+/// 三项的含义：是否读到 Clash Verge 配置 / 读不到的原因 / 可选项数量
+/// （混合端口 + 各监听器）。切片 3 起是真实值。
+fn proxies_summary() -> Value {
+    let clash = crate::server::core::proxies::clash_proxy_options();
+    json!({
+        "clashAvailable": clash.get("available").and_then(Value::as_bool).unwrap_or(false),
+        "clashError": clash.get("error").cloned().unwrap_or(Value::Null),
+        "optionCount": clash
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0),
+    })
+}
+
+// ─── POST /api/session/login/start ──────────────────────────
+
+/// 发起登录：起任务后最多等 15 秒拿 authUrl。
+///
+/// 拿不到就 502 `{success:false, error}` —— 注意**任务仍在后台跑**
+/// （Node 版同样如此：返回 502 只是这一次没等到 URL）。
+///
+/// ── `provider` 维度 ───────────────────────────────────────
+/// body 里的可选 `provider`（缺省 = workbuddy）决定走哪条链：
+///   - **由插件接管的家**（含全部内置家装上插件后、以及第三方 provider）→
+///     `start_plugin_web_login`：问插件的 `login.start` 拿完整 `LoginStart`
+///     （授权地址 + flow + 流程形态），回调型等 `login.callback`、轮询型由网关
+///     按 `pollIntervalMs` 问 `login.poll`；
+///   - 注册表里的 provider 但**没有插件接管** → 503，指名「需要安装插件」；
+///   - 注册表里没有的 id → 400「未知的提供商」（不静默回落 workbuddy：
+///     那会把一次小浣熊登录发起成 workbuddy 登录）。
+///
+/// 网关已经没有任何一家的登录实现 —— 这一段的分流只有「插件」与「没装插件」
+/// 两种结果，不再有内置换码的分支。
+pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Response {
+    // 请求里的 `edition` 不再参与地区判定：拆家后界面上两张卡片各发各的
+    // provider id，那是权威（`edition` 只是前端回显字段，见下面 Qoder /
+    // ZCode 两个分支的说明）。解析失败不是错误（Node 版 `catch { edition = null }`）。
+    let payload = parse_body(&body).ok();
+    let provider = payload
+        .as_ref()
+        .and_then(|payload| payload.get("provider").and_then(Value::as_str))
+        .map(str::trim)
+        .unwrap_or("");
+    // AutoClaw：网页登录走**另一条入口**（`/api/session/login/oauth/start`），
+    // 必须在下面所有分流之前挡掉 —— 通用插件链会回「插件未能生成授权地址」，
+    // 而国际版是**支持**的，只是发起方式不同（授权地址要先过一次浏览器端风控
+    // 验证码，由前端拿地址再交壳开窗口）。
+    if let Some(region) = crate::server::core::providers::autoclaw::Region::from_provider_id(provider) {
+        let message = if region == crate::server::core::providers::autoclaw::Region::Intl {
+            "AutoClaw 国际版的网页登录需要先完成一次风控验证，请回到「添加账号」弹窗，             用「网页登录（Zai / Google）」发起"
+        } else {
+            // 国内版确实没有 OAuth（上游 oauth-captcha-config 返回 enabled:false），
+            // 它的官方唯一登录方式是手机验证码 —— 文案要指向那条
+            "AutoClaw 国内版没有网页授权登录，请改用「手机验证码登录」或「填写凭证」"
+        };
+        return management_error(400, message);
+    }
+    // 注册表是 provider 白名单的唯一事实来源（见 providers::kind_from_id 的说明）
+    let kind = match provider {
+        "" => crate::server::core::providers::ProviderKind::WorkBuddy,
+        other => match crate::server::core::providers::kind_from_id(other) {
+            // 已被插件接管的内置家：走插件那条路。下面那些分支是**内置实现**
+            // 的登录链，插件接管的同一 id 若从这里进，会拿内置的 OAuth 流程
+            // 换一个插件并不认识的会话（症状是「登录成功但账号不能用」）。
+            Some(_) if crate::server::core::plugin_host::serves_provider(other) => {
+                return start_plugin_web_login(state, other.to_string()).await;
+            }
+            Some(kind) => kind,
+            // 插件家的 id 不在枚举里（第三方 provider 没有 `ProviderKind`）。
+            // 它们走 `start_plugin_web_login`：`build_login_url_async` 发一次
+            // `login.start` RPC，拿到授权地址与 state 后与内置家同一条收尾链。
+            None => {
+                if crate::server::core::providers::adapter::adapter_by_id(other).is_none() {
+                    return management_error(400, format!("未知的提供商：{other}"));
+                }
+                return start_plugin_web_login(state, other.to_string()).await;
+            }
+        },
+    };
+    // 走到这里说明：这是注册表里的 provider，但此刻没有插件接管它 ——
+    // 小浣熊 / CatPaw / Qoder / ZCode / WorkBuddy / Trae / OfficeAce / AtomCode /
+    // Cline / AutoClaw 等都属这一类。历史上这里按家分流到各自的
+    // `start_web_login`，那套实现已逐家搬空。
+    // 内置实现已经一家不剩（`implemented_kinds()` 为空），所以剩下的每种
+    // 情况都只有「没装插件」这一个解释。直接说清楚，而不是回一句「这家不支持
+    // 网页登录」—— 后者会让用户去翻凭证格式，而真正该做的是装插件。
+    management_error(
+        503,
+        format!(
+            "{}的网页登录需要安装提供商插件：本版本不再内置该家的登录实现",
+            crate::server::core::providers::meta(kind).label
+        ),
+    )
+}
+
+/// 插件家的网页登录分支。
+///
+/// 网关唯一一条网页登录发起链：授权地址由**插件进程**生成（`login.start`
+/// RPC），任务句柄仍由网关持有 —— 回调进来时 `submit_login_callback` 按任务上
+/// 记的 provider id 找插件，走 `login.callback` 收尾。
+///
+/// ── 两种流程形态都在这里分流（`poll_interval_ms` 是唯一判据）─────
+///   - `0` = **回调型**：网关把地址交给壳、等回调到达（LobsterAI / 小浣熊）；
+///   - `> 0` = **轮询型**：授权回调在**上游域名**终结、永远不回到本机
+///     （AtomCode / OfficeAce / ZCode 这类代理中介流程），网关必须自己按
+///     插件给的间隔问 `login.poll`。
+///
+/// 丢掉这个位的后果是「地址出来了、界面一直挂着等一个永远不会到的跳转」——
+/// 没有任何报错，是最难查的一类失败。所以**必须**用 `login_start_async`
+/// 拿完整的 `LoginStart`，不能用只回 `(url, state)` 的那个。
+async fn start_plugin_web_login(state: ServerState, provider: String) -> Response {
+    let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(&provider) else {
+        return management_error(400, format!("未知的提供商：{provider}"));
+    };
+    let label = adapter.label();
+    if !adapter.supports_web_login() {
+        return management_error(
+            400,
+            format!("{label}不支持网页登录，请改用「填写凭证」或「导入桌面端登录态」添加账号"),
+        );
+    }
+    let Some(start) = adapter.login_start_async().await else {
+        return management_error(400, format!("{label}未能生成网页登录授权地址，请重试"));
+    };
+    // 版本标签只有 WorkBuddy 系有意义（`workbuddy` → cn / `workbuddy-intl` → intl），
+    // 别家传空串。判据按 provider id 反查地区，不猜 —— 猜错会让国际版账号
+    // 的登录完成摘要显示成国内版。
+    let edition = crate::server::core::providers::workbuddy::Region::from_provider_id(&provider)
+        .map(|region| region.id())
+        .unwrap_or("");
+    let handle = state.login().new_handle_for_provider(edition, &provider);
+    handle.update(|task| {
+        task.state = Some(start.flow.clone());
+        task.auth_url = Some(start.url.clone());
+    });
+    state.login().tasks().register(&start.flow, handle.clone());
+    // 轮询型：起后台任务问上游「授权完了没」，完成后落账号并写回任务状态
+    if start.poll_interval_ms > 0 {
+        spawn_plugin_login_poll(
+            adapter.clone(),
+            handle.clone(),
+            start.flow.clone(),
+            start.poll_interval_ms,
+            provider.clone(),
+        );
+        logging::log(
+            "[Login]",
+            &format!(
+                "发起{label}网页登录（轮询型：每 {}ms 问一次上游）",
+                start.poll_interval_ms
+            ),
+        );
+    } else {
+        logging::log("[Login]", &format!("发起{label}网页登录（等待浏览器回调…）"));
+    }
+    ok_json(json!({
+        "state": start.flow,
+        "authUrl": start.url,
+        "edition": edition,
+        "provider": provider,
+        // 壳侧据此决定「打开窗口等跳转」还是「只打开窗口、由网关轮询」
+        "pollIntervalMs": start.poll_interval_ms,
+        "externalBrowser": start.external_browser,
+        "allowedHosts": start.allowed_hosts,
+    }))
+}
+
+/// 轮询型插件登录的后台任务。
+///
+/// ── 为什么不在请求里等 ──────────────────────────────────────
+/// 轮询要跑几分钟（用户在浏览器里操作）。阻塞在 `/start` 会让那次 HTTP 请求
+/// 挂到超时，而前端拿不到 state 就无法 `/wait`。
+///
+/// ── 失败语义 ────────────────────────────────────────────────
+///   - `Failed` → 落定任务错误（前端 `/wait` 立刻拿到）；
+///   - 传输层错误 → 也落定错误。与「设备授权」那套不同：这里一次问不成就
+///     说明代理不可达，继续等只会把一个网络故障伪装成「用户还没操作」；
+///   - `Pending` → 继续，直到 `LOGIN_TIMEOUT_MS`。
+///
+/// 任务被取消（`/cancel`）时循环下一拍就退出（`cancel` 会把任务从表里移除，
+/// 但句柄还在，所以这里查的是句柄上的 `canceled` 标记）。
+fn spawn_plugin_login_poll(
+    adapter: std::sync::Arc<dyn crate::server::core::providers::adapter::ProviderAdapter>,
+    handle: crate::server::core::login::LoginTaskHandle,
+    flow: String,
+    interval_ms: u64,
+    provider: String,
+) {
+    crate::spawn_task(async move {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(crate::server::core::login::LOGIN_TIMEOUT_MS);
+        let interval = std::time::Duration::from_millis(interval_ms.max(1_000));
+        loop {
+            tokio::time::sleep(interval).await;
+            let task = handle.snapshot();
+            if task.canceled || task.done {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                crate::server::core::login::fail_plugin_login(
+                    &handle,
+                    "网页登录超时，请重新发起",
+                );
+                return;
+            }
+            match adapter.login_poll_async(&flow).await {
+                Ok(agent2api_provider_protocol::LoginPoll::Done { account }) => {
+                    // 落库走与回调型同一条路（`persist_login_account`），
+                    // 插件的 identity 决定是新增还是更新
+                    match adapter.persist_login_account(&account) {
+                        Ok(account_id) => {
+                            crate::server::core::login::finish_plugin_login(&handle, &account_id);
+                            logging::log(
+                                "[Login]",
+                                &format!("✅ {provider} 网页登录完成，账号已加入列表"),
+                            );
+                        }
+                        Err(error) => {
+                            crate::server::core::login::fail_plugin_login(&handle, &error.message)
+                        }
+                    }
+                    return;
+                }
+                Ok(agent2api_provider_protocol::LoginPoll::Pending { .. }) => continue,
+                Ok(agent2api_provider_protocol::LoginPoll::Failed { message }) => {
+                    crate::server::core::login::fail_plugin_login(&handle, &message);
+                    return;
+                }
+                Err(error) => {
+                    crate::server::core::login::fail_plugin_login(&handle, &error.message);
+                    return;
+                }
+            }
+        }
+    });
+}
+
+
+// ─── GET /api/session/login/wait ────────────────────────────
+// ─── GET /api/session/login/wait ────────────────────────────
+
+/// 轮询登录结果（三种响应：pending / done+error / done+session）
+pub async fn login_wait(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let task_state = params.get("state").cloned().unwrap_or_default();
+    let Some(task) = state.login().tasks().get(&task_state) else {
+        return management_error(404, "登录任务不存在或已过期");
+    };
+    ok_json(task.snapshot().to_wait_response())
+}
+
+// ─── POST /api/session/login/cancel ─────────────────────────
+
+pub async fn login_cancel(State(state): State<ServerState>, body: Bytes) -> Response {
+    let task_state = parse_body(&body)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    // 走 LoginService 那一层（而不是 `tasks().cancel`）：AutoClaw 那条链借来的
+    // 回调端口挂在它的待办表上，取消时得一起释放（见 `LoginService::cancel`）
+    let canceled = state.login().cancel(&task_state);
+    ok_json(json!({ "canceled": canceled }))
+}
+
+// ─── POST /api/session/login/callback ───────────────────────
+
+/// 提交网页登录的回调 URL（**壳侧登录窗口专用**）。
+///
+/// ── 什么样的家需要它 ────────────────────────────────────────
+/// 回调落在一个**壳或浏览器抓得住、网关自己收不到**的地方时，由这一侧的调用方
+/// 把原文转进来。两种来源：
+///   - 壳侧登录窗口：`on_navigation` 认出回调 URL、拦下导航、把原文 POST 进来
+///     （自定义协议如 `office-raccoon://`、`orcaterm://` 只能这样）；
+///   - 网页端：用户在弹窗里手工粘贴地址栏里的整条 URL（`web_shim.rs` 的
+///     `needsManualCallback`）。
+///
+/// ── 网关不认识任何一家的回调形状 ──────────────────────────────
+/// 本函数只做「按 state 找回登录任务 → 把整条 URL 交给**服务这一家的插件**」。
+/// `scheme / host / path / 查询串里哪个键是授权码` 全在插件里（`login.callback`
+/// 收到的是原样 URL 与 `code` 两份），所以新增一家不需要改这里一行代码。
+///
+/// ── 校验与失败语义 ──────────────────────────────────────────
+/// body `{state, callbackUrl}`：
+///   - state 必须对应一个**进行中**的登录任务（404 表示没有这个任务，前端应重新发起）；
+///   - 插件负责 state 逐字比对与一次性换码；失败要落定任务错误，
+///     否则前端会一直等到 5 分钟超时。
+pub async fn login_callback(State(state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let task_state = payload
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let callback_url = payload
+        .get("callbackUrl")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if callback_url.is_empty() {
+        return management_error(400, "缺少 callbackUrl（登录回调地址）");
+    }
+    // ── AutoClaw 的网页登录是**轮询型**（回调落在插件自己的登记端口）──
+    // `submit_login_callback` 那条路只服务「网关等回调」的回调型家（它会把
+    // 一次性 code 交给插件的 `login.callback`）。AutoClaw 的流程活在插件的
+    // 流程表里，没有 `login.callback` 语义 —— 用户粘贴的地址要**投递进那个
+    // 流程**（`login.oauth-callback` 管理动作），后续仍由 `login.poll` 收尾。
+    if let Some(task) = state.login().tasks().get(&task_state) {
+        if crate::server::core::providers::autoclaw::Region::from_provider_id(&task.snapshot().provider)
+            .is_some()
+        {
+            let provider = task.snapshot().provider;
+            let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(&provider)
+            else {
+                return management_error(503, "AutoClaw 的提供商插件没有安装，无法提交回调");
+            };
+            return match adapter
+                .admin_action(
+                    state.store(),
+                    "",
+                    "login.oauth-callback",
+                    &json!({ "state": task_state, "url": callback_url }),
+                )
+                .await
+            {
+                Ok(_) => ok_json(json!({ "accepted": true })),
+                Err(error) => management_error(error.status_code, error.message),
+            };
+        }
+    }
+    match state
+        .login()
+        .submit_login_callback(&task_state, &callback_url)
+        .await
+    {
+        Ok(crate::server::core::login::LoginCallbackSubmission::Completed(account_id)) => {
+            ok_json(json!({ "accountId": account_id }))
+        }
+        Ok(crate::server::core::login::LoginCallbackSubmission::ContinueTo(next_url)) => {
+            ok_json(json!({ "continue": true, "nextUrl": next_url }))
+        }
+        Err(error) => management_error(error.status_code, error.message),
+    }
+}
+
+// ─── GET /api/session/login/remote-callback ────────────────
+
+/// **远程网页登录回调中转**（浏览器能到网关、但授权页只能把授权码带回一个
+/// 普通 HTTP 地址时用）。
+///
+/// ── 谁在用 ──────────────────────────────────────────────────
+/// 网页端（`web_shim.rs`）：内嵌窗口拿不到自定义协议，网页 shim 改走授权页的
+/// `redirect` 分支，把 `authorization_code` 追加到面板自己的地址上导航回来。
+/// 面板地址是浏览器与网关**都能到达**的那一个，所以由网关收下这一次跳转。
+///
+/// ── 为什么路径是通用的 ──────────────────────────────────────
+/// 回调里带什么参数（`code` / `authorization_code`）、要还原成什么协议的形态，
+/// 都是**那一家的上游知识**，已经随实现搬到插件。网关这边只做三件事：
+///   ① 从 query 认出一次性授权码（只认这两个标准 OAuth 参数名）；
+///   ② 把原始查询串原样交给 `submit_login_callback`，由插件自己解释；
+///   ③ 回一张人看的 HTML 页（用户此刻正盯着浏览器）。
+///
+/// 该路由必须免鉴权：调用方是授权页，不会携带面板 API Key；安全性由本次
+/// 登录任务生成的不可预测 state 承担（插件侧再逐字比对一次）。
+pub async fn login_remote_callback(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let task_state = params.get("state").cloned().unwrap_or_default();
+    if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+        return oauth_callback_page(400, &format!("登录失败：授权被拒绝（{error}）"));
+    }
+    let code = params
+        .get("code")
+        .or_else(|| params.get("authorization_code"))
+        .cloned()
+        .unwrap_or_default();
+    drop(params);
+    if task_state.trim().is_empty() || code.trim().is_empty() {
+        return oauth_callback_page(
+            400,
+            "登录失败：回调缺少 state 或授权码，请重新发起网页登录。",
+        );
+    }
+    // 组一条**只承载查询串**的回调地址：插件按自己的规则解释参数名与协议形态，
+    // 网关不在这里替它选（`http://localhost` 只是 `url::Url` 要求的占位 origin，
+    // 不会被访问）。
+    // `Serializer` 不是 Send：必须只在同步块里活，不能跨 `.await`
+    // （否则 handler 的 future 不是 Send，axum 的 Handler bound 直接不成立）。
+    let callback_url = {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("code", code.trim());
+        query.append_pair("state", task_state.trim());
+        format!("http://localhost/login-remote-callback?{}", query.finish())
+    };
+    match state
+        .login()
+        .submit_login_callback(&task_state, &callback_url)
+        .await
+    {
+        Ok(crate::server::core::login::LoginCallbackSubmission::Completed(_)) => {
+            oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。")
+        }
+        Ok(crate::server::core::login::LoginCallbackSubmission::ContinueTo(_)) => {
+            oauth_callback_page(400, "登录回调仍需继续，请重新发起网页登录。")
+        }
+        Err(error) => {
+            oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message))
+        }
+    }
+}
+
+// ─── POST /api/session/login/sms/send 与 /verify ────────────
+
+/// 从请求体里读 AutoClaw 地区（`provider` 字段，与 `POST /api/accounts` 同名）。
+///
+/// 缺省（字段没带 / 空串）落**国内版**：与 provider id 的历史口径一致 ——
+/// 老客户端不带这个字段，而那些用户本来就在用国内版。
+///
+/// ── 带值却不认识：明确拒绝（issue #93 的教训）──────────────────
+/// 原来是「未知值也落国内版」，代价是**跨 provider 的误投完全无声**：另一个家
+/// 的 id（如 Loomy）发到这条端点时，号码被发去 AutoClaw 的站点、账号也存成
+/// AutoClaw，而调用方拿到的是**成功响应**。因此只有「没带」才按历史口径回落；
+/// 带了不认识的值就报出来。
+fn autoclaw_region_of(
+    payload: &Value,
+) -> Result<crate::server::core::providers::autoclaw::Region, Response> {
+    use crate::server::core::providers::autoclaw::Region;
+    let raw = payload
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if raw.is_empty() {
+        return Ok(Region::Cn);
+    }
+    match Region::from_provider_id(raw) {
+        Some(region) => Ok(region),
+        None => {
+            let known = Region::ALL
+                .into_iter()
+                .map(Region::provider_id)
+                .collect::<Vec<_>>()
+                .join(" / ");
+            Err(management_error(
+                400,
+                format!("未知的登录地区「{raw}」（只支持 {known}）"),
+            ))
+        }
+    }
+}
+
+/// 取 AutoClaw 插件适配器（没装插件时给出可操作的文案）。
+fn autoclaw_adapter(
+    region: crate::server::core::providers::autoclaw::Region,
+) -> Result<std::sync::Arc<dyn crate::server::core::providers::adapter::ProviderAdapter>, Response> {
+    let provider = region.provider_id();
+    match crate::server::core::providers::adapter::adapter_by_id(provider) {
+        Some(adapter) => Ok(adapter),
+        None => Err(management_error(
+            503,
+            format!(
+                "AutoClaw {} 的登录需要安装提供商插件：本版本不再携带该家的登录实现",
+                region.label()
+            ),
+        )),
+    }
+}
+
+/// 发送短信验证码（**AutoClaw 国内版专用**，手机号验证码登录的第一步）。
+///
+/// ── 为什么这不是「网页登录」──────────────────────────────────
+/// AutoClaw 国内版没有网页授权：桌面端没有公网 Web 应用、账号体系里没有授权码，
+/// 它的唯一入口是手机号 + 验证码（国际版反过来，只有 OAuth）。因此这里既不开
+/// 窗口也不起任务，就是**一次同步的上游调用**（插件侧 `login.sms-send`）。
+///
+/// body `{phone, provider?}` → `{deviceId}`。
+///
+/// ── 为什么把 deviceId 回给前端 ──────────────────────────────
+/// 上游把「发的这个码」绑在发码时的 device_id 上，登录必须带同一个 ——
+/// 但网关不替用户保存这个中间态（一次登录可以跨多次 HTTP 请求、也可以被用户
+/// 放弃，存在服务端只会多一份要清理的状态）。回给前端让它随下一次请求带回。
+pub async fn login_sms_send(State(state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
+    let region = match autoclaw_region_of(&payload) {
+        Ok(region) => region,
+        Err(response) => return response,
+    };
+    let adapter = match autoclaw_adapter(region) {
+        Ok(adapter) => adapter,
+        Err(response) => return response,
+    };
+    // 发码不需要账号（还没登录），`account` 传空串；插件那条动作不读账号库。
+    match adapter
+        .admin_action(state.store(), "", "login.sms-send", &json!({ "phone": phone }))
+        .await
+    {
+        Ok(result) => ok_json(result),
+        Err(error) => management_error(error.status_code, error.message),
+    }
+}
+
+/// 用手机号 + 验证码登录并**直接落成账号**（**AutoClaw 国内版专用**）。
+///
+/// body `{phone, code, deviceId?, name?, provider?}` → `{account, list}` ——
+/// 响应形状与 `POST /api/accounts` **逐字一致**：登录只是另一种拿到凭证的方式，
+/// 落盘、命名、去重、优先级分配全部复用插件那条落库通路。
+pub async fn login_sms_verify(State(state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
+    let code = payload.get("code").and_then(Value::as_str).unwrap_or("");
+    let device_id = payload.get("deviceId").and_then(Value::as_str);
+    let name = payload.get("name").and_then(Value::as_str);
+    let region = match autoclaw_region_of(&payload) {
+        Ok(region) => region,
+        Err(response) => return response,
+    };
+    let adapter = match autoclaw_adapter(region) {
+        Ok(adapter) => adapter,
+        Err(response) => return response,
+    };
+    let account = match adapter
+        .admin_action(
+            state.store(),
+            "",
+            "login.sms-verify",
+            &json!({ "phone": phone, "code": code, "deviceId": device_id, "name": name }),
+        )
+        .await
+    {
+        Ok(value) => match serde_json::from_value::<agent2api_provider_protocol::NormalizedAccount>(value)
+        {
+            Ok(account) => account,
+            Err(error) => {
+                return management_error(502, format!("插件返回的登录结果无法解析：{error}"))
+            }
+        },
+        Err(error) => return management_error(error.status_code, error.message),
+    };
+    match adapter.persist_login_account(&account) {
+        Ok(account_id) => {
+            let label = account
+                .public
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("AutoClaw 账号");
+            logging::log(
+                "[Login]",
+                &format!("✅ AutoClaw {}登录成功: {label}", region.label()),
+            );
+            let list = state.store().list_visible_accounts();
+            let account = list
+                .get("accounts")
+                .and_then(Value::as_array)
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| item.get("id").and_then(Value::as_str) == Some(&account_id))
+                })
+                .cloned()
+                .unwrap_or(account.public);
+            ok_json(json!({ "account": account, "list": list }))
+        }
+        Err(error) => management_error(error.status_code, error.message),
+    }
+}
+
+// ─── Loomy 手机号验证码登录（两段）─────────────────────────
+
+/// 发送短信验证码（**Loomy 专用**，手机号验证码登录的第一步）。
+///
+/// ── 为什么这不是「网页登录」──────────────────────────────────
+/// Loomy 的账号体系（CAccount）没有网页授权码那套 —— 官方客户端唯一的自助
+/// 入口就是手机号 + 验证码（微信扫码那条需要讯飞侧登记的回调域名，网关复刻
+/// 不了，见 `providers/loomy/login.rs` 的模块头）。因此这里既不开窗口也不起
+/// 后台任务，就是**一次同步的上游调用**（带 HMAC-SHA1 签名头）。
+///
+/// body `{phone}` → `{msgid}`。
+///
+/// ── 为什么把 msgid 回给前端（与 AutoClaw 的 deviceId 同款）──
+/// 上游把「发的这个码」绑在发码响应的 msgid 上，登录必须带同一个 ——
+/// 但网关不替用户保存这个中间态（一次登录可以跨多次 HTTP 请求、也可以被
+/// 放弃，存在服务端只会多一份要清理的状态）。
+pub async fn login_loomy_sms_send(State(state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
+    let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id("loomy") else {
+        return management_error(400, "Loomy 的提供商插件没有安装，无法发送验证码");
+    };
+    // 发码不需要账号（还没登录），`account` 传空串；`store` 也只是占位
+    // （插件的这条动作不读账号库）。
+    match adapter
+        .admin_action(state.store(), "", "login.sms-send", &json!({ "phone": phone }))
+        .await
+    {
+        Ok(result) => ok_json(result),
+        Err(error) => management_error(error.status_code, error.message),
+    }
+}/// 用手机号 + 验证码登录并**直接落成账号**（**Loomy 专用**）。
+///
+/// body `{phone, code, msgid, name?}` → `{account, list}` —— 响应形状与
+/// `POST /api/accounts` **逐字一致**：登录只是另一种拿到凭证的方式，落盘、
+/// 命名、去重、优先级分配全部复用既有的添加路径（`add_loomy_account`），
+/// 前端因此可以直接把结果交给同一个「已添加账号」收尾逻辑。
+pub async fn login_loomy_sms_verify(State(state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
+    let code = payload.get("code").and_then(Value::as_str).unwrap_or("");
+    let msgid = payload.get("msgid").and_then(Value::as_str);
+    let Some(adapter) =
+        crate::server::core::providers::adapter::adapter_by_id("loomy")
+    else {
+        return management_error(400, "Loomy 的提供商插件没有安装，无法登录");
+    };
+    let credentials = match adapter
+        .admin_action(
+            state.store(),
+            "",
+            "login.sms-verify",
+            &json!({ "phone": phone, "code": code, "msgid": msgid }),
+        )
+        .await
+    {
+        Ok(credentials) => credentials,
+        Err(error) => return management_error(error.status_code, error.message),
+    };
+    // 备注名：用户显式填的优先；没填则用脱敏手机号（`138****8000`）——
+    // 比默认的「Loomy 账号」更像用户自己认得出来的标识
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            credentials
+                .get("phoneTail")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let store = state.store();
+    match store.add_loomy_account(&credentials, name.as_deref()) {
+        Ok(account) => {
+            let label = account
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Loomy 账号");
+            logging::log("[Login]", &format!("✅ Loomy 登录成功: {label}"));
+            ok_json(json!({ "account": account, "list": store.list_visible_accounts() }))
+        }
+        Err(error) => super::accounts::store_error(error),
+    }
+}
+
+// ─── KukuAI 短信登录收尾（百度通行证）──────────────────────────
+
+/// `POST /api/session/login/kuku/complete` —— 壳侧交回登录态。
+///
+/// 百度通行证登录成功后的跳转**不携带授权码**（凭证在 `.baidu.com` 域的
+/// Cookie 里，跨域跳转不会带过去），而 `BDUSS` 是 **HttpOnly** Cookie，
+/// 登录窗口的页面脚本 `document.cookie` 读不到 —— 因此交回由**壳侧进程**
+/// 完成：登录窗口跳转 `success.html` 后，壳用 WebView2 的 Cookie 存储
+/// （`cookies()` 含 HttpOnly）读出 `BDUSS` / `STOKEN`，拼成 Cookie 头
+/// POST 到这里（`state` + `cookie` 在请求体里，不走 URL）。
+///
+/// 该路由**免鉴权**：调用方是壳侧进程（登录窗口），不带 API Key；安全性由
+/// 登录任务的一次性 state 承担（与远程回调中转同口径）。
+pub async fn login_kuku_complete(
+    State(state): State<ServerState>,
+    Json(payload): Json<Value>,
+) -> Response {
+    let task_state = payload
+        .get("state")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let cookie = payload
+        .get("cookie")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if task_state.is_empty() || cookie.is_empty() {
+        return management_error(400, "登录失败：回调缺少 state 或登录态 Cookie，请重新发起短信登录。");
+    }
+    // 收尾走**插件**那条通用回调链：Cookie 作为一次性 `code` 交给插件，
+    // 插件自己解析（`BDUSS` / `STOKEN` / 其余百度域 Cookie）、打 `userreport`
+    // 复核、产出账号 —— 网关这边不认识任何百度 Cookie 的名字。
+    match state.login().submit_login_callback(task_state, cookie).await {
+        Ok(_) => ok_json(json!({ "ok": true })),
+        Err(error) => management_error(error.status_code, &format!("登录失败：{}", error.message)),
+    }
+}
+
+// ─── OrcaTerm 网页登录收尾（兜底入口）──────────────────────────
+
+/// `POST /api/session/login/orcaterm/complete` —— 直接交回一枚现成的令牌。
+///
+/// ── 正式链路不在这里（必读）─────────────────────────────────
+/// 网页登录走**官方 OAuth**：窗口停在授权页 → 微信扫码 → 上游把浏览器带回
+/// `orcaterm://oauth_callback?session_id=…` → 壳侧把回调 URL 交给
+/// `POST /api/session/login/callback` → 后端 `OAuthExchangeToken` 换令牌
+/// （见 `providers/orcaterm/login.rs` 模块头，那里也记录了「为什么不用控制台
+/// 的 `ot_session`」：那枚 Cookie 在 SPA 内扫码时根本不会被写出来）。
+///
+/// 本端点留给「调用方手里已经有一枚令牌」的场景（壳侧若从别处读到、外部工具
+/// 替我们拿到）：`{state, token}` POST 进来，同样做上游探活，通过才落账号。
+///
+/// 令牌形态兼容 `ot_session=…` 前缀（后端 `normalize_token` 会剥），
+/// 因此字段既叫 `token` 也接受别名 `cookie`。
+///
+/// 该路由**免鉴权**：调用方是壳侧进程（登录窗口），不带 API Key；安全性由
+/// 登录任务的一次性 state 承担（与 kuku/complete 同口径）。
+pub async fn login_orcaterm_complete(
+    State(state): State<ServerState>,
+    Json(payload): Json<Value>,
+) -> Response {
+    let task_state = payload
+        .get("state")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    // 字段叫 `token`：交回的是裸令牌（`ot_session=` 前缀由后端再剥一次，
+    // 兼容壳侧原样传整段 Cookie 的形态）；`cookie` 作为别名一并接受。
+    let token = payload
+        .get("token")
+        .or_else(|| payload.get("cookie"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if task_state.is_empty() || token.is_empty() {
+        return management_error(
+            400,
+            "登录失败：回调缺少 state 或登录态令牌，请重新发起网页登录。",
+        );
+    }
+    match state.login().finish_orcaterm_login(task_state, token).await {
+        Ok(_) => ok_json(json!({ "ok": true })),
+        Err(error) => management_error(error.status_code, &format!("登录失败：{}", error.message)),
+    }
+}
+
+// ─── AutoClaw OAuth 网页登录（国际版，三段）──────────────────
+
+/// 从请求体里读 OAuth 变体（`vendor` 字段：`zai` / `google`）。
+///
+/// 不认识的值一律 400：**不静默回落**到某一个变体 —— 那会让用户点 Google
+/// 却打开 Zai 的授权页（两者是不同账号体系，登进去是个陌生账号）。
+///
+/// 变体清单由插件申报（`login.oauth-config` 的 `region` 段不列变体，因此这里
+/// 只做**形态**校验：非空且是已知的两个字面量之一 —— 这是路由层的事实，
+/// 不是上游知识）。
+fn oauth_vendor_of(payload: &Value) -> Result<&'static str, Response> {
+    let raw = payload
+        .get("vendor")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    match raw {
+        "zai" => Ok("zai"),
+        "google" => Ok("google"),
+        _ => Err(management_error(
+            400,
+            format!("未知的登录方式「{raw}」（只支持 zai / google）"),
+        )),
+    }
+}
+
+/// `POST /api/session/login/oauth/captcha-config` —— 取风控验证配置。
+///
+/// 前端据此初始化阿里云 SDK（`prefix` / `sceneId` 是 SDK 的必填参数）。
+/// `?provider=` 决定问哪个地区；缺省国内版。
+///
+/// ── 为什么这条单独成一个端点（不塞进 start）──────────────────
+/// 验证码要在**浏览器环境**里跑（SDK 是浏览器端 JS），而 SDK 初始化需要
+/// `prefix` / `sceneId` —— 那两个值只能从上游拿。若把「取配置」与「取授权
+/// 地址」合并成一个请求，就变成「网关先取配置、但它没法自己跑验证码」，
+/// 前端仍然要再发一次请求带验证码回来。
+///
+/// `enabled: false`（国内版）不是错误：前端据此不渲染 OAuth 按钮。
+pub async fn login_oauth_captcha_config(State(state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let region = match autoclaw_region_of(&payload) {
+        Ok(region) => region,
+        Err(response) => return response,
+    };
+    let adapter = match autoclaw_adapter(region) {
+        Ok(adapter) => adapter,
+        Err(response) => return response,
+    };
+    match adapter
+        .admin_action(state.store(), "", "login.oauth-config", &Value::Null)
+        .await
+    {
+        Ok(config) => ok_json(config),
+        Err(error) => management_error(error.status_code, error.message),
+    }
+}
+
+/// `POST /api/session/login/oauth/start` —— 带验证码参数发起 OAuth 登录。
+///
+/// body `{provider, vendor, captchaVerifyParam}` → `{state, authUrl, provider,
+/// edition, pollIntervalMs, warning?}`（与另外几条登录链**同一个响应形状**，
+/// 前端与壳侧的等待逻辑不必为新家分叉）。
+///
+/// ── 为什么这条不走壳侧的 `start_login` ────────────────────────
+/// 壳侧那条命令的职责是「打开一个窗口去登录」，而这条的前提是「前端已经在
+/// **主窗口里**跑完验证码 SDK 了」。把验证码参数从渲染层传给壳、再让壳回头调
+/// 网关，等于绕一圈传一个不该由壳理解的不透明字符串。
+///
+/// ── 回调落在哪里（拆家后）─────────────────────────────────
+/// 插件自己借 z.ai 登记的四个端口之一并**自己收下**回调（`web_login` +
+/// `callback_server`）；插件报 `pollIntervalMs`，网关起轮询问 `login.poll`。
+/// 网关这边**不再有** `/auth/callback-*` 路由 —— 它不再知道那四个端口的存在。
+pub async fn login_oauth_start(State(state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let region = match autoclaw_region_of(&payload) {
+        Ok(region) => region,
+        Err(response) => return response,
+    };
+    let vendor = match oauth_vendor_of(&payload) {
+        Ok(vendor) => vendor,
+        Err(response) => return response,
+    };
+    let captcha = payload
+        .get("captchaVerifyParam")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let adapter = match autoclaw_adapter(region) {
+        Ok(adapter) => adapter,
+        Err(response) => return response,
+    };
+    if !adapter.supports_web_login() {
+        return management_error(
+            400,
+            format!(
+                "AutoClaw {}没有网页授权登录，请改用「填写凭证」或「导入桌面端登录态」",
+                region.label()
+            ),
+        );
+    }
+    let started = match adapter
+        .admin_action(
+            state.store(),
+            "",
+            "login.oauth-start",
+            &json!({ "vendor": vendor, "captchaVerifyParam": captcha }),
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => return management_error(error.status_code, error.message),
+    };
+    let flow = started
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let auth_url = started
+        .get("authUrl")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if flow.is_empty() || auth_url.is_empty() {
+        return management_error(502, "插件没有返回授权地址或登录流程 id，请重试");
+    }
+    // 网关侧任务：`/wait` 按 state 查它，`pollIntervalMs > 0` 时起后台轮询。
+    let handle = state.login().new_handle_for_provider("", region.provider_id());
+    handle.update(|task| {
+        task.state = Some(flow.clone());
+        task.auth_url = Some(auth_url.clone());
+    });
+    state.login().tasks().register(&flow, handle.clone());
+    let interval = started
+        .get("pollIntervalMs")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if interval > 0 {
+        spawn_plugin_login_poll(
+            adapter.clone(),
+            handle,
+            flow.clone(),
+            interval,
+            region.provider_id().to_string(),
+        );
+    }
+    logging::log(
+        "[Login]",
+        &format!(
+            "发起 AutoClaw {} {}网页登录（插件侧回调，轮询 {}ms）",
+            region.label(),
+            vendor,
+            interval
+        ),
+    );
+    let mut body = json!({
+        "state": flow,
+        "authUrl": auth_url,
+        "edition": "intl",
+        "provider": region.provider_id(),
+        "pollIntervalMs": interval,
+    });
+    if let Some(warning) = started.get("warning").and_then(Value::as_str) {
+        if let Some(object) = body.as_object_mut() {
+            object.insert("warning".to_string(), Value::String(warning.to_string()));
+        }
+    }
+    ok_json(body)
+}
+
+/// OAuth 回调结果页（浏览器停在它上边，用户看到人话即可）。
+///
+/// 不带任何脚本与外链：这一页的内容我们完全控制，注入面越小越好。
+/// 状态码可能是 410（登录上下文已丢失）这类非 200 —— 统一用 `from_u16`
+/// 兜底成 200，避免一个非法状态码让响应构造失败。
+fn oauth_callback_page(status: i32, message: &str) -> Response {
+    use axum::response::IntoResponse;
+
+    let escaped = message
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    let html = format!(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">\
+         <title>登录回调</title></head>\
+         <body style=\"font-family:system-ui,sans-serif;padding:48px;text-align:center\">\
+         <p style=\"font-size:16px\">{escaped}</p></body></html>"
+    );
+    let status = u16::try_from(status)
+        .ok()
+        .and_then(|code| axum::http::StatusCode::from_u16(code).ok())
+        .unwrap_or(axum::http::StatusCode::OK);
+    (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
+
+// ─── /auth/callback（LobsterAI 的 loopback 回调）─────────────
+
+/// LobsterAI 网页登录的回调。**浏览器 302 到这里**（授权页完成后顶层导航回我们
+/// 交给上游门户的 `redirect_uri`，查询串带 `code` / `state`）。
+///
+/// 路径是裸 `/auth/callback`（与别家带家名后缀的风格不一致）——理由见
+/// `http.rs` 里那条路由的注释：`redirect_uri` 是我们给门户的，而门户是否对
+/// 回调路径有白名单没有实测支撑，所以跟随参考实现那条已验证的形状。
+///
+/// 免鉴权的理由与 antigravity / lobsterai 几条 loopback 回调
+/// 同一句：调用方是**用户的浏览器**，它当然没有我们的 API Key；安全性由本次
+/// 登录任务生成的一次性 `state` 承担（见 `core::login::lobsterai`）。
+pub async fn login_lobsterai_callback(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let code = params.get("code").cloned().unwrap_or_default();
+    let task_state = params.get("state").cloned().unwrap_or_default();
+    if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+        return oauth_callback_page(400, &format!("登录失败：授权被拒绝（{error}）"));
+    }
+    match state.login().finish_lobsterai_login(&code, &task_state).await {
+        Ok(_) => oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。"),
+        // 失败时不再由网关清理 pending：那一轮在**插件进程**里（`take_pending`
+        // 取走即失效），网关这边的任务表已由 `finish_lobsterai_login` 落定错误，
+        // 前端 `/wait` 会读到同一条文案。
+        Err(error) => {
+            oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message))
+        }
+    }
+}
+
+// ─── GET /oauth-callback（Antigravity 的 Google OAuth 登录回调）────
+
+/// Antigravity 网页登录的回调（**浏览器 302 到这里**，查询串带 `code` / `state`）。
+///
+/// ── 路径为什么是 `/oauth-callback`（连字符）──────────────────
+/// 它是发起授权时交给 Google 的 `redirect_uri` 的路径，参考实现
+/// （`Antigravity-Manager/src-tauri/src/modules/oauth_server.rs`）逐字使用
+/// `/oauth-callback`；Google 的 desktop 型 client 允许 loopback 任意端口 +
+/// 这个路径。
+///
+/// ── 为什么免鉴权（挂 public 组）──────────────────────────────
+/// 调用方是**用户的浏览器**（Google 授权页完成后顶层导航回来），它当然没有
+/// 我们的 API Key。与 CatPaw / Accio 几条 loopback 回调同一取舍；
+/// 安全性由本次登录任务生成的不可预测 state 承担（逐字比对见
+/// `core::login::submit_login_callback` 的 Antigravity 分支）。
+///
+/// ── 与「手动粘贴回调 URL」共用同一收尾 ────────────────────────
+/// 远程 / Docker 场景下浏览器可能到不了本机端口，用户会把地址栏整条 URL 粘
+/// 回登录弹窗；那条入口同样落到 `submit_login_callback`（Accio 同款理由），
+/// 本函数只负责把浏览器看到的结果渲染成人话。
+pub async fn login_antigravity_callback(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let code = params.get("code").cloned().unwrap_or_default();
+    let task_state = params.get("state").cloned().unwrap_or_default();
+    if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+        return oauth_callback_page(400, &format!("登录失败：授权被拒绝（{error}）"));
+    }
+    if task_state.trim().is_empty() || code.trim().is_empty() {
+        return oauth_callback_page(400, "登录失败：回调缺少 state 或授权码，请重新发起网页登录。");
+    }
+    let callback_url = antigravity_callback_url(&code, &task_state);
+    match state
+        .login()
+        .submit_login_callback(&task_state, &callback_url)
+        .await
+    {
+        Ok(crate::server::core::login::LoginCallbackSubmission::Completed(_)) => {
+            oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。")
+        }
+        Ok(crate::server::core::login::LoginCallbackSubmission::ContinueTo(_)) => {
+            oauth_callback_page(400, "登录回调仍需继续，请重新发起网页登录。")
+        }
+        Err(error) => {
+            oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message))
+        }
+    }
+}
+
+/// 把 `code` / `state` 还原成标准回调 URL（与 Google 交回我们的形态同款）。
+/// 只用于走 `submit_login_callback` 的解析路径（它只读查询串）。
+fn antigravity_callback_url(code: &str, state: &str) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("code", code);
+    query.append_pair("state", state);
+    format!("http://localhost/oauth-callback?{}", query.finish())
+}
+
+// ─── POST /api/session/refresh ──────────────────────────────
+
+/// POST /api/session/refresh
+///
+/// 出错时走**最外层 catch → errorPayload**（OpenAI 风格 `{error:{message,type}}`），
+/// 而不是管理 API 的 `{success:false,error}` 信封 —— Node 版这条就在大 try 里，
+/// 刷新失败的响应形状与 /api/accounts/refresh 不同，别混用。
+///
+/// ── 续期怎么走（2026-10 拆家）───────────────────────────────
+/// 原来这里调 `AuthService::refresh_stored_session`，那是 WorkBuddy 自己的
+/// `/auth/token/refresh`。续期协议随实现搬到了提供商插件，所以本入口改成
+/// **按当前账号的归属分派到适配器**（`refresh_access_token`）—— 与
+/// `/api/accounts/refresh` 走同一条链路，只是不带账号 id（默认取当前账号）。
+pub async fn session_refresh(State(state): State<ServerState>) -> Response {
+    let Some(entry) = state.store().get_active_entry() else {
+        return session_error(401, "当前没有可刷新的登录态");
+    };
+    let Some(provider) = state.store().account_provider_of(&entry.id) else {
+        return session_error(401, "当前没有可刷新的登录态");
+    };
+    let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(&provider) else {
+        return session_error(400, format!("未知的提供商：{provider}"));
+    };
+    match adapter.refresh_access_token(state.store(), &entry.id).await {
+        Ok(_) => ok_json(json!({ "session": state.auth().get_status() })),
+        Err(error) => {
+            logging::log("[Auth]", &format!("❌ {}", error.message));
+            use axum::response::IntoResponse;
+            error.into_response()
+        }
+    }
+}
+
+/// 一条 OpenAI 风格的错误响应（`{error:{message,type}}`）。
+fn session_error(status: i32, message: impl Into<String>) -> Response {
+    use axum::response::IntoResponse;
+    crate::server::errors::GatewayError::with_status(status, message).into_response()
+}
+
+// ─── POST /api/session/logout 与 POST /auth/logout ─────────
+
+pub async fn session_logout(State(state): State<ServerState>) -> Response {
+    state.auth().clear_session();
+    crate::server::http::ok_empty()
+}
+
+/// POST /auth/logout —— 与 /api/session/logout 同一动作与同一响应形状
+pub async fn auth_logout(State(state): State<ServerState>) -> Response {
+    state.auth().clear_session();
+    crate::server::http::ok_empty()
+}
+
+// ─── POST /auth/login ───────────────────────────────────────
+
+/// 同步登录（对照 server.mjs 601-610 行的 `runLogin`）：等登录完成才响应。
+///
+/// 桌面端不用这条（它走 /api/session/login/* 的异步三步），保留它是为了
+/// 与 Node 版的命令行/脚本入口保持契约一致。
+///
+/// ── 实现已经不在网关里（2026-10 拆家）────────────────────────
+/// 原来这里调 `LoginService::run_login`，那是 WorkBuddy 自己的
+/// `auth/state` → `auth/token` → `login/account` 轮询链。那条链已整体搬到
+/// 提供商插件（`workbuddy::login`），所以本入口改成**通用的插件驱动**：
+/// 问插件要授权地址 → 打印给用户 → 按插件给的间隔轮询 `login.poll` →
+/// 完成时落库。与异步三步的差别只是「谁来轮询」（这里在请求内轮询）。
+///
+/// ── 地区怎么定 ──────────────────────────────────────────────
+/// 优先读 `provider`（`workbuddy` / `workbuddy-intl`，与其它入口同一口径：
+/// 身份即归属），其次读 `edition`（Node 版既有入参，脚本用户在用），
+/// 都没有则国内版。
+///
+/// ── 只支持轮询型 ────────────────────────────────────────────
+/// 回调型（`poll_interval_ms == 0`）在命令行里无法完成 —— 没有浏览器窗口
+/// 替它收回调。那种情况明确报错并指向网页登录入口，而不是挂到 5 分钟超时。
+pub async fn auth_login(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).ok();
+    let provider = payload
+        .as_ref()
+        .and_then(|payload| payload.get("provider").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            // 没有 `provider` 时按 `edition` 归一（脚本用户的历史入参）
+            let edition = payload
+                .as_ref()
+                .and_then(|payload| payload.get("edition").and_then(Value::as_str))
+                .filter(|value| !value.is_empty());
+            crate::server::core::providers::workbuddy::Region::from_edition_id(edition)
+                .provider_id()
+                .to_string()
+        });
+    let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(&provider) else {
+        return management_error(400, format!("未知的提供商：{provider}"));
+    };
+    let label = adapter.label();
+    if !adapter.supports_web_login() {
+        return management_error(
+            400,
+            format!("{label}不支持网页登录，请改用「填写凭证」或「导入桌面端登录态」添加账号"),
+        );
+    }
+    let Some(start) = adapter.login_start_async().await else {
+        return management_error(400, format!("{label}未能生成网页登录授权地址，请重试"));
+    };
+    if start.poll_interval_ms == 0 {
+        return management_error(
+            400,
+            format!(
+                "{label}的网页登录要等浏览器回调，命令行入口无法完成；\
+                 请用桌面端的「网页登录」，或改用「填写凭证」"
+            ),
+        );
+    }
+    logging::log("[Login]", "请在浏览器中打开以下链接并完成登录：");
+    logging::console_line("[Login]", &format!("  {}", start.url));
+    logging::log("[Login]", "登录完成后本网关将自动获取并保存 token…");
+
+    let interval = Duration::from_millis(start.poll_interval_ms.max(1_000));
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(LOGIN_TIMEOUT_MS);
+    loop {
+        tokio::time::sleep(interval).await;
+        if tokio::time::Instant::now() >= deadline {
+            return management_error(
+                504,
+                format!("{label}登录轮询超时（{} 分钟），请重试", LOGIN_TIMEOUT_MS / 60_000),
+            );
+        }
+        match adapter.login_poll_async(&start.flow).await {
+            Ok(agent2api_provider_protocol::LoginPoll::Pending { .. }) => continue,
+            Ok(agent2api_provider_protocol::LoginPoll::Done { account }) => {
+                let public = account.public.clone();
+                return match adapter.persist_login_account(&account) {
+                    Ok(account_id) => {
+                        logging::log(
+                            "[Login]",
+                            &format!("✅ {label}登录完成，账号已加入列表"),
+                        );
+                        crate::server::http::raw_json(json!({
+                            "accountId": account_id,
+                            "provider": provider,
+                            "account": public,
+                        }))
+                    }
+                    Err(error) => management_error(error.status_code, error.message),
+                };
+            }
+            Ok(agent2api_provider_protocol::LoginPoll::Failed { message }) => {
+                return management_error(400, message)
+            }
+            Err(error) => return management_error(error.status_code, error.message),
+        }
+    }
+}
