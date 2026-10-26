@@ -411,10 +411,14 @@ pub(crate) async fn renew_forced(
 /// 写入。插件侧的 `store::save` 是同一语义的通用形态（`expect` 是读到时的
 /// 那份 secret，网关只在它没变时才写）。
 ///
-/// ── 期望值已变时为什么报 409 而不是静默重读 ─────────────────
-/// 记录在续期期间被别人改过（并发登录 / 手工粘贴）时，**不能**把这次换发
-/// 结果写进去，也不能把新串丢掉不管 —— 报一句让用户知道 refreshToken
-/// 可能已经被服务端轮换过，下一次重试会以落盘那份为准。
+/// ── 期望值已变时为什么不报错、而是采用落盘值（2026-10-26 修订）──
+/// 旧实现报 409（「与账号记录不匹配」）。但 3.3.0-beta.4 起主包的凭证维护
+/// 与签到/自愈链会**同时**发现令牌失效并各自换发：ExchangeToken 一次性
+/// 轮换，两边竞争，**后落盘的赢** —— 输的那方拿到 CAS false。此时落盘的
+/// 正是并发者换好的**有效新凭证**，报错等于把到手的续期扔掉（实测两次
+/// 手动签到都撞上，令牌永远救不回来）。所以改为：重读落盘记录直接采用
+/// ——真正的「重新登录才救得回」会在下一次 1001 的 needs_relogin / 重放
+/// 失败文案里如实暴露，不会被这里的 409 挡住。
 async fn renew(
     ctx: &PluginCtx,
     record: &Value,
@@ -439,10 +443,14 @@ async fn renew(
         ));
     }
     if !crate::store::save(ctx, account_id, &expect, &next).await? {
-        return Err(GatewayError::with_status(
-            409,
-            "Trae 续期结果与账号记录不匹配（期间被改过），本次换发未落盘，请重试",
-        ));
+        // 期望值已变 = 并发刷新（凭证维护 / 另一条链）先落盘了。落盘的就是
+        // 网关认可的最新凭证，直接采用（理由见函数头）。
+        crate::logging::log(
+            "[Refresh]",
+            &format!("Trae {account_id} 写回时发现并发刷新已落盘，采用落盘凭证"),
+        );
+        let fresh = read_record(ctx, account_id).await?;
+        return Credential::from_payload(&fresh).map_err(GatewayError::new);
     }
     Ok(renewed)
 }
