@@ -41,13 +41,16 @@ use agent2api_provider_sdk::{PluginCtx, Provider, ProviderMeta, SendFuture};
 use serde_json::Value;
 
 /// provider id（`pack.json` 里必须写同一个）。
-pub const ID: &str = "minimax";
+///
+/// 用 `minimax-cn` 而不是 `minimax`：与主仓预置卡里「国内站」那张卡的
+/// key 同名，用户在账号页 / 签到中心看到的名字和预置卡是同一套叫法。
+pub const ID: &str = "minimax-cn";
 
 pub struct MiniMaxProvider;
 
 impl Provider for MiniMaxProvider {
     fn meta(&self) -> ProviderMeta {
-        ProviderMeta::new(ID, "MiniMax")
+        ProviderMeta::new(ID, "minimax-cn")
             .with_capabilities(proto::Capabilities {
                 // 本插件没有转发实现 —— 必须显式 false（这一位的 serde 缺省是 true）
                 chat: false,
@@ -79,7 +82,8 @@ impl Provider for MiniMaxProvider {
                 proto::LoginMethod::Browser {
                     button: "网页登录".to_string(),
                     hint: Some(
-                        "打开 MiniMax 授权页（设备码），确认后自动收下账号并支持自动续期".to_string(),
+                        "在弹出的窗口里完成 MiniMax 登录（设备码），完成后自动收下账号并支持自动续期"
+                            .to_string(),
                     ),
                 },
             ])

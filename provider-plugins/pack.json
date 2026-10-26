@@ -185,8 +185,8 @@
       "default_enabled": true
     },
     {
-      "id": "minimax",
-      "label": "MiniMax",
+      "id": "minimax-cn",
+      "label": "minimax-cn",
       "order": 30,
       "default_enabled": true
     }

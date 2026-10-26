@@ -588,13 +588,28 @@ pub async fn login_start() -> Result<proto::LoginStart, GatewayError> {
         flow,
         url: verification_uri_complete.unwrap_or(verification_uri),
         instructions: if user_code.is_empty() {
-            "在打开的页面里完成 MiniMax 授权，完成后会自动收下账号".to_string()
+            "在弹出的窗口里完成 MiniMax 登录，完成后会自动收下账号".to_string()
         } else {
-            format!("在打开的页面里完成 MiniMax 授权（确认码 {user_code}），完成后会自动收下账号")
+            format!("在弹出的窗口里完成 MiniMax 登录（确认码 {user_code}），完成后会自动收下账号")
         },
         poll_interval_ms: interval * 1000,
-        external_browser: true,
-        allowed_hosts: vec!["minimax.cn".to_string(), "minimaxi.com".to_string()],
+        // 走**内嵌弹窗**（面板里的登录窗口），不是系统浏览器：
+        //   ① 与旧网关的 webLogin 默认档（内嵌窗口）一致，用户点一下就在原地登录，
+        //      不用切到外部浏览器再切回来；
+        //   ② 设备码授权页本身就是登录页，弹窗里能完成全部步骤；
+        //   ③ 系统浏览器那条路复用不到已登录的会话反而更慢（同一台机器上两者 cookie
+        //      不共享，用户在外部浏览器里常常还得重新登录一次）。
+        external_browser: false,
+        // 登录页会经过的域：授权页在 account.*，登录成功后可能跳到官网/控制台。
+        // 给足子域，漏一个的表现是「窗口一片空白」（导航被白名单拦掉）。
+        allowed_hosts: vec![
+            "minimax.cn".to_string(),
+            "account.minimax.cn".to_string(),
+            "agent.minimax.cn".to_string(),
+            "minimaxi.com".to_string(),
+            "platform.minimaxi.com".to_string(),
+            "www.minimaxi.com".to_string(),
+        ],
     })
 }
 
