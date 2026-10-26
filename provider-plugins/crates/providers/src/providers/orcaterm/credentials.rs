@@ -521,5 +521,15 @@ pub fn account_view(secret: &Value) -> Result<Value, String> {
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| format!("OrcaTerm {}", credentials.token_tail()));
-    Ok(super::public_view(&name, &credentials.user_id, &credentials.token_tail()))
+    let mut view = super::public_view(&name, &credentials.user_id, &credentials.token_tail());
+    // 界面上的「刷新 Token」按这个字段决定显不显示（见 accounts-panels 的
+    // MoreMenu）。OrcaTerm 的实现是「有 accessToken 就能强制续期一次」，所以
+    // 判据就是 accessToken 非空 —— 缺了它按钮根本不出现，用户只能重登。
+    if let Some(map) = view.as_object_mut() {
+        map.insert(
+            "hasRefreshToken".to_string(),
+            Value::Bool(!credentials.access_token.trim().is_empty()),
+        );
+    }
+    Ok(view)
 }

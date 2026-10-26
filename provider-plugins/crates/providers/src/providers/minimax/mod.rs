@@ -42,15 +42,22 @@ use serde_json::Value;
 
 /// provider id（`pack.json` 里必须写同一个）。
 ///
-/// 用 `minimax-cn` 而不是 `minimax`：与主仓预置卡里「国内站」那张卡的
-/// key 同名，用户在账号页 / 签到中心看到的名字和预置卡是同一套叫法。
-pub const ID: &str = "minimax-cn";
+/// ── 为什么 id 是 `minimax` 而显示名是 `minimax-cn` ────────────
+/// id 是**账号存储的键**：`accounts.provider` 里写的就是它，签到中心、
+/// 凭证刷新、限流事件全按它匹配。改动它等于把用户已经加好的账号变成孤儿
+/// （签到中心会显示「无账号」，刷新也会落到兜底报错）。所以 id 一经发布就
+/// 保持稳定；要改的只是**给人看的名字**，那是 `ProviderMeta` 的 label
+/// 与 `pack.json` 的 label —— 两处都是 `minimax-cn`。
+pub const ID: &str = "minimax";
+
+/// 界面上的名字（账号页、签到中心、添加账号弹窗都用它）。
+pub const LABEL: &str = "minimax-cn";
 
 pub struct MiniMaxProvider;
 
 impl Provider for MiniMaxProvider {
     fn meta(&self) -> ProviderMeta {
-        ProviderMeta::new(ID, "minimax-cn")
+        ProviderMeta::new(ID, LABEL)
             .with_capabilities(proto::Capabilities {
                 // 本插件没有转发实现 —— 必须显式 false（这一位的 serde 缺省是 true）
                 chat: false,
