@@ -1,0 +1,90 @@
+name: plugin-build
+
+# 只编插件（`provider-plugins/` 这棵独立 workspace），不碰主包的 exe/安装包。
+#
+# ── 为什么单独一条工作流 ─────────────────────────────────────
+# 插件产物是 **独立 zip**（`pack.json` + `bin/agent2api-providers.exe`），网关
+# 按 `pack.json` 的 `entry` 装载，形态固定 —— 它不能被并进主包安装程序里。
+# 所以「一起编译」在这里的含义是：同一个仓库、两条流水线、两个产物。
+#
+# ── 为什么只跑 Windows ───────────────────────────────────────
+# 使用方是 Windows。多平台矩阵（macOS×2 / Linux×2）会让一次构建从十几分钟
+# 变成一小时，而这里用不到。将来要补平台，加一个 matrix 即可（`pack.json`
+# 的 `entry` 已经写好五个 target 的路径）。
+#
+# ── 触发面 ───────────────────────────────────────────────────
+# 只在 `plugin` 分支、且动到 `provider-plugins/**` 或本文件时触发 —— 主包那几条
+# 工作流（build.yml / docker.yml）只认 tag 和手动触发，互不干扰。
+#
+# ── 签名 ─────────────────────────────────────────────────────
+# **不签名**。网关的验签是三态：`Verified`（官方私钥）、`Unsigned`（允许安装、
+# 界面标黄）、`Invalid`（带签名但公钥不在信任表里 → **必须拒绝**）。自建包一旦
+# 签名就会落进 `Invalid`，反而装不上；保持未签名才是正确姿态。
+
+on:
+  push:
+    branches: [plugin]
+    paths:
+      - 'provider-plugins/**'
+      - '.github/workflows/plugin-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: provider-plugins
+
+    steps:
+      - name: 取源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust（workspace 要求 1.88+）
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo 产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          # 缓存键按这个目录算；不写的话会去主仓的 target/ 找，永远不命中
+          workspaces: provider-plugins
+
+      - name: 编译插件二进制
+        run: cargo build --release -p agent2api-providers
+
+      - name: 打包成可安装的 zip
+        # --skip-build：上一步已经编好了，这里只做「二进制 + pack.json → zip」
+        run: node scripts/pack.mjs --skip-build
+
+      - name: 确认产物存在
+        run: dir dist
+
+      - name: 上传构建产物（工作流页面可下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-windows
+          path: provider-plugins/dist/*.zip
+          if-no-files-found: error
+
+      - name: 发布到 Release（固定下载地址）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 同一个 release 反复覆盖 —— 这样下载地址永远不变，方便收藏
+          gh release view plugin-latest --repo "${{ github.repository }}" >/dev/null 2>&1 \
+            || gh release create plugin-latest \
+                 --repo "${{ github.repository }}" \
+                 --title "插件构建（最新）" \
+                 --notes "由 plugin 分支自动构建。**未签名**：网关安装时标黄属正常现象。" \
+                 --prerelease
+          gh release upload plugin-latest dist/*.zip \
+            --repo "${{ github.repository }}" \
+            --clobber
+          echo "=== 下载地址 ==="
+          gh release view plugin-latest --repo "${{ github.repository }}" --json assets \
+            --jq '.assets[] | .name + " → " + .url'
