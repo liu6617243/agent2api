@@ -165,37 +165,12 @@ async fn create_conversation(
     let code = value.get("code").and_then(Value::as_i64).unwrap_or(-1);
     if code != 0 {
         let message = value.get("message").and_then(Value::as_str).unwrap_or("未知错误");
-        // lightai 把「登录态失效」塞在 **HTTP 200 的业务体**里（code=-1），而不是
-        // 回 401。照 502 上报的话，上面那个 `is_auth()` 自愈循环永远不会触发 ——
-        // 用户看到的是一条与「该重新登录」毫无关系的 502。命中失效文案时译成
-        // 401，交给「强制续期 + 重发一次」那条路。
-        let status = if looks_like_auth_failure(message) { 401 } else { 502 };
         return Err(HttpFailure {
-            status,
+            status: 502,
             message: format!("OrcaTerm 建会话失败（code={code}：{message}）"),
         });
     }
     Ok(format!("cid-{uuid}-orcaterm"))
-}
-
-/// 业务体文案是否在说「登录态没了」。
-///
-/// 只认一组**明确的**特征词（大小写不敏感）：宁可漏判（退化成 502，与改造前
-/// 行为一致），也不要误判 —— 误判的代价是所有业务错误都触发一次强制续期。
-fn looks_like_auth_failure(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    [
-        "accesstoken",
-        "access token",
-        "未登录",
-        "登录态",
-        "登录失效",
-        "重新登录",
-        "token 已失效",
-        "token expired",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
 }
 
 /// 打开对话 SSE 流。

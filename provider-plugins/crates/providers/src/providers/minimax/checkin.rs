@@ -65,8 +65,9 @@ fn upstream_message(payload: &Value) -> String {
         .to_string()
 }
 
-/// 业务码非 0 → 网关错误（502：上游业务失败；文案带上游原文）
-fn ensure_business_ok(payload: &Value, what: &str) -> Result<(), GatewayError> {
+/// 业务码非 0 → 网关错误（502：上游业务失败；文案带上游原文）。
+/// `pub(crate)`：`balance.rs` 的余额查询是同族端点（base_resp 口径），共用。
+pub(crate) fn ensure_business_ok(payload: &Value, what: &str) -> Result<(), GatewayError> {
     let code = business_code(payload);
     if code == 0 {
         return Ok(());
@@ -83,7 +84,8 @@ fn ensure_business_ok(payload: &Value, what: &str) -> Result<(), GatewayError> {
 }
 
 /// 带 Bearer 打一次 JSON 接口。
-async fn bearer_request(
+/// `pub(crate)`：`balance.rs` 的余额查询同族同口径（Bearer + base_resp），共用。
+pub(crate) async fn bearer_request(
     method: &str,
     url: &str,
     access_token: &str,

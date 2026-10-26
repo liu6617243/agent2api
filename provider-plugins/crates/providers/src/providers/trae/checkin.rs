@@ -18,6 +18,13 @@
 //!   · 9074 之后反复重试（参考实现有当日指数退避定时器）—— 这里不搬。
 //! 因此态度是「按定稿姿势碰，且每天只发该发的几次请求」。
 //!
+//! ── 2026-10-26 对齐 AgentHub（同族实现的长跑者）──────────────
+//! 同一分钟的同批账号对照：本仓 11:45 撞 1001，AgentHub 11:46 success。
+//! 据此收敛三处：请求头改为极简浏览器形态（`checkin_headers`，不再叠 ug 的
+//! VSCode 画像）；1001 换发重放以**落盘最新记录**为准（`renew_with_fresh_record`，
+//! 旧写法拿自己第一发写进去的 secret 当 CAS 基线，必然误报「期间被改过」）；
+//! 业务码 200 归一为成功（对齐 AgentHub 的 `code!==0 && code!==200`）。
+//!
 //! ── 一轮到底发几个请求（这是本模块的安全边界）──────────────────
 //! 状态 1 发 + （未签时）领取 1 发 + 同设备号回查 1 发 = **常态 3 发**；
 //! 请求体恒 `{}`（见 `probe_bodies`），最坏情况因 9074 不换方案而止于一发。
@@ -55,7 +62,7 @@ use super::adapter::{account_proxy, read_record, renew_forced, renew_if_due};
 use super::credentials::Credential;
 use super::errors::classify;
 use super::http::{get_json, post_json};
-use super::usage::{UG_HOST, ug_headers};
+use super::usage::UG_HOST;
 
 /// 签到状态查询（参考实现 `EpCheckinStatus`）。
 const EP_CHECKIN_STATUS: &str = "/trae/api/v2/ug/checkin_credits/status";
@@ -229,7 +236,12 @@ pub fn status_of(payload: &Value) -> Status {
         enable: flag(payload, "enable"),
         credits: number("credits"),
         extra_credits: number("extra_credits"),
-        code: payload.get("code").and_then(Value::as_i64).unwrap_or(CODE_OK),
+        code: {
+            let raw = payload.get("code").and_then(Value::as_i64).unwrap_or(CODE_OK);
+            // AgentHub 的码表把 200 也按成功收（`code!==0 && code!==200` 才算
+            // 失败）。在这里归一到 CODE_OK，调用方就不用两处各认一遍。
+            if raw == 200 { CODE_OK } else { raw }
+        },
         message: payload
             .get("message")
             .and_then(Value::as_str)
@@ -356,7 +368,7 @@ pub async fn claim_daily_checkin(
     if !needs_reauth(&first) {
         return Ok(first);
     }
-    let renewed = match renew_forced(ctx, &record, &credential, proxy.as_ref()).await {
+    let renewed = match renew_with_fresh_record(ctx, account_id).await {
         Ok(renewed) => renewed,
         Err(error) => {
             // 连 refreshToken 都换不出新令牌：这才是真的"要重新登录"。
@@ -376,10 +388,42 @@ pub async fn claim_daily_checkin(
         }
     };
     let mut row = run(&renewed, proxy.as_ref(), UG_HOST).await?;
+    let replay_still_rejected = needs_reauth(&row);
     if let Some(map) = row.as_object_mut() {
         map.insert("reauthAttempted".to_string(), json!(true));
+        // 重放**仍然**撞 1001：把语气从"计划"改成"结论"——已做了什么、
+        // 还剩哪条路，一句话说完。追加句同样不许出现「已签到」。
+        if replay_still_rejected {
+            let head = map.get("msg").and_then(Value::as_str).unwrap_or_default().to_string();
+            map.insert(
+                "msg".to_string(),
+                json!(format!(
+                    "{head}；已换发新令牌并重放一轮仍被拒，请在「账号」页重新登录"
+                )),
+            );
+        }
     }
     Ok(row)
+}
+
+/// 1001 之后的换发：**以落盘的最新记录为准**，不复用本轮开头的旧物。
+///
+/// ── 为什么必须重读（2026-10-26 实测踩坑）──────────────────────
+/// 旧写法把本轮开头的 `record` / `credential` 原样传给 `renew_forced`，两个
+/// 后果都是自伤：① 本轮 `renew_if_due` 若已换发落盘，store 里的 secret 就比
+/// 手里的 record 新一代 —— 拿旧 record 当 CAS 的 `expect` 比较必然不等，报
+/// 「续期结果与账号记录不匹配（期间被改过）」，其实没别人改，是自己上一发写
+/// 的；② 旧 credential 的 refreshToken 也可能已被第一发轮换，拿它换证等于拿
+/// 作废串去打。重读之后 expect 与 refreshToken 都取最新落盘值，CAS 只在真有
+/// 并发改动时才失败，单飞（refresh_shared）也按新指纹去重。
+async fn renew_with_fresh_record(
+    ctx: &PluginCtx,
+    account_id: &str,
+) -> Result<Credential, GatewayError> {
+    let record = read_record(ctx, account_id).await?;
+    let credential = Credential::from_payload(&record).map_err(GatewayError::new)?;
+    let proxy = account_proxy(&record)?;
+    renew_forced(ctx, &record, &credential, proxy.as_ref()).await
 }
 
 /// 一轮签到（凭证 → 结果行）。`base` 让测试夹具能把这三发指向假上游；
@@ -559,16 +603,41 @@ fn with_status_probe(row: Value, status: &Status) -> Value {
     row
 }
 
-/// 官方客户端的浏览器特征头。
-///
-/// AgentHub 的实测：补上 `origin` / `referer` / `x-app-type` 之后，同一批账号
-/// 不再撞 9074（ug 那套画像头照旧保留，两套一起发）。缺这几个头时，请求在
-/// 设备画像上像「直接打 API 的脚本」而不是官方客户端 —— 这正是签到这条链
-/// 最容易被风控挑出来的一维。
+/// 官方客户端的浏览器特征头（origin / referer / x-app-type，与 AgentHub
+/// 同值同形）。单独一个函数是因为它同时被 status 与 claim 两条路用。
 fn add_client_headers(headers: &mut BTreeMap<String, String>) {
     headers.insert("Origin".to_string(), "https://www.trae.cn".to_string());
     headers.insert("Referer".to_string(), "https://www.trae.cn/".to_string());
     headers.insert("X-App-Type".to_string(), "trae".to_string());
+}
+
+/// 签到三发的请求头（2026-10-26 起对齐 AgentHub 的实测形状）。
+///
+/// ── 为什么不再带 ug 那套 VSCode 画像 ──────────────────────────
+/// AgentHub 的签到长期稳定（2026-10-26 11:46 与本仓 11:45 的 1001 同分钟
+/// 对照），请求头是**极简浏览器形态**：Content-Type 与 Accept 都是
+/// application/json，鉴权 + 地区 + 设备 + 来源几件套，**没有** VSCode 的
+/// UA / 市场 ID / SDK 版本 / sec-fetch / trace 那一大串。签到这条链的画像
+/// 是「像官方网页端」，头越少越不像拼出来的脚本；余额那条链
+/// （`usage.rs::ug_headers`）有自己的实测依据，不在这里动。
+///
+/// 鉴权方案由调用方定：status 首发是 Bearer（GET），claim 是
+/// Cloud-IDE-JWT（POST）—— 与 AgentHub / 官方客户端一致。
+fn checkin_headers(
+    access_token: &str,
+    device_id: &str,
+    scheme: Scheme,
+) -> BTreeMap<String, String> {
+    let mut headers = BTreeMap::new();
+    headers.insert("Content-Type".to_string(), "application/json".to_string());
+    headers.insert("Accept".to_string(), "application/json".to_string());
+    headers.insert("Authorization".to_string(), scheme.authorization(access_token));
+    headers.insert("X-User-Region".to_string(), "CN".to_string());
+    if !device_id.is_empty() {
+        headers.insert("X-Device-Id".to_string(), device_id.to_string());
+    }
+    add_client_headers(&mut headers);
+    headers
 }
 
 /// 状态查询（一轮里会发两次：领取前与领取后回查）。
@@ -586,14 +655,8 @@ async fn status(
     device_id: &str,
     proxy: Option<&agent2api_provider_protocol::WireProxy>,
 ) -> Result<Status, GatewayError> {
-    let mut headers = ug_headers(variant, &credential.access_token, device_id);
-    add_client_headers(&mut headers);
-    // GET 那条用 Bearer（与 AgentHub / 官方客户端一致）；ug_headers 默认写的是
-    // Cloud-IDE-JWT，claim 与 POST 兜底仍走它。
-    headers.insert(
-        "Authorization".to_string(),
-        Scheme::Bearer.authorization(&credential.access_token),
-    );
+    // 首发 GET + Bearer：与 AgentHub / 官方客户端同形（`checkin_headers`）。
+    let headers = checkin_headers(&credential.access_token, device_id, Scheme::Bearer);
     let prepared: Vec<(String, String)> = headers.into_iter().collect();
     let pairs: Vec<(&str, String)> = prepared
         .iter()
@@ -688,21 +751,15 @@ async fn round_trip(
 async fn post_checkin(
     url: &str,
     body: &Value,
-    variant: &str,
+    _variant: &str,
     device_id: &str,
     access_token: &str,
     scheme: Scheme,
     proxy: Option<&agent2api_provider_protocol::WireProxy>,
 ) -> Result<super::http::Reply, GatewayError> {
-    let mut headers = ug_headers(variant, access_token, device_id);
-    // 补官方客户端的浏览器特征头（见 `add_client_headers` 的实测依据）
-    add_client_headers(&mut headers);
-    // `ug_headers` 写的是 Cloud-IDE-JWT；换 Bearer 兜底时**只换这一个头**，
-    // 其余画像头保持逐字一致（混改会撞上"画像对不上"的风控）。
-    headers.insert(
-        "Authorization".to_string(),
-        scheme.authorization(access_token),
-    );
+    // 对齐 AgentHub 的极简浏览器形态（`checkin_headers`）：鉴权方案由调用方定，
+    // 画像头不再混入 ug 那套 VSCode 头组。
+    let headers = checkin_headers(access_token, device_id, scheme);
     let prepared: Vec<(String, String)> = headers.into_iter().collect();
     let pairs: Vec<(&str, String)> = prepared
         .iter()

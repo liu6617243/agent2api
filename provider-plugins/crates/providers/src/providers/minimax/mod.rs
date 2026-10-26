@@ -1,10 +1,11 @@
-//! MiniMax（MiniMax Code / agent.minimax.cn）：**只接账号 + 签到**的 provider。
+//! MiniMax（MiniMax Code / agent.minimax.cn）：**账号 + 签到 + 余额**的 provider。
 //!
-//! ── 为什么只接这两块 ─────────────────────────────────────────
+//! ── 演进 ────────────────────────────────────────────────────
 //! 这家最初由 fork 在网关内核里接入（转发 + 余额 + 签到全家）。上游 3.3.0
-//! 把 provider 实现整体移出主仓之后，本仓只补回「账号 + 每日签到」——
-//! 转发/余额的端点常量留在 `endpoints.rs` 备用，但能力位一律 false，
-//! 网关不会把模型请求派过来（派过来也没有实现，只会拿到一条明确错误）。
+//! 把 provider 实现整体移出主仓之后，本仓先补回「账号 + 每日签到」；
+//! 2026-10-26 余额也接回来了（`balance.rs`，从内核版整体移植）—— 端点常量
+//! 一直留在 `endpoints.rs` 备用，接回只是把能力位与实现补上，无需再逆向。
+//! 仍未接的只剩推理转发（`chat=false`，模型请求请走别的家）。
 //!
 //! ── 能力位（申报错方向的后果见 `Capabilities` 各字段注释）──
 //! ```text
@@ -12,7 +13,7 @@
 //!   stateful        false
 //!   refresh         true   refresh_token 一次性轮换，后台维护可续
 //!   model_refresh   false 没有远程模型目录
-//!   usage           false 本插件不查余额
+//!   usage           true  余额查询（credit/details，balance.rs）
 //!   checkin         true  每日签到（signin/status + signin/claim）
 //!   claims          false
 //!   web_login       true  PKCE 设备码授权（oauth.rs）
@@ -32,6 +33,7 @@
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
+pub mod balance;
 pub mod checkin;
 pub mod endpoints;
 pub mod oauth;
@@ -39,6 +41,8 @@ pub mod oauth;
 use agent2api_provider_protocol as proto;
 use agent2api_provider_sdk::{PluginCtx, Provider, ProviderMeta, SendFuture};
 use serde_json::Value;
+
+use crate::errors::GatewayError;
 
 /// provider id（`pack.json` 里必须写同一个）。
 ///
@@ -65,8 +69,8 @@ impl Provider for MiniMaxProvider {
                 // 设备码登录拿到的 refresh_token 可续期，后台凭证维护可以管它
                 refresh: true,
                 model_refresh: false,
-                // 不查余额（端点常量留着备用）
-                usage: false,
+                // 余额查询（credit/details，balance.rs；2026-10-26 接回）
+                usage: true,
                 checkin: true,
                 claims: false,
                 // PKCE 设备码授权（oauth.rs）+ 粘贴 refreshToken
@@ -108,6 +112,38 @@ impl Provider for MiniMaxProvider {
                 daily: true,
                 ..Default::default()
             })
+            // 余额入口（界面侧）：有余额列 + 「积分明细」弹层 + 逐份到期排序。
+            // `credits[]` 由 balance.rs 产出（每批带 expireAt，升序），三位的
+            // 承诺都兑现得了才敢开 —— 点开一个空框比没有入口更糟。
+            .with_account_features(proto::AccountFeatures {
+                usage: true,
+                credit_detail: true,
+                credit_expiry: true,
+                ..Default::default()
+            })
+    }
+
+    // ── 余额 ──────────────────────────────────────────────────
+
+    fn usage<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        account: &'a str,
+    ) -> SendFuture<'a, proto::UsageReport> {
+        Box::pin(async move {
+            match balance::query_usage(ctx, account).await {
+                Ok(report) => Ok(report),
+                // 登录态被服务端提前作废时（本地 expiresAt 看不出来）强制刷一次
+                // 再打一发 —— 与 checkin 的 401 重救同口径。
+                Err(error) if error.status_code == 401 => {
+                    oauth::ensure_fresh(ctx, account, true)
+                        .await
+                        .map_err(|error| error.message)?;
+                    balance::query_usage(ctx, account).await.map_err(|error| error.message)
+                }
+                Err(error) => Err(error.message),
+            }
+        })
     }
 
     // ── 签到 ──────────────────────────────────────────────────

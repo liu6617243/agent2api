@@ -383,9 +383,16 @@ pub(crate) async fn forward_at(
     }
     let mut response = send(&plan, effective.as_ref()).await?;
     // 401 只救一次：强制换发后重发（这条路径不换号，见模块头）。
+    // 换发以**落盘最新记录**为准：本轮 `renew_if_due` 若已换发落盘，store 里的
+    // secret 就比手里的 record 新一代 —— 拿旧 record 当 CAS 基线会误报
+    // 「续期结果与账号记录不匹配（期间被改过）」（2026-10-26，与 checkin.rs 的
+    // `renew_with_fresh_record` 同一脚）。
     if response.status().as_u16() == 401 {
         let _ = response.text().await;
-        credential = super::adapter::renew_forced(ctx, &record, &credential, effective.as_ref()).await?;
+        let fresh = crate::store::record(ctx, PROVIDER_ID, account_id).await?;
+        let fresh_credential = Credential::from_payload(&fresh).map_err(GatewayError::new)?;
+        credential =
+            super::adapter::renew_forced(ctx, &fresh, &fresh_credential, effective.as_ref()).await?;
         plan = build_plan(&credential, body, base)?;
         response = send(&plan, effective.as_ref()).await?;
     }

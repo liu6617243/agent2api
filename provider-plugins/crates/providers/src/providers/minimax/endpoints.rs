@@ -1,9 +1,9 @@
 //! MiniMax（MiniMax Code / agent.minimax.cn）的上游地址与 OAuth 常量。
 //!
-//! ── 本插件只接「账号 + 签到」，不接推理转发 ─────────────────
-//! 转发常量（`MESSAGES_PATH`）与余额常量（`CREDIT_PATH`）留在表里是**刻意**的：
-//! 它们是这位上游的既有事实，将来补转发/余额时照抄即可，不必再逆向一遍；
-//! 但 `Capabilities::chat` / `usage` 都申报为 false，网关不会把请求派过来。
+//! ── 本插件接「账号 + 签到 + 余额」，不接推理转发 ─────────────
+//! 转发常量（`MESSAGES_PATH`）留在表里是**刻意**的：它是这位上游的既有事实，
+//! 将来补转发时照抄即可；但 `Capabilities::chat` 申报为 false，网关不会把
+//! 模型请求派过来。余额（`CREDIT_PATH`）已由 `balance.rs` 接上。
 //!
 //! ── 上游长什么样（网关内核版实测定案，随代码迁入插件）──────
 //! ```text
@@ -49,7 +49,7 @@ pub const AUTHORIZE_PATH: &str = "/oauth-authorize";
 /// 推理路径（Anthropic Messages，相对 API 基址）—— 本插件不实现转发，留作将来
 pub const MESSAGES_PATH: &str = "/mavis/api/v1/llm/v1/messages";
 
-/// 余额明细路径（相对 API 基址）—— 本插件不实现余额，留作将来
+/// 余额明细路径（相对 API 基址）—— `balance.rs` 的查询端点
 pub const CREDIT_PATH: &str = "/minimax-cloud/api/v1/credit/details";
 
 /// 签到状态路径（相对 API 基址，含固定 query；与网关内核版逐字一致）
@@ -117,4 +117,9 @@ pub fn signin_status_url() -> String {
 /// 签到领取端点完整地址
 pub fn signin_claim_url() -> String {
     format!("{}{SIGNIN_CLAIM_PATH}", api_base_url())
+}
+
+/// 余额明细端点完整地址（`balance.rs` 查询用）
+pub fn credit_url() -> String {
+    format!("{}{CREDIT_PATH}", api_base_url())
 }

@@ -150,7 +150,11 @@ pub async fn callback(ctx: &PluginCtx, callback: proto::LoginCallback) -> Result
             let secret = credentials::secret_of(&credentials);
             Ok(proto::LoginPoll::Done {
                 account: proto::NormalizedAccount {
-                    public: super::public_view(&credentials, &display_name(&credentials)),
+                    public: super::public_view(
+                        &display_name(&credentials),
+                        &credentials.user_id,
+                        &credentials.token_tail(),
+                    ),
                     identity: credentials::identity_of(&secret),
                     secret,
                     desktop: false,

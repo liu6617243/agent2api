@@ -494,7 +494,7 @@ pub async fn normalize(
     let identity = identity_of(&secret_of(&credentials));
     Ok(proto::NormalizedAccount {
         secret: secret_of(&credentials),
-        public: super::public_view(&credentials, &name),
+        public: super::public_view(&name, &credentials.user_id, &credentials.token_tail()),
         identity,
         desktop,
     })
@@ -521,5 +521,5 @@ pub fn account_view(secret: &Value) -> Result<Value, String> {
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| format!("OrcaTerm {}", credentials.token_tail()));
-    Ok(super::public_view(&credentials, &name))
+    Ok(super::public_view(&name, &credentials.user_id, &credentials.token_tail()))
 }
