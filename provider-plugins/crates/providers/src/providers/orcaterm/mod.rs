@@ -248,10 +248,28 @@ pub(crate) fn header_map(headers: &[(String, String)]) -> BTreeMap<String, Strin
 }
 
 /// 拼一个账号公开视图（前端账号页用）。
-pub(crate) fn public_view(name: &str, uid: &str, tail: &str) -> Value {
+///
+/// ── 为什么必须带 `tokenExpireAt` 与 `hasRefreshToken` ──────────
+/// 这两项不是「丰富一下展示」，而是两个界面上**直接少东西**的成因：
+///   · `tokenExpireAt` 缺了，有效期列显示「—」，用户看不出凭证还剩多久；
+///   · `hasRefreshToken` 缺了，账号「⋯」菜单里那条**「刷新 Token」根本不出现**
+///     （前端纯按这一位门控，见 `accounts-panels.tsx` 的 MoreMenu）——
+///     OrcaTerm 的令牌只有 2 小时，没有这个按钮就只能等它自己续期。
+/// 单位用毫秒：别家公开形态都是 13 位毫秒，前端 `expiryMillis` 虽也兼容 10 位
+/// 秒，但同口径能少一处「这家的数是什么单位」的猜测。判不出（0）时前端显示
+/// 「—」而不是「已过期」——**「不知道」不等于「已过期」**。
+pub(crate) fn public_view(credentials: &credentials::Credentials, name: &str) -> Value {
     json!({
         "name": name,
-        "uid": uid,
-        "tokenTail": tail,
+        "uid": credentials.user_id,
+        "tokenTail": credentials.token_tail(),
+        "tokenExpireAt": if credentials.expires_at > 0 {
+            credentials.expires_at.saturating_mul(1000)
+        } else {
+            0
+        },
+        // 续期只依赖 accessToken（`OAuthRefreshToken` 传旧 token 换新），
+        // 所以「有没有 accessToken」就是「能不能手动刷」。
+        "hasRefreshToken": !credentials.access_token.trim().is_empty(),
     })
 }
