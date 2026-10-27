@@ -34,11 +34,12 @@
 //! | 福利台账在账号记录的 `codeartsWelfare` 字段 | `ctx.ledger_*`（同名 kind） |
 //! | 新手任务结算记忆在 `onboardingSettled` 字段 | `ctx.ledger_*`（同名 kind） |
 //! | 登录回调挂在网关端口 + 进程级 `LOOPBACK_PORT` | `login.rs` 自绑 loopback 端口 |
-//! | `catalog_cache` 落盘 | **不迁**（见 `models::store_catalog`） |
+//! | 网关落盘的目录缓存 | 插件不落盘，**改为从网关回灌**（`models::ensure_catalog`） |
 //!
 //! ── 已知的能力差（如实列出）─────────────────────────────────
 //!   1. 调试抓包与用量上报没有协议挂点（`telemetry` 是空实现）；
-//!   2. 目录缓存不落盘 —— 插件进程重启后首轮必须真打一次上游才能列模型；
+//!   2. 目录缓存插件侧只在内存（不落盘，落盘归网关）—— 但进程重启后会先向
+//!      网关要回落盘那份（`models::ensure_catalog`），不必再让用户手点「获取模型」；
 //!   3. 面板上「并发上限」读的是账号 secret 里的 `maxConcurrent`（插件读不到
 //!      记录的普通字段），没写就用默认 3；
 //!   4. `checkin` 没有 `manual` 维度（本家的定时签到本来就不接，见 `adapter.rs`）。

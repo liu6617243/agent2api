@@ -138,9 +138,15 @@ impl Provider for CodeArtsProvider {
         })
     }
 
-    /// 清单来自刷新链路落的进程内缓存（`models::list` 是同步读）。
-    fn models<'a>(&'a self, _ctx: &'a PluginCtx, _account: &'a str) -> SendFuture<'a, proto::ModelList> {
+    /// 目录清单：**内存空就先向网关要回落盘那份**（[`models::ensure_catalog`]）。
+    ///
+    /// 不做这一步的后果就是那句反复出现的「模型目录还没拉取过」：插件进程一
+    /// 重启内存槽清零，而网关那份一直好好躺在库里。
+    fn models<'a>(&'a self, ctx: &'a PluginCtx, _account: &'a str) -> SendFuture<'a, proto::ModelList> {
         Box::pin(async move {
+            // 回灌失败（网关也没有）不影响这次调用：下面的 `list()` 会给空清单，
+            // 上层如实显示「还没拉取过」，与从前一致。
+            let _ = models::ensure_catalog(ctx).await;
             Ok(proto::ModelList {
                 models: models::list(),
                 meta: proto::CatalogMeta {
@@ -188,7 +194,7 @@ impl Provider for CodeArtsProvider {
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            let catalog = models::cached_catalog().ok_or_else(|| {
+            let catalog = models::ensure_catalog(ctx).await.ok_or_else(|| {
                 "CodeArts 模型目录还没拉取过：请先在模型页对该账号执行一次「获取模型」".to_string()
             })?;
             let Some(model) = catalog.resolve(&requested) else {
