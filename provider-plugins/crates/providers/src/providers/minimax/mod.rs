@@ -138,44 +138,13 @@ impl Provider for MiniMaxProvider {
     ) -> SendFuture<'a, agent2api_provider_sdk::ChatPlan> {
         Box::pin(async move {
             if req.account.trim().is_empty() {
-                return Err(GatewayError::with_status(
-                    400,
-                    "MiniMax 转发需要指定账号（该请求没有携带 account）",
-                ));
+                // 这一层的错误类型是 String（见 SDK 的 `SendFuture` 定义）
+                return Err("MiniMax 转发需要指定账号（该请求没有携带 account）".to_string());
             }
             let credential = oauth::ensure_fresh(ctx, &req.account, false)
                 .await
                 .map_err(|error| error.into_message())?;
             chat::build(&credential, &req.body).map_err(|error| error.into_message())
-        })
-    }
-
-    /// 取一个现在能用的 access token（临期主动刷新；一次性 refresh_token 的
-    /// 轮换与回写都在 `ensure_fresh` 里）。
-    fn ensure_token<'a>(
-        &'a self,
-        ctx: &'a PluginCtx,
-        account: &'a str,
-    ) -> SendFuture<'a, String> {
-        Box::pin(async move {
-            let credentials = oauth::ensure_fresh(ctx, account, false)
-                .await
-                .map_err(|error| error.into_message())?;
-            Ok(credentials.access_token)
-        })
-    }
-
-    /// 凭证此刻算不算临期（判不出来按不临期处理，宁可漏刷不打冤枉仗）。
-    fn token_expiring<'a>(
-        &'a self,
-        ctx: &'a PluginCtx,
-        account: &'a str,
-    ) -> SendFuture<'a, bool> {
-        Box::pin(async move {
-            let (_, credentials) = oauth::snapshot(ctx, account)
-                .await
-                .map_err(|error| error.into_message())?;
-            Ok(credentials.expiring())
         })
     }
 
