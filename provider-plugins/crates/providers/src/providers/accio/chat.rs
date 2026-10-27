@@ -156,11 +156,11 @@ pub async fn send(
     plan: &ChatPlan,
     proxy: Option<&ResolvedProxy>,
 ) -> Result<reqwest::Response, GatewayError> {
-    // **流式必须用 `client_stream`**：`egress::client` 带 20 秒**总超时**
+    // **流式必须用 `stream_client`**：`egress::client` 带 20 秒**总超时**
     // （从建连算到 body 读完），长回答会在 body 读取层被掐断，报
     // `error decoding response body → operation timed out`。2026-10-27 与
     // CodeArts 同一处根因（CodeArts 已实测每答必断）。
-    let client = egress::client_stream(proxy, "direct");
+    let client = egress::stream_client(proxy, "direct");
     let mut builder = client.post(&plan.url).body(plan.body.clone());
     for (key, value) in &plan.headers {
         builder = builder.header(key, value);

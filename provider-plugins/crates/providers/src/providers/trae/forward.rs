@@ -116,9 +116,9 @@ async fn send(plan: &Plan, proxy: Option<&ResolvedProxy>) -> Result<reqwest::Res
     //
     // 2026-10-27 修正：上面这段注释原本**不成立** —— `egress::client` 内部设了
     // `CONTROL_TIMEOUT`（20 秒**总超时**，覆盖到 body 读完），长推理一样会被
-    // 掐断。现改用 `egress::client_stream`（建连 + 读空闲，无总超时），
+    // 掐断。现改用 `egress::stream_client`（建连 + 读空闲，无总超时），
     // 与本注释的意图对齐。CodeArts 是同一处的另一个受害者。
-    let mut request = egress::client_stream(proxy, "direct")
+    let mut request = egress::stream_client(proxy, "direct")
         .post(&plan.url)
         .header("User-Agent", format!("Trae/{IDE_VERSION} antigravity-cockpit-tools"));
     for (name, value) in &plan.headers {

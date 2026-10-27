@@ -38,6 +38,11 @@ fn cache() -> &'static Mutex<HashMap<String, reqwest::Client>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn stream_cache() -> &'static Mutex<HashMap<String, reqwest::Client>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// 取一个客户端：账号级代理优先，其次网关默认出口，都没有就直连。
 ///
 /// `gateway_proxy` 传 `ctx.env.proxy`（`""` = 直连，`"direct"` = 显式直连，
@@ -48,55 +53,45 @@ fn cache() -> &'static Mutex<HashMap<String, reqwest::Client>> {
 /// 客户端 —— 与网关侧 `ProxyResolution` 的第三态同一条口径：可用性优先，
 /// 「代理配错了」不该让整条链路不可用。
 pub fn client(proxy: Option<&proto::WireProxy>, gateway_proxy: &str) -> reqwest::Client {
+    cached_client(proxy, gateway_proxy, false)
+}
+
+/// 长响应按连接与读取空闲设限，不使用覆盖整个响应体的固定总时限。
+pub fn stream_client(proxy: Option<&proto::WireProxy>, gateway_proxy: &str) -> reqwest::Client {
+    cached_client(proxy, gateway_proxy, true)
+}
+
+fn cached_client(proxy: Option<&proto::WireProxy>, gateway_proxy: &str, stream: bool) -> reqwest::Client {
+    let cache = if stream { stream_cache() } else { cache() };
     let key = match proxy {
         Some(proxy) => proxy.to_url(),
         None => gateway_proxy.trim().to_string(),
     };
-    if let Ok(guard) = cache().lock() {
+    if let Ok(guard) = cache.lock() {
         if let Some(client) = guard.get(&key) {
             return client.clone();
         }
     }
-    let built = build(&key);
-    if let Ok(mut guard) = cache().lock() {
+    let built = build(&key, stream);
+    if let Ok(mut guard) = cache.lock() {
         guard.insert(key, built.clone());
     }
     built
 }
 
 /// 建一个客户端（代理 URL 为空 / `direct` = 直连）。
-fn build(proxy_url: &str) -> reqwest::Client {
-    build_inner(proxy_url, false)
-}
-
-/// 流式请求的客户端（**不设总超时**）。
-fn build_stream(proxy_url: &str) -> reqwest::Client {
-    build_inner(proxy_url, true)
-}
-
-fn build_inner(proxy_url: &str, stream: bool) -> reqwest::Client {
+fn build(proxy_url: &str, stream: bool) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         // 与网关同一条栈：rustls，不依赖系统 openssl
-        .use_rustls_tls();
+        .use_rustls_tls()
+        .user_agent(DEFAULT_USER_AGENT);
     builder = if stream {
-        // ── 流式为什么**不能**用总超时 ──────────────────────────────
-        // `reqwest` 的 `.timeout()` 是**总超时**：从建连一直算到 response body
-        // 读完。控制面（目录 / 余额 / 签到）用它合适；SSE 长流用它就是灾难 ——
-        // 上游已经 200、正在持续出字，总时长一过就被掐在 body 读取那一层，
-        // 报 `error decoding response body → ... operation timed out`。
-        // 2026-10-27 实测：CodeArts 每个长回答都断在 **20 秒整**
-        // （请求记录里 `20秒005ms` / `20秒037ms`，稳定复现）。
-        //
-        // 流式的正确形状是三段分开：建连有上限、**相邻数据之间有上限**、
-        // 整流时长不设上限。前两个分别对应下面两项。
-        builder
-            .connect_timeout(Duration::from_millis(crate::timeouts::current().connect_ms()))
-            .read_timeout(Duration::from_millis(crate::timeouts::current().stream_idle_ms()))
+        let timeouts = crate::timeouts::current();
+        builder.connect_timeout(Duration::from_millis(timeouts.connect_ms()))
+            .read_timeout(Duration::from_millis(timeouts.stream_idle_ms()))
     } else {
-        // 控制面的默认超时；流式请求由调用方用 [client_stream] 取客户端
         builder.timeout(CONTROL_TIMEOUT)
     };
-    let mut builder = builder.user_agent(DEFAULT_USER_AGENT);
     let trimmed = proxy_url.trim();
     if trimmed.is_empty() || trimmed == "direct" {
         // ── `no_proxy()` 为什么必须显式调 ──────────────────────────
@@ -116,33 +111,6 @@ fn build_inner(proxy_url: &str, stream: bool) -> reqwest::Client {
         }
     }
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
-}
-
-/// 取一个**流式**客户端：不设总超时，只有建连超时与读空闲超时。
-///
-/// ── 什么时候必须用它 ────────────────────────────────────────
-/// 上游回 SSE / 长回答（`chat`、`conversation`）时。用 [`client`] 的后果是
-/// **整流被 `CONTROL_TIMEOUT` 截断**：短问答看不出来，长推理必断，且错误文案
-/// 是 `operation timed out`，很容易被误判成网络问题或上游故障。
-///
-/// 与 [`client`] **分开缓存**：同一个出口 URL 在「控制面 / 流式」两种语义下
-/// 必须是两个实例，不能共用。
-pub fn client_stream(proxy: Option<&proto::WireProxy>, gateway_proxy: &str) -> reqwest::Client {
-    let raw = match proxy {
-        Some(proxy) => proxy.to_url(),
-        None => gateway_proxy.trim().to_string(),
-    };
-    let key = format!("\u{1}stream\u{1}{raw}");
-    if let Ok(guard) = cache().lock() {
-        if let Some(client) = guard.get(&key) {
-            return client.clone();
-        }
-    }
-    let built = build_stream(&raw);
-    if let Ok(mut guard) = cache().lock() {
-        guard.insert(key, built.clone());
-    }
-    built
 }
 
 /// 跟随**系统代理**的客户端（进程级一份）。

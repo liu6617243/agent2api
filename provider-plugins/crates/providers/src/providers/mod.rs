@@ -28,8 +28,6 @@ pub mod atomcode;
 pub mod autoclaw;
 #[cfg(feature = "catpaw")]
 pub mod catpaw;
-#[cfg(feature = "chatglm")]
-pub mod chatglm;
 #[cfg(feature = "cline")]
 pub mod cline;
 #[cfg(feature = "commandcode")]
@@ -46,6 +44,7 @@ pub mod loomy;
 pub mod modelscope;
 #[cfg(feature = "monkeycode")]
 pub mod monkeycode;
+// 本地新增（非上游）：MiniMax 国内站
 #[cfg(feature = "minimax")]
 pub mod minimax;
 #[cfg(feature = "officeace")]
@@ -126,9 +125,6 @@ pub fn registry() -> Vec<BoxProvider> {
     #[cfg(feature = "atomcode")]
     list.push(Box::new(atomcode::AtomcodeProvider));
 
-    #[cfg(feature = "chatglm")]
-    list.push(Box::new(chatglm::ChatglmProvider));
-
     // AutoClaw 的两个地区是两个 provider、两个实例（同一份实现按地区参数化）
     #[cfg(feature = "autoclaw")]
     {
@@ -170,7 +166,8 @@ pub fn registry() -> Vec<BoxProvider> {
     list.push(Box::new(codearts::adapter::CODEARTS));
     #[cfg(feature = "antigravity")]
     list.push(Box::new(antigravity::adapter::ANTIGRAVITY));
-    // 本地新增（非上游）：MiniMax 国内站，只做账号 / 登录续期 / 签到
+
+    // 本地新增（非上游）：MiniMax 国内站（账号 / 登录续期 / 签到 / 余额 / 转发）
     #[cfg(feature = "minimax")]
     list.push(Box::new(minimax::MiniMaxProvider));
 

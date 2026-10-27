@@ -34,7 +34,7 @@
 //! | 福利台账在账号记录的 `codeartsWelfare` 字段 | `ctx.ledger_*`（同名 kind） |
 //! | 新手任务结算记忆在 `onboardingSettled` 字段 | `ctx.ledger_*`（同名 kind） |
 //! | 登录回调挂在网关端口 + 进程级 `LOOPBACK_PORT` | `login.rs` 自绑 loopback 端口 |
-//! | 网关落盘的目录缓存 | 插件不落盘，**改为从网关回灌**（`models::ensure_catalog`） |
+//! | `catalog_cache` 落盘 | **不迁**（落盘归网关；插件从网关回灌，见 `models::ensure_catalog`） |
 //!
 //! ── 已知的能力差（如实列出）─────────────────────────────────
 //!   1. 调试抓包与用量上报没有协议挂点（`telemetry` 是空实现）；
@@ -60,6 +60,7 @@ pub(crate) mod oauth;
 pub(crate) mod onboarding;
 pub(crate) mod redact;
 pub(crate) mod refresh;
+pub(crate) mod response_stream;
 pub(crate) mod session;
 pub(crate) mod signer;
 pub(crate) mod size_gate;

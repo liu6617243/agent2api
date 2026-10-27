@@ -84,16 +84,24 @@ pub(crate) async fn claim(session: &Value) -> Result<Value, GatewayError> {
                 "code".to_string(),
                 Value::from(result.code.unwrap_or(-1)),
             );
-            let message = result_msg(&result.raw).unwrap_or_else(|| "签到失败".to_string());
-            failure.insert("msg".to_string(), Value::String(message.clone()));
-            // 「今天已签到，请明天再来」是正常终态：上游对重复领取回 HTTP 400，
-            // `call` 已把它放行成 Ok，走到这里只剩一条非 0 业务码的失败行。
-            // 必须补上 `alreadyCompleted`，否则 `report_of` 只能按「success=false
-            // 且无已完成标记」判 Failed —— 界面会把「今日已领」显示成红字失败
-            // （2026-10-27 截图实证）。判据与 `is_duplicate_claim` 的文案半边同源。
-            if call::is_duplicate_text(&message) {
-                failure.insert("alreadyCompleted".to_string(), Value::Bool(true));
-            }
+            failure.insert(
+                "msg".to_string(),
+                Value::String(result_msg(&result.raw).unwrap_or_else(|| "签到失败".to_string())),
+            );
+            let message = failure.get("msg").and_then(Value::as_str).unwrap_or("");
+            // 「今天已签到，请明天再来」是正常终态，不是失败：不补这个标记，
+            // `report_of` 只能按「success=false 且无已完成标记」判 Failed，
+            // 界面就把「今日已领」显示成红字失败（2026-10-27 截图实证）。
+            //
+            // ── 判据为什么比 `call::is_duplicate_claim` 多一层否定词排除 ──
+            // 这里拿到的是**非 0 业务码**，文案可能是「未能领取，稍后再试」这类
+            // 既含「领取」又明确是失败的话。只按关键词判会把真失败洗成已完成，
+            // 当日就不会再自动重试 —— 比报红字更糟。`call` 那边的场景是 HTTP
+            // 400/409（上游对重复领取的专属状态码），语义已经足够限定，故不必
+            // 再排除否定词。两处判据不同是**有意的**，不是漏改。
+            let already = !(message.contains("可能") || message.contains("未能") || message.contains("失败"))
+                && (message.contains("已签到") || message.contains("已领取"));
+            failure.insert("alreadyCompleted".to_string(), Value::Bool(already));
             Ok(Value::Object(failure))
         }
         // 请求本身没打成（超时 / 断连 / 401 / 非 2xx）—— 这是真的失败

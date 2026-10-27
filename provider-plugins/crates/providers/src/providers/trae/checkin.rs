@@ -382,6 +382,11 @@ pub async fn claim_daily_checkin(
     if !needs_reauth(&first) {
         return Ok(first);
     }
+    // 没有 refreshToken 就没得换：如实回报，别拿一个必然 401 的换发放大失败感
+    // （上游 beta.4 同款早退，2026-10-27 合入）。
+    if !credential.can_refresh() {
+        return Ok(first);
+    }
     let renewed = match renew_with_fresh_record(ctx, account_id).await {
         Ok(renewed) => renewed,
         Err(error) => {
@@ -401,7 +406,15 @@ pub async fn claim_daily_checkin(
             return Ok(row);
         }
     };
-    let mut row = run(&renewed, proxy.as_ref(), UG_HOST).await?;
+    let mut row = run(&renewed, proxy.as_ref(), UG_HOST).await.map_err(|error| {
+        // 401 打上专属码：换发重放之后仍 401 = 「重试已耗尽」，与本轮开头的
+        // 普通 401 不是同一件事，编排层据此决定要不要再进冷却（上游 beta.4 同款）。
+        if error.status_code == 401 {
+            error.with_code("checkin_auth_retry_exhausted")
+        } else {
+            error
+        }
+    })?;
     let replay_still_rejected = needs_reauth(&row);
     if let Some(map) = row.as_object_mut() {
         map.insert("reauthAttempted".to_string(), json!(true));

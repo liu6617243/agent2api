@@ -61,12 +61,6 @@
       "default_enabled": true
     },
     {
-      "id": "chatglm",
-      "label": "智谱清言",
-      "order": 9,
-      "default_enabled": true
-    },
-    {
       "id": "autoclaw",
       "label": "AutoClaw 国内版",
       "order": 10,
