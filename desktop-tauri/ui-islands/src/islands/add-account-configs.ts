@@ -580,7 +580,7 @@ const MINIMAX: ProviderConfig = {
   label: 'minimax-cn',
   desktop: false,
   webLogin: {
-    noteHtml: t('点下面的按钮打开 <b>MiniMax</b> 的官方授权页（<code>minimax.cn</code>），在页面上确认登录即可。若页面要求输入确认码，按页面显示的那串填 —— 授权完成后本站会自动收下账号并支持到期自动续期，<b>不需要</b>把任何地址粘回来（授权回调由网关自己完成）。'),
+    noteHtml: t('点下面的按钮打开 <b>MiniMax</b> 的官方授权页（<code>minimax.cn</code>），在页面上确认登录即可。确认码会随页面带过去；链接 <b>5 分钟内有效</b>，超时或没确认就会作废（可重新发起）。授权完成后本站会自动收下账号并支持到期自动续期，<b>不需要</b>把任何地址粘回来（授权回调由网关自己完成）。'),
     button: t('打开 MiniMax 授权页'),
     busyText: t('等待 MiniMax 授权完成…'),
     modes: [
