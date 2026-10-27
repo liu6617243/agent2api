@@ -44,8 +44,6 @@ use agent2api_provider_protocol as proto;
 use agent2api_provider_sdk::{PluginCtx, Provider, ProviderMeta, SendFuture};
 use serde_json::Value;
 
-use crate::errors::GatewayError;
-
 /// provider id（`pack.json` 里必须写同一个）。
 ///
 /// ── 为什么 id 是 `minimax` 而显示名是 `minimax-cn` ────────────

@@ -31,37 +31,6 @@ impl Reply {
 /// 会把整页 HTML 拼进错误消息里，日志与客户端都会被淹掉。
 const MAX_BODY_BYTES: usize = 1 << 20;
 
-/// `GET` 一个 JSON 接口（签到状态查询的现行形态：设备号放在 `?did=` 里）。
-///
-/// 与 [`post_json`] 同一套错误口径：网络层错误归一成 502，HTTP 状态不在这里
-/// 判成错误 —— 由调用方决定「换 POST 兜底」还是上报。
-pub async fn get_json(
-    url: &str,
-    headers: &[(&str, String)],
-    timeout: Duration,
-    proxy: Option<&ResolvedProxy>,
-) -> Result<Reply, GatewayError> {
-    let mut request = egress::client(proxy, "direct")
-        .get(url)
-        .header("Accept", "application/json")
-        .timeout(timeout);
-    for (name, value) in headers {
-        request = request.header(*name, value.clone());
-    }
-    let response = request.send().await.map_err(|error| {
-        GatewayError::with_status(
-            502,
-            format!(
-                "Trae 请求发不出去：{}",
-                egress::describe_chain(&error)
-            ),
-        )
-    })?;
-    let status = response.status().as_u16();
-    let text = read_limited(response).await;
-    Ok(Reply { status, body: text })
-}
-
 /// `POST` 一个 JSON 体。网络层错误归一成 502（"上游没答"），
 /// HTTP 状态本身**不**在这里判成错误 —— 多候选轮询要靠状态码决定换不换 host。
 pub async fn post_json(

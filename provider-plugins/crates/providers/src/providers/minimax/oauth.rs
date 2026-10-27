@@ -74,11 +74,6 @@ const DEFAULT_INTERVAL_SECONDS: u64 = 5;
 /// 上游错误文在报错里的截断长度
 const MAX_ERROR_CHARS: usize = 300;
 
-/// 供登录链路复用的默认有效期（秒）
-pub fn default_expires_in_seconds() -> i64 {
-    DEFAULT_EXPIRES_IN_SECONDS
-}
-
 /// 一次 token 端点调用的结果
 #[derive(Clone, Debug)]
 pub struct TokenResponse {
@@ -615,12 +610,11 @@ pub async fn login_start() -> Result<proto::LoginStart, GatewayError> {
 
 /// 轮询登录进度（网关按 `poll_interval_ms` 反复调用）。
 pub async fn login_poll(flow: &str) -> Result<proto::LoginPoll, GatewayError> {
-    let Some((device_code, verifier, interval, deadline_ms)) = with_flows(|table| {
+    let Some((device_code, verifier, deadline_ms)) = with_flows(|table| {
         table.get(flow).map(|entry| {
             (
                 entry.device_code.clone(),
                 entry.code_verifier.clone(),
-                entry.interval,
                 entry.deadline_ms,
             )
         })

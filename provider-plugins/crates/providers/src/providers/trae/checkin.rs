@@ -298,8 +298,6 @@ pub enum Outcome {
     Claimed(Award),
     /// 领取被拒（`code` 是上游业务码，`message` 是上游原话）
     Rejected(i64, String),
-    /// claim 回了 code:0 但同设备号回查没翻转 —— 服务端静默拒签，**不算成功**
-    Unconfirmed,
 }
 
 /// 今日奖励的**两部分**（基础 + 加成）。
@@ -523,7 +521,7 @@ async fn run(
 ///   1. 数字口径：`credits`/`extra_credits` 是上游**报出的当日奖励数额**，不是
 ///      到账余额 —— 文案说"官方报出的当日奖励"，把"实际到账"留给界面上已有的
 ///      余额列，不用一句会撒谎的成功文案替它背书。
-///   2. Rejected / Unconfirmed 的文案不许出现「已签到」「已领取」：批量层
+///   2. Rejected 的文案不许出现「已签到」「已领取」：批量层
 ///      `billing::checkin::checkin_completed_today` 是按 msg 子串判"当日已办"的，
 ///      写进去就把一次失败洗成已签、当日不再重试。（上游自己给的文案落在
 ///      `{reason}` 里，那一格若真说"已领"，被批量层当成当日已办是对上游原话
@@ -597,15 +595,6 @@ fn complete(outcome: Outcome, device_id: &str) -> Value {
                 )
             };
             row.insert("msg".into(), json!(text));
-            None
-        }
-        Outcome::Unconfirmed => {
-            row.insert("success".into(), json!(false));
-            row.insert("claimUnconfirmed".into(), json!(true));
-            row.insert(
-                "msg".into(),
-                json!("签到返回成功但同设备号回查未确认（服务端静默拒签），当日不再自动重试"),
-            );
             None
         }
     };
