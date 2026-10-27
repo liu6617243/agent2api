@@ -76,6 +76,10 @@ export const PROVIDER_ICONS: Record<string, string> = {
   'zcode-intl': 'assets/providers/zcode.png',
   codearts: 'assets/providers/codearts.png',
   trae: 'assets/providers/trae.png',
+  // MiniMax：官方品牌图标（粉→橙渐变圆角块 + 白色声波），与「预置 API」段
+  // Minimax Coding 模板卡（preset-providers.js 的 icon: 'minimax.png'）是同一枚
+  // 文件。此前缺这一条 → 徽章回落到首字母「M」的蓝色方块，与品牌无关。
+  minimax: 'assets/providers/minimax.png',
   // Loomy：取自安装包 `resources/app.asar` 的 Windows 图标集
   // （`build/icons/favicon-228.png`，与系统里显示的应用图标为同一张；
   // 绿色圆底上的品牌形象）

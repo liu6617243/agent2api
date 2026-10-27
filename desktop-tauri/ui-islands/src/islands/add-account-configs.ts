@@ -554,6 +554,62 @@ const TRAE: ProviderConfig = {
 }
 
 /**
+ * MiniMax（MiniMax Code / agent.minimax.cn）。
+ *
+ * ── 为什么 `provider` 是 `minimax` 而 `label` 是 `minimax-cn` ────────
+ * 两个值的作用域不同，**不能统一**：`provider` 参与请求（`startLogin` 的第三个
+ * 参数、`POST /api/accounts` 的分派键、账号表的 `accounts.provider`），它是插件
+ * 里写死的存储键，一经发布不能改（改了存量账号全变孤儿）；`label` 只进文案与
+ * 弹窗标题。后端的显示名本来就是 `minimax-cn`（见 `providers/minimax/mod.rs`
+ * 的 `LABEL` 注释），所以这里照抄同一个字面量。
+ *
+ * ── 登录形态：设备码轮询，**不是**本机回调 ──────────────────────
+ * 插件（`providers/minimax/oauth.rs`）走 PKCE 设备码：`login.start` 拿到
+ * `device_code` 与 `verification_uri` 之后，由**网关自己**按上游给的 interval
+ * 反复问 `login.poll`「授权完成没」—— 授权回调在上游域名终结，永远不回到本机。
+ * 所以这里**不能**用 `WEB_LOGIN_PASTE_HINT`（那套「把地址栏里的回调地址粘回来」
+ * 是给 Trae / CodeArts 那种回调落在本机端口的家用的）：本家跨机部署照样能登录，
+ * 写了反而会让用户去找一个不存在的回调地址。
+ *
+ * ── 为什么没有「导入桌面端登录态」────────────────────────────
+ * MiniMax Code 桌面端的登录态在它自己的加密存储里，没有 `auth.json` 那种稳定
+ * 可读的形态 —— 给了入口只会稳定失败（与 Accio / ZCode / Trae 同一处境）。
+ */
+const MINIMAX: ProviderConfig = {
+  provider: 'minimax',
+  label: 'minimax-cn',
+  desktop: false,
+  webLogin: {
+    noteHtml: t('点下面的按钮打开 <b>MiniMax</b> 的官方授权页（<code>minimax.cn</code>），在页面上确认登录即可。若页面要求输入确认码，按页面显示的那串填 —— 授权完成后本站会自动收下账号并支持到期自动续期，<b>不需要</b>把任何地址粘回来（授权回调由网关自己完成）。'),
+    button: t('打开 MiniMax 授权页'),
+    busyText: t('等待 MiniMax 授权完成…'),
+    modes: [
+      {
+        value: 'embedded',
+        label: t('内嵌窗口（推荐）'),
+        hint: t('将打开内嵌窗口；在上游页面确认后自动加入账号列表。关掉窗口即取消等待'),
+      },
+      {
+        value: 'external',
+        label: t('系统浏览器'),
+        hint: t('将用系统默认浏览器打开授权页（会复用浏览器里已登录的 MiniMax 账号）；确认后自动加入账号列表。'),
+      },
+    ],
+  },
+  manualTitle: t('填写凭证'),
+  manualNoteHtml: t('粘贴 <code>refreshToken</code>（MiniMax Code 的主凭证）。<b>它是一次性轮换的</b>：每换发一次 access_token 就换一枚新的，旧的那枚随即被上游作废 —— 所以别让两份程序同时刷同一个账号。<br>手头没有 refreshToken 时的正路是上方的「网页登录」：设备码走完会自动落一枚，且之后自动续期。'),
+  fields: [
+    {
+      key: 'refreshToken',
+      label: 'refreshToken',
+      rows: 3,
+      placeholder: t('MiniMax 的 refreshToken（旧版网关里存的那枚也可）'),
+    },
+    { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空自动用账号标识') },
+  ],
+}
+
+/**
  * Loomy（讯飞）：短信登录 + 粘贴 session。
  *
  * ── 三处与别家不同（都有上游依据，别照抄别家）────────────────
@@ -1102,6 +1158,10 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   CODEARTS,
   // Trae 只有 SOLO 那一家（没有地区分叉，理由见 TRAE 上方那段）
   TRAE,
+  // MiniMax（MiniMax Code / agent.minimax.cn）：设备码网页登录 + 粘贴
+  // refreshToken。注意 `provider` 必须是 `minimax`（插件里的存储键），
+  // 显示名才是 minimax-cn —— 两者不能统一，见 MINIMAX 上方的说明。
+  MINIMAX,
   // Loomy（讯飞）：单一入口（手机验证码登录），排在末尾 —— 与后端注册表
   // PROVIDERS 的排列一致（新增的一家加在表尾）
   LOOMY,
