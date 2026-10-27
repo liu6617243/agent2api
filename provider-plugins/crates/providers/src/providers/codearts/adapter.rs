@@ -298,7 +298,12 @@ impl Provider for CodeArtsProvider {
                     }
                 }
             };
-            let mut request = crate::http::client(req.proxy.as_ref(), "direct").post(&url);
+            // **必须用 `client_stream`**：这条是 SSE 长流，用控制面的
+            // `http::client`（`CONTROL_TIMEOUT` = 20 秒**总超时**）会在
+            // body 读取层被掐断，症状是「HTTP 200 之后必断在 20 秒整，
+            // 报 `error decoding response body → operation timed out`」。
+            // 2026-10-27 用户实测每一条 CodeArts 长回答都复现。
+            let mut request = crate::http::client_stream(req.proxy.as_ref(), "direct").post(&url);
             for (name, value) in headers {
                 request = request.header(name.as_str(), value.as_str());
             }

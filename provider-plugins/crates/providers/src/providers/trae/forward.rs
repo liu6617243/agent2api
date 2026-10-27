@@ -113,7 +113,12 @@ async fn send(plan: &Plan, proxy: Option<&ResolvedProxy>) -> Result<reqwest::Res
     // **不设 reqwest 总超时**：`timeout(0)` 不是"不限时"而是"立刻超时"
     // （实测报 operation timed out，症状是随机 502），而不带总超时的长流
     // 才符合本家的形状 —— 读空闲由下面的 `idle_guard` 管，整流时长不该被截。
-    let mut request = egress::client(proxy, "direct")
+    //
+    // 2026-10-27 修正：上面这段注释原本**不成立** —— `egress::client` 内部设了
+    // `CONTROL_TIMEOUT`（20 秒**总超时**，覆盖到 body 读完），长推理一样会被
+    // 掐断。现改用 `egress::client_stream`（建连 + 读空闲，无总超时），
+    // 与本注释的意图对齐。CodeArts 是同一处的另一个受害者。
+    let mut request = egress::client_stream(proxy, "direct")
         .post(&plan.url)
         .header("User-Agent", format!("Trae/{IDE_VERSION} antigravity-cockpit-tools"));
     for (name, value) in &plan.headers {
