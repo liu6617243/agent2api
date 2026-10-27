@@ -283,7 +283,16 @@ pub(super) async fn call(
 /// `detail` 是 `msg`（或回退的 `message`）原文，空串表示上游没给文案 ——
 /// 空串不含关键词，自然落到「不放过」，正是想要的失败方向。
 pub(super) fn is_duplicate_claim(status: u16, detail: &str) -> bool {
-    matches!(status, 400 | 409) && (detail.contains("已签到") || detail.contains("已领取"))
+    matches!(status, 400 | 409) && is_duplicate_text(detail)
+}
+
+/// `is_duplicate_claim` 的**文案半边**：只按文案判「今天已领」。
+///
+/// 状态码那一半只对非 2xx 有意义；`claim` 走的是「2xx + 非 0 业务码」的形态
+/// （`expect_code_ok=false`），那里拿不到状态码，但文案是同一句，故单列此函数
+/// 供两侧共用 —— 判据必须与网关 `checkin_completed_today` 第 3 条一致。
+pub(super) fn is_duplicate_text(detail: &str) -> bool {
+    detail.contains("已签到") || detail.contains("已领取")
 }
 
 /// `Accept-Language` 的取值（网关 `BillingService::accept_language` 的同义物）。

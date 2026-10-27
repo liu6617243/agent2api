@@ -84,10 +84,16 @@ pub(crate) async fn claim(session: &Value) -> Result<Value, GatewayError> {
                 "code".to_string(),
                 Value::from(result.code.unwrap_or(-1)),
             );
-            failure.insert(
-                "msg".to_string(),
-                Value::String(result_msg(&result.raw).unwrap_or_else(|| "签到失败".to_string())),
-            );
+            let message = result_msg(&result.raw).unwrap_or_else(|| "签到失败".to_string());
+            failure.insert("msg".to_string(), Value::String(message.clone()));
+            // 「今天已签到，请明天再来」是正常终态：上游对重复领取回 HTTP 400，
+            // `call` 已把它放行成 Ok，走到这里只剩一条非 0 业务码的失败行。
+            // 必须补上 `alreadyCompleted`，否则 `report_of` 只能按「success=false
+            // 且无已完成标记」判 Failed —— 界面会把「今日已领」显示成红字失败
+            // （2026-10-27 截图实证）。判据与 `is_duplicate_claim` 的文案半边同源。
+            if call::is_duplicate_text(&message) {
+                failure.insert("alreadyCompleted".to_string(), Value::Bool(true));
+            }
             Ok(Value::Object(failure))
         }
         // 请求本身没打成（超时 / 断连 / 401 / 非 2xx）—— 这是真的失败

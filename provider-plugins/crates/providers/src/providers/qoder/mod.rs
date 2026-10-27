@@ -807,6 +807,24 @@ fn checkin_report(value: &Value) -> proto::CheckinReport {
                 message
             }),
         }
+    } else if value
+        .get("alreadyCompleted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        // `checkin.rs` 的「今天已领取 / 活动已领完」三条分支都带这个标记 ——
+        // 它们是**正常终态**，不是失败。这里丢掉标记会让网关侧 `report_of`
+        // 一律判 Failed，界面就把「今日已领」显示成红字失败（2026-10-27 实证）。
+        proto::CheckinReport {
+            outcome: proto::CheckinOutcome::Done,
+            credit: None,
+            streak: None,
+            message: Some(if message.is_empty() {
+                "今天已经签过了".to_string()
+            } else {
+                message
+            }),
+        }
     } else {
         proto::CheckinReport {
             outcome: proto::CheckinOutcome::Failed,
