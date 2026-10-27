@@ -63,10 +63,12 @@ jobs:
         run: dir dist
 
       - name: 上传构建产物（工作流页面可下载）
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: plugin-windows
+          # archive:false 时 name 参数被忽略，artifact 名即文件名
+          # （下载下来就是 agent2api-providers-<版本>-<target>.zip，可直接装）
           path: provider-plugins/dist/*.zip
+          archive: false
           if-no-files-found: error
 
       - name: 发布到 Release（固定下载地址）
