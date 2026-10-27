@@ -1,18 +1,18 @@
-//! MiniMax（MiniMax Code / agent.minimax.cn）：**账号 + 签到 + 余额**的 provider。
+//! MiniMax（MiniMax Code / agent.minimax.cn）：**账号 + 转发 + 余额 + 签到**。
 //!
 //! ── 演进 ────────────────────────────────────────────────────
 //! 这家最初由 fork 在网关内核里接入（转发 + 余额 + 签到全家）。上游 3.3.0
 //! 把 provider 实现整体移出主仓之后，本仓先补回「账号 + 每日签到」；
-//! 2026-10-26 余额也接回来了（`balance.rs`，从内核版整体移植）—— 端点常量
-//! 一直留在 `endpoints.rs` 备用，接回只是把能力位与实现补上，无需再逆向。
-//! 仍未接的只剩推理转发（`chat=false`，模型请求请走别的家）。
+//! 2026-10-26 余额接回（`balance.rs`）；2026-10-27 推理转发也接回
+//! （`chat.rs` + `models.rs`，Anthropic Messages 通道，端点与静态模型表
+//! 都从内核版整体移植）。
 //!
 //! ── 能力位（申报错方向的后果见 `Capabilities` 各字段注释）──
 //! ```text
-//!   chat            false  没有转发实现（模型请求请走别的家 / 自定义提供商）
+//!   chat            true   转发到 mavis/api/v1/llm/v1/messages（Anthropic 协议）
 //!   stateful        false
 //!   refresh         true   refresh_token 一次性轮换，后台维护可续
-//!   model_refresh   false 没有远程模型目录
+//!   model_refresh   false 没有远程目录，清单是静态 4 项（models.rs）
 //!   usage           true  余额查询（credit/details，balance.rs）
 //!   checkin         true  每日签到（signin/status + signin/claim）
 //!   claims          false
@@ -34,8 +34,10 @@
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
 pub mod balance;
+pub mod chat;
 pub mod checkin;
 pub mod endpoints;
+pub mod models;
 pub mod oauth;
 
 use agent2api_provider_protocol as proto;
@@ -63,8 +65,8 @@ impl Provider for MiniMaxProvider {
     fn meta(&self) -> ProviderMeta {
         ProviderMeta::new(ID, LABEL)
             .with_capabilities(proto::Capabilities {
-                // 本插件没有转发实现 —— 必须显式 false（这一位的 serde 缺省是 true）
-                chat: false,
+                // 转发到 Anthropic Messages 端点（chat.rs；2026-10-27 接回）
+                chat: true,
                 stateful: false,
                 // 设备码登录拿到的 refresh_token 可续期，后台凭证维护可以管它
                 refresh: true,
@@ -98,8 +100,8 @@ impl Provider for MiniMaxProvider {
                     ),
                 },
             ])
-            // 没有模型目录：清单交空，界面不会给「获取模型」入口
-            .with_models(Vec::new())
+            // 静态模型清单（上游没有远程目录，model_refresh=false；见 models.rs）
+            .with_models(models::list())
             .with_checkin(proto::CheckinInfo {
                 description: Some(
                     "MiniMax 每日签到（signin/status → signin/claim，Bearer 登录态）".to_string(),
@@ -121,6 +123,65 @@ impl Provider for MiniMaxProvider {
                 credit_expiry: true,
                 ..Default::default()
             })
+    }
+
+    // ── 转发 ──────────────────────────────────────────────────
+
+    /// 无状态转发：Anthropic Messages（`chat.rs`）。
+    ///
+    /// 令牌临期先刷（`ensure_fresh` 负责一次性 refresh_token 的轮换与回写），
+    /// 再把客户端 chat 体转成 Anthropic 体，交给网关发流与翻译回 chat SSE。
+    fn build_chat<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        req: proto::ChatRequest,
+    ) -> SendFuture<'a, agent2api_provider_sdk::ChatPlan> {
+        Box::pin(async move {
+            if req.account.trim().is_empty() {
+                return Err(GatewayError::with_status(
+                    400,
+                    "MiniMax 转发需要指定账号（该请求没有携带 account）",
+                ));
+            }
+            let credential = oauth::ensure_fresh(ctx, &req.account, false).await?;
+            chat::build(&credential, &req.body)
+        })
+    }
+
+    /// 上游错误分类：401/403 令牌失效（编排层强刷后同号重试一次）、429 限额
+    /// 冷却换号、400 命中内容审核不罚账号，其余原样透传。
+    fn classify(&self, status: u16, body: &Value) -> proto::ErrorClass {
+        let raw = body
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .or_else(|| body.get("message").and_then(Value::as_str))
+            .or_else(|| body.pointer("/base_resp/status_msg").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("上游错误")
+            .to_string();
+        let message = format!("上游返回 {status}: {raw}");
+        let code = body
+            .get("code")
+            .and_then(Value::as_i64)
+            .or_else(|| body.pointer("/base_resp/status_code").and_then(Value::as_i64));
+        match status {
+            401 | 403 => proto::ErrorClass::TokenExpired { message },
+            429 => proto::ErrorClass::QuotaLimited {
+                reset_at: None,
+                message,
+                upstream_code: code,
+                status,
+            },
+            400 if raw.contains("敏感") || raw.contains("审核") => {
+                proto::ErrorClass::ContentBlocked { status, message }
+            }
+            _ => proto::ErrorClass::Fatal {
+                status,
+                message,
+                upstream_code: code,
+            },
+        }
     }
 
     // ── 余额 ──────────────────────────────────────────────────
