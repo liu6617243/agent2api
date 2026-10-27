@@ -61,7 +61,7 @@ use crate::errors::GatewayError;
 use super::adapter::{account_proxy, read_record, renew_forced, renew_if_due};
 use super::credentials::Credential;
 use super::errors::classify;
-use super::http::{get_json, post_json};
+use super::http::post_json;
 use super::usage::UG_HOST;
 
 /// 签到状态查询（参考实现 `EpCheckinStatus`）。
@@ -88,6 +88,11 @@ const CODE_REJECTED: i64 = 9074;
 /// 失效，动作是换发新 JWT 后重放一次。参考实现的码表里没有这一码；
 /// 本仓一手验证过语义：连拒 1001 的账号刷新令牌后当天就签到成功 ——
 /// 不是"名额"、不是"没资格"，就是令牌被服务端作废而 `expiredAt` 没反映。
+///
+/// ── 2026-10-27 补充：1001 有两种来源，处置不同 ────────────────
+/// 只有 **claim 的 1001** 才是「令牌被吊销」，才走换发重放；**status 的
+/// 1001 不能当判据** —— 已废弃的 GET 形态对任何令牌（含刚领取成功的）都回
+/// 1001，那是网关层的形态拒绝。`run()` 因此允许 status 1001 继续走 claim。
 const CODE_TOKEN_DEAD: i64 = 1001;
 
 /// 单次请求超时。与 `usage.rs` 同一个数：这条族没有流式，`egress` 默认的
@@ -316,19 +321,28 @@ impl Award {
 /// `before` 是本轮第一发状态；`after` 是领取后用**同一个设备号**的回查；
 /// `claim` 是领取那一发的响应（只读它的 code 与 message，数额归回查读）。
 pub fn decide(before: &Status, claim: &Status, after: Option<&Status>) -> Outcome {
-    if !before.enable {
-        return Outcome::NotEnabled;
-    }
-    if before.done_today() {
-        return Outcome::AlreadyCheckedIn(before.award());
+    // 前置状态只有 code 0 时才可信：1001 下它的 enable/checked_in 全是缺字段兜
+    // 出来的 false，据此判「活动没开」会把活账号判成没有签到活动。
+    if before.code == CODE_OK {
+        if !before.enable {
+            return Outcome::NotEnabled;
+        }
+        if before.done_today() {
+            return Outcome::AlreadyCheckedIn(before.award());
+        }
     }
     if claim.code != CODE_OK {
         return Outcome::Rejected(claim.code, claim.message.clone());
     }
+    // claim 的 code 0 就是领取成功的权威答复（2026-10-27 实测：code 0 的同时
+    // 积分 +100 落账；AgentHub 也完全按这个码判成功）。回查可用且有翻转时优先
+    // 用回查的数额；回查不可用（status 1001）时不能把一次真领取报成"未确认"
+    // —— 那是把成功洗成失败。
     match after {
-        // 回查确认：奖励数按回查那份读（上游在 claim 里不保证给数额）
-        Some(confirmed) if confirmed.done_today() => Outcome::Claimed(confirmed.award()),
-        Some(_) | None => Outcome::Unconfirmed,
+        Some(confirmed) if confirmed.code == CODE_OK && confirmed.done_today() => {
+            Outcome::Claimed(confirmed.award())
+        }
+        _ => Outcome::Claimed(claim.award()),
     }
 }
 
@@ -447,22 +461,28 @@ async fn run(
         return Err(GatewayError::with_status(401, "该 Trae 账号没有可用凭证，无法签到"));
     }
 
-    // 设备号由账号稳定标识派生（见 `checkin_device_id`）：跨天、跨轮、跨令牌
-    // 刷新都不变 —— 官方客户端就是一台设备一个号。旧实现「每轮新号」正是
-    // 9074 反复出现的根因（每次点击都像一台新设备来领奖）。
-    let device_id = checkin_device_id(&device_seed(credential));
+    // 设备号优先用**登录时注册的真实设备号**（凭据里的 `deviceId`）：web 授权
+    // 登录会把这台设备的号与密钥对一起注册到会话上，领取时带别的号就是"另一台
+    // 设备来领这个账号的奖"。没有登录注册的老数据（手工粘贴）才退回稳定派生
+    // （见 `checkin_device_id`）——那一档在 10-25 实测可用。
+    let device_id = if !credential.device_id.trim().is_empty() {
+        credential.device_id.trim().to_string()
+    } else {
+        checkin_device_id(&device_seed(credential))
+    };
     let before = status(base, credential, &variant, &device_id, proxy).await?;
-    // 状态那一发自己回**非零业务码**时必须原样报成拒绝，不许退化成"活动没开"。
-    // 退化是真的会发生的形状：`status_of` 对缺字段一律按 `enable=false` 收，
-    // 于是 1001（这张 JWT 已被服务端作废）会被翻成「当前没有可领取的签到活动」
-    // —— 把一个鉴权失败报成一件中性事，用户与定时链都会据此放弃这个账号。
-    if before.code != CODE_OK {
+    // 1001 不再当场判死（2026-10-27 修订）：状态接口的 1001 实测对**所有**令牌
+    // 都会出现（包括同一枚刚领取成功 100 积分的），它是网关层的形态拒绝，不是
+    // 令牌失效。领取的生死由 claim 自己说 —— 拿 status 的 1001 判失败，正是
+    // 10-26 全天「换发成功却永远报失败」的根因。
+    // 真正的业务拒绝（9074 等）仍原样上报，不许退化成"活动没开"。
+    if before.code != CODE_OK && before.code != CODE_TOKEN_DEAD {
         return Ok(complete(
             Outcome::Rejected(before.code, before.message.clone()),
             &device_id,
         ));
     }
-    if !before.enable || before.done_today() {
+    if before.code == CODE_OK && (!before.enable || before.done_today()) {
         // 这一条分支根本没打领取；`decide` 在读 claim 之前就返回了，给一个空响应占位。
         return Ok(complete(decide(&before, &Status::default(), None), &device_id));
     }
@@ -621,8 +641,8 @@ fn add_client_headers(headers: &mut BTreeMap<String, String>) {
 /// 是「像官方网页端」，头越少越不像拼出来的脚本；余额那条链
 /// （`usage.rs::ug_headers`）有自己的实测依据，不在这里动。
 ///
-/// 鉴权方案由调用方定：status 首发是 Bearer（GET），claim 是
-/// Cloud-IDE-JWT（POST）—— 与 AgentHub / 官方客户端一致。
+/// 鉴权方案由调用方定：status 与 claim 现在都走 Cloud-IDE-JWT（POST）。10-27
+/// 起不再使用 Bearer（GET 形态已被上游整体拒绝，见 `status` 的说明）。
 fn checkin_headers(
     access_token: &str,
     device_id: &str,
@@ -642,12 +662,13 @@ fn checkin_headers(
 
 /// 状态查询（一轮里会发两次：领取前与领取后回查）。
 ///
-/// ── 首发是 GET + `?did=`（2026-10-26 修订）─────────────────
-/// 同族实现（AgentHub）实测：官方现行的签到状态接口是 GET，设备号放在
-/// `?did=` 查询串里、鉴权用 `Bearer`；这条形态长期稳定。旧实现两发都发 POST，
-/// 虽然也能通，但接口形态与官方客户端不一致本身就是画像上的可疑项。
-/// GET 不通（网络错误 / 业务码非 0 / HTTP 4xx）时回落到原来的 POST 往返，
-/// 保留换探测体、换鉴权方案两条兜底。
+/// ── 形态：POST + Cloud-IDE-JWT（2026-10-27 实测修订）──────────
+/// 10-26 曾按「AgentHub 同形」把首发改成 GET `?did=` + Bearer；10-27 实测
+/// 这条 GET 形态**已对所有人失效**：拿 AgentHub 自己那枚刚签到成功的令牌
+/// 打 GET 也回 1001「not able to authenticate you」，而不带鉴权头 / 假令牌
+/// 回的是一字不差的同一句 —— 说明这一形态在网关层就被整体拒了，与令牌无关。
+/// 同一时刻同一枚令牌打 POST（Cloud-IDE-JWT、空体）能正常领取并到账 100 积分。
+/// 故 status 回到 POST（`round_trip`，与 claim 同一套鉴权），不再白发那发 GET。
 async fn status(
     base: &str,
     credential: &Credential,
@@ -655,27 +676,6 @@ async fn status(
     device_id: &str,
     proxy: Option<&agent2api_provider_protocol::WireProxy>,
 ) -> Result<Status, GatewayError> {
-    // 首发 GET + Bearer：与 AgentHub / 官方客户端同形（`checkin_headers`）。
-    let headers = checkin_headers(&credential.access_token, device_id, Scheme::Bearer);
-    let prepared: Vec<(String, String)> = headers.into_iter().collect();
-    let pairs: Vec<(&str, String)> = prepared
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.clone()))
-        .collect();
-    let url = format!("{base}{EP_CHECKIN_STATUS}?did={device_id}");
-    if let Ok(reply) = get_json(&url, &pairs, REQUEST_TIMEOUT, proxy).await {
-        if reply.status < 400 {
-            let payload = reply.json().unwrap_or_else(|| json!({}));
-            let read = status_of(&payload);
-            // 正常码与两个**已知**业务码都直接采信：9074 是限流窗口，再打一发
-            // POST 只会把窗口烧得更长（外部实测过的教训）；1001 要走的是换发
-            // 令牌那条路，不是换接口形态。只有「GET 这个形态本身不通」
-            // （网络错 / 4xx / 未知业务码）才回落到 POST 兜底。
-            if read.code == CODE_OK || read.code == CODE_REJECTED || read.code == CODE_TOKEN_DEAD {
-                return Ok(read);
-            }
-        }
-    }
     let payload = round_trip(base, EP_CHECKIN_STATUS, variant, device_id, credential, proxy).await?;
     Ok(status_of(&payload))
 }
