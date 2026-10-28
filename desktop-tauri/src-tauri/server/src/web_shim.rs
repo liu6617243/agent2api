@@ -1792,15 +1792,6 @@ pub fn shim_js() -> &'static str {
       return call('PUT', '/api/developer-role-compat', { developerRoleCompat: enabled === true });
     },
 
-    // ── 识图（把图换成文字交给纯文本模型）──
-    // 与桌面桥（src/bridge.rs 的 getVision / saveVision / getVisionModels）
-    // 同一映射，三个接口名与签名必须一致。`saveVision` 收的是补丁对象
-    // （`{imageRecognition?, imageRecognitionEffort?}`），后端 PUT 语义就是
-    // 「传了哪个改哪个」，所以这里原样透传、不做字段拼装。
-    getVision: function () { return call('GET', '/api/vision'); },
-    saveVision: function (patch) { return call('PUT', '/api/vision', patch || {}); },
-    getVisionModels: function () { return call('GET', '/api/vision/models'); },
-
     // ── Cline 伪装头（转发头逐键覆盖）──
     // 与桌面桥（src/bridge.rs 的 getClineHeaders / saveClineHeaders）同一映射。
     // 这两个方法曾经漏在网页桥里：设置页调用 `getClineHeaders` 抛

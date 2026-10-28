@@ -402,11 +402,6 @@ pub(super) async fn execute(
         pinned_account: None,
         ignore_model_gate: false,
         proxy_override: None,
-        // 图生图 / 文生图走的是 Images 分派（`images` 字段），与「把图换成
-        // 文字」是两条互斥的路：`forward` 里识图那一步也带了
-        // `images.is_none()` 条件。这里显式置 false，语义更清楚 ——
-        // 「这条请求没跳过识图，只是识图不处理 Images 路径」
-        skip_vision: false,
     };
     let result = match operation {
         image_models::ImageOperation::Generate => state.upstream().generate_images(request).await,

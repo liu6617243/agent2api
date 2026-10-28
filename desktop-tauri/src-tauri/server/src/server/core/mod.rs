@@ -129,5 +129,3 @@ pub mod update;
 pub mod upstream;
 pub mod usage_query;
 pub mod usage_records;
-// 识图（把图换成文字交给纯文本模型）：两段式机制的实施点，见该文件模块头
-pub mod vision;

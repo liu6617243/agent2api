@@ -60,9 +60,6 @@ import {
   type ModelsDevState,
   type NumberField,
   type PromptPatch,
-  type VisionModelOption,
-  type VisionModelsData,
-  type VisionPatch,
 } from './settings-model'
 import {
   INITIAL_SANITIZE, sanitizeStateFrom, type SanitizePatch, type SanitizeState,
@@ -92,7 +89,6 @@ export type BusyScope =
   | 'debug'
   | 'sanitize'
   | 'developerRoleCompat'
-  | 'vision'
   | 'clineHeaders'
   | 'zcodeVersion'
   | 'cors'
@@ -161,30 +157,6 @@ export type DebugState = {
 
 /** 开发者角色兼容开关 */
 export type DeveloperRoleCompatState = { status: LoadStatus; on: boolean }
-
-/**
- * 识图（把图换成文字交给纯文本模型）。
- *
- * 状态行要表达的不只是「开 / 关」，而是三件互相独立的事：
- *   - `selection`：用户**配**了什么（`"off"` / `""` 自动 / `"provider/model"`）；
- *   - `declaring`：对外**是否正在**声明「所有模型都收图」（= 这一步真的生效了）；
- *   - `active`：当前**实际**用哪个模型描述图片（auto 档下是网关替用户挑的）。
- *   - `models`：候选下拉的数据源。
- *
- * 三者分开存而不是派生成一个布尔值：用户要能看出「我配了 A，但实际生效的是 B」
- * 或「配了但没生效」—— 这些状态用 on/off 表达不了。
- */
-export type VisionState = {
-  status: LoadStatus
-  selection: string
-  effort: string
-  declaring: boolean
-  active: { model: string; provider: string | null; effort: string | null } | null
-  /** 候选模型（加载失败时为空数组，下拉退化成「只能手填」） */
-  models: VisionModelOption[]
-  /** 候选表读取失败的提示（空串 = 没失败）；与面板主体状态分开，不拖垮整个面板 */
-  modelsError: string
-}
 
 /** Cline 伪装头：三份表（默认 / 覆盖 / 生效）都来自后端，界面据此渲染与判断改动 */
 export type ClineHeadersState = {
@@ -317,7 +289,6 @@ export type SettingsSnapshot = {
   debug: DebugState
   sanitize: SanitizeState
   developerRoleCompat: DeveloperRoleCompatState
-  vision: VisionState
   clineHeaders: ClineHeadersState
   zcodeVersion: ZcodeVersionState
   cors: CorsState
@@ -452,15 +423,6 @@ const INITIAL: SettingsSnapshot = {
   debug: { status: 'loading', on: false, count: null, limit: null },
   sanitize: INITIAL_SANITIZE,
   developerRoleCompat: { status: 'loading', on: false },
-  vision: {
-    status: 'loading',
-    selection: '',
-    effort: '',
-    declaring: false,
-    active: null,
-    models: [],
-    modelsError: '',
-  },
   clineHeaders: { status: 'loading', defaults: {}, overrides: {}, effective: {} },
   zcodeVersion: { status: 'loading', version: '', envOverride: '' },
   cors: { status: 'loading', on: false },
@@ -1787,124 +1749,6 @@ export async function saveDeveloperRoleCompat(next: boolean): Promise<void> {
   }
 }
 
-/* ─── 识图（图像识别 / Vision）── */
-
-/**
- * 从响应里读出 `active`（当前生效的模型）。
- *
- * 形状不对一律当 null（= 不生效）而不是当「有值」：面板据此显示
- * 「配置了但没生效」，把一个坏字段读成生效会让用户以为功能好好的。
- */
-function readVisionActive(value: unknown): VisionState['active'] {
-  if (!value || typeof value !== 'object') return null
-  const record = value as Record<string, unknown>
-  const model = typeof record.model === 'string' ? record.model : ''
-  if (!model) return null
-  return {
-    model,
-    provider: typeof record.provider === 'string' ? record.provider : null,
-    effort: typeof record.effort === 'string' ? record.effort : null,
-  }
-}
-
-/** 只认字符串元素的候选表（坏条目丢掉，而不是让整个下拉崩掉） */
-function readVisionModels(value: unknown): VisionModelOption[] {
-  if (!Array.isArray(value)) return []
-  const out: VisionModelOption[] = []
-  for (const item of value) {
-    if (!item || typeof item !== 'object') continue
-    const record = item as Record<string, unknown>
-    const provider = typeof record.provider === 'string' ? record.provider : ''
-    const model = typeof record.model === 'string' ? record.model : ''
-    // value 缺了就按 provider/model 自己拼 —— 它是配置里真正要存的形态
-    const fallback = provider && model ? `${provider}/${model}` : ''
-    const option = typeof record.value === 'string' && record.value ? record.value : fallback
-    if (!option) continue
-    out.push({
-      provider,
-      providerLabel: typeof record.providerLabel === 'string' && record.providerLabel
-        ? record.providerLabel
-        : provider,
-      model,
-      name: typeof record.name === 'string' ? record.name : null,
-      value: option,
-    })
-  }
-  return out
-}
-
-/**
- * 渲染识图配置。候选表是另一条独立的取数（`loadVisionModels`），
- * 这里只动配置那几项，保留已有的候选表 —— 保存配置不该把下拉清空。
- */
-export function renderVision(data?: unknown): void {
-  if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ vision: { status: 'unavailable', selection: '', effort: '', declaring: false, active: null, models: [], modelsError: '' } })
-    return
-  }
-  const record = data as Record<string, unknown>
-  const previous = snapshot.vision
-  publish({
-    vision: {
-      ...previous,
-      status: 'ready',
-      selection: typeof record.imageRecognition === 'string' ? record.imageRecognition : '',
-      effort: typeof record.imageRecognitionEffort === 'string' ? record.imageRecognitionEffort : '',
-      declaring: record.declaring === true,
-      active: readVisionActive(record.active),
-    },
-  })
-}
-
-async function loadVisionModels(): Promise<void> {
-  try {
-    const data = (await shared().workbuddyDesktop?.getVisionModels()) as VisionModelsData | null | undefined
-    const models = readVisionModels(data?.models)
-    publish({ vision: { ...snapshot.vision, models, modelsError: '' } })
-  } catch (error) {
-    // 候选表挂了不该让整个面板不可用：手填 provider/model 仍然可行，
-    // 所以这里只记一行提示，status 保持原样
-    publish({ vision: { ...snapshot.vision, models: [], modelsError: errorMessage(error) } })
-  }
-}
-
-export async function loadVision(): Promise<void> {
-  // 两条取数并行：配置决定状态行，候选表只决定下拉内容，互不阻塞
-  await Promise.all([
-    (async () => {
-      try {
-        renderVision(await shared().workbuddyDesktop?.getVision())
-      } catch (error) {
-        console.warn('读取识图设置失败:', errorMessage(error))
-        renderVision(null)
-      }
-    })(),
-    loadVisionModels(),
-  ])
-}
-
-export async function saveVision(patch: VisionPatch): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('vision')
-  // 乐观先行：下拉/输入框立刻显示新值，保存失败再回滚（与其它面板同一手感）
-  const optimistic: Partial<VisionState> = {}
-  if (patch.imageRecognition !== undefined) optimistic.selection = patch.imageRecognition
-  if (patch.imageRecognitionEffort !== undefined) optimistic.effort = patch.imageRecognitionEffort
-  publish({ vision: { ...snapshot.vision, ...optimistic } })
-  try {
-    const saved = await shared().workbuddyDesktop?.saveVision(patch)
-    renderVision(saved)
-    // 生效模型可能变了（改成 off、或点名的模型没账号），状态行要跟着走
-    toast(patch.imageRecognition !== undefined ? t('✅ 识图设置已保存') : t('✅ 识图思考等级已保存'))
-  } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadVision() // 回滚到后端的真实值（含生效模型）
-  } finally {
-    endBusy()
-  }
-}
-
 /* ─── Cline 伪装头（转发头的逐键覆盖）── */
 
 /** 非字符串值一律丢弃（后端只会给字符串，这里是给「形状不对的响应」兜底） */
@@ -2757,7 +2601,6 @@ export async function load(): Promise<void> {
     loadDebug(),
     loadSanitize(),
     loadDeveloperRoleCompat(),
-    loadVision(),
     loadClineHeaders(),
     loadZcodeVersion(),
     loadCors(),
@@ -2821,10 +2664,6 @@ export async function refreshDeveloperRoleCompat(): Promise<void> {
   toast(t('开发者角色兼容设置已刷新'))
 }
 
-export async function refreshVision(): Promise<void> {
-  await loadVision()
-  toast(t('识图设置已刷新'))
-}
 export async function refreshCors(): Promise<void> {
   await loadCors()
   toast(t('网关跨域访问设置已刷新'))

@@ -719,15 +719,6 @@ const BRIDGE_JS: &str = r#"
     saveDeveloperRoleCompat: enabled =>
       call('PUT', '/api/developer-role-compat', { developerRoleCompat: enabled === true }),
 
-    // ── 识图（把图换成文字交给纯文本模型）──
-    // 三个方法与 web_shim.rs 的同名方法逐字同形：`getVision` 读配置（含
-    // `declaring` / `active` 两个后端算好的判定），`saveVision` 写配置（两个键
-    // 都可选，只改一个就只传一个），`getVisionModels` 取候选下拉（只含真的声明
-    // 收图的模型）。漏一侧的症状与 getCors 那段同型：设置页那块显示「不可用」。
-    getVision: () => call('GET', '/api/vision'),
-    saveVision: patch => call('PUT', '/api/vision', patch || {}),
-    getVisionModels: () => call('GET', '/api/vision/models'),
-
     // ── Cline 伪装头 ──
     // 与 getSanitize / saveSanitize 同形：GET 读（overrides + effective），
     // PUT 整体替换覆盖表（空值 = 不发该头，删行 = 回落默认值）。

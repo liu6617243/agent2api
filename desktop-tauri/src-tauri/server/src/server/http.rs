@@ -688,16 +688,6 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/keepalive-strip",
             get(api::keepalive::get_keepalive_strip).put(api::keepalive::put_keepalive_strip),
         )
-        // ── 识图（把图换成文字交给纯文本模型）──
-        // 两个端点形态不同：`/api/vision` 是 GET 读 / PUT 写的配置对，
-        // `/api/vision/models` 是只读候选表（设置页的模型下拉）。都挂
-        // protected：前者决定「要不要对所有模型宣称收图」与「用谁的额度识图」，
-        // 敏感度与上面的开关同级。机制见 `core::vision` 模块头。
-        .route(
-            "/api/vision",
-            get(api::vision::get_vision).put(api::vision::put_vision),
-        )
-        .route("/api/vision/models", get(api::vision::list_vision_models))
         // ── 长度截断的自动续写 ──
         // 与 /api/keepalive-strip 同一族（GET 读 / PUT 写、默认关、改的是客户端
         // 看得见的行为），比它多一项：一个布尔开关 + 一个有界整数（轮数上限）——

@@ -24,10 +24,4 @@ pub mod shape;
 // 取这些名字，保持与拆分前同一条导入路径。
 // `shape_value_text` 是 `shape::value_text` 的别名导出：聚合目录要按 `name`
 // 匹配模型，需要与 `shape` 内部同一套 JS 文本化。
-//
-// `js_truthy` 同样对外：识图（`core::vision` / `api::vision`）要按**与出口条目
-// 同一口径**判定 `supportsImages` —— 自己再写一份真值规则，就会出现「列表里
-// 声明收图、识图却说它不收图」这种自相矛盾。
-pub use shape::{
-    js_truthy, list_item, list_response_from, model_id, suggest_from, value_text as shape_value_text,
-};
+pub use shape::{list_item, list_response_from, model_id, suggest_from, value_text as shape_value_text};

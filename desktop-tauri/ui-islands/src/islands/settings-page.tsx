@@ -71,7 +71,6 @@ import {
   panelLogout,
   refreshDebug,
   refreshDeveloperRoleCompat,
-  refreshVision,
   refreshClineHeaders,
   refreshZcodeVersion,
   refreshCors,
@@ -113,7 +112,6 @@ import {
   saveRetentionField,
   saveRetryField,
   saveDeveloperRoleCompat,
-  saveVision,
   saveTimeoutField,
   saveToggle,
   selectCategory,
@@ -135,7 +133,6 @@ import {
   type ProviderPromptState,
   type SettingsSnapshot,
   type StorageState,
-  type VisionState,
 } from './settings-state'
 // 账号列表的两项偏好与账号页共用同一份 store：设置页写、账号页订阅，
 // 因此两边读写必须走同一组函数（别在这里自己 localStorage.setItem 一份字面量）
@@ -1350,10 +1347,6 @@ function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<str
         </CardContent>
       </Card>
 
-      {/* 识图：网关自己的配置（不依赖插件申报），放这里与上面两个「出站改写」
-          类开关同一分类 —— 它们改的都是「发给上游的副本」。 */}
-      <VisionPanel snap={snap} />
-
       {/* Cline 伪装头：实现与默认值都在插件里，插件没申报就不画。
           放在「网关」分类下是历史位置，语义上它属于插件面板。 */}
       {panels.has('upstream_headers') ? <ClineHeadersPanel snap={snap} /> : null}
@@ -1421,183 +1414,6 @@ function sameOverrides(a: Record<string, string>, b: Record<string, string>): bo
   const keys = Object.keys(a)
   if (keys.length !== Object.keys(b).length) return false
   return keys.every(key => a[key] === b[key])
-}
-
-/* ─── 识图（图像识别 / Vision）───────────────── */
-
-/**
- * 识图面板的状态行。
- *
- * 三种配置形态 × 「是否真的生效」要分开表达：点了名但模型不可用（账号被删 /
- * 未启用）与「自动但目录里没有收图的模型」都**不生效**，但原因完全不同 ——
- * 用一句「已开启」盖过去，用户会以为图片已经在被描述了。
- */
-function visionStateText(state: VisionState): string {
-  if (state.status === 'unavailable') return STATES.visionUnavailable
-  const selection = state.selection.trim()
-  const active = state.active
-  if (selection.toLowerCase() === VISION_OFF) return STATES.visionOff
-  // 状态文案都是「整句 + 接一个值」的形态（同 debugStateText 的写法）：
-  // STATES 里存的是已经过 t() 的前半句，模型名 / 配置值由这里接上去。
-  // 不再把整句二次丢进 t() 当 key —— 那样占位符不会被替换（译文里查无此键，
-  // 原样返回带 {model} 的字面量）。
-  if (!selection) {
-    return active ? `${STATES.visionAuto}${active.model}` : STATES.visionAutoPending
-  }
-  return active ? STATES.visionPinned : `${STATES.visionPinnedMissing}${selection}`
-}
-
-/**
- * 下拉里的两个哨兵档位 + 真实模型值。
- *
- * `关闭` 直接用后端字面量 `off`；`自动` 在后端存的是**空串**，但空串不能当
- * `<SelectItem value>`（Base UI 对空 value 的处理靠实现细节，选中态容易静默
- * 匹配不上），所以界面用哨兵 `auto` 表示，只在提交那一刻换回空串。
- * `auto` 不含 `/`，与真实的 `provider/model` 不可能撞。
- */
-const VISION_OFF = 'off'
-const VISION_AUTO = 'auto'
-
-/** 配置原值 → 下拉的 value（空串 = 自动） */
-function visionSelectValue(selection: string): string {
-  if (selection.toLowerCase() === VISION_OFF) return VISION_OFF
-  return selection === '' ? VISION_AUTO : selection
-}
-
-/** 下拉的 value → 要写进配置的原值（auto → 空串） */
-function visionConfigValue(value: string): string {
-  return value === VISION_AUTO ? '' : value
-}
-
-/**
- * 识图面板：让纯文本模型也能收到图片。
- *
- * 三个控件：选择（关闭 / 自动 / 具体模型）、思考等级（一般留空）、说明。
- * 保存是**部分更新**：改哪一个就只提交哪一个，不会把另一项顺手覆盖。
- *
- * 「自动」档要显示当前挑中了谁（`active`）：自动是个黑盒，只写「自动」两个字
- * 用户没法判断它选得对不对、是不是挑了个昂贵的模型。
- */
-function VisionPanel({ snap }: { snap: SettingsSnapshot }) {
-  const state = snap.vision
-  const ready = state.status === 'ready'
-  const busy = snap.busy === 'vision'
-  const disabled = !ready || busy
-  // 下拉的当前值：配置原值可能是 `off` / 空串（自动）/ provider/model，
-  // 空串在界面上换成哨兵 `auto`（理由见 visionSelectValue）
-  const selection = state.selection
-  const selectValue = visionSelectValue(selection)
-  const active = state.active
-  const selectedLabel = selectValue === VISION_OFF
-    ? t('关闭')
-    : selectValue === VISION_AUTO
-      ? (active ? `${t('自动')} · ${active.model}` : t('自动'))
-      : selection
-
-  // 思考等级是自由文本（各家档位名不统一），用草稿 + 失焦提交，
-  // 与 NumberRow 同一手感；值没变就不发请求
-  const [effortDraft, setEffortDraft] = React.useState<string | null>(null)
-  const effortText = effortDraft !== null ? effortDraft : state.effort
-
-  function commitEffort(): void {
-    const next = effortDraft
-    setEffortDraft(null)
-    if (next === null) return
-    if (next.trim() === state.effort) return
-    void saveVision({ imageRecognitionEffort: next.trim() })
-  }
-
-  return (
-    <Card render={<section />} className='panel'>
-      <PanelHead
-        title={t('识图')}
-        tip={TIPS.vision}
-        badge={ready
-          ? (state.declaring
-            ? <StatusBadge tone='ok'>{t('已生效')}</StatusBadge>
-            : <StatusBadge tone='bad'>{t('未生效')}</StatusBadge>)
-          : state.status === 'unavailable'
-            ? <StatusBadge tone='bad'>{t('不可用')}</StatusBadge>
-            : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
-        actions={<RefreshButton id='btn-vision-refresh' onClick={() => void refreshVision()} />}
-      />
-      <CardContent className='panel-body'>
-        <div className='retention-row'>
-          <label htmlFor='settings-vision-model'>{t('识图模型')}</label>
-          <span className='prompt-input'>
-            <Select
-              value={selectValue}
-              onValueChange={(next: unknown) => {
-                // Base UI 在「清空 / 取消选择」时回调 null：这一档没有「未选中」
-                // 语义（三个档位总有一个），当成没操作直接返回
-                if (next == null) return
-                const value = String(next)
-                const configValue = visionConfigValue(value)
-                if (configValue === selection) return
-                void saveVision({ imageRecognition: configValue })
-              }}
-            >
-              <SelectTrigger
-                id='settings-vision-model'
-                className='w-[280px]'
-                disabled={disabled}
-                aria-label={t('用哪个模型描述图片')}
-              >
-                <SelectValue>{selectedLabel}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={VISION_OFF}>{t('关闭（不声明收图，图片原样透传）')}</SelectItem>
-                <SelectItem value={VISION_AUTO}>{t('自动（网关挑一个收图的模型）')}</SelectItem>
-                {state.models.map(item => (
-                  <SelectItem key={item.value} value={item.value}>
-                    {/* 带家名的标签：不同家的同名模型必须能分辨 */}
-                    {item.name ? `${item.providerLabel} · ${item.name}` : `${item.providerLabel} · ${item.model}`}
-                  </SelectItem>
-                ))}
-                {/* 配了但候选表里没有（模型下架 / 账号被删）：把这个值本身列出来，
-                    否则 Select 找不到匹配项会显示空白，看起来像「什么都没配」。
-                    `auto` 是界面哨兵，不是真实配置值，排除掉。 */}
-                {selectValue !== VISION_OFF && selectValue !== VISION_AUTO
-                  && !state.models.some(item => item.value === selection)
-                  ? <SelectItem value={selection}>{selection}</SelectItem>
-                  : null}
-              </SelectContent>
-            </Select>
-          </span>
-          <div className='hint'>
-            {state.models.length
-              ? t('候选只有目录里声明收图的模型（共 {count} 个）。', { count: String(state.models.length) })
-              : (state.modelsError
-                ? t('候选列表读取失败（{message}），可直接手填 provider/model。', { message: state.modelsError })
-                : t('目录里没有声明收图的模型 —— 先在「账号」里加一个能看图的账号。'))}
-          </div>
-        </div>
-
-        <div className='retention-row'>
-          <label htmlFor='settings-vision-effort'>{t('思考等级')}</label>
-          <span className='retention-input'>
-            <Input
-              id='settings-vision-effort'
-              className='w-[180px]'
-              placeholder={t('留空 = 不指定')}
-              value={effortText}
-              disabled={disabled}
-              onChange={event => setEffortDraft(event.target.value)}
-              // 聚焦时把生效值抄进草稿：不抄的话第一次输入会从空开始，
-              // 而屏幕上显示的是已有值（看起来像把值吃掉了）
-              onFocus={() => setEffortDraft(state.effort)}
-              onBlur={commitEffort}
-              onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }}
-            />
-          </span>
-          <div className='hint'>{TIPS.visionEffort}</div>
-        </div>
-
-        <div className='settings-state'>{visionStateText(state)}</div>
-        <div className='hint retention-note'>{NOTES.vision}</div>
-      </CardContent>
-    </Card>
-  )
 }
 
 /**

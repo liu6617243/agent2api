@@ -225,8 +225,6 @@ pub async fn chat_completions(
             // 是模型测试的直达跳，见 `ForwardRequest` 的说明）
             ignore_model_gate: false,
             proxy_override: None,
-            // 生产主链路：含图请求照常走识图（把图换成文字给纯文本模型）
-            skip_vision: false,
         })
         .await;
     let stats = state.request_stats();

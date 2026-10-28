@@ -9,8 +9,7 @@ use crate::server::core::capability;
 use crate::server::core::key_scope::{self, KeyScope};
 use crate::server::core::model_meta;
 use crate::server::core::model_rules;
-use crate::server::core::models::{list_response_from, model_id, suggest_from};
-use crate::server::core::vision;
+use crate::server::core::models::{list_item, list_response_from, model_id, suggest_from};
 
 use super::routing::{builtin_target, entry_id_in_manifest};
 use super::{active_manifests, aggregate_source, managed_manifests, manifest_for_provider, refresh_meta_for_provider};
@@ -40,11 +39,7 @@ fn advertised_names(
 
 /// 先在各提供商内判断绑定，再按对外名去重；不能先合并上游 ID 再拼别名，
 /// 否则某家关闭的映射会借另一家的同名上游重新出现在列表中。
-///
-/// `declare_images` = 识图功能当前的「对外声明所有模型都收图」开关
-/// （`vision::declares_images`）。由 [`models_response`] 算**一次**再传进来，
-/// 不在这里逐条目重算 —— 那是逐条读全局配置 + 扫目录。
-fn public_builtin_items(active: &[(String, Vec<Value>)], declare_images: bool) -> Vec<(String, Value)> {
+fn public_builtin_items(active: &[(String, Vec<Value>)]) -> Vec<(String, Value)> {
     let rules = model_rules::current();
     let mut claimed = std::collections::HashMap::<String, usize>::new();
     let mut result: Vec<(String, Value)> = Vec::new();
@@ -53,7 +48,7 @@ fn public_builtin_items(active: &[(String, Vec<Value>)], declare_images: bool) -
         for name in names {
             let Some(wire) = builtin_target(&rules, provider, manifest, &name) else { continue };
             let Some(upstream) = manifest.iter().find(|item| model_id(item) == wire.model) else { continue };
-            let mut item = vision::listed_item(upstream, provider, declare_images);
+            let mut item = list_item(upstream, provider);
             if let Some(index) = claimed.get(&name.to_lowercase()).copied() {
                 let existing = &mut result[index].1;
                 if item.get("supports_image_editing").and_then(Value::as_bool) == Some(true)
@@ -84,15 +79,12 @@ pub fn models_response(store: &AccountStore, scope: Option<&KeyScope>) -> Value 
         .filter(|(provider, _)| key_scope::allows_provider(scope, provider))
         .collect();
     let (source, refreshed_at) = aggregate_source(&active);
-    // 识图是否对外声明「所有模型都收图」：整份响应只判一次（解析带 TTL 缓存，
-    // 但每次调用仍要过一遍配置读取，没必要逐条重复）
-    let declare_images = vision::declares_images(store);
-    let mut data: Vec<_> = public_builtin_items(&active, declare_images).into_iter()
+    let mut data: Vec<_> = public_builtin_items(&active).into_iter()
         .map(|(_, item)| item)
         .filter(|item| key_scope::allows_model(scope, &model_id(item)))
         .collect();
     let builtin_count = data.len();
-    super::super::custom::append_models_response(store, scope, &mut data, declare_images);
+    super::super::custom::append_models_response(store, scope, &mut data);
     let source = if data.len() > builtin_count { "aggregate" } else { source };
     list_response_from(data, source, refreshed_at)
 }
@@ -143,9 +135,7 @@ pub fn session_models(store: &AccountStore) -> Vec<Value> {
 pub fn models_by_provider(store: &AccountStore) -> Value {
     let mut map = Map::new();
     for (provider, manifest) in active_manifests(store) {
-        // 这个视图只回答「这家里有哪些名字」，不参与对外能力声明 ——
-        // 传 false，条目形态与开启识图前逐字节一致
-        let mut names: Vec<_> = public_builtin_items(&[(provider.clone(), manifest)], false).into_iter()
+        let mut names: Vec<_> = public_builtin_items(&[(provider.clone(), manifest)]).into_iter()
             .map(|(_, item)| model_id(&item)).collect();
         names.sort_by_key(|name| name.to_lowercase());
         map.insert(provider, json!(names));
