@@ -998,6 +998,9 @@ async fn forward_round_with(
             pinned_account: None,
             ignore_model_gate: false,
             proxy_override: None,
+            // 续写轮的 body 来自上一轮（图多半已被替换成文字），照常走识图
+            // —— 上一轮若因识图失败或功能关闭而保留了原图，这一轮仍有救回机会
+            skip_vision: false,
         })
         .await
 }

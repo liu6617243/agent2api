@@ -167,6 +167,17 @@ pub struct RuntimeConfig {
     /// （改完开关下一个请求就生效，不重启进程），解析一次存下来最省事。
     /// 语义与默认值见 `KEY_DEVELOPER_ROLE_COMPAT`。
     developer_role_compat: bool,
+    /// 识图配置（设置页「网关 → 图像识别」）。
+    ///
+    /// 与 `developer_role_compat` 同一理由：转发层每次发送前、`/v1/models`
+    /// 每次出口都要判一次（改完下一个请求就生效，不重启进程）。
+    ///
+    /// 空串 = auto（网关自己挑识图模型），`"off"` = 关闭，其余是
+    /// `"<provider>/<model>"` 点名。语义见 `KEY_IMAGE_RECOGNITION`。
+    image_recognition: String,
+    /// 识图模型的思考等级覆盖（空串 = 用模型自己的默认）。见
+    /// `KEY_IMAGE_RECOGNITION_EFFORT`。
+    image_recognition_effort: String,
     /// **Cline 转发头的逐键覆盖**（设置页「Cline 伪装头」）。
     ///
     /// 存的只是**用户改过的键**（覆盖表），默认值硬编码在
@@ -307,6 +318,18 @@ impl RuntimeConfig {
     /// 开发者角色兼容是否开启（转发层每次发送前判一次，见字段说明）
     pub fn developer_role_compat(&self) -> bool {
         self.developer_role_compat
+    }
+
+    /// 识图配置的**取值**（`off` / 空串 auto / `"provider/model"`）。
+    ///
+    /// 转发层与 `/v1/models` 出口逐请求读，见 `KEY_IMAGE_RECOGNITION`。
+    pub fn image_recognition(&self) -> &str {
+        &self.image_recognition
+    }
+
+    /// 识图模型的思考等级覆盖（空串 = 不覆盖）
+    pub fn image_recognition_effort(&self) -> &str {
+        &self.image_recognition_effort
     }
 
     /// 网关面（`/v1/*`）跨域访问是否开启（CORS 中间件逐请求判一次，见字段说明）
@@ -581,6 +604,23 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
             .get(KEY_DEVELOPER_ROLE_COMPAT)
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        // 识图：缺失 → auto（空串）。刻意**不默认 off**：默认关等于这个功能
+        // 永远不被发现（用户要自己去设置页打开才知道有它）。而自动档在
+        // 「一个声明收图的模型都没有」时不声明、不描述（见 `core::vision`），
+        // 与 off 等价 —— 于是默认值的代价是零，不需要用户先做什么。
+        // 值只收字符串：手改库写成布尔/数字的项回落 auto（`off` 必须字面写）。
+        image_recognition: raw
+            .get(KEY_IMAGE_RECOGNITION)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string(),
+        image_recognition_effort: raw
+            .get(KEY_IMAGE_RECOGNITION_EFFORT)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string(),
         // Cline 伪装头覆盖表：只收 string → string 的项（手改库写出数字/布尔
         // 值的项直接忽略 —— 头值只会是文本），缺失 = 全默认
         cline_upstream_headers: cline_headers_from(&raw),
@@ -1138,6 +1178,31 @@ pub fn auto_continue() -> bool {
         }
     }
     env_auto_continue()
+}
+
+/// 只取识图两项配置的轻量读取（**不克隆整份 raw**），返回 `(选择, 思考等级)`。
+///
+/// 与 [`auto_continue`] 同一取舍：`core::vision::resolve` 在**每个含图请求**
+/// 上问一次（它随后还要扫目录，那已经不便宜），而 `current()` 每次都克隆整个
+/// `raw` Map（含提示词全文那几百行）—— 为读两个短字符串付那个代价没必要。
+///
+/// 名字带 `_of` 后缀是为了与 [`RuntimeConfig::image_recognition`] 那个 getter
+/// 区分开（同名的自由函数与实例方法混在一起，读代码时很容易看错成「快照上的
+/// 一次字段读」，而它其实是一次加锁 + 两次克隆）。
+///
+/// 返回**克隆的两个短串**（不是切片）：`RuntimeConfig` 活在 `RwLock` 的 guard
+/// 里，guard 一 drop 切片就悬空。两个短串的克隆可以忽略，而整份 `raw` 的克隆
+/// 不可以 —— 这才是本函数的取舍点。
+///
+/// 未初始化时返回空串（= auto），与 `current()` 在同样情形下 `build(空)` 的
+/// 口径一致。
+pub fn image_recognition_of() -> (String, String) {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return (config.image_recognition.clone(), config.image_recognition_effort.clone());
+        }
+    }
+    (String::new(), String::new())
 }
 
 /// 只取续写轮数上限的轻量读取（**不克隆整份 raw**）。
@@ -1813,6 +1878,36 @@ pub fn set_developer_role_compat(enabled: bool) -> bool {
             .raw
             .insert(KEY_DEVELOPER_ROLE_COMPAT.to_string(), Value::Bool(enabled));
         config.developer_role_compat = enabled;
+    })
+}
+
+// ─── 识图（imageRecognition / imageRecognitionEffort）──────────
+
+/// 写入识图配置。`value` 由调用方（`api::vision`）校验后传入：
+/// `"off"` / 空串（auto）/ `"provider/model"`。
+///
+/// 与 `set_developer_role_compat` 同一模式：内存快照与 raw 底稿一起改 ——
+/// 前者让下一个请求立刻用新值，后者保证写盘时不吃掉 config.json 里的其它字段。
+/// 返回是否落盘成功（失败时内存仍已更新，见调用点）。
+pub fn set_image_recognition(value: &str) -> bool {
+    let value = value.trim().to_string();
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_IMAGE_RECOGNITION.to_string(), Value::String(value.clone()));
+        config.image_recognition = value;
+    })
+}
+
+/// 写入识图思考等级覆盖（空串 = 清掉覆盖）。
+pub fn set_image_recognition_effort(value: &str) -> bool {
+    let value = value.trim().to_string();
+    update(|config| {
+        config.raw.insert(
+            KEY_IMAGE_RECOGNITION_EFFORT.to_string(),
+            Value::String(value.clone()),
+        );
+        config.image_recognition_effort = value;
     })
 }
 

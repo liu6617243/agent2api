@@ -136,6 +136,34 @@ pub const KEY_SANITIZE_FINGERPRINTS: &str = "sanitizeBlacklistFingerprints";
 /// 转换实施点见 `core::upstream::payload`（send_body 的角色归一层）。
 pub const KEY_DEVELOPER_ROLE_COMPAT: &str = "developerRoleCompat";
 
+/// 识图配置（config.json 键，设置页「网关 → 识图」）。
+///
+/// 取值三态：
+///   - `"off"`：关闭（既不对内识图，也不对外声明收图）；
+///   - `""`（空串）/ 缺键：**auto** —— 在目录里确定性地挑一个声明收图的模型；
+///   - `"<provider>/<model>"` / `"<model>"`：用户点名的固定识图模型。
+///
+/// 这个键同时驱动两件事，缺一不可：
+///   ① **对外声明所有模型都收图**（`core::providers::catalog` 的出口）；
+///   ② **网关内部把图换成文字**（`core::vision`）—— 纯文本模型才接得住。
+///
+/// 只做 ② 等于白做（客户端按 `/v1/models` 的声明决定要不要把图交出来，
+/// 标成纯文本时它根本不会请求网关，而是自己在本地绕）；只做 ① 更糟（图来了
+/// 却描述不了，纯文本上游直接报错）。完整机制见 `core::vision` 的模块头。
+///
+/// **默认 auto**（缺键 → 空串）：刻意不默认 `off` —— 默认关等于这个功能永远
+/// 不被发现（用户得自己去设置页打开才知道有它）。而 auto 档在「一个声明收图的
+/// 模型都没有」时不声明、不描述（见 `core::vision`），与 off 等价，
+/// 于是默认值的代价是零。识图要多打一次上游请求（一份额度、一段首字延迟），
+/// 用户可以随时在这里写 `off` 关掉。
+pub const KEY_IMAGE_RECOGNITION: &str = "imageRecognition";
+
+/// 识图模型的**思考等级**覆盖（config.json 键，可选）。
+///
+/// 空串 = 用该模型自己的默认档。magpie 的 `VisionEffort` 同义：描述一张密集
+/// 截图时抬高思考档能显著减少漏读，但便宜的模型不值得，所以做成可选而不是默认值。
+pub const KEY_IMAGE_RECOGNITION_EFFORT: &str = "imageRecognitionEffort";
+
 /// **Cline 转发头的逐键覆盖**（config.json 键）。
 ///
 /// 形状：`{"User-Agent": "Cline/3.0.62", ...}`（string → string）。语义是

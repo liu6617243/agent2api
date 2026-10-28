@@ -148,6 +148,10 @@ pub mod subscriptions;
 pub mod timeouts_api;
 pub mod update;
 pub mod upgrade_api;
+// 识图配置（GET/PUT /api/vision、GET /api/vision/models）：两段式机制
+// （对外声明收图 + 内部把图换成文字）的实施点见 `core::vision` 与
+// `core::upstream::vision_step` 的模块头
+pub mod vision;
 // 活动套餐通道的人机验证令牌池（界面铸造 → 网关消费），见该文件模块头
 pub mod zcode_captcha;
 // 令牌池的**补货节奏**设置（目标 / 轮询间隔 / 单轮上限），见该文件模块头

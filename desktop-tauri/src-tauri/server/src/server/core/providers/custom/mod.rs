@@ -5,7 +5,8 @@ use serde_json::Value;
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::custom_providers;
 use crate::server::core::key_scope::{self, KeyScope};
-use crate::server::core::models::{list_item, model_id};
+use crate::server::core::models::model_id;
+use crate::server::core::vision;
 
 /// 余额查询：七种方案（sub2api / NewAPI / DeepSeek / OpenCode Go / 商汤日日新 /
 /// 智谱 / 智谱 z.ai 国际）的编排。方案由提供商记录的 `balanceScheme` 决定
@@ -29,7 +30,15 @@ pub(crate) fn catalog_providers(store: &AccountStore) -> Vec<(String, Vec<Value>
     }).collect()
 }
 
-pub fn append_models_response(store: &AccountStore, scope: Option<&KeyScope>, data: &mut Vec<Value>) {
+/// `declare_images` 与内置家同一个开关（由 `catalog::view::models_response`
+/// 算一次后传进来）：**要声明就全套声明** —— 只给内置家声明、漏掉自定义家，
+/// 用户在自定义家上贴图仍会被客户端在本地挡掉，等于功能对一半人无效。
+pub fn append_models_response(
+    store: &AccountStore,
+    scope: Option<&KeyScope>,
+    data: &mut Vec<Value>,
+    declare_images: bool,
+) {
     let mut claimed: std::collections::HashSet<_> = data.iter()
         .map(|item| model_id(item).to_lowercase()).collect();
     for (provider, models) in catalog_providers(store) {
@@ -37,7 +46,7 @@ pub fn append_models_response(store: &AccountStore, scope: Option<&KeyScope>, da
         for model in models {
             let id = model_id(&model);
             if key_scope::allows_model(scope, &id) && claimed.insert(id.to_lowercase()) {
-                data.push(list_item(&model, &provider));
+                data.push(vision::listed_item(&model, &provider, declare_images));
             }
         }
     }

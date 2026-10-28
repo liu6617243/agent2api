@@ -119,6 +119,9 @@ async fn forward_chat(
             // 是模型测试的直达跳，见 `ForwardRequest` 的说明）
             ignore_model_gate: false,
             proxy_override: None,
+            // Responses / Anthropic 两个协议入口同样收图（`input_image` /
+            // Anthropic 的 `image` 进转发层前已归一成 Chat 形态），走识图
+            skip_vision: false,
         })
         .await;
     // 续写包装：流式在下游状态机接手之前把整条流换掉（终止帧必须在

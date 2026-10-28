@@ -10,9 +10,10 @@ mod view;
 use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::custom_providers;
 use crate::server::core::model_meta;
 use crate::server::core::model_rules;
-use crate::server::core::models::model_id;
+use crate::server::core::models::{js_truthy, model_id};
 use crate::server::core::providers::adapter::adapter_by_id;
 use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind, PROVIDERS};
 
@@ -98,6 +99,63 @@ pub fn active_manifests(store: &AccountStore) -> Vec<(String, Vec<Value>)> {
             .unwrap_or_default();
         (!manifest.is_empty()).then_some((provider, manifest))
     }).collect()
+}
+
+/// 某家在本进程里承载 `entry_model` 时，是否声明支持图片输入。
+///
+/// ── 为什么要先解析「该家实际发送的 target」────────────────────
+/// 一个对外的请求名（映射别名）在**承载它的那些家**的清单里通常不存在：
+/// 别名 `deepseek-v4.1-flash` 由三条映射分别指向 `glm-5.3-flash`、
+/// `qwen3.8-flash`、`deepseek-v4.1-flash`，而 glm / qwen 两家的目录里根本
+/// 没有 `deepseek-v4.1-flash` 这个名字。直接拿入口名去查，这两家必然查不到
+/// 条目、返回 false。
+///
+/// 因此先经 [`routing::wire_target_for_provider`] 解析出「**这一家实际会发送
+/// 的那个模型名**」（与发送侧改写同源），再拿它去这家的清单里查
+/// `supportsImages`。
+///
+/// 认不出的家 / 认不出的 target → `false`（保守：不声称有视觉）。
+///
+/// ── 与 3.1.0 那条线的差别 ───────────────────────────────────
+/// 老实现按 `ProviderKind` 取清单（`manifest_for(kind)`）；beta.4 已把内置家
+/// 全部迁到插件宿主，清单按**字符串 id** 取（`manifest_for_provider`），所以
+/// 这里不再需要 kind 分支。
+pub fn provider_supports_images(provider_id: &str, entry_model: &str) -> bool {
+    if custom_providers::is_custom_provider_id(provider_id) {
+        // 自定义家：存储条目里能力位嵌在 `capabilities` 对象里，平铺的
+        // `supportsImages` 只在对外条目上 —— 走 `public_models`（与
+        // `/v1/models` 同源：登记覆盖 > models.dev > 未声明）。自定义家没有
+        // `wire_target_for_provider` 那套改写，别名条目的能力本来取自 target，
+        // 直接按来电名比对即可。
+        return custom_provider_supports_images(provider_id, entry_model);
+    }
+    // 认不出的家走 `manifest_for_provider` 的空清单 → `false`，不必单独判 ——
+    // 那个函数里 `adapter_by_id` 查不到就返回空 Vec（beta.4 的家身份由适配器
+    // 注册决定，`PROVIDERS` 只是编译期遗留的静态表）
+    let target = routing::wire_target_for_provider(entry_model, provider_id, None);
+    item_supports_images(&manifest_for_provider(provider_id), &target.model)
+}
+
+/// 在一条清单里按模型 id 定位条目，取它的 `supportsImages`（与 `/v1/models`
+/// 出口同一真值口径，见 `models::js_truthy`）。
+fn item_supports_images(manifest: &[Value], model: &str) -> bool {
+    manifest
+        .iter()
+        .find(|item| model_id(item).eq_ignore_ascii_case(model))
+        .and_then(|item| item.get("supportsImages"))
+        .map(js_truthy)
+        .unwrap_or(false)
+}
+
+/// 自定义家：能力位判读与内置家同源 —— 读 `custom_providers::public_models`
+/// 产出的**对外条目**（`/v1/models` 就发这份），而不是原始存储。
+fn custom_provider_supports_images(provider_id: &str, model: &str) -> bool {
+    let Some(provider) = custom_providers::list().into_iter().find(|provider| {
+        provider.get("id").and_then(Value::as_str) == Some(provider_id)
+    }) else {
+        return false;
+    };
+    item_supports_images(&custom_providers::public_models(&provider), model)
 }
 
 fn aggregate_source(active: &[(String, Vec<Value>)]) -> (&'static str, i64) {

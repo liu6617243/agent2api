@@ -319,6 +319,50 @@ export type ClineHeadersData = {
   effective: Record<string, string>
 }
 
+/**
+ * 识图（图像识别）配置的响应（GET 与 PUT 同形，键与后端 api/vision.rs 一致）。
+ *
+ * `imageRecognition` 三个取值形态：`"off"` 关闭、`""` 自动、`"<provider>/<model>"`
+ * 点名。界面把它直接当「当前选中的值」用 —— 三种形态在同一个字符串里，
+ * 与后端配置存的是同一个东西，不做额外的枚举映射（多一层映射就多一处能写歪）。
+ */
+export type VisionData = {
+  /** 模型选择：`"off"` / `""`（自动）/ `"<provider>/<model>"` */
+  imageRecognition: string
+  /** 思考等级覆盖（自定义模型用来压思考；空串 = 不覆盖） */
+  imageRecognitionEffort: string
+  /** 对外是否**正在**声明「所有模型都收图」（= 这一步真的生效了） */
+  declaring: boolean
+  /**
+   * 当前**生效**的识图模型（auto 档下就是它替用户挑中的那个），或 null。
+   * auto 是个黑盒，不显示这一行用户没法判断选得对不对。
+   */
+  active: { model: string; provider: string | null; effort: string | null } | null
+}
+
+/** 识图候选模型（`GET /api/vision/models` 的一项） */
+export type VisionModelOption = {
+  provider: string
+  providerLabel: string
+  model: string
+  name: string | null
+  /** 直接填进配置的整串 `provider/model`（后端拼好，前端不再拼一次） */
+  value: string
+}
+
+/** `GET /api/vision/models` 的响应 */
+export type VisionModelsData = {
+  /** 当前配置值，前端据此高亮「正在用的是哪个」 */
+  imageRecognition: string
+  models: VisionModelOption[]
+}
+
+/** 识图配置的写入载荷：**部分更新**，只带改动的键 */
+export type VisionPatch = {
+  imageRecognition?: string
+  imageRecognitionEffort?: string
+}
+
 /** 本页用到的壳 / HTTP 桥（方法名与 bridge.rs 一一对应，一个都不能改） */
 export type SettingsBridge = {
   /** 'desktop' | 'web'：面板登录那一块只在网页端有意义 */
@@ -341,6 +385,9 @@ export type SettingsBridge = {
   saveSanitize(patch: boolean | SanitizePatch): Promise<unknown>
   getDeveloperRoleCompat(): Promise<unknown>
   saveDeveloperRoleCompat(enabled: boolean): Promise<unknown>
+  getVision(): Promise<unknown>
+  saveVision(patch: VisionPatch): Promise<unknown>
+  getVisionModels(): Promise<unknown>
   getClineHeaders(): Promise<unknown>
   saveClineHeaders(overrides: Record<string, string>): Promise<unknown>
   getZcodeVersion(): Promise<unknown>
@@ -843,6 +890,8 @@ export const TIPS = {
   retention: t('日志与请求日志同时受保留天数和数量上限限制。日志默认 30 天、10000 条，各级别按比例保留；调试详情最多保留 3 天。请求日志默认 99999 天、1000000 条（100 万），超出后从最旧的记录开始清理，并同步删除对应原始正文。按天聚合默认 99999 天，只按天数保留，不受请求日志数量清理影响。天数可填 1–99999，数量可填 1–100000000。调小任一设置并确认后立即清理，且不可恢复。'),
   storage: t('全部数据（账号、事件日志、请求记录、调试报文、设置）统一保存在配置目录下的 agent2api.db 这一个 SQLite 数据库里。备份时只需拷贝这个文件；更换保存位置请设置环境变量 AGENT2API_PROXY_HOME 后重启程序。'),
   modelsDev: t('models.dev 是一个开源的模型资料库（社区维护），这里用它补齐「上游没告诉我们」的模型能力：上下文窗口、最大输出、工具调用、图片、视频、是否支持思考，以及这个模型认识哪些思考档位。优先级是：你在「模型能力」里手工改的值 > 上游清单自己声明的值 > models.dev 的值 —— 它只填上游没声明的空位，从不推翻上游已声明的。网关随包内嵌了一份快照，所以离线、首次启动、访问不通时也有数据；开启时会按「模型目录刷新」任务的间隔联网更新（同一轮里一并刷新，也可在这里立即刷新）。关闭只停联网刷新，已经拿到的数据继续用。'),
+  vision: t('让纯文本模型也能收到图片。客户端发请求前会先看 /v1/models 里声明的能力：模型被标成纯文本，它根本不会把图发出，而是自己在本地找 OCR、把图删掉、或直接提示「不支持图像输入」。开启本项后网关做两件事：① 对**所有**模型统一声明「收图」，客户端因此愿意把图交出来；② 收到图后，先交给下面点名的那个视觉模型描述成文字，再把这段文字插回原位置交给原本要答的模型 —— 于是纯文本模型读到的是图片的文字说明，看图能力等于借来的。默认「自动」，网关在目录里挑一个声明收图的模型；也可以点名固定某一个（推荐：钉住一个稳定的视觉模型，行为可预期）。代价是每张图会多花一次视觉模型的额度，同一张图有缓存（按模型 + 图片内容算键），重复发不重复花钱。关闭后一切照旧：不声明收图，图片原样透传。'),
+  visionEffort: t('只对**认思考等级**的视觉模型有意义（如 Gemini 系）：值填进子请求的 reasoning_effort。描述图片是读取任务而不是推理任务，档位调高通常没有收益、只会更慢更贵，一般留空即可。留空 = 不传这个字段，由模型自己决定。'),
 } as const
 
 /** 面板底注（`.hint.retention-note`）与各面板内的说明行 */
@@ -855,6 +904,7 @@ export const NOTES = {
   retryCodes: t('命中这些上游状态码的失败不在同一账号重发，直接换下一个账号继续试（换号占用「切换账号重试次数」，换满仍失败才把错误原样返回给客户端）。输入 100–599 的状态码后回车添加，点 × 或退格删除；默认 402（积分不足）。清空全部表示任何错误都照常重试。'),
   sanitize: t('默认开启并应用全部提供商。编辑词表或应用范围后点击「保存设置」，下一次请求立即生效，不用重启。命中明细仍记进请求日志的「敏」标签。'),
   developerRoleCompat: t('默认开启。只改 role 字段本身，消息内容与顺序都不动；本项只改发给上游的副本，客户端看到的响应内容不变。'),
+  vision: t('保存后下一个请求立即生效，不用重启。候选列表只列出**目录里声明收图**的模型；列表为空说明当前没有任何能识图的账号，先去「账号」里加一个视觉模型（如 Gemini / GLM 的视觉版）。「自动」在目录里有多个候选时挑选结果可能因为账号增减而变化，要稳定行为就点名一个。'),
   clineHeaders: t('值与默认值相同的行不占覆盖（存的是「改过的键」，不是全量配置）；值留空保存表示这个头不发送，删除改过的行表示回落默认值。改完立即生效，不用重启。'),
   zcodeVersion: t('留空 = 用插件内置的默认版本号（每期活动由插件跟随官方更新）。只有遇到「官方客户端里能看到活动、这里探测为空」时才需要填：那种情况几乎都是上游抬高了版本门槛，而版本落后的表现是一份空列表而不是报错。按官方客户端当前版本填（形如 3.16.2），保存后回到套餐明细刷新一次即刻生效。环境变量 ZCODE_APP_VERSION 若已设置，优先级高于这里。'),
   cors: t('默认关闭。改动立即生效，不用重启；关闭期间的跨源请求会被预检拦下。'),
@@ -895,6 +945,15 @@ export const STATES = {
   roleCompatUnavailable: t('未能读取开发者角色兼容设置，请稍后重试'),
   roleCompatOn: t('正在归一角色：developer 角色消息转发前改写为 system。'),
   roleCompatOff: t('未开启，developer 角色消息会原样发往上游，不认识该角色的上游会报错（400）。'),
+  visionUnavailable: t('未能读取识图设置，请稍后重试'),
+  visionOff: t('已关闭：所有模型按实际能力声明，纯文本模型仍会被客户端当成不能看图。'),
+  /** 自动档且已生效；生效模型名由视图层接在后面（同 debugOn 的写法） */
+  visionAuto: t('自动：由目录里挑中的模型描述图片，当前是'),
+  visionAutoPending: t('自动：目录里没有声明收图的模型，当前不生效 —— 请先添加一个能看图的账号。'),
+  /** 点名且已生效；模型名接在后面 */
+  visionPinned: t('已钉住：所有图片都先交给下方模型描述成文字。'),
+  /** 点名但不生效；点名的值接在后面 */
+  visionPinnedMissing: t('已保存，但该模型当前不可用（账号被删或未启用），识图暂不生效：'),
   corsUnavailable: t('未能读取网关跨域访问设置，请稍后重试'),
   corsOn: t('正在应答跨源请求：浏览器跨域请求可直连 /v1/*。'),
   corsOff: t('未开启，浏览器跨域无法直连网关。'),

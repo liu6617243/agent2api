@@ -61,6 +61,8 @@ pub mod sse;
 pub mod stall;
 pub mod translate;
 pub mod usage;
+// 识图的执行（把图片块换成文字描述）：见 `vision_step` 的模块头
+mod vision_step;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -250,6 +252,16 @@ pub struct ForwardRequest {
     /// - `Some(None)`：本次强制直连（忽略账号绑定的代理，且不回退系统代理）；
     /// - `Some(Some(proxy))`：本次强制走指定代理节点。
     pub proxy_override: Option<Option<ResolvedProxy>>,
+    /// **跳过识图步骤**（`core::vision` 把图换成文字的那一步）。
+    ///
+    /// 生产链路一律 `false`。唯一的 `true` 来自识图**自己的**那次上游请求：
+    /// 描述请求本身也是一个转发（要走完整的选路 / 重试 / 限流），若它也去
+    /// 识图就会无限递归 —— 这个字段就是那条递归的出口。
+    ///
+    /// 为什么不用「探测请求体里有没有图」来自动判断：识图请求体里本来就
+    /// 可能有图（描述一张图得先把图发过去），靠内容无法区分「要给用户
+    /// 识图」与「识图自己发的请求」。
+    pub skip_vision: bool,
 }
 
 /// 转发结果：要么是可直接下发的流，要么是聚合好的 JSON
@@ -406,6 +418,31 @@ impl UpstreamService {
                 "[Upstream]",
                 &format!("历史 sanitize：{}", history.describe()),
             );
+        }
+        // ── 识图：把图换成文字（`config::KEY_IMAGE_RECOGNITION`）──────────
+        // 位置刻意在**历史 sanitize 之后、选路之前**：
+        //   · 在 sanitize 之后 —— 这一步只动图片块，与工具历史互不干涉；放在
+        //     它之前也不会错，但那时 body 还可能被 sanitize 再改一次，白跑一趟。
+        //   · 在选路之前 —— 图必须**在挑家之前**就变成文字，否则
+        //     `provider_loop` 的图片能力过滤会看到图、把候选收窄到「声明收图
+        //     的那些家」，而这正是这个功能要绕开的行为（用户的诉求是「纯文本
+        //     模型也能接图」，不是「含图请求改派给视觉模型」）。变成文字后那条
+        //     过滤对纯文本请求零成本直通。
+        //   · Images 路径（图片生成 / 编辑）**必须跳过**：它的 body 里带的是
+        //     待编辑的原图，把它描述成文字等于毁掉这次请求。`images` 为
+        //     `Some(_)` 时一律不碰。
+        //
+        // 失败不影响主请求：描述拿不到就**保留原图原样往下发**（见
+        // `describe_images` 的失败分支）—— 那时纯文本上游会报错，但那是上游
+        // 对事实的如实回答，比网关自己编一段空描述诚实。
+        if !request.skip_vision && images.is_none() {
+            let replaced = self.describe_images(&mut upstream_body).await;
+            if let Some(count) = replaced {
+                logging::verbose(
+                    "[Upstream]",
+                    &format!("识图：{count} 个图片块已替换为文字描述"),
+                );
+            }
         }
         // 内容处理的两个开关**按请求取一次快照**：同一次请求里各 provider 的判定用同一
         // 份值（请求进行中改设置不会让语义漂移）。上面那两处改动（stream 归一、
