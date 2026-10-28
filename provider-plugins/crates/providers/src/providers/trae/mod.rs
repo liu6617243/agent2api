@@ -89,10 +89,10 @@ pub const PROVIDER_ID: &str = "trae";
 /// 签到结果行 → 协议报告（形状见 `CheckinReport` 的文档）。
 ///
 /// ── 为什么判据是 `success` 而不看 `code` ────────────────────
-/// 本家的 claim 对**当日已签过**的账号回 `code:0`（假成功），所以
-/// `checkin.rs` 已经把「真领到」翻成了 `success:true`（回查确认才给）。
-/// 这里只做翻译，不再判一次 —— 两处各判一套的话，「今日已签」会时而算成功、
-/// 时而算失败。
+/// 本家 claim 对**当日已签过**的账号只回一句文案（不给专属码），所以
+/// `checkin.rs` 已经把判定收在内部：真领到 → `success:true`，已签 →
+/// `success:false` + `alreadyCompleted:true`。这里只做翻译，不再判一次 ——
+/// 两处各判一套的话，「今日已签」会时而算成功、时而算失败。
 pub(crate) fn checkin_report(value: &serde_json::Value) -> agent2api_provider_protocol::CheckinReport {
     use agent2api_provider_protocol::{CheckinOutcome, CheckinReport};
     let success = value
@@ -127,10 +127,10 @@ pub(crate) fn checkin_report(value: &serde_json::Value) -> agent2api_provider_pr
         // 数额是上游**报出的当日奖励**，不是到账余额（见 `checkin.rs` 模块头）
         credit: if success {
             value
-                .get("reward")
-                .or_else(|| value.get("credit"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
+                .get("awarded")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|total| *total > 0)
+                .map(|total| total.to_string())
         } else {
             None
         },
