@@ -287,10 +287,10 @@ fn block_source(map: &serde_json::Map<String, Value>) -> Option<String> {
 pub fn cache_key(target: &Target, sources: &[String]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(target.model.as_bytes());
-    hasher.update(b"\u{1}");
+    hasher.update(b"\x01");
     hasher.update(target.effort.as_deref().unwrap_or("").as_bytes());
     for source in sources {
-        hasher.update(b"\u{2}");
+        hasher.update(b"\x02");
         hasher.update(source.as_bytes());
     }
     hex(&hasher.finalize())
@@ -298,7 +298,7 @@ pub fn cache_key(target: &Target, sources: &[String]) -> String {
 
 /// 取缓存里的描述（未命中给 `None`）。
 pub fn cached(key: &str) -> Option<String> {
-    let mut guard = cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.entries.get(key).cloned()
 }
 
