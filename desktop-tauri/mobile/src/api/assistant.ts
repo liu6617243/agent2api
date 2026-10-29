@@ -20,37 +20,41 @@
  */
 
 import { ApiError, apiCall, authHeaders, refreshPanelAuth, refreshPanelAuthIfExpiring, resolveUrl } from '../api/client'
-import type { ImageAsset } from '../../../ui-shared/assistant-image-tools'
+import type { ChatMessage } from '../../../ui-shared/assistant-history'
+import { parseAssistantMessages, assistantTitle } from '../../../ui-shared/assistant-history'
+export type { ChatMessage } from '../../../ui-shared/assistant-history'
 import { readAssistantStream, type ChatEvent, type ToolCall } from '../../../ui-shared/assistant-stream'
 import { t } from '../i18n'
-import { serverIdentity } from '../lib/servers'
+import { serverIdentity, apiBase } from '../lib/servers'
+import { readModelApiKeySelection, rememberModelApiKeySelection } from '../../../ui-shared/model-api-key-memory'
 export type { ChatEvent, ToolCall } from '../../../ui-shared/assistant-stream'
 
 export type ChatRole = 'user' | 'assistant' | 'tool'
 
-export type ChatMessage = {
-  role: ChatRole
-  content: string
-  /** assistant 消息上的工具调用（回灌给上游时要带上） */
-  toolCalls?: ToolCall[]
-  /** role = 'tool' 时对应哪一次调用 */
-  toolCallId?: string
-  images?: string[] | ImageAsset[]
-}
-
 /** 助手配置（只读用得到的几项） */
 export type AssistantConfig = {
   model?: string | null
+  apiKeyId?: string | null
   reasoning?: string | null
   mode?: 'confirm' | 'full'
+  systemPromptEnabled?: boolean
+  systemPrompt?: string
+  titleModel?: string | null
+  titlePrompt?: string
   /** 工具勾选表：tool id → 是否勾选（后端已把缺省值展开） */
   tools?: Record<string, boolean>
 }
 
 export async function fetchAssistantConfig(): Promise<AssistantConfig> {
+  const identity = serverIdentity()
+  const scope = apiBase()
   const payload = await apiCall<{ config?: AssistantConfig }>('/api/assistant/config')
+  if (serverIdentity() !== identity) throw new DOMException('服务器已切换', 'AbortError')
   if (!payload.config) throw new Error(t('配置响应不完整'))
-  return payload.config
+  const apiKeyId = typeof payload.config.apiKeyId === 'string' && payload.config.apiKeyId.trim() ? payload.config.apiKeyId.trim()
+    : readModelApiKeySelection(scope, 'assistant')
+  if (apiKeyId) rememberModelApiKeySelection(scope, 'assistant', apiKeyId)
+  return { ...payload.config, apiKeyId }
 }
 
 /**
@@ -60,6 +64,7 @@ export async function fetchAssistantConfig(): Promise<AssistantConfig> {
  * 用户的意图，不是错误（调用方按 `signal.aborted` 区分）。
  */
 export async function streamAssistantChat(options: {
+  apiKey: string
   messages: ChatMessage[]
   /** 勾选过的工具表（OpenAI tools 形态）；空数组 = 纯聊天 */
   tools?: Array<Record<string, unknown>>
@@ -84,7 +89,7 @@ export async function streamAssistantChat(options: {
     if (serverIdentity() !== identity) throw new DOMException('服务器已切换', 'AbortError')
     return fetch(target, {
       method: 'POST',
-      headers: { ...authHeaders(), 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      headers: { ...authHeaders(), 'x-api-key': options.apiKey, Authorization: `Bearer ${options.apiKey}`, 'Content-Type': 'application/json', Accept: 'text/event-stream' },
       body: JSON.stringify(body),
       signal: options.signal,
     })
@@ -151,7 +156,48 @@ function wireMessage(message: ChatMessage): Record<string, unknown> {
   ] }
 }
 
-export function saveAssistantSession(id: string, messages: ChatMessage[], model?: string | null): Promise<unknown> {
-  const title = messages.find(message => message.role === 'user')?.content.slice(0, 40) || ''
-  return apiCall('/api/assistant/sessions', { method: 'POST', body: { id, title, messages, model: model || null } })
+export type SessionSummary = { id: string; title: string; model: string | null; reasoning: string | null; createdAt: number; updatedAt: number; titleGenerated: boolean }
+export type SessionDetail = SessionSummary & { messages: ChatMessage[] }
+
+export async function saveAssistantSession(id: string, messages: ChatMessage[], model?: string | null, title?: string): Promise<SessionSummary> {
+  const data = await apiCall<{ session: SessionSummary }>('/api/assistant/sessions', { method: 'POST', body: { id, title: title ?? assistantTitle(messages), messages, model: model || null } })
+  return data.session
+}
+
+export async function listAssistantSessions(): Promise<SessionSummary[]> {
+  const data = await apiCall<{ sessions: SessionSummary[] }>('/api/assistant/sessions')
+  return data.sessions
+}
+
+export async function getAssistantSession(id: string): Promise<SessionDetail> {
+  const data = await apiCall<{ session: SessionDetail }>(`/api/assistant/sessions/${encodeURIComponent(id)}`)
+  return { ...data.session, messages: parseAssistantMessages(data.session.messages) }
+}
+
+export async function forkAssistantSession(id: string, messageId: string): Promise<SessionDetail> {
+  const data = await apiCall<{ session: SessionDetail }>(`/api/assistant/sessions/${encodeURIComponent(id)}/fork`, { method: 'POST', body: { id: crypto.randomUUID(), messageId } })
+  return { ...data.session, messages: parseAssistantMessages(data.session.messages) }
+}
+
+export async function summarizeAssistantSession(id: string, apiKey: string): Promise<SessionSummary> {
+  const data = await apiCall<{ session: SessionSummary }>(`/api/assistant/sessions/${encodeURIComponent(id)}/title`, { method: 'POST', apiKey })
+  return data.session
+}
+
+export async function saveAssistantConfig(config: AssistantConfig): Promise<AssistantConfig> {
+  const identity = serverIdentity()
+  const scope = apiBase()
+  rememberModelApiKeySelection(scope, 'assistant', config.apiKeyId)
+  const data = await apiCall<{ config: AssistantConfig }>('/api/assistant/config', { method: 'PUT', body: { config } })
+  if (serverIdentity() !== identity) throw new DOMException('服务器已切换', 'AbortError')
+  rememberModelApiKeySelection(scope, 'assistant', data.config.apiKeyId)
+  return data.config
+}
+
+export async function saveAssistantTitleConfig(config: AssistantConfig, titleModel: string | null, titlePrompt: string): Promise<AssistantConfig> {
+  return saveAssistantConfig({ ...config, titleModel, titlePrompt })
+}
+
+export async function deleteAssistantSession(id: string): Promise<void> {
+  await apiCall(`/api/assistant/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }

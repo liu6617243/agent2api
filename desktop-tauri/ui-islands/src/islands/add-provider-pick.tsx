@@ -13,6 +13,7 @@
 import * as React from 'react'
 import { DialogSection, InputGroup, InputGroupAddon, InputGroupInput, SegmentedControl, Button, Item } from '@ui'
 
+import { isSuspendedProvider } from '../../../ui-shared/provider-availability'
 import { accountCountOf, shared } from './add-account-bridge'
 import { presetOfProvider, providerPresetIcon, providerSiteLabel } from './add-provider-metadata'
 import { WORKBUDDY_ENTRY_LABEL, WORKBUDDY_PROVIDER } from './add-account-configs'
@@ -109,6 +110,7 @@ export const PROVIDER_ICONS: Record<string, string> = {
   // （`assets/icon.png`，512×512，与系统里显示的应用图标为同一形象；
   // 归一成 256×256 入库 —— 与 officeace 同一处置）
   chatglm: 'assets/providers/chatglm.png',
+  'deepseek-web': 'assets/providers/deepseek.png',
   // ModelScope（魔搭）：取自官网 favicon（`https://modelscope.cn/favicon.ico`，
   // 内含 128×128 的一帧，归一成 256×256 入库 —— 与站点标签页上显示的是同一形象；
   // 国内 / 国际版共用这一张，同 AutoClaw / MonkeyCode 的形态）
@@ -121,12 +123,31 @@ export const PROVIDER_ICONS: Record<string, string> = {
   // （`cdn-static.gitcode.host/static/images/logo-favicon.png`），不是本产品的形象，
   // 所以没有采用它。
   atomcode: 'assets/providers/atomcode.png',
-  // LobsterAI（网易有道「有道龙虾」）：图标取自 sibling 仓库 cpa-jethub-plugins 里
-  // 已核过的品牌图标（`internal/jethub/brandicons/brandicons.go` 的 `LobsterAI`
-  // 常量 —— 那正是产品站点从有道共享 CDN 引用的同一枚，不是有道自家的 favicon）。
-  // 该处是 24×24 的 SVG，已栅格化成 256×256 RGBA 入库（与 orcaterm / officeace
-  // 同一处置）。
+  // LobsterAI（网易有道「有道龙虾」）：取自官方开源仓库的应用图标
+  // （`build/icons/png/256x256.png`，原尺寸直接入库 —— 红底白龙虾，与官网
+  // `lobsterai.youdao.com/icon-192.png`、README 的 `public/logo.png` 同一形象，
+  // 也就是系统里显示的客户端图标）。⚠️ 早前用的是 sibling 仓库
+  // cpa-jethub-plugins 里那枚 24×24 通用小怪物 SVG，与产品实际形象不符，已换掉。
   lobsterai: 'assets/providers/lobsterai.png',
+  doubaowork: 'assets/providers/doubaowork.png',
+  cursor: 'assets/providers/cursor.svg',
+  kiro: 'assets/providers/kiro.svg',
+  devin: 'assets/providers/devin.svg',
+  factory: 'assets/providers/factory.svg',
+  zed: 'assets/providers/zed.svg',
+  grok: 'assets/providers/grok.svg',
+  'minimax-code': 'assets/providers/minimax-code.svg',
+  'minimax-code-global': 'assets/providers/minimax-code.svg',
+  qwenwork: 'assets/providers/qwenwork.svg',
+  'qwenwork-enterprise': 'assets/providers/qwenwork.svg',
+  'kimi-work': 'assets/providers/kimi-work.svg',
+  opendesign: 'assets/providers/opendesign.svg',
+  'nous-portal': 'assets/providers/nous-portal.svg',
+  'claude-subscription': 'assets/providers/anthropic.png',
+  'codex-subscription': 'assets/providers/openai.png',
+  'chatgpt-subscription': 'assets/providers/openai.png',
+  'copilot-subscription': 'assets/providers/copilot.svg',
+  'gemini-subscription': 'assets/providers/gemini-cli.svg',
 }
 
 /**
@@ -183,6 +204,7 @@ function providerCards(accountType: AccountType): CardItem[] {
   // providerSummaries、models-page 的左栏），不经过这里，所以存量 cline-pass
   // 账号仍照常成组显示。
   const list = (providers?.all?.() || [])
+    .filter(item => !isSuspendedProvider(String(item?.id || '')))
     .filter(item => (item.category === 'web') === (accountType === TYPE_WEB))
     .filter(item => accountType === TYPE_WEB || !HIDDEN_AGENT_PROVIDERS.has(String(item?.id || '')))
   // WorkBuddy 这张卡与它的弹窗标题用**中性品牌名**（不带地区）而不是注册名：
@@ -191,10 +213,13 @@ function providerCards(accountType: AccountType): CardItem[] {
   // 的两半：入口一处、版本在块里选。
   // 注册名（「AutoClaw 国内版」这类）过一遍词典：卡片名与弹窗标题都由它出，
   // 不查表的话非中文界面会在这里印中文
-  const labelOf = (id: string, fallback: string): string =>
-    id === WORKBUDDY_PROVIDER
-      ? WORKBUDDY_ENTRY_LABEL
-      : t(shared().wbProviders?.labelOf?.(id) || fallback)
+  const labelOf = (id: string, fallback: string): string => {
+    if (id === 'minimax-code') return t('MiniMax Code 国内版')
+    if (id === 'minimax-code-global') return t('MiniMax Code 国际版')
+    if (id === 'qwenwork') return t('QwenWork 千问办公')
+    if (id === 'qwenwork-enterprise') return t('QwenWork 千问办公企业版')
+    return id === WORKBUDDY_PROVIDER ? WORKBUDDY_ENTRY_LABEL : t(shared().wbProviders?.labelOf?.(id) || fallback)
+  }
   // 摘要为空**不再兜底放 WorkBuddy 一张**（2026-10 改）：
   // 以前那张兜底卡的理由是「弹窗不能因为一次状态未就绪就空着」，但本版本
   // 转发与账号实现全在插件里，没装插件时它点了必然 503 —— 兜底一张点不动的卡
@@ -327,9 +352,7 @@ export function PickStep({
   const hit = cards.filter(item => !keyword || [item.label, item.site, item.template].filter(Boolean).join(' ').toLowerCase().includes(keyword))
   // 有关键词时「新建」那张卡收起来 —— 用户在找的是一家
   const newCard = accountType === TYPE_CUSTOM && !keyword
-  // Agent 段有没有内容：没装插件时后端摘要里一家都没有，这一段就是空的。
-  // 空段不该出现在分段控件里 —— 点进去只有一句「去装插件」，等于把
-  // 「还没装插件」这个状态做成一个可点的分类，用户会以为是功能缺失。
+  // Agent 与 Web 只列出已加载且未暂停的提供商。
 
   return (
     // 分段与列表同一块：两者是同一个问题的两面（「给什么形态的上游加账号」→
@@ -388,7 +411,7 @@ export function PickStep({
             插件页的按钮，省得用户自己去左侧菜单找。 */}
         {!hit.length && !keyword && effectiveType === TYPE_PROXY ? (
           <Empty className='add-provider-empty'>
-            <p className='mb-2'>{t('还没有可用的提供商。各家提供商的转发与账号实现都在插件包里，装好之后这里就会出现。')}</p>
+            <p className='mb-2'>{t('请安装并启用对应的提供商插件；列表为空时请刷新后重试。')}</p>
             <Button size='default' variant='ghost'
               type='button'
               className='text-primary underline underline-offset-2'

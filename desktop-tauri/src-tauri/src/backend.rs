@@ -56,7 +56,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_TERMINATE,
 };
 
-use crate::gateway::proxy_port;
+use crate::gateway::{local_client, proxy_port};
 use crate::port_conflict::{ConflictKind, Occupant, PortConflict, StartupFailure};
 use crate::settings;
 use crate::server;
@@ -75,9 +75,7 @@ const HEALTH_INTERVAL: Duration = Duration::from_millis(100);
 /// 同时被 `commands::backend_status` 使用（前端启动阶段显示「服务已就绪」提示），
 /// 因此保持为公开函数、语义不变：能拿到 2xx 就算就绪。
 pub async fn is_ready(port: u16) -> bool {
-    // 本机回环探测必须关系统代理，否则用户开代理后 /health 会被丢给
-    // 127.0.0.1:7897「代理访问本机」，连不上被误判为未就绪（见 gateway::client_with_timeout 同注）
-    let Ok(client) = reqwest::Client::builder().timeout(HEALTH_TIMEOUT).no_proxy().build() else {
+    let Ok(client) = local_client(HEALTH_TIMEOUT) else {
         return false;
     };
     matches!(
@@ -603,8 +601,7 @@ fn process_image_path(pid: u32) -> Option<String> {
 
 /// 端口上的服务是否是 WorkBuddy 网关（读 /health 的 product 特征字段）。
 async fn health_reports_workbuddy(port: u16) -> bool {
-    // 同 is_ready：回环探测显式关系统代理，避免用户开代理时误判
-    let Ok(client) = reqwest::Client::builder().timeout(HEALTH_TIMEOUT).no_proxy().build() else {
+    let Ok(client) = local_client(HEALTH_TIMEOUT) else {
         return false;
     };
     let Ok(response) = client.get(format!("http://127.0.0.1:{port}/health")).send().await

@@ -176,7 +176,7 @@ pub fn config_dir() -> PathBuf {
 }
 
 /// 读取本地 API Key。仅在本机内存里取；未配置时返回 None。
-/// 先取 `apiKeys` 里第一把启用的 Key，没有该列表再退回旧的单 Key 字段 `apiKey`。
+/// 优先读取可用且不受限的本机管理 Key，缺少时取环境变量 Key。
 ///
 /// ── 为什么不再读文件（本切片改掉的一处真实开销）──────────────
 /// 改造前这里是 `fs::read_to_string(config.json)` —— 而本函数在**每一个**管理
@@ -193,10 +193,12 @@ pub fn config_dir() -> PathBuf {
 /// `config::current()` 在快照未装入时按「空配置 + 环境变量」临时构造一份。
 /// 管理请求和直连凭证出口必须先等待本进程启动完成，不能把临时空值带进页面缓存。
 fn read_api_key() -> Option<String> {
-    crate::server::config::current()
-        .active_api_keys()
-        .into_iter()
-        .next()
+    let snapshot = crate::server::config::current();
+    let entries = crate::server::core::api_keys::entries_from(snapshot.raw());
+    entries.iter()
+        .find(|entry| entry.is_usable() && entry.allowed_models.is_empty() && entry.allowed_providers.is_empty())
+        .map(|entry| entry.key.clone())
+        .or_else(|| snapshot.active_api_keys().into_iter().find(|key| !entries.iter().any(|entry| entry.key == *key)))
 }
 
 /// 壳自己发管理请求时用的那把 Key —— 供**界面直连网关**时取用
@@ -218,22 +220,18 @@ pub fn management_key() -> Option<String> {
     read_api_key()
 }
 
-/// 指定总超时的 Client。
+/// 指定总超时的本机直连 Client。
+///
+/// 本机管理请求携带凭据，必须绕过系统与环境变量代理。
 ///
 /// ── 为什么云同步要单独放宽 ──────────────────────────────────
 /// 通用 60 秒是给「管理 API 小请求」定的；云同步的上传 / 下载要打外网传几 MB，
 /// 慢速云盘上 60 秒根本不够。放宽的是**这一条命令**的超时，不是全局 ——
 /// 其它管理请求仍应快速失败（卡住的面板比报错更难排查）。
-fn client_with_timeout(timeout_ms: u64) -> Result<reqwest::Client, String> {
-    // 管理 API 永远只打本机回环，必须**显式关**系统代理探测：reqwest 默认
-    // 会读系统设置/环境变量里的代理（Windows 上连 127.0.0.1 也不例外，
-    // 除非代理排除列表写了 localhost —— 多数客户端如 Clash 默认并不写）。
-    // 不关的话，用户一开系统代理，壳 → 网关的每个请求都会被丢给
-    // 127.0.0.1:7897 去「代理访问本机」，连不上直接失败 → 账号列表刷不出来。
-    // （转发链路的 egress::build_client 对直连出口就是这么处理同一问题的。）
+pub(crate) fn local_client(timeout: Duration) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
         .no_proxy()
+        .timeout(timeout)
         .build()
         .map_err(|error| format!("创建 HTTP 客户端失败: {error}"))
 }
@@ -249,7 +247,8 @@ fn request_builder_with_timeout(
     timeout_ms: u64,
 ) -> Result<reqwest::RequestBuilder, String> {
     let url = format!("http://127.0.0.1:{}{path}", proxy_port());
-    let base = client_with_timeout(timeout_ms)?;
+    crate::panel_session::ensure_local_access()?;
+    let base = local_client(Duration::from_millis(timeout_ms))?;
     let mut builder = match method.to_uppercase().as_str() {
         "GET" => base.get(&url),
         "POST" => base.post(&url),
@@ -262,8 +261,7 @@ fn request_builder_with_timeout(
     if let Some(key) = read_api_key() {
         builder = builder.header("X-API-Key", key);
     }
-    // 面板会话令牌（注册过管理员后才有）：与 Key 并存 —— 服务端两种凭证都认，
-    // 会话存在时以它为主（Key 只服务 /v1 转发与兼容形态）。见 panel_session 模块头。
+    // 管理会话与 Key 并存；模型入口仍必须校验显式携带的 Key。
     builder = crate::panel_session::attach(builder);
     // 与原实现一致：POST/PUT/PATCH 即使无参数也发一个空对象，
     // 后端部分路由按「有 body」判定，省略会让它们走错分支
@@ -288,6 +286,36 @@ fn request_builder_with_timeout(
 /// 提示「登录已过期」。重试只做一次，不会无限循环。
 pub async fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
     call_with_timeout(method, path, body, REQUEST_TIMEOUT_MS).await
+}
+
+pub async fn call_with_api_key(method: &str, path: &str, body: Option<&Value>, api_key: &str) -> Result<Value, String> {
+    if path != "/api/models/test" {
+        return Err("显式 API Key 仅用于模型测试".to_string());
+    }
+    crate::startup::wait().await?;
+    crate::panel_session::refresh_if_expiring().await;
+    let send = || async {
+        let mut request = request_builder(method, path, body)?.build()
+            .map_err(|error| format!("构造模型测试请求失败: {error}"))?;
+        let key = reqwest::header::HeaderValue::from_str(api_key)
+            .map_err(|_| "API Key 包含无效的请求头字符".to_string())?;
+        request.headers_mut().insert("x-api-key", key);
+        let response = local_client(Duration::from_millis(REQUEST_TIMEOUT_MS))?.execute(request).await
+            .map_err(|error| describe_transport_error(&error))?;
+        let status = response.status().as_u16();
+        let text = response.text().await.map_err(|error| format!("读取响应失败: {error}"))?;
+        let payload = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
+        Ok::<_, String>(RawResponse { status, text, payload })
+    };
+    let first = send().await?;
+    if first.status == 401
+        && first.payload.pointer("/error/type").and_then(Value::as_str) == Some("panel_login_required")
+        && crate::panel_session::refresh().await
+    {
+        let retried = send().await?;
+        return unwrap_envelope(&retried.text, retried.status);
+    }
+    unwrap_envelope(&first.text, first.status)
 }
 
 /// 与 [`call`] 同形，但用指定的总超时。

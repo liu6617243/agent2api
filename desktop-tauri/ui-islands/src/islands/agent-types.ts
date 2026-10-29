@@ -1,3 +1,5 @@
+import type { ResourceCapabilities } from '../../../ui-shared/agent-resources'
+
 export type AgentModel = {
   id: string
   name: string
@@ -33,10 +35,13 @@ export type AgentProfile = {
   sourceId?: string
   inFile?: boolean
   validationError?: string | null
+  editable?: boolean
+  deletable?: boolean
   updatedAt?: number
 }
 
 export type AgentClient = {
+  resources?: ResourceCapabilities
   id: string
   name: string
   vendor: string
@@ -73,6 +78,7 @@ export type AgentClient = {
   viaGateway: boolean
   activeId: string | null
   revision: string
+  nativeRevision?: string | null
   applied: { canUndo?: boolean; canDisconnect?: boolean; modifiedExternally?: boolean; pendingRecovery?: boolean; appliedAt?: number; backupId?: string; error?: string }
 }
 
@@ -92,13 +98,13 @@ export type AgentPreview = {
   }>
 }
 
-export type AgentGatewayKey = { id: string; name: string; allowedModels: string[] }
+export type AgentGatewayKey = { id: string; name: string; allowedModels: string[]; allowedProviders?: string[] }
 export type AgentPayload = {
   clients: AgentClient[]
-  gateway: { baseUrl: string; requiresKey: boolean; keys: AgentGatewayKey[] }
+  gateway: { baseUrl: string; requiresKey: boolean; keys: AgentGatewayKey[]; defaultModel?: string }
   detectedAt: number
   host: { name: string }
   applied?: { changed?: boolean; verified?: boolean; needsRestart?: boolean }
   imported?: { count: number }
 }
-export type AgentOperation = 'apply' | 'default' | 'restore' | 'disconnect'
+export type AgentOperation = 'apply' | 'default' | 'restore' | 'disconnect' | 'native-edit' | 'native-delete' | 'quick-connect'

@@ -33,10 +33,11 @@
  * （模型测试的候选清单、⋯ 菜单的「已在第一位」判定）。
  */
 
-import { shared, formatTime, type AccountRecord, type AccountsSnapshot, type LimiterRule, type RateLimitInfo, type TokenReading, type UsageEntry } from './accounts-shared'
+import { shared, formatTime, type AccountRecord, type AccountsSnapshot, type AccountSorting, type GroupSortRule, type LimiterRule, type RateLimitInfo, type TokenReading, type UsageEntry } from './accounts-shared'
 import { providerFeatures, type ProviderFeatures } from './accounts-features'
 import { t } from '../i18n'
 import { limiterHit } from './accounts-limiter-model'
+import { accountReloginText } from './accounts-authorization'
 
 // 能力表与插件申报的读取在 accounts-features.ts（那边的模块头说明了查询顺序）。
 // 这里转出去，是因为域层的既有调用点（`providerFeatures` 被 app.js / report.js /
@@ -145,15 +146,7 @@ export function providerSummaries(snapshot: AccountsSnapshot | null | undefined)
     if (known.has(id)) return
     known.set(id, { id, label: shared().wbProviders?.labelOf?.(id) || id, count })
   })
-  // 摘要还没到时的兜底项：名字优先问注册表，问不到才用字面量 —— 与
-  // add-provider-pick 那张卡的兜底同一口径（拆家后注册名带「国内版」）
-  if (!known.size) {
-    known.set(DEFAULT_PROVIDER_ID, {
-      id: DEFAULT_PROVIDER_ID,
-      label: shared().wbProviders?.labelOf?.(DEFAULT_PROVIDER_ID) || 'WorkBuddy 国内版',
-      count: 0,
-    })
-  }
+  // 首屏尚无摘要/账号时保持空表；不凭空创建未安装插件的提供商分组。
   return [...known.values()]
 }
 
@@ -300,32 +293,18 @@ export const TOKEN_PERIOD_MAX_SECONDS = 86_400
 /** 旧「余额不足处理」的缺省阈值（限制器上线后只作为旧记录的推导兜底） */
 export const DEFAULT_LOW_BALANCE_THRESHOLD = 1
 
-/** CodeArts 缺省 Token 规则的阈值：**每日** 950 万 Token（自然日 0 点重置）。
- * 不给满 1000 万：实际消耗停不到精确的额度上限，上游在 995 万左右就会开始
- * 报余额不足，压着 1000 万判定只会让请求撞报错，950 万是留足余量的判定线。 */
-export const DEFAULT_DAILY_TOKEN_LIMIT = 9_500_000
-
 /**
  * 各 provider 的**缺省限制规则**。查询顺序：**插件申报 → 内置表**。
  *
  * 插件申报优先（`AccountFeatures::default_limiters`）：这是「这一家的额度形态
  * 长什么样」的结论，属于 provider 知识。`undefined` = 插件没申报，走下面这张
  * 内置表（与后端 `limiter::default_rules` 同一口径）：
- * - **CodeArts → Token 自然日 950 万，跳过**：这家的余额读数常判不出
- *   （免费版账号没有积分类计量表，额度全在福利 token 池），余额规则形同虚设；
- *   「过了 0 点额度就回来」正是它的额度形态，按自然日 Token 判定才兜得住。
  * - **Cline 免费池 → 无规则**（原「不处理」缺省的理由不变）。
- * - **其余 → 余额 < 1 跳过**（历史缺省不变）。
+ * - **其余 → 总余额 < 1 跳过**。
  */
 export function defaultLimiters(provider: string | undefined | null): LimiterRule[] {
   const declared = provider ? providerFeatures(provider).defaultLimiters : undefined
-  if (declared) return declared.slice()
-  if (provider === 'codearts') {
-    return [{
-      type: 'token', action: 'skip', threshold: DEFAULT_DAILY_TOKEN_LIMIT,
-      reset: 'daily', enabled: true,
-    }]
-  }
+  if (declared && (provider !== 'codearts' || declared.every(rule => rule.type === 'balance'))) return declared.slice()
   if (provider === 'cline-free') return []
   return [{ type: 'balance', action: 'skip', threshold: DEFAULT_LOW_BALANCE_THRESHOLD, enabled: true }]
 }
@@ -370,7 +349,7 @@ function limiterRuleValid(rule: unknown): rule is LimiterRule {
 /**
  * 记录上没有 `limiters` 键（旧版后端 / 旧记录）时的推导：有显式 `lowBalance`
  * （用户 / 旧版配过）就原样尊重；两者都没有时按 provider 给缺省规则
- * （`defaultLimiters`，CodeArts 拿到的是 Token 自然日规则）。
+ * （`defaultLimiters`）。
  * 与后端 `limiter::derive_from_legacy` 同一口径。
  */
 function legacyRulesOf(account: AccountRecord | null | undefined): LimiterRule[] {
@@ -730,12 +709,13 @@ export function supportsCreditDetail(account: AccountRecord | null | undefined):
  * 领取 / 到期（见 `billing::usage` 的 `credit_packs_from`）。只有登记了
  * `creditDetail` 能力的家才会产出这个数组，其余家自然读到 `null`。
  *
- * ── 三种要跳过的包（与 creditRowsOf 的展示判据同源）────────────
+ * ── 非到期积分包要跳过（与 creditRowsOf 的展示判据同源）────────
+ *   · `snapshot: true` —— 钱包余额或计数器读数，不是一份有到期的积分包。
  *   · `daily: true` —— 每日回满而不是到期作废，它的 expireAt 是周期边界
  *     （今天 24 点）；拿它参与排序会让日额度账号天天霸占组首。
  *   · `record: true` —— 流水一笔（收支记录），不是一份还有余额的包。
  *   · `unlimited: true` —— 没有「花完」的概念。
- * 这三种在 `creditRowsOf` 里也有对应判据（那边决定「要不要折进已用完」），
+ * 这些形态在 `creditRowsOf` 里也有对应判据（那边决定「要不要折进已用完」），
  * 两处问的是同一件事：这份包现在还值不值得关心。
  */
 export function creditExpiryOf(entry: UsageEntry, now = Date.now()): number | null {
@@ -745,7 +725,7 @@ export function creditExpiryOf(entry: UsageEntry, now = Date.now()): number | nu
   let best: number | null = null
   for (const pack of packs) {
     if (!pack || typeof pack !== 'object') continue
-    if (pack.record === true || pack.daily === true || pack.unlimited === true) continue
+    if (pack.snapshot === true || pack.record === true || pack.daily === true || pack.unlimited === true) continue
     const expire = Number(pack.expireAt)
     if (!Number.isFinite(expire) || expire <= 0 || expire <= now) continue
     const remain = pack.remain
@@ -1042,12 +1022,14 @@ export function activeLimits(account: AccountRecord | null | undefined): Array<R
 /**
  * 转发顺序位置表：accountId → `{ position, total }`（1 起）。
  *
- * **全局一条队列**：四家账号按优先级混排，序号就是整张表的行序，与后端选路
- * （全局优先级）、↑/↓ 的边界同源 —— 否则会出现「界面上不是第一位、但下移按钮
- * 已经点不动」这种对不上的情况。
+ * 有网关快照时使用有效消耗顺序；旧客户端回落到账号库的手动优先级。
  */
-export function positionMap(all: AccountRecord[] | null | undefined): Map<string, { position: number; total: number }> {
-  const ordered = (all || []).slice().sort(byPriorityOrder)
+export function positionMap(all: AccountRecord[] | null | undefined, sorting?: AccountSorting | null): Map<string, { position: number; total: number }> {
+  const positions = new Map((sorting?.providerOrder || []).flatMap(provider => sorting?.accountOrder[provider] || [])
+    .map((id, index) => [id, index]))
+  const ordered = (all || []).slice().sort(positions.size
+    ? (left, right) => (positions.get(left.id) ?? Infinity) - (positions.get(right.id) ?? Infinity)
+    : byPriorityOrder)
   const map = new Map<string, { position: number; total: number }>()
   ordered.forEach((account, index) => map.set(account.id, { position: index + 1, total: ordered.length }))
   return map
@@ -1062,24 +1044,15 @@ export function positionMap(all: AccountRecord[] | null | undefined): Map<string
  * 只登记「可比较的字段」这两项：`manual` 不是一条规则，它是所有规则都相等时的
  * 兜底（保持拖出来的顺序），所以不在这里出现。
  */
-export type GroupSortRule =
-  | { key: 'credit'; on: boolean; dir: 'soon' | 'late' }
-  | { key: 'added'; on: boolean; dir: 'new' | 'old' }
+export type { GroupSortRule } from './accounts-shared'
 
-/**
- * 默认规则：两条都**关闭**（= 默认回到纯手动顺序）。
- *
- * ── 为什么默认关 ──────────────────────────────────────────────
- * 排序规则换掉的是用户已经拖熟的组内顺序。不打招呼就生效，用户第一次想拖
- * 会发现把手锁着、顺序也变了，只会当成 bug。所以规则**只作为可选能力**存在：
- * 想要「快到期先试」的人自己去分组设置里勾上，不想要的人行为与改造前一致。
- *
- * 两条规则仍然都列在设置弹窗里（默认未勾选）—— 那是「可选项」，不是「已生效」。
- */
-export const DEFAULT_GROUP_SORT: GroupSortRule[] = [
-  { key: 'credit', on: false, dir: 'soon' },
-  { key: 'added', on: false, dir: 'new' },
-]
+/** 默认规则不依赖余额缓存，支持积分到期的提供商在查到数据后自动排序。 */
+export function defaultGroupSortRules(provider: string): GroupSortRule[] {
+  return [
+    { key: 'credit', on: supportsCreditExpiry(provider), dir: 'soon' },
+    { key: 'added', on: false, dir: 'new' },
+  ]
+}
 
 export type AccountGroup = {
   /** 这一组的家（provider id） */
@@ -1088,16 +1061,9 @@ export type AccountGroup = {
   label: string
   /** 组顺位（1 起）：拖动整组改变的就是它 */
   rank: number
-  /** 组内**全部**账号，**显示顺序**（按这一组的排序规则，不受筛选影响）：
-   *  组内序号、统计都用它。开着规则时它与 `queueMembers` 不同。 */
+  /** 组内全部账号，按网关的全局消耗规则排序；筛选不改变序号。 */
   members: AccountRecord[]
-  /**
-   * 组内全部账号的**转发顺序**（= 落库的 priority 升序）。
-   *
-   * 排序规则是纯展示偏好，不写库 —— 所以「整队重排」拼队列时必须用它而不是
-   * `members`：拿显示顺序拼队列，拖一次整组就把规则排出来的先后悄悄写成了真实
-   * 转发优先级。没开规则时两者逐项相同（`sortGroupMembers` 原样返回）。
-   */
+  /** 落库的手动顺序；自动规则只投影有效顺序，不覆盖手动兜底。 */
   queueMembers: AccountRecord[]
   /** 组内**可见**的账号（members 里通过筛选的那些，顺序同上）：渲染用它 */
   accounts: AccountRecord[]
@@ -1168,10 +1134,8 @@ function compareExpiry(dir: 'soon' | 'late', a: number | null, b: number | null)
  * `keep` 是可见性谓词（筛选 / 搜索），**只过滤组内的行、不参与定组序**：筛选时
  * 组序不跳动，被筛掉的行也不会让整组消失（组头还在，只是组内空了）。
  *
- * ── `sortOf`：按组的排序规则（见 sortGroupMembers）────────────
- * 只重排**组内**的显示顺序；组顺位（`rank`）仍由队列里最靠前的那个账号决定 ——
- * 那是转发顺序，不是查看顺序，拖整组改的才是它。排序规则不写库：它是「这一组
- * 想先看谁」的展示偏好，而转发顺序只能由用户显式拖动来表达。
+ * 自动消耗规则由网关执行，`sorting` 提供实际生效的组内顺序。
+ * 没有该字段的旧网关才在前端按同一口径降级排序。
  */
 export function accountGroups(
   all: AccountRecord[] | null | undefined,
@@ -1179,6 +1143,7 @@ export function accountGroups(
   usageOf?: UsageLookup,
   tokenUsageOf?: TokenUsageLookup,
   sortOf?: ((provider: string) => GroupSortRule[] | null | undefined) | null,
+  sorting?: AccountSorting | null,
 ): AccountGroup[] {
   const ordered = (all || []).slice().sort(byPriorityOrder)
   const providers: string[] = []
@@ -1191,13 +1156,20 @@ export function accountGroups(
     }
     members.get(provider)!.push(account)
   }
+  if (sorting) {
+    const ranks = new Map(sorting.providerOrder.map((provider, index) => [provider, index]))
+    providers.sort((left, right) => (ranks.get(left) ?? Infinity) - (ranks.get(right) ?? Infinity))
+  }
   return providers.map((provider, index) => {
     const list = members.get(provider) || []
-    const shown = sortOf ? sortGroupMembers(list, sortOf(provider), usageOf) : list
+    const ids = sorting?.accountOrder[provider]
+    const positions = new Map((ids || []).map((id, position) => [id, position]))
+    const shown = ids ? list.slice().sort((left, right) => (positions.get(left.id) ?? Infinity) - (positions.get(right.id) ?? Infinity))
+      : sortOf ? sortGroupMembers(list, sortOf(provider), usageOf) : list
     return {
       provider,
       label: shared().wbProviders?.labelOf?.(provider) || provider,
-      rank: index + 1,
+      rank: sorting?.providerOrder.includes(provider) ? sorting.providerOrder.indexOf(provider) + 1 : index + 1,
       members: shown,
       queueMembers: list,
       accounts: keep ? shown.filter(keep) : shown,
@@ -1292,16 +1264,11 @@ export type AccountTag = { text: string; kind: 'plain' | 'bad'; title: string }
  */
 export function accountTags(account: AccountRecord): AccountTag[] {
   return [
-    // 登录态被上游注销（issue #215）：refresh token 链已死，刷新不会再成功，
-    // 凭证维护也会跳过它 —— 只能重新登录。不标出来用户只会看到「刷新一直失败」。
-    // 放在最前面：它比下面任何一条都更该被看见（账号等于已经废了）。
     account.needsRelogin
       ? {
         text: t('需要重新登录'),
         kind: 'bad' as const,
-        title: account.needsReloginReason
-          ? t('{reason}。该账号的登录态已被上游注销，自动刷新不会再成功，请重新登录该账号', { reason: account.needsReloginReason })
-          : t('该账号的登录态已被上游注销，自动刷新不会再成功，请重新登录该账号'),
+        title: accountReloginText(account),
       }
       : null,
     // 没有转发能力的家：它的启用开关对转发没有意义，这里如实说明，而不是留一片空白

@@ -167,19 +167,27 @@ const BRIDGE_JS: &str = r#"
     // 返回 `{ 头名: 值 }`：网页端 shim 的同名方法回面板令牌 / 用户输入的
     // Key（见 web_shim.rs），助手页对两端一视同仁，只负责合并进请求头。
     directCredentials: () => invoke('direct_credentials'),
+    saveAssistantImage: id => invoke('save_assistant_image', { id: String(id || '') }),
 
     // ── 会话 ──
     getState: () => call('GET', '/api/session'),
-    startLogin: (edition, mode, provider, socialRestore) =>
+    startLogin: (edition, mode, provider, socialRestore, options) =>
       invoke('start_login', {
         edition: edition || 'cn',
         mode: mode || 'embedded',
         // provider 缺省留给 Rust 侧兜底成 workbuddy：老界面（或将来别处的调用点）
         // 不传它时必须走原来那条链，这里不做猜测式整形
         provider: provider || null,
-        // 第三方登录入口恢复（Google / GitHub / X）。缺省 false 与界面默认不勾选一致：
-        // 不传就照官方登录页的形态走，不额外放宽域名白名单
+        // 第四参仍是第三方入口开关；动态登录 options 只能占第五参，不能挤掉它。
         socialRestore: socialRestore === true,
+        ...(options === undefined ? {} : { options }),
+      }),
+    // URL / 裸 code 都原样交给网关；accepted / pending 不是登录完成，startLogin
+    // 仍须等 /wait 的 done 才返回成功。
+    submitLoginCallback: (state, callbackUrl) =>
+      call('POST', '/api/session/login/callback', {
+        state: String(state ?? ''),
+        callbackUrl: String(callbackUrl ?? ''),
       }),
     getLoginState: () => invoke('login_state'),
     cancelLogin: () => invoke('cancel_login'),
@@ -249,6 +257,8 @@ const BRIDGE_JS: &str = r#"
     pushZcodeCaptchaTokens: tokens =>
       call('POST', '/api/zcode/captcha', { tokens: Array.isArray(tokens) ? tokens : [] }),
     onLoginState: callback => on('login:state', callback),
+    // 动态登录说明与 /wait 的 pending.hint；不含授权地址或用户输入。
+    onLoginProgress: callback => on('login:progress', callback),
     // KukuAI 短信登录的窗口进度（壳侧监视任务推送，见 `start_kuku_sms`）：
     // {status: 'opening'|'filling'|'sending'|'sent'|'captcha'|'timeout'}。
     // 面板提示行据此实时显示，用户不会「点了没反应」。
@@ -319,7 +329,10 @@ const BRIDGE_JS: &str = r#"
     // `terminateStatsRequest(id)` 把它掐掉（桌面壳的 invoke 没有 abort，
     // 这是前端唯一能中止在途测试的手段，见后端那段说明）。
     // 结论失败也返回 2xx：上游的错误在返回值的 status / error 里
-    testModel: payload => call('POST', '/api/models/test', payload || {}),
+    testModel: (payload, apiKey) => invoke('api_request', { request: {
+      method: 'POST', path: '/api/models/test', body: payload || {}, apiKey: String(apiKey || ''),
+    } }),
+    getModelApiKeys: () => call('GET', '/api/model-access/keys'),
 
     // ── 网关 API Key（多把）──
     getKeys: () => call('GET', '/api/keys'),
@@ -329,6 +342,8 @@ const BRIDGE_JS: &str = r#"
 
     // ── 多账号 ──
     getAccounts: () => call('GET', '/api/accounts'),
+    getAccountSorting: () => call('GET', '/api/accounts/sorting'),
+    saveAccountSorting: payload => call('PUT', '/api/accounts/sorting', payload || {}),
     // switchAccount 仅把账号移到全局队列第一位，不改变启用状态
     switchAccount: id => call('POST', '/api/accounts/current', { id }),
     refreshAccountToken: id => call('POST', '/api/accounts/refresh', id ? { id } : {}),
@@ -484,6 +499,7 @@ const BRIDGE_JS: &str = r#"
     decodeQrImage: payload => call('POST', '/api/subscriptions/decode-qr', payload || {}),
     getKernelStatus: () => call('GET', '/api/subscriptions/kernel'),
     downloadKernel: payload => call('POST', '/api/subscriptions/kernel/download', payload || {}),
+    importKernel: payload => call('POST', '/api/subscriptions/kernel/import', payload || {}),
     cancelKernelDownload: () => call('POST', '/api/subscriptions/kernel/download/cancel', {}),
     restartKernel: () => call('POST', '/api/subscriptions/kernel/restart', {}),
     stopKernel: () => call('POST', '/api/subscriptions/kernel/stop', {}),
@@ -621,7 +637,7 @@ const BRIDGE_JS: &str = r#"
       call('POST', '/api/checkin-schedules/' + encodeURIComponent(String(id || '')) + '/run', {}),
     // WorkBuddy 国际版日活保活的模型链（读 / 存；与 web_shim.rs 的同名方法成对）
     getCheckinKeepalive: () => call('GET', '/api/checkin-keepalive'),
-    saveCheckinKeepalive: models => call('POST', '/api/checkin-keepalive', { models }),
+    saveCheckinKeepalive: (models, apiKeyId) => call('POST', '/api/checkin-keepalive', { models, apiKeyId }),
     // 猫猫旅行定时排程（国内版）：读 / 存开关与时刻 / 立即巡检全部
     // （与 web_shim.rs 的同名方法成对；调度体在 core::growth_scheduler）
     getTravelSchedule: () => call('GET', '/api/travel-schedule'),

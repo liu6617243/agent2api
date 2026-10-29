@@ -89,6 +89,32 @@ pub fn apply(
     )
 }
 
+pub fn apply_plan(def: &ClientDef, path: &Path, plan: &clients::Plan, token: &str) -> Result<(), String> {
+    let _guard = mutation_lock().lock().map_err(|_| "客户端配置写入锁不可用")?;
+    preview::verify(plan, def.id, token)?;
+    write_plan(def, path, plan)
+}
+
+pub fn apply_resource(def: &ClientDef, path: &Path, plan: &clients::Plan) -> Result<(), String> {
+    let _guard = mutation_lock().lock().map_err(|_| "客户端配置写入锁不可用")?;
+    write_plan(def, path, plan)
+}
+
+fn write_plan(def: &ClientDef, path: &Path, plan: &clients::Plan) -> Result<(), String> {
+    let changes = plan.changes.iter().filter(|change| !change.unchanged()).cloned().collect::<Vec<_>>();
+    if changes.is_empty() { return Ok(()); }
+    for change in &changes { change.check()?; }
+    backups::ensure_no_pending(def.id, path)?;
+    let mut backup = backups::prepare(def.id, path, plan)?;
+    if let Err(error) = commit(&changes).and_then(|_| verify_bytes(&changes)) {
+        if rollback(&changes).is_ok() { backup.phase = "rolled_back".into(); let _ = backups::write(&backup); }
+        return Err(error);
+    }
+    backup.phase = "committed".into();
+    if let Err(error) = backups::write(&backup) { let _ = rollback(&changes); return Err(error); }
+    Ok(())
+}
+
 fn verify_bytes(changes: &[Change]) -> Result<(), String> {
     for change in changes {
         if files::target(&change.path)? != change.target

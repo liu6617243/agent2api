@@ -10,6 +10,7 @@ import { apiCall } from './client'
 import type { ProxyUsage } from '../../../ui-shared/proxy-usage'
 import type { CheckinCenter } from '../../../ui-shared/checkin'
 import type { HiddenAccountsSummary } from '../../../ui-shared/plugins'
+import type { AccountSorting } from '../../../ui-shared/account-sorting'
 import { logQueryString, type LogPage, type LogQuery } from '../../../ui-shared/logs'
 
 export type { LogEntry, LogPage } from '../../../ui-shared/logs'
@@ -18,7 +19,7 @@ export type { CheckinAccount, CheckinCenter, ProviderGroup as CheckinProviderRow
 
 /* ─── 会话 / 账号 ─────────────────────────────── */
 
-export type ProviderSummary = { id?: string; label?: string; count?: number }
+export type ProviderSummary = { id?: string; label?: string; count?: number; category?: 'agent' | 'web'; source?: 'builtin' | 'plugin' }
 
 export type RateLimitInfo = {
   status?: number | string
@@ -43,6 +44,12 @@ export type Account = {
   editionLabel?: string
   tokenExpiresAt?: number
   expiresAt?: number
+  hasAccessToken?: boolean
+  accessTokenExpiresAt?: number | null
+  hasRefreshToken?: boolean
+  refreshTokenLongLived?: boolean
+  refreshExpiresAt?: number | null
+  refreshTokenExpiresAt?: number | null
   needsRelogin?: boolean
   needsReloginReason?: string
   /** 智谱清言：这条账号是不是访客（后端只对本家注入；访客没有积分体系，不查余额） */
@@ -66,6 +73,7 @@ export type SessionPayload = {
     accounts?: Account[]
     providers?: ProviderSummary[]
     hiddenAccounts?: HiddenAccountsSummary
+    sorting?: AccountSorting
   }
   accountFeatures?: Record<string, unknown>
   lastRequestModel?: string | null
@@ -84,6 +92,7 @@ export function fetchAccounts(signal?: AbortSignal): Promise<{
   accounts?: Account[]
   providers?: ProviderSummary[]
   hiddenAccounts?: HiddenAccountsSummary
+  sorting?: AccountSorting
   currentAccountId?: string | null
   currentAccountIds?: Record<string, string | null>
 }> {
@@ -197,6 +206,7 @@ export type RequestRow = {
   sensitiveHits?: Array<{ word?: string; count?: number }>
   route?: unknown
   client?: string
+  isTest?: boolean
   apiKeyId?: string; apiKeyName?: string; apiKeySource?: string
 }
 
@@ -400,6 +410,7 @@ export function runScheduledTask(id: string): Promise<unknown> {
 /* ─── Agent 接管 ───────────────────────────────── */
 
 export type AgentClient = {
+  resources?: import('../../../ui-shared/agent-resources').ResourceCapabilities
   id?: string
   name?: string
   resolvedPath?: string
@@ -435,18 +446,10 @@ export function restoreAgentClient(clientId: string, token: string): Promise<unk
 
 /* ─── 账号余额 ─────────────────────────────── */
 
-export type UsageRow = {
-  id?: string
-  name?: string | null
-  /** 后端按家给不同形状；前端只读其中几个通用键，故用 Record */
-  usage?: Record<string, unknown> | null
-  error?: string | null
-  code?: string | number | null
-  /** 这一行的结论时刻（毫秒） */
-  at?: number
-}
+export type UsageRow = import('../../../ui-shared/usage-query-state').UsageQueryRow
 
 export type UsageSnapshot = {
+  sorting?: AccountSorting
   /** 全部行里最新的结论时刻 */
   at?: number
   results?: UsageRow[]

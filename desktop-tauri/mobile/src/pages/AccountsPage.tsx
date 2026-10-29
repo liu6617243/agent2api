@@ -5,6 +5,7 @@ import { ProviderLogo } from '../components/ProviderLogo'
 import { HiddenAccountsNotice } from '../components/HiddenAccountsNotice'
 import { Icon } from '../components/Icon'
 import { AccountSheet } from './AccountSheet'
+import { DynamicProviderSheet } from './add-account-dynamic-sheet'
 import {
   AccountsFilterSheet,
   DEFAULT_FILTERS,
@@ -22,6 +23,7 @@ import {
 import { accountName, formatExpiry, formatRelative, isRateLimited } from '../lib/format'
 import { expiryOf, hasExpiry, isLongLivedCredential, supportsUsage } from '../lib/providerFacts'
 import { usageIndex, usageText } from '../lib/usage'
+import { credentialExpiryRowsOf, credentialExpiryText } from '../../../ui-shared/credential-expiry'
 import { providerLabel } from '../lib/providers'
 import { usePolling } from '../lib/usePolling'
 import { usePullToRefresh, PullIndicator } from '../components/PullToRefresh'
@@ -39,8 +41,7 @@ import { Toggle as UiToggle } from '@ui'
  * 余额、代理；提供商信息上移到分组头，行里不再重复。
  *
  * ── 分组口径 ──────────────────────────────────────────────────
- * 与后端一致：同一提供商的账号是一组，组内按 priority 升序（= 转发尝试顺序）。
- * 组本身的先后也按最小 priority 排 —— 这就是全局队列在手机上的投影。
+ * 组内使用网关的全局消耗顺序，组顺位仍由账号库的手动优先级决定。
  */
 
 type Filter = 'all' | 'enabled' | 'limited' | 'disabled'
@@ -51,10 +52,13 @@ export function AccountsPage() {
   const [filterOpen, setFilterOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [openId, setOpenId] = useState<string | null>(null)
+  const [adding, setAdding] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [usage, setUsage] = useState<UsageSnapshot | null>(null)
   const accounts = state.session?.accounts?.accounts || []
+  const sessionSorting = state.session?.accounts?.sorting
+  const sorting = (usage?.sorting?.updatedAt || 0) > (sessionSorting?.updatedAt || 0) ? usage?.sorting : sessionSorting
 
   const load = async () => {
     // 余额快照与账号刷新并行：快照失败不影响账号列表（余额查不到是常态，
@@ -207,12 +211,20 @@ export function AccountsPage() {
       map.set(provider, list)
     })
     return [...map.entries()]
-      .map(([provider, list]) => ({
-        provider,
-        list: [...list].sort((a, b) => (a.priority ?? 999) - (b.priority ?? 999)),
-      }))
-      .sort((a, b) => (a.list[0]?.priority ?? 999) - (b.list[0]?.priority ?? 999))
-  }, [filtered])
+      .map(([provider, list]) => {
+        const positions = new Map((sorting?.accountOrder[provider] || []).map((id, index) => [id, index]))
+        return {
+          provider,
+          list: [...list].sort((a, b) => positions.size
+            ? (positions.get(a.id) ?? Infinity) - (positions.get(b.id) ?? Infinity)
+            : (a.priority ?? 999) - (b.priority ?? 999)),
+        }
+      })
+      .sort((a, b) => sorting
+        ? (sorting.providerOrder.indexOf(a.provider) < 0 ? Infinity : sorting.providerOrder.indexOf(a.provider))
+          - (sorting.providerOrder.indexOf(b.provider) < 0 ? Infinity : sorting.providerOrder.indexOf(b.provider))
+        : Math.min(...a.list.map(account => account.priority ?? 999)) - Math.min(...b.list.map(account => account.priority ?? 999)))
+  }, [filtered, sorting])
 
   const enabledCount = accounts.filter(item => item.enabled).length
   const limitedCount = accounts.filter(item => item.enabled && isRateLimited(item)).length
@@ -241,6 +253,7 @@ export function AccountsPage() {
         subtitle={t('{n} 个账号 · {e} 启用 · {l} 限流', { n: accounts.length, e: enabledCount, l: limitedCount })}
         actions={
           <>
+            <Button variant='outline' size='sm' onClick={() => setAdding(true)}>{t('添加账号')}</Button>
             <Button size='icon-touch' variant='outline'
               type='button'
               className='m-icon-btn'
@@ -275,10 +288,7 @@ export function AccountsPage() {
             <IconButton
               name='refresh'
               label={t('刷新')}
-              onClick={() => {
-                void store.refresh(true)
-                store.toast(t('已刷新'))
-              }}
+              onClick={() => void load()}
             />
           </>
         }
@@ -328,7 +338,7 @@ export function AccountsPage() {
                   ? t('没有匹配「{kw}」的账号', { kw: query })
                   : activeFilterCount(filters) > 0
                     ? t('当前筛选下没有账号')
-                    : t('还没有账号，去桌面端添加')
+                    : t('还没有账号，请点击「添加账号」')
               }
             />
           </Card>
@@ -369,6 +379,10 @@ export function AccountsPage() {
 
       </div>
 
+      {adding ? <DynamicProviderSheet onClose={() => setAdding(false)} onAdded={() => {
+        setAdding(false)
+        void load()
+      }} /> : null}
       <AccountSheet
         account={openAccount}
         onClose={() => setOpenId(null)}
@@ -406,19 +420,19 @@ function AccountRow({
   const limited = isRateLimited(account)
   const expiresAt = expiryOf(account)
   const expired = expiresAt > 0 && expiresAt <= Date.now()
-  const tone = !account.enabled
-    ? 'mute'
-    : account.needsRelogin
-      ? 'bad'
+  const tone = account.needsRelogin
+    ? 'bad'
+    : !account.enabled
+      ? 'mute'
       : limited
         ? 'warn'
         : expired
           ? 'bad'
           : 'ok'
-  const badgeText = !account.enabled
-    ? t('已禁用')
-    : account.needsRelogin
-      ? t('需重登')
+  const badgeText = account.needsRelogin
+    ? t('需重登')
+    : !account.enabled
+      ? t('已禁用')
       : limited
         ? t('限流')
         : expired
@@ -426,7 +440,8 @@ function AccountRow({
           : t('正常')
   // 有效期：这家没有这个概念时不显示，而不是显示「—」（少一行噪音）；
   // 长期有效的家写「长期有效」—— 与「—」（读不到到期时间）是两件事
-  const expiryText = isLongLivedCredential(account.provider)
+  const credentialRows = credentialExpiryRowsOf(account, expiresAt)
+  const expiryText = credentialRows.length ? '' : isLongLivedCredential(account.provider)
     ? t('长期有效')
     : hasExpiry(account.provider) ? formatExpiry(expiresAt) : ''
   // 余额：只有这家有查询能力时才占一行；快照里没有这一行 = 还没查过
@@ -489,9 +504,27 @@ function AccountRow({
               ) : null}
             </span>
             {showUsage ? (
-              <span style={{ flex: 'none', color: usageColor }}>· {usageView.text}</span>
+              <span style={{ flex: 'none', color: usageView.failureStatus ? 'var(--m-text-3)' : usageColor }} title={usageView.detail}>· {usageView.text}</span>
             ) : null}
           </div>
+          {showUsage && usageView.failureStatus ? (
+            <div className='text-xs text-destructive whitespace-normal break-words mt-1' title={usageView.failureDetail}>
+              {usageView.failureStatus}
+            </div>
+          ) : null}
+          {credentialRows.length ? <div className='flex flex-col gap-1 mt-1.5 text-[11px]'>
+            {credentialRows.map(row => <div key={row.label} className='flex items-center gap-2'>
+              <span className='text-subtle' translate='no'>{row.label}</span>
+              <span className={row.expiresAt !== null && row.expiresAt <= Date.now() ? 'text-destructive' : 'text-subtle'}>
+                {credentialExpiryText(row, t)}
+              </span>
+            </div>)}
+          </div> : null}
+          {account.needsRelogin ? (
+            <div className='text-xs text-destructive whitespace-normal break-words mt-1'>
+              {account.needsReloginReason || t('登录授权已失效，请重新登录；自动续期无法恢复已过期或已撤销的刷新令牌。')}
+            </div>
+          ) : null}
         </div>
       </Button>
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 5, flex: 'none' }}>

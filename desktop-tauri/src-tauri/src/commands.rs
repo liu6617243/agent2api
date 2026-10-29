@@ -24,12 +24,17 @@ pub struct ApiRequest {
     pub path: String,
     #[serde(default)]
     pub body: Option<Value>,
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 /// 统一的管理 API 入口：返回后端 data，出错时返回可读消息。
 #[tauri::command]
 pub async fn api_request(request: ApiRequest) -> Result<Value, String> {
-    gateway::call(&request.method, &request.path, request.body.as_ref()).await
+    match request.api_key.as_deref() {
+        Some(key) => gateway::call_with_api_key(&request.method, &request.path, request.body.as_ref(), key).await,
+        None => gateway::call(&request.method, &request.path, request.body.as_ref()).await,
+    }
 }
 
 /// 取原始文本（导出日志用）
@@ -422,7 +427,8 @@ pub async fn change_lan_access(app: AppHandle, enabled: bool, panel: bool) -> Re
 pub async fn direct_credentials() -> Result<Value, String> {
     crate::startup::wait().await?;
     crate::panel_session::refresh_if_expiring().await;
-    let mut headers = serde_json::Map::new();
+    crate::panel_session::ensure_local_access()?;
+    let mut headers = crate::panel_session::credential_headers();
     if let Some(key) = crate::gateway::management_key() {
         headers.insert("x-api-key".to_string(), Value::String(key));
     }
@@ -465,6 +471,8 @@ pub fn local_ip() -> Result<Option<String>, String> {
 /// 主窗口 —— 于是「拿地址」这一步在渲染层完成，壳只负责开窗口。因此它走
 /// [`start_autoclaw_oauth_login`]（入参是已经拿到的 state + authUrl），
 /// 不走这里。
+/// `options` 是新增的可选第五参（methodIndex / inputs / proxy / manualCallback），
+/// 不改变第四参 social_restore。没有 methodIndex 时继续走旧登录支路。
 #[tauri::command]
 pub async fn start_login(
     app: AppHandle,
@@ -472,13 +480,15 @@ pub async fn start_login(
     mode: String,
     provider: Option<String>,
     social_restore: Option<bool>,
+    options: Option<Value>,
 ) -> Result<Value, String> {
-    login::start(
+    login::start_with_options(
         &app,
         edition,
         mode,
         provider.unwrap_or_default(),
         social_restore.unwrap_or(false),
+        options,
     )
     .await
 }

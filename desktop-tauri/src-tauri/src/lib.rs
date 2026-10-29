@@ -22,9 +22,11 @@
  */
 
 mod account_export;
+mod assistant_image;
 mod backend;
 mod bridge;
 mod commands;
+mod doubaowork_login;
 mod gateway;
 mod legacy_install;
 mod login;
@@ -295,6 +297,7 @@ pub fn run() {
             commands::save_app_settings,
             commands::export_accounts,
             account_export::export_account_files,
+            assistant_image::save_assistant_image,
             commands::import_accounts,
             commands::export_database,
             commands::import_database,
