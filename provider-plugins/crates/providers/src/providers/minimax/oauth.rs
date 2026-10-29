@@ -343,7 +343,7 @@ pub async fn post_token_form(
     fields: &[(&str, &str)],
     proxy: Option<&proto::WireProxy>,
 ) -> Result<(u16, Value, String), GatewayError> {
-    let client = crate::http::client(proxy, "direct");
+    let client = crate::http::control_client(proxy, "direct");
     let response = client
         .post(endpoints::token_url())
         .timeout(Duration::from_millis(REQUEST_TIMEOUT_MS))
@@ -493,7 +493,7 @@ fn code_challenge(verifier: &str) -> String {
 pub async fn login_start() -> Result<proto::LoginStart, GatewayError> {
     let verifier = format!("{}{}", ids::random_id("mm"), ids::uuid_v4().replace('-', ""));
     let challenge = code_challenge(&verifier);
-    let client = crate::http::client(None, "direct");
+    let client = crate::http::control_client(None, "direct");
     let response = client
         .post(endpoints::device_code_url())
         .timeout(Duration::from_millis(REQUEST_TIMEOUT_MS))
