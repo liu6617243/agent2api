@@ -15,9 +15,23 @@ use crate::errors::GatewayError;
 
 const V3_GROUP: &str = "pc_incentive_task_mvp_v3";
 
+/// 签到接口。抓包（Reqable，豆包客户端 2.32.6 / doubao_pc_version 5.73.60）
+/// 证实客户端点「签到」**只**调这一个接口：
+/// `POST /alice/ug/campaign/landing/checkin` body `{"scene":"<活动组>"}`，
+/// 回执 `data.checked_in / reward_status / continuous_days` 就是权威结果。
+const CHECKIN_PATH: &str = "/alice/ug/campaign/landing/checkin";
+
+/// 任务奖励领取接口。只用于**非签到**任务；签到走 [`CHECKIN_PATH`]。
+///
+/// 历史坑：daily_signin 打这个接口永远只回
+/// `biz_error{code:3,message:"领取结果确认中，请稍后重试"}, task_status:0`，
+/// 且 task_status 不会自行变 3 —— 于是每场签到都停在「未确认到账」，
+/// 这就是「豆包签到总是有问题」的真正原因。
+const CLAIM_PATH: &str = "/alice/ug/campaign/item/reward/claim/";
+
 /// 领奖回执为「已受理但未出结果」时，等一拍再回查的时长。
 ///
-/// 豆包的奖励发放是**异步**的：claim 接口先回执「领取结果确认中，请稍后
+/// 豆包的奖励发放是**异步**的：老领奖接口先回执「领取结果确认中，请稍后
 /// 重试」，积分/任务状态随后才落地。触发完立刻回查大概率还是未完成。
 const CLAIM_SETTLE_WAIT_MS: u64 = 8_000;
 
@@ -149,11 +163,14 @@ fn tasks(value: &Value, group: &str) -> Vec<Task> {
     output
 }
 
-/// 领奖回执的判读结果。
+/// 领奖回执的判读结果。**仅服务于 [`claim_extras`]**（非签到任务领奖）。
 ///
-/// 三种之外还有第四种语义：「上游说已经受理，但结果还没出」。以前它落在
-/// `Err` 里被当成致命错误，于是整场签到判失败、`retryAt` 也带不出去，
-/// 只能等用户手点第二次 —— 这是「豆包签到总是有问题」的主因。
+/// 签到不再用这套判读：抓包证实 daily_signin 打领奖接口永远只回
+/// `biz_error{code:3,"领取结果确认中，请稍后重试"}`，任务状态不会自行落地。
+/// 签到现在走 [`CHECKIN_PATH`]，回执自带 `checked_in` 权威字段。
+///
+/// 「上游说已经受理，但结果还没出」以前落在 `Err` 里被当成致命错误，于是整场
+/// 判失败、`retryAt` 也带不出去 —— 那是旧签到路径的成因，留此备查。
 #[derive(Clone, Copy, PartialEq)]
 enum Receipt {
     /// 上游回执明确表示已领取/已完成
@@ -264,64 +281,76 @@ pub async fn checkin(ctx: &PluginCtx, account: &str) -> Result<CheckinResult, Ga
             "今日已领取豆包工作签到奖励",
         )));
     }
-    let Some(body) = task.body.as_ref() else {
-        return Ok(CheckinResult::from(report(
-            proto::CheckinOutcome::Inactive,
-            "今日签到任务尚未满足领取条件",
-        )));
-    };
+    // 签到**不是**任务领奖：抓包证实 daily_signin 打 `item/reward/claim/` 只会
+    // 回 biz_error code 3「领取结果确认中，请稍后重试」，状态永不落地——这正是
+    // 「签到总是有问题」的根因。真正的签到是 landing/checkin，body 只带 scene
+    // （= campaign_group_code），同步返回权威字段 checked_in。
     let response = api::post(
         &client,
         &credentials,
-        "/alice/ug/campaign/item/reward/claim/",
-        body,
+        CHECKIN_PATH,
+        &json!({"scene": task.group}),
     )
     .await?;
-    let verdict = receipt(&response)?;
-    if verdict == Receipt::Accepted {
+    let data = response
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or_else(|| GatewayError::with_status(502, "豆包工作未返回签到回执"))?;
+    // biz_error 在这里只作「上游暂时不受理」的信号；成功判据只有 checked_in。
+    if let Some(error) = data.get("biz_error").filter(|error| !error.is_null()) {
+        if !settled_later(error) {
+            return Err(api::error(200, error));
+        }
         // 上游说「确认中」：等一拍再回查，多半就能看到状态翻转
         tokio::time::sleep(std::time::Duration::from_millis(CLAIM_SETTLE_WAIT_MS)).await;
     }
-    // 回查失败**不能**把整场判失败：领奖请求已经发出去了，这里只是没读到权威
-    // 状态。报中性 Inactive + retryAt，等网关复核即可（上游按天幂等，重跑不会
-    // 重复发奖）。
-    let after = match refetch(&client, &credentials, &task.key, &task.group).await {
-        Ok(after) => after,
-        Err(_) => {
-            return Ok(CheckinResult {
-                report: report(
-                    proto::CheckinOutcome::Inactive,
-                    "豆包工作签到已提交，回查未成功，稍后自动复核",
-                ),
-                retry_at: Some(crate::http::now_ms() + CLAIM_RETRY_MS),
-            });
+    // checked_in 是幂等的：当天已签再打一次仍回 true（并置 idempotent），所以
+    // 重跑不会重复发奖，也不会误判失败。
+    let confirmed = data.get("checked_in").and_then(Value::as_bool) == Some(true)
+        || api::number(&response["data"]["reward_status"]) == Some(3)
+        || api::number(&response["data"]["task_status"]) == Some(3);
+    // 回查失败**不能**把整场判失败：签到请求已经发出去了，这里只是没读到权威
+    // 状态。报中性 Inactive + retryAt，等网关复核即可。
+    let after = if confirmed {
+        None
+    } else {
+        match refetch(&client, &credentials, &task.key, &task.group).await {
+            Ok(after) => after,
+            Err(_) => {
+                return Ok(CheckinResult {
+                    report: report(
+                        proto::CheckinOutcome::Inactive,
+                        "豆包工作签到已提交，回查未成功，稍后自动复核",
+                    ),
+                    retry_at: Some(crate::http::now_ms() + CLAIM_RETRY_MS),
+                });
+            }
         }
     };
-    if after.as_ref().is_some_and(|(done, _)| *done) {
+    let done = confirmed || after.as_ref().is_some_and(|(done, _)| *done);
+    if done {
         let points = crate::quota::number(response.pointer("/data/reward_amount")).or(task.points);
         return Ok(CheckinResult {
             report: proto::CheckinReport {
                 outcome: proto::CheckinOutcome::Claimed,
                 credit: points.map(|points| format!("{points} 额度")),
-                streak: after.and_then(|(_, streak)| streak).or(task.streak),
-                message: Some("豆包工作签到奖励已领取，已回查确认".into()),
+                streak: api::number(&response["data"]["continuous_days"])
+                    .and_then(|days| u32::try_from(days).ok())
+                    .or_else(|| after.and_then(|(_, streak)| streak))
+                    .or(task.streak),
+                message: Some("豆包工作签到成功".into()),
             },
             retry_at: None,
         });
     }
 
-    // 走到这里是「本次没确认到账」，两种情况都不该判失败（失败会让用户以为
-    // 签到坏了，也可能触发无意义的人工重试），统一报中性 Inactive 并挂
-    // retryAt 让网关自动复核：
-    //   - Accepted：上游受理中，只是还没出结果（异步入账）
-    //   - Unconfirmed：回执与回查都没确认，但接口本身没报错
-    let message = if verdict == Receipt::Accepted {
-        "豆包工作签到已被受理，结果确认中，稍后自动复核"
-    } else {
-        "豆包工作签到未确认到账，稍后自动复核"
-    };
+    // 走到这里是「本次没确认到账」：接口没报错，只是状态还没翻转。不判失败
+    // （失败会让用户以为签到坏了），报中性 Inactive 挂 retryAt 让网关自动复核。
     Ok(CheckinResult {
-        report: report(proto::CheckinOutcome::Inactive, message),
+        report: report(
+            proto::CheckinOutcome::Inactive,
+            "豆包工作签到未确认到账，稍后自动复核",
+        ),
         retry_at: Some(crate::http::now_ms() + CLAIM_RETRY_MS),
     })
 }
@@ -387,13 +416,7 @@ pub async fn claim_extras(ctx: &PluginCtx, account: &str) -> Result<Value, Gatew
         let Some(body) = task.body.as_ref() else {
             continue;
         };
-        let response = api::post(
-            &client,
-            &credentials,
-            "/alice/ug/campaign/item/reward/claim/",
-            body,
-        )
-        .await;
+        let response = api::post(&client, &credentials, CLAIM_PATH, body).await;
         let result = match response {
             Ok(response) => receipt(&response).map(|_| ()),
             Err(error) => Err(error),
