@@ -122,8 +122,21 @@ impl Snapshot {
     ///
     /// 直接哈希**序列化后的字节**：两次构建的字段顺序由 `BTreeMap` 与
     /// `serde_json` 的结构化序列化保证稳定，不必自己做规范化。
+    ///
+    /// ── 为什么必须把 `exported_at` 抹掉再哈希 ──────────────────────
+    /// 这个哈希的唯一用途是回答「本地业务内容变了没有」（见
+    /// `auto_sync::run_once` 的 `unchanged` 判断）。而 `exported_at` 是
+    /// **每次构建都取当前时间**的元数据，跟内容无关 —— 若把它一起哈希，
+    /// 两次构建的哈希必然不同，`unchanged` 永远为 `false`，于是**每一个
+    /// 自动同步信号都会重传整份快照**（值几 MB），把云盘的上传配额烧光。
+    ///
+    /// 实测代价：坚果云免费账号上传速率被 `TrafficRateExhausted` 拒绝后，
+    /// PUT 一律 403，同步彻底停摆。所以这里只哈希「内容」：把时间戳归零，
+    /// 其余字段（tables / kv / format / version / schemaVersion）照常参与。
     pub(crate) fn content_hash(&self) -> String {
-        match serde_json::to_vec(self) {
+        let mut normalized = self.clone();
+        normalized.exported_at = 0;
+        match serde_json::to_vec(&normalized) {
             Ok(bytes) => super::sha256_hex(&bytes),
             Err(_) => String::new(),
         }
@@ -529,5 +542,48 @@ mod tests {
         };
         let (db, _guard) = crate::server::db::test_temp::TempDb::open("cloud-sync-newer-schema");
         assert!(apply(&db, &snapshot).is_err());
+    }
+
+    /// 关键回归：`exported_at` 不同但内容相同的两份快照，哈希必须一致。
+    ///
+    /// 这条曾经是 bug：哈希把 `exported_at` 算进去，导致 `auto_sync` 的
+    /// 「内容没变就跳过」永远不成立 —— 每个信号都重传整份快照，
+    /// 最终把坚果云的上传流量配额烧光（403 TrafficRateExhausted）。
+    #[test]
+    fn content_hash_ignores_exported_at() {
+        let mut tables = BTreeMap::new();
+        tables.insert("accounts".to_string(), Vec::new());
+        let first = Snapshot {
+            format: SNAPSHOT_FORMAT.to_string(),
+            version: SNAPSHOT_VERSION,
+            schema_version: SCHEMA_VERSION,
+            exported_at: 1_000,
+            tables: tables.clone(),
+            kv: BTreeMap::new(),
+        };
+        let mut later = first.clone();
+        later.exported_at = 9_999_999;
+
+        assert_eq!(
+            first.content_hash(),
+            later.content_hash(),
+            "仅导出的时间戳不同，内容哈希必须相等（否则自动同步会无限重传）"
+        );
+    }
+
+    /// 内容真的变了，哈希必须跟着变（别把去重做成瞎眼跳过）
+    #[test]
+    fn content_hash_changes_with_real_content() {
+        let base = Snapshot {
+            format: SNAPSHOT_FORMAT.to_string(),
+            version: SNAPSHOT_VERSION,
+            schema_version: SCHEMA_VERSION,
+            exported_at: 1_000,
+            tables: BTreeMap::new(),
+            kv: BTreeMap::new(),
+        };
+        let mut changed = base.clone();
+        changed.kv.insert("locale".to_string(), "\"zh-CN\"".to_string());
+        assert_ne!(base.content_hash(), changed.content_hash());
     }
 }

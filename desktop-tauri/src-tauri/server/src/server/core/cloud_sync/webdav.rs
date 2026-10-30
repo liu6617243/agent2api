@@ -130,14 +130,101 @@ fn is_jianguoyun(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 从 WebDAV 的错误响应体里取出服务器自己写的原因。
+///
+/// 坚果云（以及不少 SabreDAV 系服务）在响应体里给出**真正的原因**，例如：
+/// ```xml
+/// <d:error xmlns:d="DAV:" xmlns:s="http://ns.jianguoyun.com">
+///   <s:exception>TrafficRateExhausted</s:exception>
+///   <s:message>The upstream traffic rate is exhausted.</s:message>
+/// </d:error>
+/// ```
+/// 只看状态码会把这些全部压成一句「403 Forbidden」，再套上固定的猜谜式
+/// 提示 —— 排查方向会被彻底带偏（403 被当成密码错，实际是流量配额耗尽）。
+fn server_reason(body: &str) -> Option<(String, String)> {
+    static EXC: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    static MSG: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    let exc = EXC.get_or_init(|| {
+        regex::Regex::new(r"(?is)<(?:[a-z0-9]+:)?exception>\s*([^<]+?)\s*</").ok()
+    });
+    let msg = MSG.get_or_init(|| {
+        regex::Regex::new(r"(?is)<(?:[a-z0-9]+:)?message>\s*([^<]*?)\s*</").ok()
+    });
+    let exception = exc.as_ref()?.captures(body)?.get(1)?.as_str().trim().to_string();
+    let message = msg
+        .as_ref()
+        .and_then(|re| re.captures(body))
+        .and_then(|caps| caps.get(1))
+        .map(|found| found.as_str().trim().to_string())
+        .unwrap_or_default();
+    Some((exception, message))
+}
+
+/// 把服务器自报的原因翻译成可照着做的提示。
+///
+/// 认得的几个都是坚果云真实出现过的（配额耗尽、容量满）；认不出的**原样
+/// 带出去**（比替换成猜谜提示有用得多）。判断用子串而不是全等：不同服务的
+/// exception 命名有出入（`TrafficRateExhausted` / `TrafficRateLimitExceeded`），
+/// 但这类名字的公共词干是稳定的。
+fn reason_hint(exception: &str, message: &str) -> Option<String> {
+    let lower = exception.to_ascii_lowercase();
+    let hint = if lower.contains("trafficrate")
+        || message.to_ascii_lowercase().contains("traffic rate")
+    {
+        // 坚果云的 message 会带上「还剩多少 / 想写多少」，直接透传比我们自己编更有用
+        let detail = if message.is_empty() {
+            String::new()
+        } else {
+            format!("（服务器说明：{message}）")
+        };
+        format!(
+            "坚果云本月上传流量配额已耗尽，与用户名 / 密码无关{detail}。\
+             可在坚果云网页端「账户信息 → 流量详情」查看配额与重置时间；\
+             或改为关闭「自动同步」，只在需要时手动上传。"
+        )
+    } else if lower.contains("quota") || lower.contains("insufficientstorage") {
+        format!("云盘容量已满或超出配额（服务器说明：{message}）。请清理云盘空间后重试。")
+    } else if message.is_empty() {
+        return None;
+    } else {
+        format!("服务器说明：{message}")
+    };
+    Some(hint)
+}
+
+/// 状态码 → 错误文案（无响应体的回落形态）。
+///
+/// 还有调用方在用（GET / DELETE 走 `download.rs` 与 `delete`），但那两处
+/// 的失败原因较单纯；写路径一律走 [`status_error_with_body`]。
 fn status_error(op: &str, status: StatusCode, url: &str) -> String {
+    status_error_with_body(op, status, url, "")
+}
+
+/// 状态码 + **响应体** → 错误文案。
+///
+/// 有响应体时**优先信服务器自报的原因**；只有服务器什么都没说，才回落到
+/// 按状态码猜的那套通用提示。
+fn status_error_with_body(op: &str, status: StatusCode, url: &str, body: &str) -> String {
     let safe_url = redact_url(url);
     let mut message = format!("WebDAV {op} 失败: {status} ({safe_url})");
+
+    // 1) 服务器自报原因优先 —— 这是唯一「不猜」的信息来源
+    if let Some((exception, detail)) = server_reason(body) {
+        if let Some(hint) = reason_hint(&exception, &detail) {
+            message.push('。');
+            message.push_str(&hint);
+            return message;
+        }
+    }
+
+    // 2) 回落：按状态码给通用提示
     let jgy = is_jianguoyun(url);
     if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
         if jgy {
+            // 403 不必然是凭据问题（流量配额也会回 403），文案不再一口咬定是密码
             message.push_str(
-                "。坚果云请使用「第三方应用密码」，并确认地址指向 /dav/ 下的目录。",
+                "。若已用「第三方应用密码」仍报此错，多半是云盘侧限额（上传流量 / \
+                 容量）或目录权限，可到云盘网页端查看流量与共享设置。",
             );
         } else {
             message.push_str("。请检查 WebDAV 用户名、密码与目录读写权限。");
@@ -228,7 +315,9 @@ pub(crate) async fn test_connection(base_url: &str, auth: &WebDavAuth) -> Result
     if response.status().is_success() || response.status() == StatusCode::MULTI_STATUS {
         return Ok(());
     }
-    Err(status_error("PROPFIND", response.status(), base_url))
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(status_error_with_body("PROPFIND", status, base_url, &body))
 }
 
 /// 逐级创建远端目录（`MKCOL` 必须一级一级来）。
@@ -270,7 +359,9 @@ pub(crate) async fn ensure_remote_directories(
                 continue;
             }
         }
-        return Err(status_error("MKCOL", status, &dir_url));
+        // 失败时读响应体：原因同样可能写在里面（配额 / 权限 / 锁定）
+        let body = response.text().await.unwrap_or_default();
+        return Err(status_error_with_body("MKCOL", status, &dir_url, &body));
     }
     Ok(())
 }
@@ -317,7 +408,11 @@ pub(crate) async fn put_bytes(
     if response.status().is_success() {
         return Ok(());
     }
-    Err(status_error("PUT", response.status(), url))
+    // 失败时**读响应体**：坚果云把真实原因（如 TrafficRateExhausted）写在里面，
+    // 只看状态码会把「流量配额耗尽」误报成「密码错」。
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(status_error_with_body("PUT", status, url, &body))
 }
 
 /// GET 一个文件；404 返回 `None`（「远端还没有这份数据」是正常状态，不是错误）。
@@ -397,5 +492,70 @@ mod tests {
     fn jianguoyun_detection() {
         assert!(is_jianguoyun("https://dav.jianguoyun.com/dav"));
         assert!(!is_jianguoyun("https://nextcloud.example.com/dav"));
+    }
+
+    /// 坚果云流量配额耗尽时的真实响应体（抓包原样，仅截断）
+    const JGY_QUOTA_403: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<d:error xmlns:d="DAV:" xmlns:s="http://ns.jianguoyun.com">
+  <s:exception>TrafficRateExhausted</s:exception>
+  <s:message>The upstream traffic rate is exhausted. The free rate is 310920 while you want to consume 524288</s:message>
+</d:error>"#;
+
+    #[test]
+    fn server_reason_parses_jianguoyun_exception() {
+        let (exception, message) = server_reason(JGY_QUOTA_403).expect("应解析出 exception");
+        assert_eq!(exception, "TrafficRateExhausted");
+        assert!(message.contains("free rate is 310920"), "message: {message}");
+    }
+
+    #[test]
+    fn server_reason_returns_none_on_empty_or_plain_body() {
+        assert!(server_reason("").is_none());
+        assert!(server_reason("<html>403 Forbidden</html>").is_none());
+    }
+
+    /// 关键回归：403 遇上配额耗尽，**不能**再报「请使用第三方应用密码」
+    #[test]
+    fn quota_403_is_reported_as_quota_not_password() {
+        let message = status_error_with_body(
+            "PUT",
+            StatusCode::FORBIDDEN,
+            "https://dav.jianguoyun.com/dav/a/snapshot.json",
+            JGY_QUOTA_403,
+        );
+        assert!(message.contains("上传流量配额已耗尽"), "实际文案: {message}");
+        assert!(
+            !message.contains("第三方应用密码"),
+            "403 的通用猜测文案不该出现在有服务器原因的场景: {message}"
+        );
+        // 服务器自带的数字要透传，用户才知道差多少
+        assert!(message.contains("310920"), "应透传服务器给的数量: {message}");
+    }
+
+    /// 没有响应体时仍要回落到通用提示，且不再一口咬定是密码错
+    #[test]
+    fn forbidden_without_body_still_hints_but_not_only_password() {
+        let message = status_error_with_body(
+            "PUT",
+            StatusCode::FORBIDDEN,
+            "https://dav.jianguoyun.com/dav/a/snapshot.json",
+            "",
+        );
+        assert!(message.contains("403"), "应带状态码: {message}");
+        assert!(message.contains("限额"), "应提到云盘侧限额: {message}");
+    }
+
+    #[test]
+    fn unknown_exception_message_is_passed_through() {
+        let body = r#"<d:error xmlns:d="DAV:" xmlns:s="http://ns.jianguoyun.com">
+            <s:exception>SomethingBrandNew</s:exception>
+            <s:message>服务器自己说的话</s:message></d:error>"#;
+        let message = status_error_with_body(
+            "PUT",
+            StatusCode::BAD_REQUEST,
+            "https://dav.jianguoyun.com/dav/a/x.json",
+            body,
+        );
+        assert!(message.contains("服务器自己说的话"), "不认识的也应原样带出: {message}");
     }
 }
