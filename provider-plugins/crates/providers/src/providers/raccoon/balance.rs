@@ -339,6 +339,21 @@ pub(super) fn desktop_client_headers() -> Vec<(String, String)> {
     ]
 }
 
+/// setting_info 触发后账单复核的等待时长。
+///
+/// 实测台账（本机 checkin_records）：21:41:37 首查「今日未见积分入账」→
+/// 21:41:58 手动重查「今日积分 +300」——发放是服务端在 setting_info 之**后**
+/// 异步入账的，触发完立刻查账单大概率看不到今天的入账。15 秒来自样本折中
+/// （21 秒后重查已恢复），叠加首查本身约 9 秒，复核时刻落在触发后约 24 秒，
+/// 覆盖实测窗口；总耗时上界 2×25s+15s < 70s，仍在 checkin RPC 的 120 秒
+/// 超时（网关 NETWORK_TIMEOUT）之内。
+const GRANT_SETTLE_WAIT_MS: u64 = 15_000;
+
+/// 「今日确无入账」时的自动复核间隔：挂进 claim 的 `retryAt`，网关调度
+/// （auto_checkin::retry）按它自动重跑整场签到。不给的话这条 pending 永远
+/// 停在台账里，只能等用户手点 —— beta.5.1 的实况。与 zcode 的 10 分钟同款。
+const GRANT_RETRY_MS: i64 = 10 * 60_000;
+
 /// 客户端身份头：官方手机端（Capacitor App）请求登录积分接口带的两个头。
 ///
 /// 平台值是 App 壳的 `getPlatform()` 加 `app-` 前缀（`app-android` / `app-ios`，
@@ -352,6 +367,81 @@ pub(super) fn mobile_client_headers() -> Vec<(String, String)> {
         ("X-Client-Platform".to_string(), "app-android".to_string()),
         ("X-Client-Version".to_string(), "v1.0.3".to_string()),
     ]
+}
+
+/// 今日入账的核对结果（账单核对口径，见 [`claim_daily_grant`]）。
+struct GrantCheck {
+    /// 今日入账条目（已过滤 points>0 且 created_at 是今天）。
+    grants: Vec<Value>,
+    /// 账单接口失败时的错误文案（拿不到权威结果，不谎报成功）。
+    error: Option<String>,
+}
+
+/// 拉一次账单，核对**今天**（北京时间）的入账。
+///
+/// 「今天」按**北京时间**（上游自然日即 UTC+8 零点，见 `core::beijing`），
+/// 不跟机器时区：海外 / 容器部署下跟本地时区走会把 16 小时的账单认成昨天，
+/// 让「今日积分 +N」与「今天已领过」的判定整体错位（issue #138）。
+///
+/// 账单接口慢（limit=20 实测约 9 秒），用独立超时兜底；失败降级，
+/// 不影响 ① 的领取本身。
+async fn check_today_grants(
+    origin: &str,
+    token: &str,
+    today: &str,
+) -> GrantCheck {
+    let bills_path = format!(
+        "/api/web/points/v1/bills?paging.limit={GRANT_CHECK_LIMIT}&paging.offset=0"
+    );
+    match request_json_ex(
+        origin,
+        "GET",
+        &bills_path,
+        token,
+        &[],
+        GRANT_CHECK_TIMEOUT_MS,
+    )
+    .await
+    {
+        Ok(data) => {
+            let items = data.get("items").and_then(Value::as_array);
+            let grants: Vec<Value> = items
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            // points>0 且 created_at 的日期部分 == 本地今天
+                            // （源实现直接比对字符串前 10 位，口径一致）
+                            let points = to_int(item.get("points"))?;
+                            if points <= 0 {
+                                return None;
+                            }
+                            let created_at =
+                                item.get("created_at").and_then(Value::as_str).unwrap_or("");
+                            if created_at.get(..10) != Some(today) {
+                                return None;
+                            }
+                            Some(json!({
+                                "name": item.get("event_name").and_then(Value::as_str).unwrap_or("积分发放"),
+                                "points": points,
+                                "at": created_at.replace('T', " ").get(11..19).unwrap_or(""),
+                            }))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            GrantCheck {
+                grants,
+                error: None,
+            }
+        }
+        // 账单核对失败（401 也好、超时也好）都不谎报成功：把上游文案带出去，
+        // 由调用方判成「未能核对今日入账」并挂 retryAt 复核。
+        Err(error) => GrantCheck {
+            grants: Vec::new(),
+            error: Some(error.message),
+        },
+    }
 }
 
 /// 小浣熊账号的每日签到（claim 形状与 WorkBuddy 的 claim_daily_checkin 对齐：
@@ -400,57 +490,26 @@ pub async fn claim_daily_grant(
         Err(error) => return Err(error),
     };
 
-    // ② 账单核对今日入账（慢接口独立超时；失败降级为 grantsError）。
-    // 「今天」按**北京时间**（上游自然日即 UTC+8 零点，见 `core::beijing`），
-    // 不跟机器时区：海外 / 容器部署下跟本地时区走会把 16 小时的账单认成昨天，
-    // 让「今日积分 +N」与「今天已领过」的判定整体错位（issue #138）。
+    // ② 账单核对今日入账。
+    //
+    //    **发放是异步入账**：setting_info 只是触发器，服务端随后才把积分
+    //    记进账单（实测台账：21:41:37 首查「未见入账」→ 21:41:58 重查
+    //    「+300」）。触发完立刻查账单大概率查空 —— 于是判成「今日未见积分
+    //    入账」的 pending，账号还得用户手点第二次才补上。
+    //
+    //    对策：首查为空时等一拍（GRANT_SETTLE_WAIT_MS）再核对一轮；两轮
+    //    都空才是真·未见入账，此时挂 `retryAt` 交给网关调度自动复核，
+    //    不再要求用户手点。
     let today = beijing::today_key();
-    let bills_path = format!(
-        "/api/web/points/v1/bills?paging.limit={GRANT_CHECK_LIMIT}&paging.offset=0"
-    );
-    let (grants, grants_error) = match request_json_ex(
-        &origin,
-        "GET",
-        &bills_path,
-        &credentials.token,
-        &[],
-        GRANT_CHECK_TIMEOUT_MS,
-    )
-    .await
-    {
-        Ok(data) => {
-            let items = data.get("items").and_then(Value::as_array);
-            let grants: Vec<Value> = items
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| {
-                            // points>0 且 created_at 的日期部分 == 本地今天
-                            // （源实现直接比对字符串前 10 位，口径一致）
-                            let points = to_int(item.get("points"))?;
-                            if points <= 0 {
-                                return None;
-                            }
-                            let created_at =
-                                item.get("created_at").and_then(Value::as_str).unwrap_or("");
-                            if created_at.get(..10) != Some(today.as_str()) {
-                                return None;
-                            }
-                            Some(json!({
-                                "name": item.get("event_name").and_then(Value::as_str).unwrap_or("积分发放"),
-                                "points": points,
-                                "at": created_at.replace('T', " ").get(11..19).unwrap_or(""),
-                            }))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            (grants, None)
-        }
-        Err(error) if error.status_code == 401 => return Err(error),
-        Err(error) => (Vec::new(), Some(error.message)),
-    };
+    let mut check = check_today_grants(&origin, &credentials.token, &today).await;
+    if check.grants.is_empty() && check.error.is_none() {
+        // 首查为空：等上游把积分记进账单，再核对一轮
+        tokio::time::sleep(std::time::Duration::from_millis(GRANT_SETTLE_WAIT_MS)).await;
+        check = check_today_grants(&origin, &credentials.token, &today).await;
+    }
 
+    let grants = check.grants;
+    let grants_error = check.error;
     let granted_today = grants.iter().map(|item| to_int(item.get("points")).unwrap_or(0)).sum::<i64>();
     let mut msg_parts: Vec<String> = Vec::new();
     if granted_today > 0 {
@@ -465,11 +524,17 @@ pub async fn claim_daily_grant(
         msg_parts.push(format!("账单核对失败：{error}"));
     }
 
-    Ok(json!({
+    let mut claim = json!({
         "success": granted_today > 0,
         "msg": msg_parts.join("；"),
         "grantsToday": grants,
         "settings": settings,
         "grantsError": grants_error.map(Value::String).unwrap_or(Value::Null),
-    }))
+    });
+    // 今日确无入账 → 让网关调度 10 分钟后自动复核这一场（见 GRANT_RETRY_MS）。
+    // 上游按天幂等，重跑不会重复发奖。
+    if granted_today == 0 {
+        claim["retryAt"] = Value::from(crate::http::now_ms() + GRANT_RETRY_MS);
+    }
+    Ok(claim)
 }

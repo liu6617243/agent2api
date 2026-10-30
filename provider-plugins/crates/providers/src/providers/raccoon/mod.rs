@@ -44,7 +44,9 @@ pub mod oauth;
 pub mod onboarding;
 
 use agent2api_provider_protocol as proto;
-use agent2api_provider_sdk::{ChatPlan, PluginCtx, Provider, ProviderMeta, SendFuture};
+use agent2api_provider_sdk::{
+    ChatPlan, CheckinResult, PluginCtx, Provider, ProviderMeta, SendFuture,
+};
 use serde_json::{json, Value};
 
 use crate::errors::GatewayError;
@@ -349,6 +351,30 @@ impl Provider for RaccoonProvider {
                 .await
                 .map_err(GatewayError::into_control_message)?;
             Ok(checkin_report_of(&claim))
+        })
+    }
+
+    /// 带 `manual` 的签到：本家没有写请求限流闸，两档执行体一致，差别只在
+    /// **要把 `retryAt` 透出去**。
+    ///
+    /// 小浣熊的积分是异步入账的，`claim_daily_grant` 两轮核对都空时会挂
+    /// `retryAt`（10 分钟后复核）。默认实现 `checkin(...).map(Into::into)` 会
+    /// 把 `retry_at` 置成 `None`，那场 pending 就只能等用户手点 —— 这正是
+    /// 「小浣熊签到总是有问题」的一半原因。故这里显式重写。
+    fn checkin_with_options<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        account: &'a str,
+        _manual: bool,
+    ) -> SendFuture<'a, CheckinResult> {
+        Box::pin(async move {
+            let claim = balance::claim_daily_grant(ctx, account)
+                .await
+                .map_err(GatewayError::into_control_message)?;
+            Ok(CheckinResult {
+                report: checkin_report_of(&claim),
+                retry_at: claim.get("retryAt").and_then(Value::as_i64),
+            })
         })
     }
 

@@ -7,13 +7,23 @@ fn claim_lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 use agent2api_provider_protocol as proto;
-use agent2api_provider_sdk::PluginCtx;
+use agent2api_provider_sdk::{CheckinResult, PluginCtx};
 use serde_json::{json, Value};
 
 use super::api;
 use crate::errors::GatewayError;
 
 const V3_GROUP: &str = "pc_incentive_task_mvp_v3";
+
+/// 领奖回执为「已受理但未出结果」时，等一拍再回查的时长。
+///
+/// 豆包的奖励发放是**异步**的：claim 接口先回执「领取结果确认中，请稍后
+/// 重试」，积分/任务状态随后才落地。触发完立刻回查大概率还是未完成。
+const CLAIM_SETTLE_WAIT_MS: u64 = 8_000;
+
+/// 「确实没确认到账」时的自动复核间隔：挂进 `retryAt`，由网关调度重跑本次
+/// 签到。上游按天幂等，重跑不会重复发奖。
+const CLAIM_RETRY_MS: i64 = 10 * 60_000;
 
 fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value[key]
@@ -139,59 +149,126 @@ fn tasks(value: &Value, group: &str) -> Vec<Task> {
     output
 }
 
-fn receipt(value: &Value) -> Result<bool, GatewayError> {
+/// 领奖回执的判读结果。
+///
+/// 三种之外还有第四种语义：「上游说已经受理，但结果还没出」。以前它落在
+/// `Err` 里被当成致命错误，于是整场签到判失败、`retryAt` 也带不出去，
+/// 只能等用户手点第二次 —— 这是「豆包签到总是有问题」的主因。
+#[derive(Clone, Copy, PartialEq)]
+enum Receipt {
+    /// 上游回执明确表示已领取/已完成
+    Confirmed,
+    /// 上游未确认（任务状态仍是未领取）
+    Unconfirmed,
+    /// 上游受理中，稍后才出结果
+    Accepted,
+}
+
+/// 上游回执里的 `biz_error.msg` 是否表示「已受理、结果待定」。
+///
+/// 文案原样来自豆包服务端（`领取结果确认中，请稍后重试`），不是本插件写的。
+/// 用宽松词表匹配，避免上游换措辞后又被当成致命错误打死整场签到。
+fn settled_later(error: &Value) -> bool {
+    let message = error
+        .get("msg")
+        .or_else(|| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let normalized = message.to_lowercase();
+    ["确认中", "稍后重试", "处理中", "审核中", "请稍候"]
+        .iter()
+        .any(|needle| normalized.contains(*needle))
+        || normalized.contains("processing")
+        || normalized.contains("pending")
+}
+
+fn receipt(value: &Value) -> Result<Receipt, GatewayError> {
     let data = value["data"]
         .as_object()
         .ok_or_else(|| GatewayError::with_status(502, "豆包工作未返回奖励领取回执"))?;
-    if data.get("success") == Some(&Value::Bool(false)) {
-        return Err(GatewayError::with_status(502, "豆包工作奖励领取被拒绝"));
-    }
+    // 先读 biz_error：受理态可能和 `success: false` 一起出现（「确认中」本来
+    // 就不是成功），先判拒绝会把这种可恢复的异步态打死成致命错误。
+    let mut accepted = false;
     if let Some(error) = data.get("biz_error").filter(|error| !error.is_null()) {
         if !matches!(api::number(&error["code"]), Some(0 | 4 | 6)) {
-            return Err(api::error(200, error));
+            if !settled_later(error) {
+                return Err(api::error(200, error));
+            }
+            accepted = true;
         }
     }
-    Ok(api::number(&value["data"]["task_status"]) == Some(3)
+    if data.get("success") == Some(&Value::Bool(false)) && !accepted {
+        return Err(GatewayError::with_status(502, "豆包工作奖励领取被拒绝"));
+    }
+    if api::number(&value["data"]["task_status"]) == Some(3)
         || value["data"]["checked_in_today"] == true
-        || value["data"]["daily_checkin"]["checked_in_today"] == true)
+        || value["data"]["daily_checkin"]["checked_in_today"] == true
+    {
+        return Ok(Receipt::Confirmed);
+    }
+    Ok(if accepted {
+        Receipt::Accepted
+    } else {
+        Receipt::Unconfirmed
+    })
 }
 
-pub async fn checkin(ctx: &PluginCtx, account: &str) -> Result<proto::CheckinReport, GatewayError> {
+/// 回查活动详情里那个每日签到任务，返回 (是否已完成, 连续天数)。
+async fn refetch(
+    client: &reqwest::Client,
+    credentials: &Value,
+    key: &str,
+    group: &str,
+) -> Result<Option<(bool, Option<u32>)>, GatewayError> {
+    let fresh = detail(client, credentials).await?;
+    Ok(fresh.as_ref().and_then(|(group_code, value)| {
+        tasks(value, group_code)
+            .into_iter()
+            .find(|row| row.daily && row.key == key && row.group == group)
+            .map(|row| (row.checked || row.state == 3, row.streak))
+    }))
+}
+
+/// 每日签到。返回 SDK 的 [`CheckinResult`]：`report` 是协议化结果，
+/// `retry_at` 是「稍后自动复核」的时刻 —— 必须一路带到网关
+/// （`claim.retryAt` → `auto_checkin::retry`），否则「没确认到账」的那一场
+/// 只能等用户手点，这正是此前的症状。
+pub async fn checkin(ctx: &PluginCtx, account: &str) -> Result<CheckinResult, GatewayError> {
     let _guard = claim_lock().lock().await;
     let (_, credentials, client) = api::account(ctx, account, false).await?;
     let Some((group, value)) = detail(&client, &credentials).await? else {
-        return Ok(report(
+        return Ok(CheckinResult::from(report(
             proto::CheckinOutcome::Inactive,
             "当前没有豆包工作签到活动",
-        ));
+        )));
     };
     let daily: Vec<_> = tasks(&value, &group)
         .into_iter()
         .filter(|task| task.daily)
         .collect();
     if daily.len() != 1 {
-        return Ok(report(
+        return Ok(CheckinResult::from(report(
             proto::CheckinOutcome::Inactive,
             "当前活动未提供可确认的每日签到任务",
-        ));
+        )));
     }
     let Some(task) = daily.first() else {
-        return Ok(report(
+        return Ok(CheckinResult::from(report(
             proto::CheckinOutcome::Inactive,
             "当前没有每日签到任务",
-        ));
+        )));
     };
     if task.checked || task.state == 3 {
-        return Ok(report(
+        return Ok(CheckinResult::from(report(
             proto::CheckinOutcome::Done,
             "今日已领取豆包工作签到奖励",
-        ));
+        )));
     }
     let Some(body) = task.body.as_ref() else {
-        return Ok(report(
+        return Ok(CheckinResult::from(report(
             proto::CheckinOutcome::Inactive,
             "今日签到任务尚未满足领取条件",
-        ));
+        )));
     };
     let response = api::post(
         &client,
@@ -200,34 +277,52 @@ pub async fn checkin(ctx: &PluginCtx, account: &str) -> Result<proto::CheckinRep
         body,
     )
     .await?;
-    let confirmed = receipt(&response)?;
-    let fresh = detail(&client, &credentials).await?;
-    let after = fresh.as_ref().and_then(|(group, value)| {
-        tasks(value, group)
-            .into_iter()
-            .find(|row| row.daily && row.key == task.key && row.group == task.group)
-    });
-    if !after
-        .as_ref()
-        .is_some_and(|task| task.checked || task.state == 3)
-    {
-        if confirmed {
-            return Err(GatewayError::with_status(
-                502,
-                "豆包工作已接受领取，但回查尚未确认今日签到；稍后重试不会重复发奖",
-            ));
-        }
-        return Err(GatewayError::with_status(
-            502,
-            "豆包工作未确认今日签到奖励，请稍后重试或前往官方活动页",
-        ));
+    let verdict = receipt(&response)?;
+    if verdict == Receipt::Accepted {
+        // 上游说「确认中」：等一拍再回查，多半就能看到状态翻转
+        tokio::time::sleep(std::time::Duration::from_millis(CLAIM_SETTLE_WAIT_MS)).await;
     }
-    let points = crate::quota::number(response.pointer("/data/reward_amount")).or(task.points);
-    Ok(proto::CheckinReport {
-        outcome: proto::CheckinOutcome::Claimed,
-        credit: points.map(|points| format!("{points} 额度")),
-        streak: after.and_then(|task| task.streak).or(task.streak),
-        message: Some("豆包工作签到奖励已领取，已回查确认".into()),
+    // 回查失败**不能**把整场判失败：领奖请求已经发出去了，这里只是没读到权威
+    // 状态。报中性 Inactive + retryAt，等网关复核即可（上游按天幂等，重跑不会
+    // 重复发奖）。
+    let after = match refetch(&client, &credentials, &task.key, &task.group).await {
+        Ok(after) => after,
+        Err(_) => {
+            return Ok(CheckinResult {
+                report: report(
+                    proto::CheckinOutcome::Inactive,
+                    "豆包工作签到已提交，回查未成功，稍后自动复核",
+                ),
+                retry_at: Some(crate::http::now_ms() + CLAIM_RETRY_MS),
+            });
+        }
+    };
+    if after.as_ref().is_some_and(|(done, _)| *done) {
+        let points = crate::quota::number(response.pointer("/data/reward_amount")).or(task.points);
+        return Ok(CheckinResult {
+            report: proto::CheckinReport {
+                outcome: proto::CheckinOutcome::Claimed,
+                credit: points.map(|points| format!("{points} 额度")),
+                streak: after.and_then(|(_, streak)| streak).or(task.streak),
+                message: Some("豆包工作签到奖励已领取，已回查确认".into()),
+            },
+            retry_at: None,
+        });
+    }
+
+    // 走到这里是「本次没确认到账」，两种情况都不该判失败（失败会让用户以为
+    // 签到坏了，也可能触发无意义的人工重试），统一报中性 Inactive 并挂
+    // retryAt 让网关自动复核：
+    //   - Accepted：上游受理中，只是还没出结果（异步入账）
+    //   - Unconfirmed：回执与回查都没确认，但接口本身没报错
+    let message = if verdict == Receipt::Accepted {
+        "豆包工作签到已被受理，结果确认中，稍后自动复核"
+    } else {
+        "豆包工作签到未确认到账，稍后自动复核"
+    };
+    Ok(CheckinResult {
+        report: report(proto::CheckinOutcome::Inactive, message),
+        retry_at: Some(crate::http::now_ms() + CLAIM_RETRY_MS),
     })
 }
 

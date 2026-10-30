@@ -15,7 +15,9 @@ mod stream;
 mod upload;
 
 use agent2api_provider_protocol as proto;
-use agent2api_provider_sdk::{ConversationSink, PluginCtx, Provider, ProviderMeta, SendFuture};
+use agent2api_provider_sdk::{
+    CheckinResult, ConversationSink, PluginCtx, Provider, ProviderMeta, SendFuture,
+};
 use serde_json::Value;
 
 pub const PROVIDER_ID: &str = "doubaowork";
@@ -180,11 +182,32 @@ impl Provider for DoubaoWorkProvider {
         })
     }
 
+    /// 每日签到（不带 options 的旧入口）：只取协议化 report，`retryAt` 由
+    /// [`Self::checkin_with_options`] 负责透传（旧宿主不认这个字段）。
     fn checkin<'a>(
         &'a self,
         ctx: &'a PluginCtx,
         account: &'a str,
     ) -> SendFuture<'a, proto::CheckinReport> {
+        Box::pin(async move {
+            rewards::checkin(ctx, account)
+                .await
+                .map(|result| result.report)
+                .map_err(crate::errors::GatewayError::into_control_message)
+        })
+    }
+
+    /// 带 `manual` 的签到：本家没有写请求限流闸，两档执行体一致，差别只在
+    /// **把 `retryAt` 透出去**。豆包领奖是异步受理的，`rewards::checkin` 在
+    /// 「结果确认中」时会挂 10 分钟后复核的时刻；默认实现
+    /// `checkin(...).map(Into::into)` 会把 `retry_at` 丢成 `None`，那场就只能
+    /// 等用户手点 —— 这正是「豆包签到总是有问题」的另一半原因。
+    fn checkin_with_options<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        account: &'a str,
+        _manual: bool,
+    ) -> SendFuture<'a, CheckinResult> {
         Box::pin(async move {
             rewards::checkin(ctx, account)
                 .await
