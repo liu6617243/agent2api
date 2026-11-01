@@ -534,8 +534,21 @@ pub async fn claim_daily_grant(
     let granted_today = grants.iter().map(|item| to_int(item.get("points")).unwrap_or(0)).sum::<i64>();
 
     let mut msg_parts: Vec<String> = Vec::new();
+    let mut grants_for_claim = grants;
+    if granted && granted_today == 0 {
+        // 账单窗口被消耗条目挤满时（本修复要治的病），今天的入账可能不在
+        // grants 里 —— 把本轮发放的 popup.points 合成一条补进去，让界面的
+        // 「+N」读数（`grantsToday` 求和）与 msg 口径一致。账单看得到时不进来。
+        if let Some(points) = granted_points {
+            grants_for_claim.push(json!({
+                "name": "每日积分发放",
+                "points": points,
+                "at": "",
+            }));
+        }
+    }
     let mut claim = json!({
-        "grantsToday": grants,
+        "grantsToday": grants_for_claim,
         "settings": json!({ "ok": settings_ok }),
         "grantsError": grants_error.clone().map(Value::String).unwrap_or(Value::Null),
     });
