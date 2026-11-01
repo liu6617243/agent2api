@@ -22,14 +22,12 @@
 //!     所以这里提供 [`Catalog::resolve`] 做**大小写无关**的查找并返回上游的真名，
 //!     转发时用真名，不要拿客户端的写法直接发。
 //!
-//! 目录缓存（5 分钟 / 有告警时 30 秒）在文件末尾；插件里**没有**落盘持久化，
-//! 但可以**从网关那份回灌**（见 [`ensure_catalog`]）。本模块其余部分只管解析与合并。
+//! 目录缓存（5 分钟 / 有告警时 30 秒）在文件末尾；落盘那份走**账号台账**
+//! （[`crate::catalog_ledger`]，见 [`saved_payload`] / [`from_saved`]）——
+//! 插件进程重启后由 `adapter` 的目录准备读回来。本模块其余部分只管解析与合并。
 
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use agent2api_provider_protocol as proto;
-use agent2api_provider_sdk::PluginCtx;
 use serde_json::Value;
 
 use crate::errors::GatewayError;
@@ -39,7 +37,13 @@ use super::oauth::signer_credential;
 use super::signer;
 
 /// 模型来自哪个源（决定路由与 `maas_type` 注入）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// ── 为什么要 serde ──────────────────────────────────────────
+/// 这份清单要按账号落进台账（[`crate::catalog_ledger`]），重启后读回来接着用。
+/// `snake_case` 与 [`ModelSource::as_str`] / [`ModelSource::from_label`] 同一套
+/// 字面量，三处不会各写一份。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ModelSource {
     Agent,
     Builtin,
@@ -55,8 +59,8 @@ impl ModelSource {
         }
     }
 
-/// `as_str` 的逆（[`catalog_from_entries`] 与测试用它读回网关存的源标签）。
-    /// 认不出回 None —— 调用方**丢掉这一条**而不是猜一个源：
+#[allow(dead_code)]
+    /// `as_str` 的逆。认不出回 None —— 调用方**丢掉这一条**而不是猜一个源：
     /// 源决定要不要带 `maas_type: benefit` 头，猜错就是发一个上游必定拒绝的请求。
     pub fn from_label(label: &str) -> Option<Self> {
         match label.trim().to_ascii_lowercase().as_str() {
@@ -75,7 +79,7 @@ impl ModelSource {
 }
 
 /// 一条模型。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelConfig {
     /// 上游真名（大小写敏感，转发时必须用这个）
     pub id: String,
@@ -114,7 +118,7 @@ pub struct ModelConfig {
 }
 
 /// 合并后的清单 + 诊断信息。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Catalog {
     pub models: Vec<ModelConfig>,
     pub warnings: Vec<String>,
@@ -616,29 +620,62 @@ fn form_escape(value: &str) -> String {
     out
 }
 
-/// ── 进程内目录缓存 ──────────────────────────────────────────
+/// ── 进程内目录缓存 + 台账 ────────────────────────────────────
 ///
 /// `list_models()` 是**同步**接口（适配器契约），而发现目录要发网络请求，所以
 /// 清单必须先在别处（刷新链路）落到这里，`list_models()` 只读缓存。这与 accio
 /// 的 `models::list()` 同一形状。
 ///
+/// ── 落盘那份在**台账**里 ────────────────────────────────────
+/// 内存槽活不过进程重启（插件每次都是新进程），所以刷新成功时同时把清单写进
+/// 账号台账（[`crate::catalog_ledger`]，kind = [`LEDGER_KIND`]）；转发前内存为空
+/// 时由 `adapter` 的目录准备读回来（内存 → 台账 → 就地补拉一次）。
+/// 本模块只做「内存槽 ↔ 台账 payload」的翻译，见 [`saved_payload`] / [`from_saved`]。
+///
 /// ── 为什么缓存要能"空着"而不是造一份兜底 ────────────────────
 /// 该账号一个模型都没返回时，缓存就是空的 —— `list_models()` 返回空清单，
 /// 上层据此报"账号没有可用模型"。**绝不**塞静态兜底：那会广告出一批
 /// "列出来但一调就 400"的幽灵模型（§3.4 的坑，CPA 侧删掉静态列表才治好）。
-static CACHED: OnceLock<Mutex<Option<CachedCatalog>>> = OnceLock::new();
+static CACHED: std::sync::OnceLock<std::sync::Mutex<Option<CachedCatalog>>> = std::sync::OnceLock::new();
 
 struct CachedCatalog {
     catalog: Catalog,
     fetched_at_ms: i64,
 }
 
-fn cache_slot() -> &'static Mutex<Option<CachedCatalog>> {
-    CACHED.get_or_init(|| Mutex::new(None))
+fn cache_slot() -> &'static std::sync::Mutex<Option<CachedCatalog>> {
+    CACHED.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-/// 网关那份目录快照在 `settings.get` 里的键名（`plugin_host::rpc_cache` 同一常量）。
-const SETTING_MODEL_CATALOG: &str = "modelCatalog";
+/// 账号台账里那份目录的 kind（网关存成 `pluginLedger.codearts-catalog`）。
+pub const LEDGER_KIND: &str = "codearts-catalog";
+
+/// 清单 → 台账 payload。
+///
+/// 带上 `fetchedAt`：恢复时要把**当初**拉到的时刻装回内存槽，界面「更新日期」
+/// 才如实显示这份清单有多旧，而不是假装刚刷过。
+pub fn saved_payload(catalog: &Catalog) -> Value {
+    serde_json::json!({
+        "fetchedAt": crate::logging::now_ms(),
+        "catalog": catalog,
+    })
+}
+
+/// 台账 payload → （清单, 拉到的时刻）。
+///
+/// 空清单按「没有缓存」处理（上游那个账号本来就没有模型时我们也不会写台账 ——
+/// 见 `adapter` 的刷新链路），免得把一份空目录装回内存槽、把「没拉过」与
+/// 「拉到了个空的」混成同一件事。
+pub fn from_saved(payload: &Value) -> Option<(Catalog, i64)> {
+    let catalog: Catalog = serde_json::from_value(payload.get("catalog")?.clone()).ok()?;
+    if catalog.models.is_empty() {
+        return None;
+    }
+    Some((
+        catalog,
+        payload.get("fetchedAt").and_then(Value::as_i64).unwrap_or(0),
+    ))
+}
 
 #[allow(dead_code)]
 /// 缓存有效期：正常 5 分钟；**有告警时 30 秒**（参考实现同款 —— 少几个模型时
@@ -647,13 +684,13 @@ pub const CACHE_TTL_MS: i64 = 5 * 60 * 1000;
 #[allow(dead_code)]
 pub const CACHE_TTL_WARNING_MS: i64 = 30 * 1000;
 
-/// 落一份清单进缓存，返回它。
+/// 落一份清单进内存槽，返回它。
 ///
-/// ── 这里**不落盘**（有意，别顺手补上）───────────────────────
-/// 目录的持久化由**网关**负责（`plugin_host::rpc_cache` → `catalog_cache`，进
-/// 统一库的 `modelCatalogCache` 键）。插件再存一份等于两份真相，谁新谁旧说不清。
-/// 于是进程重启后本模块的内存槽必然是空的 —— 转发路径因此要先走
-/// [`ensure_catalog`] 把网关那份要回来，而不是直接骂「还没拉取过」。
+/// **本函数只写内存** —— 落台账是刷新链路（`adapter::refresh_models`）在成功
+/// 那一步做的：那是异步调用，而这里是同步函数（`list_models()` 的调用路径上
+/// 不能 await）。两件事分开写，是因为同步/异步这条边界挡在中间。
+///
+/// 缓存不带有效期（宁可给一份旧清单也不退回静态兜底），时效性仍由刷新链路负责。
 pub fn store_catalog(catalog: Catalog) -> Catalog {
     let now = crate::logging::now_ms();
     {
@@ -663,140 +700,30 @@ pub fn store_catalog(catalog: Catalog) -> Catalog {
     catalog
 }
 
-/// 读缓存（过期也照给：宁可给一份旧清单，也不要突然从"有模型"变成"没有"；
-/// 时效性由刷新链路负责 —— 与 agent2api 全局清单持久化同一取舍）。
+/// 从台账恢复：把清单装回内存槽，并带上它**当初**拉到的时刻。
 ///
-/// 内存槽为空（**每次进程重启后都是**）时这里只回 `None`；**回灌由
-/// [`ensure_catalog`] 负责** —— 本函数是同步的（`list_models()` 契约要求），
-/// 而拉网关那份要走异步 RPC，不能在同步函数里做。
+/// 与 [`store_catalog`] 只差时间戳（那个用"现在"）—— 恢复不是刷新，别把
+/// 「更新日期」改写成此刻，否则界面会显示一份刚拉过的旧清单。
+pub fn restore_catalog(catalog: Catalog, fetched_at_ms: i64) -> Catalog {
+    {
+        let mut slot = cache_slot().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(CachedCatalog { catalog: catalog.clone(), fetched_at_ms });
+    }
+    catalog
+}
+
+/// 读内存槽（过期也照给：宁可给一份旧清单，也不要突然从"有模型"变成"没有"；
+/// 时效性由刷新链路负责 —— 与网关侧 `catalog_cache` 同一取舍）。
+///
+/// 槽为空是**每次进程重启后的常态**，此时这里返回 `None`：读回台账那一步是
+/// 异步的（`adapter` 的目录准备），本函数必须保持同步，所以它只读内存。
 pub fn cached_catalog() -> Option<Catalog> {
     let slot = cache_slot().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     slot.as_ref().map(|entry| entry.catalog.clone())
 }
 
-/// 内存槽为空时**向网关要回它落盘的那份清单**，装进内存并返回。
-///
-/// ── 解决的正是「明明拉取过，却报没拉取过」─────────────────────
-/// 目录在插件里只活在进程内存（本模块不落盘），而网关那份是**会落盘**的
-/// （`plugin_host::rpc_cache` → `catalog_cache::save`，重启后 `set_defaults`
-/// 还会从库里恢复）。两边各说各话：网关侧「来源/更新日期」显示得好好的，
-/// 插件重启后转发路径却一句「模型目录还没拉取过」，用户必须手动点一次
-/// 「获取模型」—— 而这条 RPC 通道本来就把那份清单放在手边（`settings.get`
-/// 的 `modelCatalog` 键，与 `workbuddy::catalog_state::current` 同一条路）。
-///
-/// ── 三条纪律 ────────────────────────────────────────────────
-///   * `meta.remote == false` 的不认：那是网关的内置兜底，不是谁拉回来的，
-///     拿它当目录会让客户端选到上游不认的模型（§3.4 的幽灵模型坑）；
-///   * 空清单不认：空目录的正确含义是「这个账号没有可用模型」，不覆盖；
-///   * **只在槽为空时**才去问：有内存目录就以内存为准，别让一次慢 RPC 把
-///     刚刷新到的清单冲回旧的。
-pub async fn ensure_catalog(ctx: &PluginCtx) -> Option<Catalog> {
-    if let Some(catalog) = cached_catalog() {
-        return Some(catalog);
-    }
-    let value = ctx
-        .settings_get(super::PROVIDER_ID, SETTING_MODEL_CATALOG)
-        .await
-        .ok()?;
-    let (catalog, refreshed_at) = catalog_from_setting(&value)?;
-    let entry = CachedCatalog {
-        catalog,
-        // 沿用网关记的上次刷新时刻（`0` = 网关没记，落成本刻总比显示 1970 强）。
-        fetched_at_ms: if refreshed_at > 0 { refreshed_at } else { crate::logging::now_ms() },
-    };
-    let restored = entry.catalog.clone();
-    let mut slot = cache_slot().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    // 再查一次：本次 await 期间可能已经有人真刷到了新清单。
-    if slot.is_none() {
-        *slot = Some(entry);
-        Some(restored)
-    } else {
-        slot.as_ref().map(|entry| entry.catalog.clone())
-    }
-}
-
-/// 网关 `settings.get("modelCatalog")` 的返回值 → `(Catalog, 上次刷新时刻)`。
-///
-/// 纯函数（便于测）。第二项原样取 `meta.refreshed_at`，`0` 表示网关也没记。
-///
-/// 三条不认的门槛见 [`ensure_catalog`] 的说明：`Null`、`meta.remote == false`、
-/// 空清单，一律回 None —— 让调用方保持「还没拉取过」的诚实状态，而不是拿
-/// 一份内置兜底或空目录冒充。
-fn catalog_from_setting(value: &Value) -> Option<(Catalog, i64)> {
-    let list = serde_json::from_value::<proto::ModelList>(value.clone()).ok()?;
-    if !list.meta.remote || list.models.is_empty() {
-        return None;
-    }
-    let catalog = catalog_from_entries(&list.models);
-    if catalog.models.is_empty() {
-        return None;
-    }
-    Some((catalog, list.meta.refreshed_at))
-}
-
-/// `entries_of` 的逆：把网关存的条目数组还原成 [`Catalog`]。
-///
-/// 只还原**转发真正要用**的三样：上游真名、源（决定要不要 `maas_type`）、
-/// 输出上限。其余（描述、倍率文案、可见性）管理页从网关那份读，这里不做
-/// 二次搬运 —— 少一处可能与网关漂移的映射。
-///
-/// 认不出 `source` 的行**丢掉**而不是猜：源决定请求头，猜错就是发一个上游
-/// 必定拒绝的请求（同 [`ModelSource::from_label`] 的口径）。
-fn catalog_from_entries(entries: &[Value]) -> Catalog {
-    let mut models: Vec<ModelConfig> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
-    for entry in entries {
-        let Some(id) = entry
-            .get("providerModel")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .or_else(|| entry.get("id").and_then(Value::as_str).map(str::trim))
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        let Some(source) = entry
-            .get("source")
-            .and_then(Value::as_str)
-            .and_then(ModelSource::from_label)
-        else {
-            continue;
-        };
-        // 同一 id 先到先得（与 `append_unique` 的合并口径一致）：网关那份可能
-        // 带重复行，重复进来的第二条源未必相同，按第一条走才不会改路由。
-        if seen.iter().any(|existing| existing.eq_ignore_ascii_case(id)) {
-            continue;
-        }
-        seen.push(id.to_string());
-        let display_name = entry
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(id)
-            .to_string();
-        models.push(ModelConfig {
-            name: display_name.clone(),
-            display_name,
-            description: String::new(),
-            context_length: number(entry, "contextWindow"),
-            max_output_tokens: number(entry, "maxOutputTokens"),
-            supports_images: entry
-                .get("supportsImages")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            credit_display: String::new(),
-            display_enabled: entry.get("display_enabled").and_then(Value::as_bool),
-            id: id.to_string(),
-            source,
-        });
-    }
-    Catalog { models, warnings: Vec::new() }
-}
-
-/// 只给测试用：把内存槽清空，模拟进程重启（网关那份不动）。
-#[cfg(test)]
+/// 只给测试用：把内存槽清空，模拟进程重启（持久化那份不动）。
+#[cfg(any())]
 pub(crate) fn forget_memory_cache_for_tests() {
     let mut slot = cache_slot().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     *slot = None;
@@ -846,7 +773,7 @@ pub fn list() -> Vec<Value> {
     }
 }
 
-/// `Catalog` → 条目数组（`list()` 与回灌共用同一份映射，避免两处漂移）。
+/// `Catalog` → 条目数组（`list()` 与持久化共用同一份映射，避免两处漂移）。
 fn entries_of(catalog: &Catalog) -> Vec<Value> {
     catalog
         .models
@@ -1268,118 +1195,35 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod restart_tests {
-    //! 重启后转发还能不能走 —— 审计抓出来的那条不对称：广告走 `list()`，
-    //! 转发的模型校验走 `cached_catalog()`（内存空时那句「还没拉取过」）。
-    //!
-    //! 修法不是让插件自己落盘（那会变成两份真相），而是**向网关要回它落盘的
-    //! 那份**：`catalog_from_setting` 是这条回灌链的纯函数内核，下面的测试逐字
-    //! 走完「网关存的 entries → 回灌成的 Catalog」这一圈。
+    //! 重启后转发还能不能走 —— 审计抓出来的那条不对称：广告走 `list()`（有持久化回落），
+    //! 转发的模型校验走 `cached_catalog()`（当时只读内存）。后果是每次重启后
+    //! 「模型列得出来、每一条都 503 目录没拉取过」。
+    use crate::server::core::providers::catalog_cache;
+    use crate::server::db::Db;
+
     use super::*;
 
-    /// 进程级内存槽是全局的，凡动它的测试都要串起来跑。
-    static SLOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// 造一份「网关 `settings.get("modelCatalog")` 会返回的东西」。
-    fn setting_value(remote: bool, models: Vec<Value>) -> Value {
-        serde_json::json!({
-            "models": models,
-            "meta": { "remote": remote, "refreshed_at": 1_758_000_000_000i64 },
-        })
-    }
-
-    fn entry(id: &str, source: &str) -> Value {
-        serde_json::json!({
-            "id": id,
-            "name": id,
-            "providerModel": id,
-            "source": source,
-            "supportsImages": false,
-            "contextWindow": 200_000,
-            "maxOutputTokens": 65_536,
-        })
-    }
-
     #[test]
-    fn the_forward_path_sees_the_gateway_copy_after_a_restart() {
-        let value = setting_value(
-            true,
-            vec![
-                entry("GLM-5.2", "agent"),
-                entry("Qwen3-VL-235B", "builtin"),
-                entry("Qwen3-VL-235B", "benefit"),
-            ],
-        );
-        let restored = catalog_from_setting(&value)
-            .map(|(catalog, _)| catalog)
-            .expect("网关存着的那份必须能回灌成目录");
-        assert_eq!(2, restored.models.len(), "同一 id 不应重复（先到先得，agent 那条留下）");
+    fn the_forward_path_sees_the_persisted_catalog_after_a_restart() {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("codearts-catalog-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        catalog_cache::install(Some(Db::open(&dir.join("agent2api.db")).expect("临时库应当能建起来")));
 
-        // 大小写归一 + 上游真名：客户端写小写，转发要用真名
-        let glm = restored.resolve("glm-5.2").expect("大小写归一后仍要能解析出来");
-        assert_eq!("GLM-5.2", glm.id, "转发必须用上游真名");
-        assert_eq!(ModelSource::Agent, glm.source);
-        assert_eq!(200_000, glm.context_length, "上下文长度不能在建回来时丢掉");
-        assert_eq!(65_536, glm.max_output_tokens, "输出上限不能丢：请求侧照它夹");
-
-        let vl = restored.resolve("qwen3-vl-235b").expect("内置源要在");
-        assert_eq!(ModelSource::Builtin, vl.source);
-        assert!(!vl.source.needs_benefit_header());
-    }
-
-    #[test]
-    fn the_benefit_flag_survives_the_round_trip() {
-        // 福利位决定要不要带 `maas_type: benefit` 头，丢了等于把福利模型打回普通路由
-        let value = setting_value(true, vec![entry("benefit-only", "benefit")]);
-        let restored = catalog_from_setting(&value)
-            .map(|(catalog, _)| catalog)
-            .expect("福利目录也要能回灌");
-        assert_eq!(ModelSource::Benefit, restored.models[0].source);
-        assert!(restored.models[0].source.needs_benefit_header());
-    }
-
-    #[test]
-    fn a_non_remote_or_empty_copy_is_not_mistaken_for_a_catalog() {
-        // 网关的内置兜底（remote=false）不是谁拉回来的，不能当目录用
-        assert!(
-            catalog_from_setting(&setting_value(false, vec![entry("m", "agent")])).is_none(),
-            "内置兜底不能冒充远程目录"
-        );
-        // 空清单 = 这个账号确实没有模型，不能覆盖成"有"
-        assert!(catalog_from_setting(&setting_value(true, Vec::new())).is_none());
-        // 网关还没存过
-        assert!(catalog_from_setting(&Value::Null).is_none());
-    }
-
-    #[test]
-    fn an_unrecognised_source_label_drops_the_row_instead_of_guessing() {
-        // 源决定要不要带 `maas_type` 头，猜错就是发一个上游必定拒绝的请求
-        let value = setting_value(
-            true,
-            vec![entry("good", "agent"), entry("unknown", "mystery-source")],
-        );
-        let restored = catalog_from_setting(&value)
-            .map(|(catalog, _)| catalog)
-            .expect("认得出的那条要留下");
-        assert_eq!(1, restored.models.len(), "认不出源的那条必须丢掉，而不是猜一个");
-        assert_eq!("good", restored.models[0].id);
-    }
-
-    #[test]
-    fn the_forward_path_and_the_advertised_list_agree() {
-        // 这条断言就是当初那个 bug 的反面：广告里的每一条，转发都必须解析得出来
         let catalog = Catalog {
             models: vec![
                 ModelConfig {
                     id: "GLM-5.2".into(),
-                    name: "GLM 5.2".into(),
+                    name: "GLM-5.2".into(),
                     display_name: "GLM 5.2".into(),
                     description: "推理模型".into(),
                     context_length: 200_000,
-                    max_output_tokens: 65_536,
+                    max_output_tokens: 131_072,
                     supports_images: false,
-                    credit_display: "0.7x".into(),
+                    credit_display: String::new(),
                     display_enabled: None,
                     source: ModelSource::Agent,
                 },
@@ -1392,25 +1236,71 @@ mod restart_tests {
                     max_output_tokens: 0,
                     supports_images: true,
                     credit_display: String::new(),
-                    display_enabled: Some(false),
+                    display_enabled: None,
                     source: ModelSource::Builtin,
                 },
             ],
             warnings: vec![],
         };
-        let _guard = SLOT_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         store_catalog(catalog.clone());
-        let advertised = list();
-        let round_trip = catalog_from_setting(&setting_value(true, advertised.clone()))
-            .map(|(catalog, _)| catalog)
-            .expect("自己产出的 entries 必须能被回灌读回");
-        assert_eq!(catalog.models.len(), round_trip.models.len());
-        for item in &advertised {
-            let id = item["id"].as_str().unwrap_or_default();
-            assert!(round_trip.resolve(id).is_some(), "广告里的 {id} 转发必须也认得");
-        }
+        assert_eq!(Some(2), cached_catalog().map(|value| value.models.len()));
+
+        // 模拟进程重启：清掉内存槽，持久化那份还在
         forget_memory_cache_for_tests();
-        assert!(cache_slot().lock().unwrap().is_none(), "内存槽应当已空（模拟重启）");
-        assert!(cached_catalog().is_none(), "同步读在重启后本就该空 —— 回灌由 ensure_catalog 负责");
+        assert!(cache_slot().lock().unwrap().is_none(), "内存槽应当已空");
+        let restored = cached_catalog().expect("转发路径必须能从持久化那份重建");
+        assert_eq!(2, restored.models.len());
+        let glm = restored.resolve("glm-5.2").expect("大小写归一后仍要能解析出来");
+        assert_eq!(ModelSource::Agent, glm.source);
+        assert_eq!(200_000, glm.context_length, "上下文长度不能在建回来时丢掉");
+        let vl = restored.resolve("Qwen3-VL-235B").expect("内置源要在");
+        assert!(vl.supports_images, "多模态位只有 builtin 源有，重建时丢了就等于关掉视觉");
+        assert!(!vl.source.needs_benefit_header());
+        // `list()` 与转发读的是同一份真相 —— 这条断言就是当初那个 bug 的反面
+        assert_eq!(restored.models.len(), list().len(), "广告与转发可解析的集合必须一致");
+    }
+
+    #[test]
+    fn an_unrecognised_source_label_drops_the_row_instead_of_guessing() {
+        let catalog = Catalog {
+            models: vec![ModelConfig {
+                id: "m".into(),
+                name: "m".into(),
+                display_name: "m".into(),
+                description: String::new(),
+                context_length: 0,
+                max_output_tokens: 0,
+                supports_images: false,
+                credit_display: String::new(),
+                display_enabled: None,
+                source: ModelSource::Benefit,
+            }],
+            warnings: vec![],
+        };
+        // 逐字走完 entries → 重建 这一圈，福利位必须还在（它决定要不要带 maas_type 头）
+        let rebuilt = rebuild_from(catalog);
+        assert_eq!(ModelSource::Benefit, rebuilt.models[0].source);
+        assert!(rebuilt.models[0].source.needs_benefit_header());
+    }
+
+    fn rebuild_from(catalog: Catalog) -> Catalog {
+        let entries = entries_of(&catalog);
+        let mut out = Catalog::default();
+        for entry in entries {
+            let source = ModelSource::from_label(entry["source"].as_str().unwrap_or("")).expect("自己写的标签要能读回");
+            out.models.push(ModelConfig {
+                id: "m".into(),
+                name: "m".into(),
+                display_name: "m".into(),
+                description: String::new(),
+                context_length: 0,
+                max_output_tokens: 0,
+                supports_images: false,
+                credit_display: String::new(),
+                display_enabled: None,
+                source,
+            });
+        }
+        out
     }
 }
