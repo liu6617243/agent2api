@@ -313,20 +313,30 @@ fn to_int(value: Option<&Value>) -> Option<i64> {
 // ─── 每日「签到」（桌面登录积分发放）─────────────────────────
 //
 // 小浣熊没有 WorkBuddy 那种「每日签到」接口；它的每日奖励走的是**桌面端
-// 登录积分**链路：官方桌面客户端每次启动会打两个接口，服务端据此按天发放
-// 每日积分（1.x 源实现 account-balance.mjs / account-routes.mjs 的
-// desktop-grant 已验证）。这里复刻同一条链路作为「签到」：
-//   ① GET  /api/web/office/v3/setting_info —— **每日积分的发放触发器**
-//      （按天幂等），发放通知在响应的 point_grant_popups / point_grant_toast；
-//   ② GET  /api/web/points/v1/bills —— 核对今日实际入账，作为权威结果
-//      （账单接口慢，limit=20 实测约 9 秒，用独立超时兜底；失败降级，
-//      不影响 ① 的领取本身）。
+// 登录积分**链路。判定链在 2026-11-01 重做（AgentHub 交叉验证 + 本机实测）：
+//   ① GET  /api/web/office/v3/setting_info —— 激活当日 Web 会话（懒结算
+//      前置；实测跳过它 grant 恒 granted:false 且账单无单据）。失败不阻断。
+//   ② POST /api/web/desktop/v1/login/points/grant（body `{}`）—— **发奖
+//      端点自己回答「今天领没领」**：`data.granted` true = 本轮刚发放，
+//      false = 今天已发放过（幂等，不是失败）。实测（当日已领）返回
+//      `{code:0,data:{granted:false,popup:null}}`，与账单 11:58 的 +300 互证。
 //
-// 同一条 grant 接口里的**首次**桌面登录奖励（一次性 3000，新手福利）原先是
-// 本函数的第①步，已拆到新手任务分组（`onboarding.rs`，与 Loomy 同一入口），
-// 不再随每日签到执行 —— 一次性动作混进每日调度，之后每一轮都会白打一次。
+// ── 为什么不再拿账单当判定依据 ───────────────────────────────
+// 旧实现「setting_info 触发 + 拉账单核对今日入账」有个窗口缺陷：账单按时间
+// 倒序而窗口固定 20 条，对话消耗频繁的账号当天就把 +300 挤出窗口 —— 明明
+// 已入账被判成 pending（台账实测 11-01 15:56 / 10-30 12:55 / 10-29 21:41
+// 三条假 pending）。现在账单核对**降级为文案补充**（granted=true 时把今日
+// 累计入账拼进 msg / grantsToday），窗口再窄也只影响显示数额，不翻转结论。
+//
+// 同一条 grant 端点里的**首次**桌面登录奖励（一次性 3000，新手福利）在
+// 新手任务分组（`onboarding.rs`，与 Loomy 同一入口）—— 一次性动作不混进
+// 每日调度，之后每一轮都会白打一次。
 
-/// 账单核对的拉取条数与超时（源实现 GRANT_CHECK_LIMIT / GRANT_CHECK_TIMEOUT_MS）
+/// 账单核对的拉取条数与超时（源实现 GRANT_CHECK_LIMIT / GRANT_CHECK_TIMEOUT_MS）。
+///
+/// 仅作**文案补充**（把今日累计入账拼进 msg / grantsToday），不再当判定依据
+/// —— 倒序固定 20 条的窗口会被高频对话消耗挤满，把当天的 +300 滑出窗口
+/// （11-01「未领取」误判根因，见模块头）。
 const GRANT_CHECK_LIMIT: usize = 20;
 const GRANT_CHECK_TIMEOUT_MS: u64 = 25_000;
 
@@ -352,6 +362,12 @@ const GRANT_SETTLE_WAIT_MS: u64 = 15_000;
 /// 「今日确无入账」时的自动复核间隔：挂进 claim 的 `retryAt`，网关调度
 /// （auto_checkin::retry）按它自动重跑整场签到。不给的话这条 pending 永远
 /// 停在台账里，只能等用户手点 —— beta.5.1 的实况。与 zcode 的 10 分钟同款。
+///
+/// 现在判定来自 grant 端点本身（见模块头），这条只剩一种触发场景：
+/// grant 与 setting_info 都成功但都拿不到结论之外的异常（例如账单补充失败
+/// 且 `granted=false`——它已经是终态，不挂重试）。保留常量供 `claim` 失败
+/// 重试路径与未来回退使用；`claim_daily_grant` 的三条终态都不再需要它。
+#[allow(dead_code)]
 const GRANT_RETRY_MS: i64 = 10 * 60_000;
 
 /// 客户端身份头：官方手机端（Capacitor App）请求登录积分接口带的两个头。
@@ -435,8 +451,8 @@ async fn check_today_grants(
                 error: None,
             }
         }
-        // 账单核对失败（401 也好、超时也好）都不谎报成功：把上游文案带出去，
-        // 由调用方判成「未能核对今日入账」并挂 retryAt 复核。
+        // 账单核对失败（401 也好、超时也好）不翻转结论：把上游文案带出去，
+        // 由调用方拼进 msg 的「账单核对失败：…」补充段（仅提示，不参与判定）。
         Err(error) => GrantCheck {
             grants: Vec::new(),
             error: Some(error.message),
@@ -447,9 +463,11 @@ async fn check_today_grants(
 /// 小浣熊账号的每日签到（claim 形状与 WorkBuddy 的 claim_daily_checkin 对齐：
 /// `{success, msg}` —— billing::checkin 的汇总只认这两个字段）。
 ///
-/// `success` 的口径是「**今日积分确有入账**」（账单核对），而不是某一步的
-/// HTTP 成败：发放是服务端在 setting_info 上按天幂等完成的，重复执行
-/// 不会重复入账，账单里看得到就是领到了。
+/// `success` 的口径是**发奖端点的 `granted` 字段**（2026-11-01 重做，见模块头）：
+///   - `granted=true`  → success，本轮刚发放（popup.points 有则透出数额）；
+///   - `granted=false` → 「今日已领取过」：**终态**，`alreadyCompleted:true`
+///     （网关按 AutoClaw 同款落 already、置 checkinAt、不再重试）；
+///   - grant 或 setting_info 网络失败 → 原样 Err（如实失败，可重试）。
 ///
 /// 首次桌面登录奖励（一次性新手福利）**不在**本函数里 —— 它已拆到
 /// `onboarding.rs` 挂新手任务分组，见那里的模块头说明。
@@ -466,11 +484,12 @@ pub async fn claim_daily_grant(
     }
     let origin = main_site_url();
 
-    // ① 每日积分发放触发器（按天幂等）。失败必须体现在结果里 ——
-    //    这步不成功当日就没有发放，账单核对会给出「今日未见入账」
+    // ① 激活当日 Web 会话（懒结算前置）。失败不阻断：AgentHub 同款取舍，
+    //    由 ② 的 grant 自行暴露问题（激活失败时 granted 恒 false 且无单据，
+    //    但那与「今天已领过」在响应上无法区分 —— 留给 ③ 的账单补充提示）。
     let mut settings_headers = desktop_client_headers();
     settings_headers.push(("X-Raccoon-Language".to_string(), "zh".to_string()));
-    let settings = match request_json_ex(
+    let settings_ok = request_json_ex(
         &origin,
         "GET",
         "/api/web/office/v3/setting_info",
@@ -479,62 +498,68 @@ pub async fn claim_daily_grant(
         REQUEST_TIMEOUT_MS,
     )
     .await
-    {
-        Ok(data) => {
-            // 发放通知原样透出（结构与上游一致，界面不深入解析）
-            json!({
-                "popups": data.get("point_grant_popups").cloned().unwrap_or(Value::Null),
-                "toast": data.get("point_grant_toast").cloned().unwrap_or(Value::Null),
-            })
-        }
-        Err(error) => return Err(error),
+    .is_ok();
+
+    // ② 发奖端点（幂等）：响应 data.granted 直接回答今天领没领。
+    let grant = request_json_ex(
+        &origin,
+        "POST",
+        "/api/web/desktop/v1/login/points/grant",
+        &credentials.token,
+        &desktop_client_headers(),
+        REQUEST_TIMEOUT_MS,
+    )
+    .await?;
+    let granted = grant.get("granted").and_then(Value::as_bool) == Some(true);
+    // 本轮刚发放时响应带 popup.points（与新手任务同一形状）
+    let granted_points = if granted {
+        grant
+            .pointer("/popup/points")
+            .and_then(Value::as_i64)
+            .filter(|points| *points > 0)
+    } else {
+        None
     };
 
-    // ② 账单核对今日入账。
-    //
-    //    **发放是异步入账**：setting_info 只是触发器，服务端随后才把积分
-    //    记进账单（实测台账：21:41:37 首查「未见入账」→ 21:41:58 重查
-    //    「+300」）。触发完立刻查账单大概率查空 —— 于是判成「今日未见积分
-    //    入账」的 pending，账号还得用户手点第二次才补上。
-    //
-    //    对策：首查为空时等一拍（GRANT_SETTLE_WAIT_MS）再核对一轮；两轮
-    //    都空才是真·未见入账，此时挂 `retryAt` 交给网关调度自动复核，
-    //    不再要求用户手点。
-    let today = beijing::today_key();
-    let mut check = check_today_grants(&origin, &credentials.token, &today).await;
+    // ③ 账单核对（best-effort，只做文案补充，不翻转结论）：granted=true 时
+    //    把今日累计入账（含本轮）拼进 msg / grantsToday；失败静默降级。
+    let mut check = check_today_grants(&origin, &credentials.token, &beijing::today_key()).await;
     if check.grants.is_empty() && check.error.is_none() {
-        // 首查为空：等上游把积分记进账单，再核对一轮
+        // 首查为空：发放是异步入账（实测 21~31 秒），等一拍再核对一轮
         tokio::time::sleep(std::time::Duration::from_millis(GRANT_SETTLE_WAIT_MS)).await;
-        check = check_today_grants(&origin, &credentials.token, &today).await;
+        check = check_today_grants(&origin, &credentials.token, &beijing::today_key()).await;
     }
-
     let grants = check.grants;
     let grants_error = check.error;
     let granted_today = grants.iter().map(|item| to_int(item.get("points")).unwrap_or(0)).sum::<i64>();
+
     let mut msg_parts: Vec<String> = Vec::new();
-    if granted_today > 0 {
-        msg_parts.push(format!("今日积分 +{granted_today}"));
-    } else if grants_error.is_some() {
-        // 账单核对失败拿不到权威结果，不谎报成功
-        msg_parts.push("未能核对今日入账".to_string());
+    let mut claim = json!({
+        "grantsToday": grants,
+        "settings": json!({ "ok": settings_ok }),
+        "grantsError": grants_error.clone().map(Value::String).unwrap_or(Value::Null),
+    });
+    if granted {
+        // 本轮刚发放。msg 以本轮数额优先（popup.points），取不到看账单累计。
+        let shown = granted_points.unwrap_or(granted_today);
+        if shown > 0 {
+            msg_parts.push(format!("今日积分 +{shown}"));
+        } else {
+            msg_parts.push("已领取每日积分".to_string());
+        }
+        claim["success"] = Value::Bool(true);
     } else {
-        msg_parts.push("今日未见积分入账，尚未确认领取".to_string());
+        // 今天已发放过 —— 终态，网关落 already 并置 checkinAt，不再重试。
+        msg_parts.push("今日已领取过".to_string());
+        if granted_today > 0 {
+            msg_parts.push(format!("今日累计入账 +{granted_today}"));
+        }
+        claim["success"] = Value::Bool(false);
+        claim["alreadyCompleted"] = Value::Bool(true);
     }
     if let Some(error) = grants_error.as_deref() {
         msg_parts.push(format!("账单核对失败：{error}"));
     }
-
-    let mut claim = json!({
-        "success": granted_today > 0,
-        "msg": msg_parts.join("；"),
-        "grantsToday": grants,
-        "settings": settings,
-        "grantsError": grants_error.map(Value::String).unwrap_or(Value::Null),
-    });
-    // 今日确无入账 → 让网关调度 10 分钟后自动复核这一场（见 GRANT_RETRY_MS）。
-    // 上游按天幂等，重跑不会重复发奖。
-    if granted_today == 0 {
-        claim["retryAt"] = Value::from(crate::http::now_ms() + GRANT_RETRY_MS);
-    }
+    claim["msg"] = Value::String(msg_parts.join("；"));
     Ok(claim)
 }

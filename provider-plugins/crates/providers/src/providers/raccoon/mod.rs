@@ -120,7 +120,7 @@ impl Provider for RaccoonProvider {
                 ..Default::default()
             })
         .with_checkin(proto::CheckinInfo {
-            description: Some("桌面端每日积分链路".to_string()),
+            description: Some("桌面端每日积分链路（发奖端点直接判定）".to_string()),
             modes: vec![proto::CheckinMode::Checkin],
             onboarding: true,
             ..Default::default()
@@ -340,7 +340,8 @@ impl Provider for RaccoonProvider {
         })
     }
 
-    /// 每日签到：`setting_info` 触发发放 + 账单核对今日入账。
+    /// 每日签到：setting_info 激活 + 发奖端点 `granted` 直接判定
+    /// （2026-11-01 重做，见 `balance::claim_daily_grant`）。
     fn checkin<'a>(
         &'a self,
         ctx: &'a PluginCtx,
@@ -357,10 +358,10 @@ impl Provider for RaccoonProvider {
     /// 带 `manual` 的签到：本家没有写请求限流闸，两档执行体一致，差别只在
     /// **要把 `retryAt` 透出去**。
     ///
-    /// 小浣熊的积分是异步入账的，`claim_daily_grant` 两轮核对都空时会挂
-    /// `retryAt`（10 分钟后复核）。默认实现 `checkin(...).map(Into::into)` 会
-    /// 把 `retry_at` 置成 `None`，那场 pending 就只能等用户手点 —— 这正是
-    /// 「小浣熊签到总是有问题」的一半原因。故这里显式重写。
+    /// 2026-11-01 起 `claim_daily_grant` 的三条结论都是终态（granted=true 刚
+    /// 发放 / alreadyCompleted 今天已发放 / Err 网络失败），不再产出 pending，
+    /// `retryAt` 通常为 None —— 重写保留是为了协议兼容（未来若加回复核场景
+    /// 仍能透传），网关侧零改动。
     fn checkin_with_options<'a>(
         &'a self,
         ctx: &'a PluginCtx,
@@ -651,6 +652,11 @@ fn base_url_from_env(name: &str, fallback: &str) -> String {
 }
 
 /// 签到结果 → 协议化的 `CheckinReport`。
+///
+/// 2026-11-01 起 `claim_daily_grant` 的判定来自发奖端点 `data.granted`
+/// （见 `balance` 模块头）：success=true → Claimed；`alreadyCompleted:true`
+/// （今天已发放过）→ Done（网关按 already 落账、置 checkinAt、不重试）；
+/// 其余按文案兜底 Failed。
 fn checkin_report_of(claim: &Value) -> proto::CheckinReport {
     let success = claim
         .get("success")
@@ -673,13 +679,10 @@ fn checkin_report_of(claim: &Value) -> proto::CheckinReport {
         })
         .filter(|points| *points > 0)
         .map(|points| format!("{points} 积分"));
-    let text = message.clone().unwrap_or_default();
     let outcome = if success {
         proto::CheckinOutcome::Claimed
     } else if claim.get("alreadyCompleted").and_then(Value::as_bool) == Some(true) {
         proto::CheckinOutcome::Done
-    } else if text.contains("未见") || text.contains("未能核对") {
-        proto::CheckinOutcome::Inactive
     } else {
         proto::CheckinOutcome::Failed
     };
