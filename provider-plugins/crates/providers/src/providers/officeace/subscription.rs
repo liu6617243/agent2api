@@ -8,7 +8,7 @@
 //! ── 为什么不用 `auth_http::send_raw` ─────────────────────────
 //! `send_raw` 在 body 非空时会**自己补一个 `Content-Type`**，而签名要求
 //! `content-type` 以**同一个值**进签名头集合 —— 两条路一起走会发成两个
-//! `Content-Type`。照 `codearts::welfare` 的先例：用直连客户端（`crate::http::client`）
+//! `Content-Type`。照 `codearts::welfare` 的先例：用直连客户端（`crate::http::control_client`）
 //! 直接发，显式带上签名算出的全套头（`Host` 由签名层从 URL 注入，见 `signer`）。
 //!
 //! ── 三条实测坑（写在这里，别在别处重推）──────────────────────
@@ -51,6 +51,52 @@ fn excerpt(text: &str) -> String {
         return cleaned;
     }
     cleaned.chars().take(240).collect::<String>() + "…"
+}
+
+/// 从响应体里认出**上游业务错误**（`error_code` + `error_msg`）。
+///
+/// ── 为什么需要它 ──────────────────────────────────────────────
+/// OfficeAce 的业务拒绝（未订购套餐、活动已下线…）回的是 **HTTP 403 + 一段
+/// 正常 JSON**，与「凭据真的过期」同一个状态码。只看状态码必然误判 —— 这正是
+/// 「果办签到总报凭据失效」的根因（详见 [`call`] 里那段说明）。
+///
+/// ── 判据 ────────────────────────────────────────────────────
+/// 响应体带 `error_code` / `error_msg` **且** `error_code` 不是平台/鉴权层前缀
+/// `APIG.` ⇒ 业务结论。`APIG.*` 是华为云 API 网关的鉴权错误（`APIG.0602` token
+/// 过期、`APIG.1002` 凭据无效…），要按「凭据失效」提示，留给 [`call`] 的状态码
+/// 分支；业务错误码形如 `OfficeAce.11020604`，前缀是本家自己的域名。
+///
+/// 返回 `Some(msg)` = 业务结论，调用方原样透出；`None` = 不是业务错误
+/// （空体 / 非 JSON / 平台错误码 / 只有无关的 `message` 字段），交给状态码判据。
+fn business_error(payload: Option<&Value>) -> Option<String> {
+    let value = payload?;
+    let code = value
+        .get("error_code")
+        .or_else(|| value.get("errorCode"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let message = value
+        .get("error_msg")
+        .or_else(|| value.get("errorMsg"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    // 平台 / 鉴权层错误码不归业务分支 —— 那要按「凭据失效」处理
+    if code.is_some_and(|code| code.starts_with("APIG.")) {
+        return None;
+    }
+    // 没有 code 也没有 message = 不是业务错误（例如网关层的裸 403）
+    if code.is_none() && message.is_none() {
+        return None;
+    }
+    let detail = match (code, message) {
+        (Some(code), Some(message)) => format!("{code} {message}"),
+        (Some(code), None) => code.to_string(),
+        (None, Some(message)) => message.to_string(),
+        (None, None) => return None,
+    };
+    Some(format!("OfficeAce 上游拒绝：{detail}"))
 }
 
 /// 调一次 V11 签名的订阅族接口，返回解析后的响应体。
@@ -123,6 +169,19 @@ async fn call(
     })?;
     let status = response.status().as_u16();
     let text = response.text().await.unwrap_or_default();
+    // ── 401/403 **不能**一刀切成「凭据失效」（2026-11-01 修正）────────
+    // 旧实现见 401/403 就回报「控制面凭据已失效（临时 AK/SK 会过期）：请重新
+    // 登录一次」。这是**误报**：上游把**业务**拒绝也包装成 403 —— 实测退订后
+    // `POST /v1/subscription/bonus/claim` 回
+    // `403 {"error_code":"OfficeAce.11020604","error_msg":"未订购套餐"}`，而同一
+    // 时刻同一凭据 `GET /v1/subscription` 是 200（token 还剩 61 分钟）。
+    // 用户按那句提示去重新登录只会白折腾一轮，问题还在。
+    //
+    // 所以判据改成先看**上游错误码**，再看 HTTP 状态：
+    //   - 响应体里带了 `error_code` / `error_msg`（非 APIG 凭据码）⇒ 这是上游的
+    //     **业务**结论，原样透出（含 code，便于排障），不冒充凭据问题；
+    //   - 真凭据失效仍走原来的 `expired || 401 || 403` 分支（`APIG.0602` 必需带
+    //     "security token has expired" 文案、`APIG.1002`、或裸 401/403 无业务码）。
     let payload = serde_json::from_str::<Value>(&text).ok();
     let expired = payload.as_ref().is_some_and(|payload| {
         let code = payload.get("error_code").and_then(Value::as_str).unwrap_or("");
@@ -131,6 +190,11 @@ async fn call(
         code == "APIG.0602" && message.to_ascii_lowercase().contains("security token has expired")
             || code == "APIG.1002"
     });
+    if let Some(message) = business_error(payload.as_ref()).filter(|_| status != 200) {
+        // 业务拒绝用上游自己的 HTTP 状态（403 就是 403），不再折成别的码，
+        // 也不再挂 `CONTROL_TOKEN_EXPIRED` 码（那会让控制面去走续期）。
+        return Err(GatewayError::with_status(i32::from(status), message));
+    }
     if expired || status == 401 || status == 403 {
         let error = GatewayError::with_status(
             i32::from(status),

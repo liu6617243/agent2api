@@ -83,9 +83,29 @@ impl Provider for OfficeAceProvider {
                 model_refresh: true,
                 // 订阅快照（`GET /v1/subscription`，V11 签名）
                 usage: true,
-                // `POST /v1/subscription/bonus/claim` 领奖励积分
-                checkin: true,
-                // 新手任务与签到是**同一个上游动作**（一次 claim 全领）
+                // ── 不再申报「每日签到」能力位（2026-11-01）────────────
+                // 上游已取消果办的每日签到活动：`GET /v1/subscription` 回报
+                // `subscribe_status=UNSUBSCRIBED`，`bonus_skus` 里「每日签到」那一条
+                // 消失（只剩新用户专属福利），再打 claim 一律
+                // `HTTP 403 {"error_code":"OfficeAce.11020604","error_msg":"未订购套餐"}`。
+                //
+                // 以前申报 true，于是签到链每天都把它拉进目标集合，多打一次注定被拒的
+                // 请求，并在签到台落一条「控制面凭据已失效（临时 AK/SK 会过期）：
+                // 请重新登录一次」——**那是误报**：同一时刻 `GET /v1/subscription`
+                // 是 200，凭据完全正常（本轮实测 token 还剩 61 分钟）。根因是
+                // `subscription::call` 把裸 403 一刀切成「凭据失效」，把上游的**业务**
+                // 拒绝吞成了凭据问题（那条已同步修正）。
+                //
+                // 关闭这一位 = 果办**不参与每日签到**：网关
+                // `billing::checkin::supports_checkin` 在插件申报后只看
+                // `CheckinInfo::daily`，置 false 之后定时 / 补签 / 批量 / 单账号
+                // 四条路径同时不再选中它。某天上游恢复该活动，把这一位与下面
+                // `CheckinInfo::daily` 一起改回 true 即可。
+                checkin: false,
+                // 新手任务仍申报：它读订阅里的 `bonus_skus` 账本（`GET`，无副作用），
+                // 退订后照样查得到已到账的奖励，签到中心「新手福利」卡照常可用。
+                // 每日签到与新手福利虽曾共用同一个 claim 上游动作，但**发放依据不同**
+                // —— 新手福利是已到账账本，签到是活动发放；活动下线不影响账本查询。
                 claims: true,
                 web_login: true,
                 // 上游回自己的模型名（不改写也无害，与内置版同一结论）
@@ -129,10 +149,22 @@ impl Provider for OfficeAceProvider {
                 ..Default::default()
             })
         .with_checkin(proto::CheckinInfo {
+            // 「签到」这个动作本身已随上游活动下线（见上面 `Capabilities::checkin`
+            // 那段说明）。留一句说明是为了让签到中心的范围外原因可读 —— 但真正
+            // 生效的是下面的 `daily: false`。
             description: Some(
-                "一次领当天全部奖励（每日签到 + 新人礼） · 幂等由上游保证".to_string(),
+                "每日签到活动已随套餐退订下线，仅保留奖励账本查询".to_string(),
             ),
             modes: vec![proto::CheckinMode::Checkin],
+            // ── 不参与每日签到（2026-11-01）────────────────────────────
+            // 网关 `supports_checkin` 在插件申报后**只看这一位**（其余 `plans` /
+            // `onboarding` / `growth` 各管自己那张卡）。置 false 之后果办不再进
+            // 签到目标集合，`api::checkin_center` 会把它归进「不参与每日签到」，
+            // 原因文案由申报位自动给出「本家没有每日签到，福利在下方对应卡片里」
+            // —— 这正是实情。
+            daily: false,
+            // 新手福利保留：它读 `bonus_skus` 账本（无副作用的 GET），退订后
+            // 仍能列出已到账的奖励，不该跟着签到一起下线。
             onboarding: true,
             ..Default::default()
         })
