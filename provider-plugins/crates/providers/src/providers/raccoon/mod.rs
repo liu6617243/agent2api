@@ -48,6 +48,7 @@ use agent2api_provider_sdk::{
     ChatPlan, CheckinResult, PluginCtx, Provider, ProviderMeta, SendFuture,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::errors::GatewayError;
 
@@ -60,6 +61,108 @@ const DEFAULT_LLM_BASE_URL: &str = "https://xiaohuanxiong.com/api/web/llm/v2";
 /// 默认鉴权 API 前缀（源实现 `DEFAULT_AUTH_ORIGIN` + `DEFAULT_AUTH_API_PREFIX`）
 const DEFAULT_AUTH_ORIGIN: &str = "https://xiaohuanxiong.com";
 const DEFAULT_AUTH_API_PREFIX: &str = "/api/web/auth/v1";
+
+// ── 上游客户端身份（2026-11-02 实测结论）──────────────────────────
+//
+// 上游 LLM 网关按 **`X-RACCOON-Session-ID` 是否存在**给并发准入档位：
+// 不带这个头 → 同时最多 **5** 个在飞请求；带上 → **10** 个。
+// 实测：8 并发下，不带时稳定「5 过 / 3 拒」（复现两次），带上时 8/8 全过
+// （复现两次）；12 并发下带上时正好 10 过 / 2 拒。值本身**不做校验**
+// （`abc`、纯数字串、非 UUID 长串都生效），它是分档标记而不是凭据。
+//
+// 反例（都实测过，**不要加**）：`x-client-name` / `x-client-platform` /
+// `x-client-version` / `x-client-os-version` / `x-client-channel` 以及
+// `X-Stainless-*` 那一整套，对档位**毫无作用** —— 只加它们仍是 5，全加也一样是 10
+// （10 是 Session-ID 带来的上限，不是它们带来的）。加进来只会让每个请求多背十几个头。
+//
+// 还有一条更要紧的：**这些头换不来风控豁免**。账号一旦进惩罚窗口，带完整官方头
+// 单发同样是 `429 user_model_rate_limited`、同样 167ms 秒拒、同样没有 `Retry-After`。
+// 降频与退避才是根本，头只解决「被罚之前的天花板」。
+//
+// 配额是**按账号**算的，不按会话：两个不同 Session-ID 各打 8 并发（同时在飞 16），
+// 合计只过 10 —— 多开会话叠不上去，别指望轮换会话提额。
+
+/// 首条 user 消息的纯文本（标题与会话种子都用它）。
+///
+/// 多段内容（`[{type:"text"},{type:"image_url"}]`）只拼 text 段：标题用不到图，
+/// 而把图片的 base64 前缀塞进头里只会撑爆长度。
+fn first_user_text(body: &Value) -> Option<String> {
+    let messages = body.get("messages")?.as_array()?;
+    messages.iter().find_map(|message| {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            return None;
+        }
+        let text = match message.get("content")? {
+            Value::String(text) => text.clone(),
+            Value::Array(parts) => parts
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => return None,
+        };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+/// 会话 ID：**同一会话内恒定、跨会话不同**，形态按 UUID v4 写。
+///
+/// 种子取「账号 id + 首条 user 消息」：首条消息在整段会话里不会变，所以多轮之间
+/// 稳定；换个会话首条消息必然不同，于是不会和别的会话撞成一个。只按账号派生也
+/// 生效（实测），但那会把用户所有会话压成一个 —— 官方客户端是一个会话一个 id，
+/// 跟着它走更稳。
+fn session_id_for(account: &str, body: &Value) -> String {
+    let seed = first_user_text(body).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(account.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(seed.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    // 版本位/变体位按 RFC 4122 覆写（`4` / `a`），与 `crate::ids::uuid_v4` 同形态
+    let part = |start: usize, end: usize| hex.get(start..end).unwrap_or("").to_string();
+    format!(
+        "{}-{}-4{}-a{}-{}",
+        part(0, 8),
+        part(8, 12),
+        part(13, 16),
+        part(17, 20),
+        part(20, 32)
+    )
+}
+
+/// 标题头：官方客户端取首条 user 消息的**前 20 个字符**。
+///
+/// HTTP 头值是 latin-1 字节串，中文标题直接塞进去会让 reqwest 造 `HeaderValue`
+/// 失败、整个请求根本发不出去 —— 所以非 ASCII 一律百分号编码（官方 Electron 侧
+/// 也是先编码再塞头）。拿不到文本时退回中性值。
+fn header_title(body: &Value) -> String {
+    let Some(text) = first_user_text(body) else {
+        return "codex".to_string();
+    };
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::new();
+    for ch in collapsed.chars().take(20) {
+        if ch.is_ascii() && !ch.is_ascii_control() {
+            out.push(ch);
+        } else {
+            let mut buf = [0u8; 4];
+            for byte in ch.encode_utf8(&mut buf).as_bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    out
+}
 
 /// 小浣熊适配器。
 pub struct RaccoonProvider;
@@ -133,10 +236,14 @@ impl Provider for RaccoonProvider {
 
     // ── 数据面 ────────────────────────────────────────────────
 
-    /// 构造 `POST {llmBase}/chat/completions`（头集合照抄源实现 `upstreamHeaders`）。
+    /// 构造 `POST {llmBase}/chat/completions`。
     ///
     /// body **原样透传**：源实现除了 `model` 走一次路由解析（未知模型回退默认，
     /// 本期由网关的模型校验/路由承担）之外不改任何字段。
+    ///
+    /// 头集合见模块头「上游客户端身份」：真正决定并发档位的只有
+    /// `X-RACCOON-Session-ID`；另外三个 X-RACCOON 头是为了让同一会话的多轮
+    /// 在上游看来是同一次对话，不影响配额但也没有代价。
     fn build_chat<'a>(
         &'a self,
         ctx: &'a PluginCtx,
@@ -153,9 +260,17 @@ impl Provider for RaccoonProvider {
             }
             let headers: Vec<(String, String)> = vec![
                 ("Content-Type".to_string(), "application/json".to_string()),
-                // 源实现给的是 `Accept: */*`（LLM 网关两种响应形态都可能回）
-                ("Accept".to_string(), "*/*".to_string()),
+                // 源实现给的是 `Accept: */*`，官方 LLM 调用方是 `application/json`；
+                // 两种都能拿到 SSE（实测），取与官方一致的那个
+                ("Accept".to_string(), "application/json".to_string()),
                 ("Authorization".to_string(), format!("Bearer {token}")),
+                (
+                    "X-RACCOON-Session-ID".to_string(),
+                    session_id_for(&req.account, &req.body),
+                ),
+                ("X-RACCOON-Turn-ID".to_string(), crate::ids::uuid_v4()),
+                ("X-RACCOON-Title".to_string(), header_title(&req.body)),
+                ("X-RACCOON-Call-Kind".to_string(), "main".to_string()),
             ];
             Ok(ChatPlan::chat(
                 format!("{}/chat/completions", llm_base_url()),
