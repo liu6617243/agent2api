@@ -45,9 +45,7 @@ const DAILY_CHECKIN_PATH: &str = "/v2/billing/meter/daily-checkin";
 /// `session` 是 `session_of_record` 折出来的会话形状（`auth` / `account` /
 /// `endpoint` / `proxy`）—— 与网关 `BillingService` 拿到的会话同一形态。
 pub(crate) async fn claim(session: &Value) -> Result<Value, GatewayError> {
-    let proxy = session
-        .get("proxy")
-        .and_then(|value| serde_json::from_value::<agent2api_provider_protocol::WireProxy>(value.clone()).ok());
+    let proxy = super::super::contract::proxy_of(session)?;
     let result = call::call(
         "POST",
         DAILY_CHECKIN_PATH,
@@ -89,16 +87,6 @@ pub(crate) async fn claim(session: &Value) -> Result<Value, GatewayError> {
                 Value::String(result_msg(&result.raw).unwrap_or_else(|| "签到失败".to_string())),
             );
             let message = failure.get("msg").and_then(Value::as_str).unwrap_or("");
-            // 「今天已签到，请明天再来」是正常终态，不是失败：不补这个标记，
-            // `report_of` 只能按「success=false 且无已完成标记」判 Failed，
-            // 界面就把「今日已领」显示成红字失败（2026-10-27 截图实证）。
-            //
-            // ── 判据为什么比 `call::is_duplicate_claim` 多一层否定词排除 ──
-            // 这里拿到的是**非 0 业务码**，文案可能是「未能领取，稍后再试」这类
-            // 既含「领取」又明确是失败的话。只按关键词判会把真失败洗成已完成，
-            // 当日就不会再自动重试 —— 比报红字更糟。`call` 那边的场景是 HTTP
-            // 400/409（上游对重复领取的专属状态码），语义已经足够限定，故不必
-            // 再排除否定词。两处判据不同是**有意的**，不是漏改。
             let already = !(message.contains("可能") || message.contains("未能") || message.contains("失败"))
                 && (message.contains("已签到") || message.contains("已领取"));
             failure.insert("alreadyCompleted".to_string(), Value::Bool(already));

@@ -1,52 +1,29 @@
-//! 小浣熊（raccoon）插件实现：无状态转发 + 凭证续期 + 目录 / 余额 / 签到 / 新手任务。
+//! 小浣熊：OpenAI 对话、图片生成/编辑、目录、积分与登录奖励。
 //!
-//! ── 上游长什么样（移植来源 `raccoon-upstream-client.mjs`）────────
-//!   - LLM 网关：`POST {llmBase}/chat/completions`（默认
-//!     `https://xiaohuanxiong.com/api/web/llm/v2`），`Authorization: Bearer <JWT>`，
-//!     `Content-Type: application/json`，OpenAI 兼容 body，SSE 流式。
-//!   - 模型 id **无前缀概念**：客户端给什么就原样发给上游（`body.model` 直填）。
-//!   - 鉴权：`POST {authBase}/refresh`，body `{"refresh_token": "..."}`。
-//!
-//! ── 与 workbuddy 的三处**关键差异**（别照抄）──────────────────
-//!   1. **不注入 system 消息**：小浣熊网关是通用 OpenAI 兼容实现，源实现从不改
-//!      消息序列。
-//!   2. **不认「默认模型」**：本家没有这个概念（`default_models` 非空只是给界面
-//!      兜底，`supports_default_model` 是网关侧的事）。
-//!   3. **环境变量旁路**：`RACCOON_TOKEN` 是小浣熊自己的脚本/CI 入口 —— 插件侧
-//!      照读，`anonymous_default_session = true`。
-//!
-//! ── 响应侧的 model 名回写 ─────────────────────────────────────
-//! 上游网关会把响应 chunk 里的 `model` 换成它自己的内部名，而客户端认的是自己
-//! 请求时给的名字。`sse_model_rewrite = true` 让网关的 SSE 出口做那次替换。
-//!
-//! ── 从网关搬来时改了什么（逐条对照，便于 parity 核对）────────────
-//! ```text
-//!   不变：JWT 解码、刷新单飞与比较写回、401/429 分类、SSE model 回写、
-//!         目录的 10 分钟 TTL 与静态兜底、积分钱包与订阅归一、
-//!         签到两步（setting_info + 账单核对）、新手任务两条一次性奖励
-//!   改：  ① 凭证来源从 `store.raccoon_account_record()` 改成 `store::record()`
-//!         ② 桌面端实时登录态（`~/.box-agent/config/auth.json`）**保留** ——
-//!            那是本机的真实登录态，不是账号库的一部分
-//!         ③ 目录缓存不落盘（网关自己缓存插件返回的清单）
-//!         ④ 新手任务台账从账号记录字段改成 `ctx.ledger_put`（形状不变）
-//!         ⑤ 登录换码返回 `NormalizedAccount`（落库由网关做）
-//! ```
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! 本 crate 编译期禁止 unwrap/expect/panic（见 `main.rs` 的 deny）。
+//! 官方 1.1.5 同时接受旧 JWT 与 IAM；后者没有 refresh grant。账号标识
+//! 仍取 user_info 的平台 ID，不能把 IAM subject 当成旧数字账号 ID。
+//! 对话消息原样保留，只按官方模型家族翻译思考字段；组织身份来自账号凭证。
+//! 桌面登录态实时读盘，刷新只比较再写，不覆盖客户端刚换入的凭证。
 
+mod account_view;
 pub mod balance;
 pub mod credentials;
-pub mod jwt;
+mod desktop;
+mod fallback;
+mod headers;
+mod iam;
 mod image_generation;
+mod image_size;
+pub mod jwt;
 pub mod models;
 pub mod oauth;
 pub mod onboarding;
+mod reasoning;
+mod refresh_api;
+mod upstream_errors;
 
 use agent2api_provider_protocol as proto;
-use agent2api_provider_sdk::{
-    ChatPlan, CheckinResult, PluginCtx, Provider, ProviderMeta, SendFuture,
-};
+use agent2api_provider_sdk::{ChatPlan, PluginCtx, Provider, ProviderMeta, SendFuture};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -62,30 +39,26 @@ const DEFAULT_LLM_BASE_URL: &str = "https://xiaohuanxiong.com/api/web/llm/v2";
 const DEFAULT_AUTH_ORIGIN: &str = "https://xiaohuanxiong.com";
 const DEFAULT_AUTH_API_PREFIX: &str = "/api/web/auth/v1";
 
-// ── 上游客户端身份（2026-11-02 实测结论）──────────────────────────
+/// 小浣熊适配器。
+
+// ── 本地补丁（非上游）：小浣熊并发准入档位 ────────────────────────
 //
 // 上游 LLM 网关按 **`X-RACCOON-Session-ID` 是否存在**给并发准入档位：
 // 不带这个头 → 同时最多 **5** 个在飞请求；带上 → **10** 个。
-// 实测：8 并发下，不带时稳定「5 过 / 3 拒」（复现两次），带上时 8/8 全过
-// （复现两次）；12 并发下带上时正好 10 过 / 2 拒。值本身**不做校验**
-// （`abc`、纯数字串、非 UUID 长串都生效），它是分档标记而不是凭据。
+// 实测：8 并发下，不带时稳定「5 过 / 3 拒」，带上时 8/8 全过；12 并发下带上
+// 时正好 10 过 / 2 拒。值本身**不做校验**（任意串都生效），它是分档标记而不是凭据。
 //
 // 反例（都实测过，**不要加**）：`x-client-name` / `x-client-platform` /
 // `x-client-version` / `x-client-os-version` / `x-client-channel` 以及
-// `X-Stainless-*` 那一整套，对档位**毫无作用** —— 只加它们仍是 5，全加也一样是 10
-// （10 是 Session-ID 带来的上限，不是它们带来的）。加进来只会让每个请求多背十几个头。
+// `X-Stainless-*` 那一整套，对档位毫无作用；加进来只会让每个请求多背十几个头。
+// 且这些头**换不来风控豁免**：账号进惩罚窗口后，带完整官方头单发同样 429。
 //
-// 还有一条更要紧的：**这些头换不来风控豁免**。账号一旦进惩罚窗口，带完整官方头
-// 单发同样是 `429 user_model_rate_limited`、同样 167ms 秒拒、同样没有 `Retry-After`。
-// 降频与退避才是根本，头只解决「被罚之前的天花板」。
-//
-// 配额是**按账号**算的，不按会话：两个不同 Session-ID 各打 8 并发（同时在飞 16），
-// 合计只过 10 —— 多开会话叠不上去，别指望轮换会话提额。
+// 与上游 `headers.rs` 的分工：那边补的是「桌面端身份 / 组织 / 请求 id」，
+// 这边补的是「并发档位」。两者字段不重名，可同时存在。
 
 /// 首条 user 消息的纯文本（标题与会话种子都用它）。
 ///
-/// 多段内容（`[{type:"text"},{type:"image_url"}]`）只拼 text 段：标题用不到图，
-/// 而把图片的 base64 前缀塞进头里只会撑爆长度。
+/// 多段内容只拼 text 段：标题用不到图，把 base64 塞进头里只会撑爆长度。
 fn first_user_text(body: &Value) -> Option<String> {
     let messages = body.get("messages")?.as_array()?;
     messages.iter().find_map(|message| {
@@ -103,20 +76,15 @@ fn first_user_text(body: &Value) -> Option<String> {
             _ => return None,
         };
         let trimmed = text.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
+        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
     })
 }
 
-/// 会话 ID：**同一会话内恒定、跨会话不同**，形态按 UUID v4 写。
+/// 会话 ID：同一会话内恒定、跨会话不同，形态按 UUID v4 写。
 ///
-/// 种子取「账号 id + 首条 user 消息」：首条消息在整段会话里不会变，所以多轮之间
-/// 稳定；换个会话首条消息必然不同，于是不会和别的会话撞成一个。只按账号派生也
-/// 生效（实测），但那会把用户所有会话压成一个 —— 官方客户端是一个会话一个 id，
-/// 跟着它走更稳。
+/// 种子取「账号 id + 首条 user 消息」：首条消息在整段会话里不变，多轮之间稳定；
+/// 换个会话首条消息不同，不会撞成一个。只按账号派生也生效，但会把用户所有会话
+/// 压成一个 —— 官方客户端是一个会话一个 id。
 fn session_id_for(account: &str, body: &Value) -> String {
     let seed = first_user_text(body).unwrap_or_default();
     let mut hasher = Sha256::new();
@@ -128,23 +96,17 @@ fn session_id_for(account: &str, body: &Value) -> String {
     for byte in digest.iter().take(16) {
         hex.push_str(&format!("{byte:02x}"));
     }
-    // 版本位/变体位按 RFC 4122 覆写（`4` / `a`），与 `crate::ids::uuid_v4` 同形态
     let part = |start: usize, end: usize| hex.get(start..end).unwrap_or("").to_string();
     format!(
         "{}-{}-4{}-a{}-{}",
-        part(0, 8),
-        part(8, 12),
-        part(13, 16),
-        part(17, 20),
-        part(20, 32)
+        part(0, 8), part(8, 12), part(13, 16), part(17, 20), part(20, 32)
     )
 }
 
-/// 标题头：官方客户端取首条 user 消息的**前 20 个字符**。
+/// 标题头：官方客户端取首条 user 消息的前 20 个字符。
 ///
-/// HTTP 头值是 latin-1 字节串，中文标题直接塞进去会让 reqwest 造 `HeaderValue`
-/// 失败、整个请求根本发不出去 —— 所以非 ASCII 一律百分号编码（官方 Electron 侧
-/// 也是先编码再塞头）。拿不到文本时退回中性值。
+/// HTTP 头值是 latin-1 字节串，中文直接塞进去会让 reqwest 造 `HeaderValue`
+/// 失败、整个请求发不出去 —— 非 ASCII 一律百分号编码。
 fn header_title(body: &Value) -> String {
     let Some(text) = first_user_text(body) else {
         return "codex".to_string();
@@ -164,7 +126,7 @@ fn header_title(body: &Value) -> String {
     out
 }
 
-/// 小浣熊适配器。
+
 pub struct RaccoonProvider;
 
 impl Provider for RaccoonProvider {
@@ -206,7 +168,7 @@ impl Provider for RaccoonProvider {
                 },
                 proto::LoginMethod::Desktop {
                     button: "导入本机登录态".into(),
-                    hint: Some("读取 ~/.box-agent/config/auth.json 里已登录的账号".into()),
+                    hint: Some("自动识别新版客户端独立目录或 ~/.box-agent/config/auth.json".into()),
                 },
             ])
             .with_models(models::raw_list())
@@ -222,12 +184,12 @@ impl Provider for RaccoonProvider {
                 expiry: vec!["expiresAt".to_string(), "tokenExpiresAt".to_string()],
                 ..Default::default()
             })
-        .with_checkin(proto::CheckinInfo {
-            description: Some("桌面端每日积分链路（发奖端点直接判定）".to_string()),
-            modes: vec![proto::CheckinMode::Checkin],
-            onboarding: true,
-            ..Default::default()
-        })
+            .with_checkin(proto::CheckinInfo {
+                description: Some("桌面端每日积分链路".to_string()),
+                modes: vec![proto::CheckinMode::Checkin],
+                onboarding: true,
+                ..Default::default()
+            })
     }
 
     fn provider_id(&self) -> String {
@@ -236,52 +198,63 @@ impl Provider for RaccoonProvider {
 
     // ── 数据面 ────────────────────────────────────────────────
 
-    /// 构造 `POST {llmBase}/chat/completions`。
-    ///
-    /// body **原样透传**：源实现除了 `model` 走一次路由解析（未知模型回退默认，
-    /// 本期由网关的模型校验/路由承担）之外不改任何字段。
-    ///
-    /// 头集合见模块头「上游客户端身份」：真正决定并发档位的只有
-    /// `X-RACCOON-Session-ID`；另外三个 X-RACCOON 头是为了让同一会话的多轮
-    /// 在上游看来是同一次对话，不影响配额但也没有代价。
+    /// 对话消息保持原样，仅翻译已确认的模型思考字段。
     fn build_chat<'a>(
         &'a self,
         ctx: &'a PluginCtx,
         req: proto::ChatRequest,
     ) -> SendFuture<'a, ChatPlan> {
         Box::pin(async move {
-            let token = token_of(ctx, &req.account).await?;
+            let (token, org_code) = request_identity(ctx, &req.account).await?;
             if token.is_empty() {
-                return Err(GatewayError::with_status(
-                    401,
-                    "小浣熊账号缺少 accessToken，无法转发",
-                )
-                .into_message());
+                return Err(
+                    GatewayError::with_status(401, "小浣熊账号缺少 accessToken，无法转发")
+                        .into_message(),
+                );
             }
-            let headers: Vec<(String, String)> = vec![
+            let mut headers: Vec<(String, String)> = vec![
                 ("Content-Type".to_string(), "application/json".to_string()),
-                // 源实现给的是 `Accept: */*`，官方 LLM 调用方是 `application/json`；
-                // 两种都能拿到 SSE（实测），取与官方一致的那个
-                ("Accept".to_string(), "application/json".to_string()),
+                // 源实现给的是 `Accept: */*`（LLM 网关两种响应形态都可能回）
+                ("Accept".to_string(), "*/*".to_string()),
                 ("Authorization".to_string(), format!("Bearer {token}")),
-                (
-                    "X-RACCOON-Session-ID".to_string(),
-                    session_id_for(&req.account, &req.body),
-                ),
-                ("X-RACCOON-Turn-ID".to_string(), crate::ids::uuid_v4()),
-                ("X-RACCOON-Title".to_string(), header_title(&req.body)),
-                ("X-RACCOON-Call-Kind".to_string(), "main".to_string()),
             ];
+            headers::append_org(&mut headers, &org_code)?;
+            // 对话链路与 onboarding / balance / iam 带同一套桌面端身份头：
+            // 少了它们，上游看到的就是一个只会发 Bearer 的裸 API 客户端
+            headers.extend(headers::desktop_client_headers());
+            // 官方客户端每条请求都带新的 X-Request-Id（relay_js_<ms>_<hex>）
+            headers.push(("X-Request-Id".to_string(), headers::request_id()));
+            headers::append_external(&mut headers);
+            // 本地补丁：并发准入档位（见上方 first_user_text 段落注释）
+            headers.push((
+                "X-RACCOON-Session-ID".to_string(),
+                session_id_for(&req.account, &req.body),
+            ));
+            headers.push(("X-RACCOON-Turn-ID".to_string(), crate::ids::uuid_v4()));
+            headers.push(("X-RACCOON-Title".to_string(), header_title(&req.body)));
+            headers.push(("X-RACCOON-Call-Kind".to_string(), "main".to_string()));
             Ok(ChatPlan::chat(
                 format!("{}/chat/completions", llm_base_url()),
                 headers,
-                req.body.clone(),
+                reasoning::normalize(&req.body, &req.wire_model),
             ))
         })
     }
 
     fn supports_image_generation(&self) -> bool {
         true
+    }
+
+    fn supports_image_editing(&self) -> bool {
+        true
+    }
+
+    fn build_image_edit<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        req: agent2api_provider_sdk::images::ImageRequest,
+    ) -> SendFuture<'a, agent2api_provider_sdk::images::ImagePlan> {
+        Box::pin(image_generation::build_edit(ctx, req))
     }
 
     fn build_image<'a>(
@@ -292,37 +265,17 @@ impl Provider for RaccoonProvider {
         Box::pin(image_generation::build(ctx, req))
     }
 
-    /// 上游错误分类（判定依据见模块头）：
-    ///   - 401 → TokenExpired
-    ///   - 429 → QuotaLimited（按 HTTP 状态码；上游不给结构化恢复时间）
-    ///   - 其余 → Fatal / 内容拦截
+    /// HTTP 与业务错误码共用分类；积分不足轮换账号，认证失败进入凭证恢复。
     fn classify(&self, status: u16, error_body: &Value) -> proto::ErrorClass {
-        let raw = error_body
-            .get("message")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-            .unwrap_or("上游错误");
-        let message = format!("上游返回 {status}: {raw}");
-        if status == 401 {
-            return proto::ErrorClass::TokenExpired { message };
-        }
-        if status == 429 {
-            // 上游文案里没有可解析的恢复时间，reset_at 给 None 让冷却标记落兜底
-            return proto::ErrorClass::QuotaLimited {
-                reset_at: None,
-                message,
-                upstream_code: None,
-                status,
-            };
-        }
-        // 内容策略拦截（审核文案）→ ContentBlocked：不罚账号，交给编排层换中性
-        // 提示词重试一次 + 触发降级
-        crate::content_block::classify_or_fatal(
-            status,
-            error_body,
-            message,
-            error_body.get("code").and_then(Value::as_i64),
-        )
+        upstream_errors::classify(status, error_body)
+    }
+
+    fn reasoning_patch(&self, level: &str, model: &str, body: &Value) -> proto::ReasoningPatch {
+        reasoning::patch(level, model, body)
+    }
+
+    fn outbound_reasoning(&self, body: &Value) -> Option<Option<String>> {
+        Some(reasoning::outbound(body))
     }
 
     // ── 凭证 ──────────────────────────────────────────────────
@@ -338,6 +291,9 @@ impl Provider for RaccoonProvider {
             // 但那条链里的「账号列表」指的是**用户显式选中的账号**）。
             if account.is_empty() {
                 if let Some(token) = env_access_token() {
+                    if jwt::is_iam_token(&token) {
+                        jwt::validate_iam_token(&token).map_err(GatewayError::into_message)?;
+                    }
                     return Ok(token);
                 }
             }
@@ -356,11 +312,7 @@ impl Provider for RaccoonProvider {
     /// 为什么必须覆盖默认实现：`ensure_token` 只在「临期」时刷新，而 401
     /// 完全可能发生在一个时间上还很新的 token 上（服务端侧失效、账号被顶下线、
     /// refreshToken 轮换）。此时只调 ensure 会拿回同一个被拒的 token。
-    fn refresh_token<'a>(
-        &'a self,
-        ctx: &'a PluginCtx,
-        account: &'a str,
-    ) -> SendFuture<'a, String> {
+    fn refresh_token<'a>(&'a self, ctx: &'a PluginCtx, account: &'a str) -> SendFuture<'a, String> {
         Box::pin(async move {
             if account.is_empty() && env_access_token().is_some() {
                 // 环境变量凭证是静态的，没有可续期的来源
@@ -386,11 +338,7 @@ impl Provider for RaccoonProvider {
     /// 先确认记录存在：`snapshot` 在记录缺失时会回落到桌面端登录态，而
     /// 「账号已被删除」不该被回答成「需要刷新」（维护任务随后会拿这个不存在的
     /// id 去刷新）。
-    fn token_expiring<'a>(
-        &'a self,
-        ctx: &'a PluginCtx,
-        account: &'a str,
-    ) -> SendFuture<'a, bool> {
+    fn token_expiring<'a>(&'a self, ctx: &'a PluginCtx, account: &'a str) -> SendFuture<'a, bool> {
         Box::pin(async move {
             if account.is_empty() {
                 return Ok(false);
@@ -415,12 +363,7 @@ impl Provider for RaccoonProvider {
         Box::pin(async { Ok(models::list()) })
     }
 
-    /// 刷新模型目录：`GET {llmBase}/model_catalog`（10 分钟缓存）。
-    ///
-    /// 目录刷新**不触发 token 刷新**：它只是维护动作，让一个临期 token 在这里
-    /// 被续期会把日志搅乱（转发链路上该续期的地方自然会续）。因此这里只用
-    /// 当前 token。没有凭证时**不带 Authorization 请求** —— 源实现同样允许
-    /// 无 token 拉公开目录。
+    /// 目录需要认证；续期后仍沿用该账号的组织身份，失败保留旧清单。
     fn refresh_models<'a>(
         &'a self,
         ctx: &'a PluginCtx,
@@ -428,18 +371,11 @@ impl Provider for RaccoonProvider {
         force: bool,
     ) -> SendFuture<'a, proto::RefreshOutcome> {
         Box::pin(async move {
-            let token = match credentials::snapshot(ctx, account).await {
-                Ok(credentials) => credentials.token,
-                Err(error) => {
-                    crate::logging::verbose(
-                        "[Models]",
-                        &format!("小浣熊模型目录刷新：{}", error.message),
-                    );
-                    String::new()
-                }
+            let (token, org_code) = match request_identity(ctx, account).await {
+                Ok(identity) => identity,
+                Err(error) => return Ok(proto::RefreshOutcome::failed(error)),
             };
-            // 目录刷新是后台维护动作，没有请求上下文 → 跟随网关默认出口
-            Ok(models::refresh(&token, None, force).await)
+            Ok(models::refresh(&token, &org_code, None, force).await)
         })
     }
 
@@ -455,8 +391,7 @@ impl Provider for RaccoonProvider {
         })
     }
 
-    /// 每日签到：setting_info 激活 + 发奖端点 `granted` 直接判定
-    /// （2026-11-01 重做，见 `balance::claim_daily_grant`）。
+    /// 每日签到：`setting_info` 触发发放 + 账单核对今日入账。
     fn checkin<'a>(
         &'a self,
         ctx: &'a PluginCtx,
@@ -467,30 +402,6 @@ impl Provider for RaccoonProvider {
                 .await
                 .map_err(GatewayError::into_control_message)?;
             Ok(checkin_report_of(&claim))
-        })
-    }
-
-    /// 带 `manual` 的签到：本家没有写请求限流闸，两档执行体一致，差别只在
-    /// **要把 `retryAt` 透出去**。
-    ///
-    /// 2026-11-01 起 `claim_daily_grant` 的三条结论都是终态（granted=true 刚
-    /// 发放 / alreadyCompleted 今天已发放 / Err 网络失败），不再产出 pending，
-    /// `retryAt` 通常为 None —— 重写保留是为了协议兼容（未来若加回复核场景
-    /// 仍能透传），网关侧零改动。
-    fn checkin_with_options<'a>(
-        &'a self,
-        ctx: &'a PluginCtx,
-        account: &'a str,
-        _manual: bool,
-    ) -> SendFuture<'a, CheckinResult> {
-        Box::pin(async move {
-            let claim = balance::claim_daily_grant(ctx, account)
-                .await
-                .map_err(GatewayError::into_control_message)?;
-            Ok(CheckinResult {
-                report: checkin_report_of(&claim),
-                retry_at: claim.get("retryAt").and_then(Value::as_i64),
-            })
         })
     }
 
@@ -536,7 +447,52 @@ impl Provider for RaccoonProvider {
         _ctx: &'a PluginCtx,
         input: proto::NormalizeInput,
     ) -> SendFuture<'a, proto::NormalizedAccount> {
-        Box::pin(async move { normalize(input).map_err(GatewayError::into_message) })
+        Box::pin(async move {
+            let mut account = normalize(input).map_err(GatewayError::into_message)?;
+            let token = if account.desktop {
+                credentials::desktop_credentials()
+                    .map_err(GatewayError::into_message)?
+                    .token
+            } else {
+                crate::store::pick(&account.secret, &["accessToken"])
+            };
+            if jwt::is_iam_token(&token) {
+                let profile = iam::user_info(&token)
+                    .await
+                    .map_err(GatewayError::into_message)?;
+                let user_id = crate::store::pick(&profile, &["id"]);
+                let previous_id = crate::store::pick(&account.secret, &["userId"]);
+                let previous_name = crate::store::pick(&account.secret, &["name"]);
+                if previous_name == format!("账号 {previous_id}")
+                    || account.desktop
+                        && previous_name == format!("桌面端登录账号（{previous_id}）")
+                {
+                    let name = crate::store::pick(&profile, &["name"]);
+                    account.secret["name"] = json!(if name.is_empty() {
+                        format!("账号 {user_id}")
+                    } else {
+                        name
+                    });
+                }
+                account.secret["userId"] = json!(user_id);
+                if crate::store::pick(&account.secret, &["officeIdentity", "office_identity"])
+                    .is_empty()
+                {
+                    let identity =
+                        crate::store::pick(&profile, &["officeIdentity", "office_identity"]);
+                    account.secret["officeIdentity"] = json!(if identity.is_empty() {
+                        "personal".to_string()
+                    } else {
+                        identity
+                    });
+                }
+                if !account.desktop {
+                    account.identity = format!("user-{user_id}");
+                }
+                account.public = account_view(&account.secret, "");
+            }
+            Ok(account)
+        })
     }
 
     fn account_view(&self, secret: &Value) -> Result<Value, String> {
@@ -626,104 +582,30 @@ impl Provider for RaccoonProvider {
 /// `tokenTail` / `expiresAt` / `officeIdentity`…。`tokenTail` 让用户能认出
 /// 「这是哪把 token」，而完整 token 绝不下发。
 pub fn account_view(secret: &Value, fallback_name: &str) -> Value {
-    let token = secret
-        .get("accessToken")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let user_id = secret
-        .get("userId")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let name = {
-        let explicit = secret
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("");
-        if !explicit.is_empty() {
-            explicit.to_string()
-        } else if !fallback_name.trim().is_empty() {
-            fallback_name.trim().to_string()
-        } else if !user_id.is_empty() {
-            format!("账号 {user_id}")
-        } else {
-            "小浣熊账号".to_string()
-        }
-    };
-    let mut view = json!({
-        "name": name,
-        "uid": user_id,
-        "userId": user_id,
-        "tokenTail": crate::store::token_tail(token),
-        "hasSession": true,
-        "canRefresh": !secret
-            .get("refreshToken")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .is_empty(),
-    });
-    if let Some(expires_at) = secret.get("expiresAt").and_then(Value::as_f64) {
-        if let Some(object) = view.as_object_mut() {
-            object.insert("expiresAt".to_string(), Value::from(expires_at));
-        }
-    }
-    for key in ["officeIdentity", "officeOrgName", "officeOrgRole"] {
-        let value = secret
-            .get(key)
-            .or_else(|| secret.get(&snake_case(key)))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("");
-        if !value.is_empty() {
-            if let Some(object) = view.as_object_mut() {
-                object.insert(key.to_string(), Value::String(value.to_string()));
-            }
-        }
-    }
-    view
+    account_view::account_view(secret, fallback_name)
 }
 
-/// 账号的稳定身份（去重用）：`user-<userId>`，与内置版 `add_raccoon_account`
-/// 的 id 形态逐字相同 —— 同一账号重新登录会被识别成更新而不是新增。
 pub fn identity_of(secret: &Value) -> String {
-    let user_id = secret
-        .get("userId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
-    if user_id.is_empty() {
-        return String::new();
-    }
-    format!("user-{user_id}")
+    account_view::identity_of(secret)
 }
 
-/// 驼峰 → 下划线（`officeIdentity` → `office_identity`）。
-fn snake_case(key: &str) -> String {
-    let mut out = String::with_capacity(key.len() + 4);
-    for ch in key.chars() {
-        if ch.is_ascii_uppercase() {
-            out.push('_');
-            out.push(ch.to_ascii_lowercase());
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-/// 一次请求的 token（空串 = 没有可用凭证）。
-async fn token_of(ctx: &PluginCtx, account: &str) -> Result<String, String> {
+/// 一次请求的凭证与组织身份必须来自同一份快照。
+async fn request_identity(ctx: &PluginCtx, account: &str) -> Result<(String, String), String> {
     if account.is_empty() {
         if let Some(token) = env_access_token() {
-            return Ok(token);
+            if jwt::is_iam_token(&token) {
+                jwt::validate_iam_token(&token).map_err(GatewayError::into_message)?;
+            }
+            return Ok((token, String::new()));
         }
     }
-    match credentials::snapshot(ctx, account).await {
-        Ok(credentials) => Ok(credentials.token),
-        // 没有账号记录时 `snapshot` 已回落到桌面端登录态；这里只剩「真的没有」
-        Err(error) => Err(error.into_message()),
-    }
+    let credentials = credentials::snapshot(ctx, account)
+        .await
+        .map_err(GatewayError::into_message)?;
+    let credentials = credentials::refresh(ctx, &credentials, false)
+        .await
+        .map_err(GatewayError::into_message)?;
+    Ok((credentials.token, credentials.org_code))
 }
 
 /// 环境变量里的 access token（`RACCOON_TOKEN`，空白串视为未设置）。
@@ -767,11 +649,6 @@ fn base_url_from_env(name: &str, fallback: &str) -> String {
 }
 
 /// 签到结果 → 协议化的 `CheckinReport`。
-///
-/// 2026-11-01 起 `claim_daily_grant` 的判定来自发奖端点 `data.granted`
-/// （见 `balance` 模块头）：success=true → Claimed；`alreadyCompleted:true`
-/// （今天已发放过）→ Done（网关按 already 落账、置 checkinAt、不重试）；
-/// 其余按文案兜底 Failed。
 fn checkin_report_of(claim: &Value) -> proto::CheckinReport {
     let success = claim
         .get("success")
@@ -794,10 +671,13 @@ fn checkin_report_of(claim: &Value) -> proto::CheckinReport {
         })
         .filter(|points| *points > 0)
         .map(|points| format!("{points} 积分"));
-    let outcome = if success {
-        proto::CheckinOutcome::Claimed
-    } else if claim.get("alreadyCompleted").and_then(Value::as_bool) == Some(true) {
+    let text = message.clone().unwrap_or_default();
+    let outcome = if claim.get("alreadyCompleted").and_then(Value::as_bool) == Some(true) {
         proto::CheckinOutcome::Done
+    } else if success {
+        proto::CheckinOutcome::Claimed
+    } else if text.contains("未见") || text.contains("未能核对") {
+        proto::CheckinOutcome::Inactive
     } else {
         proto::CheckinOutcome::Failed
     };
@@ -838,6 +718,9 @@ fn normalize(input: proto::NormalizeInput) -> Result<proto::NormalizedAccount, G
                 "tokenTail": summary.get("tokenTail").cloned().unwrap_or(Value::Null),
                 "expiresAt": summary.get("tokenExpiresAt").cloned().unwrap_or(Value::Null),
                 "name": name,
+                "officeIdentity": summary.get("officeIdentity"),
+                "officeOrgName": summary.get("officeOrgName"),
+                "officeOrgRole": summary.get("officeOrgRole"),
             });
             Ok(proto::NormalizedAccount {
                 public: account_view(&secret, &name),
@@ -934,6 +817,9 @@ fn from_token(
     let Some(claims) = jwt::decode_jwt_claims(&token) else {
         return Err(GatewayError::with_status(400, "token 不是有效的 JWT"));
     };
+    if jwt::is_iam_token(&token) {
+        jwt::validate_iam_token(&token)?;
+    }
     let user_id = {
         let extracted = jwt::extract_user_id(&claims);
         if extracted.is_empty() {
@@ -943,10 +829,10 @@ fn from_token(
         }
     };
     let mut secret = json!({
-        "accessToken": token,
+        "accessToken": token.clone(),
         "userId": user_id,
     });
-    if !refresh_token.trim().is_empty() {
+    if !refresh_token.trim().is_empty() && !jwt::is_iam_token(&token) {
         secret["refreshToken"] = Value::String(jwt::strip_bearer(refresh_token));
     }
     if let Some(expires_at) = jwt::jwt_expiry_ms(&token) {

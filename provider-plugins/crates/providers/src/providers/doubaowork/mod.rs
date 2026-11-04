@@ -6,7 +6,10 @@ mod accounts;
 mod api;
 mod catalog;
 mod chat;
+mod client;
+mod cookies_db;
 mod desktop;
+mod image_generation;
 mod login;
 mod prompt;
 mod quota;
@@ -15,9 +18,7 @@ mod stream;
 mod upload;
 
 use agent2api_provider_protocol as proto;
-use agent2api_provider_sdk::{
-    CheckinResult, ConversationSink, PluginCtx, Provider, ProviderMeta, SendFuture,
-};
+use agent2api_provider_sdk::{ConversationSink, PluginCtx, Provider, ProviderMeta, SendFuture};
 use serde_json::Value;
 
 pub const PROVIDER_ID: &str = "doubaowork";
@@ -38,7 +39,7 @@ impl Provider for DoubaoWorkProvider {
                     label: "Cookie".into(), placeholder: "sessionid=…; sessionid_ss=…（或 Cookie JSON）".into(), extra_fields: vec![],
                 },
                 proto::LoginMethod::Desktop {
-                    button: "导入本机登录态".into(), hint: Some("读取本机已登录客户端，需使用 --remote-debugging-port=9342 启动；不修改或重启客户端。".into()),
+                    button: "导入本机登录态".into(), hint: Some("直接读取本机客户端的登录数据并复制一份存进账号（不需要调试端口）；之后查余额、对话都不再依赖客户端，也不会修改或重启它。".into()),
                 },
             ])
             .with_account_features(proto::AccountFeatures {
@@ -152,6 +153,21 @@ impl Provider for DoubaoWorkProvider {
         api::classify(status, body)
     }
 
+    /// 生图：上游没有独立图片接口，出图是对话流里的一次 `image_gen` 任务
+    /// （见 `image_generation` 模块头）。编辑（参考图）不支持 ——
+    /// 上报 false，网关就不会把 `/v1/images/edits` 派到本家。
+    fn supports_image_generation(&self) -> bool {
+        true
+    }
+
+    fn build_image<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        req: agent2api_provider_sdk::images::ImageRequest,
+    ) -> SendFuture<'a, agent2api_provider_sdk::images::ImagePlan> {
+        Box::pin(image_generation::build(ctx, req))
+    }
+
     fn reasoning_patch(&self, level: &str, _model: &str, body: &Value) -> proto::ReasoningPatch {
         if !body["reasoning_effort"].is_null() {
             return proto::ReasoningPatch::Skip {
@@ -182,32 +198,11 @@ impl Provider for DoubaoWorkProvider {
         })
     }
 
-    /// 每日签到（不带 options 的旧入口）：只取协议化 report，`retryAt` 由
-    /// [`Self::checkin_with_options`] 负责透传（旧宿主不认这个字段）。
     fn checkin<'a>(
         &'a self,
         ctx: &'a PluginCtx,
         account: &'a str,
     ) -> SendFuture<'a, proto::CheckinReport> {
-        Box::pin(async move {
-            rewards::checkin(ctx, account)
-                .await
-                .map(|result| result.report)
-                .map_err(crate::errors::GatewayError::into_control_message)
-        })
-    }
-
-    /// 带 `manual` 的签到：本家没有写请求限流闸，两档执行体一致，差别只在
-    /// **把 `retryAt` 透出去**。豆包领奖是异步受理的，`rewards::checkin` 在
-    /// 「结果确认中」时会挂 10 分钟后复核的时刻；默认实现
-    /// `checkin(...).map(Into::into)` 会把 `retry_at` 丢成 `None`，那场就只能
-    /// 等用户手点 —— 这正是「豆包签到总是有问题」的另一半原因。
-    fn checkin_with_options<'a>(
-        &'a self,
-        ctx: &'a PluginCtx,
-        account: &'a str,
-        _manual: bool,
-    ) -> SendFuture<'a, CheckinResult> {
         Box::pin(async move {
             rewards::checkin(ctx, account)
                 .await

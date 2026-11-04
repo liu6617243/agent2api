@@ -4,8 +4,8 @@
 //! ZCode 没有独立的签到接口，但上游每天给账号下发一份**带日期段的新套餐**
 //! （`zcode-v3-start-plan-<日期>` / `zcode-v3-start-plan-1024` 这类），用户在
 //! 客户端里点一下就领 —— 那一下就是这一家的「签到」。判据与 `claim.rs` 模块头
-//! 记的一致：同一期再领回 `1003 already claimed`，所以「今天领过没」等价于
-//! 「今天这个 plan_id 领过没」，无需本地记账。
+//! 记的一致：同一期再领回 `1003 already claimed`。手动领取、自动签到与
+//! 领取状态预览共用逐套餐台账，已领取后从上游预览消失也不会丢失完成事实。
 //!
 //! 与 `claim.rs` 里那个**手动领取**的差别只有三点：
 //!   1. 这是**无人值守**的调度（每天定时跑），因此不弹滑块、不向用户要验证码；
@@ -48,25 +48,32 @@ const ROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(100);
 /// 每日窗口的开启时刻（北京时间秒偏移）：**19:00**。
 ///
 /// 依据：官方公告「每日 19:00 起可领当日赠送额度，23:00 至次日 09:00 可用」
-/// （2026-10 的 ZCode 每日 3 亿 GLM-5.3-Flash 活动）。窗口没开时探测拿到的是
-/// 空列表（`code: 0` + `plans: []`），不是错误 —— 所以必须靠本地时刻拦住，
-/// 否则会像 Qoder 那样一路重试。
+/// （2026-10 的 ZCode 每日 3 亿 GLM-5.3-Flash 活动）。
+///
+/// ★ 它现在只是**兜底**：上游会在 `marketing/touch` 的 `zcode_plan` 与
+/// `billing/preview` 的 `plans` 里给出每期活动的 `starts_at` / `ends_at`，
+/// 窗口判断优先用上游时间（见 [`claim_daily_checkin`]）。容器 `TZ=UTC` 时
+/// 本地时钟到不了 19:00，再把本地常量当唯一判据就会把「活动已经开了」误判成
+/// 「窗口还没开」（issue #32）。常量只在「一个套餐都没探到」时决定文案与
+/// `retryAt`，以及上游没给 `starts_at` 时兜底。
 ///
 /// 与 `core::auto_checkin::times` 的 `PROVIDER_TIMES` 是同一份事实的两处表达：
-/// 那边是**调度**用的（决定几点跑），这里是**执行体**用的（判断窗口开没开）。
+/// 那边是**调度**用的（决定几点跑），这里是**执行体**用的（兜底判断）。
 /// 改一处就要改另一处。
 const DAILY_WINDOW_HOUR: i64 = 19;
 
-/// 今天的窗口开启时刻（毫秒时间戳，北京时间口径）。
-///
-/// 用 `now + 8h` 再取整日的方式算「北京时间今天零点」，与 Qoder 的
-/// `daily_window_start` 同一算法（避免引入时区库依赖）。
-fn daily_window_start() -> i64 {
-    let beijing_now = crate::http::now_ms() + 8 * 3_600_000;
-    beijing_now.div_euclid(86_400_000) * 86_400_000 + DAILY_WINDOW_HOUR * 3_600_000
+/// 今天的窗口开启时刻（Unix 毫秒时间戳，北京时间口径）。
+fn daily_window_start(now: i64) -> i64 {
+    let offset = i64::from(crate::beijing::OFFSET_SECONDS) * 1000;
+    (now + offset).div_euclid(86_400_000) * 86_400_000
+        + DAILY_WINDOW_HOUR * 3_600_000 - offset
 }
 
 /// 执行一次签到。`manual` 只影响日志措辞（本家没有写请求限流闸）。
+///
+/// 窗口判断优先用上游每期活动自带的 `starts_at`（`marketing/touch` 与
+/// `billing/preview` 都会带），只有「一个套餐都没探到」时才回落到本地
+/// [`DAILY_WINDOW_HOUR`] —— 容器 `TZ=UTC` 不影响这条判断（issue #32）。
 ///
 /// 返回 `{success, msg, ...}` 形状与其余各家一致（`billing::checkin` 的
 /// `claim_result` 只认 `success` / `msg`），另外带：
@@ -78,16 +85,7 @@ pub async fn claim_daily_checkin(
     region: Region,
     account_id: &str,
 ) -> Result<Value, GatewayError> {
-    let now = crate::http::now_ms();
     let started = tokio::time::Instant::now();
-    let window = daily_window_start();
-    // 窗口没开：不探测、不领取，直接给中性结果并指定窗口开启时刻
-    if now < window {
-        return Ok(inactive(
-            "今日赠送套餐的活动窗口还没开（每天 19:00 起可领），稍后自动重试",
-            Some(window + 60_000),
-        ));
-    }
 
     let record = crate::store::record(ctx, region.provider_id(), account_id)
         .await
@@ -122,18 +120,54 @@ pub async fn claim_daily_checkin(
 
     claim::refresh_app_version_override(ctx).await;
     let snapshot = match claim::preview(
-        ctx, region, account_id, &jwt, mid, &user_id, proxy.as_ref(), false,
+        ctx, region, account_id, &jwt, mid, &user_id, proxy.as_ref(), claim::PreviewPurpose::Automatic, false,
     ).await {
         Ok(snapshot) => snapshot,
         Err(error) => return Ok(failed_soft(error.message)),
     };
-    if snapshot.plans.is_empty() {
-        if snapshot.preview_error.is_some() || snapshot.marketing_error.is_some() {
-            return Ok(failed_soft("部分套餐来源查询失败，尚不能确认是否有可领取套餐"));
+    // ── 2. 用上游 starts_at 判断「开始没有」，不再前置拦截 ──────
+    // 以前在探测之前就用本地常量 19:00 拦住：容器 TZ=UTC 时本地时钟到不了
+    // 19:00，营销来源也被一起短路（issue #32）。现在先探测，再按上游给的
+    // 每期活动时间过滤；常量只在「一个套餐都没探到」时兜底。
+    //
+    // `ClaimablePlan.starts_at` 是**秒**（与 `ends_at` 同一口径），本地比较
+    // 用毫秒，所以统一 `saturating_mul(1000)`。
+    let now = crate::http::now_ms();
+    let (plans, upcoming): (Vec<_>, Vec<_>) = snapshot
+        .plans
+        .into_iter()
+        .partition(|plan| plan.starts_at.is_none_or(|start| start.saturating_mul(1000) <= now));
+    if plans.is_empty() {
+        if let Some(start) = upcoming.iter().filter_map(|plan| plan.starts_at).min() {
+            // 有套餐、但全部还没到开始时间：用上游时间渲染，别再说「每天 19:00」。
+            let at = start.saturating_mul(1000);
+            let message = match crate::beijing::date_time_of_ms(at) {
+                Some(time) => format!(
+                    "今日赠送套餐的活动将于 {} 开始，稍后自动重试",
+                    time.format("%m-%d %H:%M")
+                ),
+                None => {
+                    "今日赠送套餐的活动窗口还没开（每天 19:00 起可领），稍后自动重试".to_string()
+                }
+            };
+            return Ok(inactive(message, Some(at + 60_000)));
+        }
+        if snapshot.preview_error.is_some()
+            || snapshot.marketing_error.is_some()
+            || snapshot.ledger_error.is_some()
+        {
+            return Ok(failed_soft("部分套餐来源或领取台账查询失败，尚不能确认今日领取状态"));
+        }
+        // 一个套餐都没探到：本地常量兜底（上游没给 starts_at / 活动还没上架）。
+        let window = daily_window_start(now);
+        if now < window {
+            return Ok(inactive(
+                "今日赠送套餐的活动窗口还没开（每天 19:00 起可领），稍后自动重试",
+                Some(window + 60_000),
+            ));
         }
         return Ok(inactive("当前没有可领取的赠送套餐", None));
     }
-    let plans = snapshot.plans;
     let expected = plans.len();
     let mut results = Vec::new();
     for plan in &plans {
@@ -142,7 +176,7 @@ pub async fn claim_daily_checkin(
             break;
         }
         let attempt = claim::claim_plan(
-            ctx, region, account_id, &jwt, mid, proxy.as_ref(), plan, None,
+            ctx, region, account_id, &jwt, mid, &user_id, proxy.as_ref(), plan, None,
         ).await;
         let stop = match &attempt {
             Ok(attempt) => matches!(&attempt.outcome,
@@ -154,7 +188,7 @@ pub async fn claim_daily_checkin(
         results.push(plan_result(region, plan, attempt));
         if stop { break; }
     }
-    Ok(combine_results(results, expected))
+    Ok(combine_results(results, expected, snapshot.daily_checkin))
 }
 
 fn plan_result(
@@ -176,7 +210,7 @@ fn plan_result(
                         None => format!("领到「{plan_name}」（{plan_id}）"),
                     };
                     crate::logging::log("[Checkin]", &format!("✅ ZCode {}账号签到成功：{plan_id}", region.label()));
-                    json!({ "success": true, "msg": msg, "planId": plan_id, "planName": plan_name })
+                    json!({ "success": true, "msg": msg, "planId": plan_id, "planName": plan_name, "claimedAt": attempt.claimed_at })
                 }
                 claim::ClaimOutcome::Failed { failure, code, message, failure_ends_at, .. } => {
                     use claim::ClaimFailure;
@@ -184,6 +218,7 @@ fn plan_result(
                         ClaimFailure::AlreadyClaimed => json!({
                             "success": false, "alreadyCompleted": true,
                             "msg": format!("「{plan_name}」已领取"), "planId": plan_id,
+                            "claimedAt": attempt.claimed_at,
                         }),
                         ClaimFailure::Unavailable | ClaimFailure::QuotaExhausted => inactive(
                             format!("「{plan_name}」{}（{code}）：{message}", failure.label()),
@@ -198,23 +233,30 @@ fn plan_result(
                 }
             };
             result["marketingError"] = json!(attempt.marketing_error);
+            result["dailyCheckin"] = attempt.daily_checkin;
             result
         }
         Err(error) => failed_soft(error.message),
     }
 }
 
-fn combine_results(results: Vec<Value>, expected: usize) -> Value {
+fn combine_results(results: Vec<Value>, expected: usize, daily_checkin: Value) -> Value {
+    let daily_checkin = results.iter().rev().find_map(|row| row.get("dailyCheckin")).cloned()
+        .unwrap_or(daily_checkin);
     let succeeded = results.iter().any(|row| row.get("success").and_then(Value::as_bool) == Some(true));
-    let completed = !results.is_empty() && results.len() == expected
+    let completed = daily_checkin.get("completed").and_then(Value::as_bool) == Some(true)
+        && !results.is_empty() && results.len() == expected
         && results.iter().all(|row| row.get("success").and_then(Value::as_bool) == Some(true)
             || row.get("alreadyCompleted").and_then(Value::as_bool) == Some(true));
     let pending = results.iter().any(|row| row.get("outcome").and_then(Value::as_str) == Some("inactive"));
     let failed = results.iter().any(|row| row.get("success").and_then(Value::as_bool) != Some(true)
         && row.get("alreadyCompleted").and_then(Value::as_bool) != Some(true)
         && row.get("outcome").and_then(Value::as_str) != Some("inactive"));
-    let msg = results.iter().filter_map(|row| row.get("msg").and_then(Value::as_str))
+    let mut msg = results.iter().filter_map(|row| row.get("msg").and_then(Value::as_str))
         .collect::<Vec<_>>().join("；");
+    if !completed && daily_checkin.get("sourcesComplete").and_then(Value::as_bool) != Some(true) {
+        msg.push_str("；部分套餐来源查询失败，已处理已知套餐，今日领取状态仍待确认");
+    }
     let mut result = json!({
         "success": succeeded && completed,
         "alreadyCompleted": !succeeded && completed,
@@ -222,6 +264,7 @@ fn combine_results(results: Vec<Value>, expected: usize) -> Value {
         "outcome": if completed { if succeeded { "claimed" } else { "done" } }
             else if failed { "failed" } else if pending { "inactive" } else { "failed" },
         "results": results,
+        "dailyCheckin": daily_checkin,
     });
     let retry_at = result["results"].as_array().and_then(|rows| rows.iter()
         .filter_map(|row| row.get("retryAt").and_then(Value::as_i64)).min());

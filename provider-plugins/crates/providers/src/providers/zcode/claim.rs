@@ -68,14 +68,17 @@
 // 保留的理由与 `captcha` 相同：这些判据是 parity 的对照材料，而且将来若把
 // 调度也搬进插件，它们就是现成的实现。
 #![allow(dead_code)]
+mod catalog;
 mod discovery;
 mod marketing;
+mod ownership;
 mod plans;
 mod state;
 
 pub(super) use discovery::resolve_target;
-pub use discovery::preview;
+pub use discovery::{preview, PreviewPurpose};
 pub use plans::ClaimablePlan;
+pub(super) use plans::integer;
 pub use state::{claim_plan, ClaimAttempt};
 
 use std::sync::{Mutex, OnceLock};
@@ -115,6 +118,19 @@ const REQUEST_TIMEOUT_MS: u64 = 15_000;
 /// | 3.13.0 / 3.14.0 / 3.14.3 / 3.15.0 / 3.15.1 / 3.16.0 | `[]` |
 /// | 3.16.1 / 3.16.2 / 3.17.0 | 含 `zcode-v3-start-plan-1024` |
 ///
+/// ── 2026-11-03：营销活动来源的版本门（另一条链路）────────────
+/// 上游已把每日赠送套餐改由 `GET /api/v1/marketing/touch` 下发
+/// （`billing/preview` / `billing/current` 整段为空）。同一账号实测：
+///
+/// | `X-ZCode-App-Version` | `data.deliveries` |
+/// |---|---|
+/// | 3.16.3 | 0 条 |
+/// | 3.17.1 | 1 条 |
+/// | 3.18.0 | 1 条 |
+///
+/// 两条链路共用这一个版本号，默认值取两边都够用的更高版本 `3.18.0` ——
+/// 只满足 `billing/preview` 老门槛（3.16.1+）的版本，营销活动一条都拿不到。
+///
 /// 上一期（2026-10-23 的 ZCode 1024 Dev Day，5 亿 token）的门槛落在
 /// 3.16.0 → 3.16.1 之间；旧值 `3.14.0` 拿到的是一份**空列表**（`code: 0`，
 /// 不是错误），于是症状是「活动明明在，我们却一个套餐都探不到」——
@@ -124,7 +140,7 @@ const REQUEST_TIMEOUT_MS: u64 = 15_000;
 /// 空 `plans`，所以这张表要跟着官方 changelog（zcode.z.ai/cn/changelog）
 /// 一起更新；排障时也可以先用 `ZCODE_APP_VERSION` 环境变量试几个版本，
 /// 不必改代码重发版。
-const DEFAULT_APP_VERSION: &str = "3.16.2";
+const DEFAULT_APP_VERSION: &str = "3.18.0";
 
 /// 探测与领取的路径（参考实现 `client.ts` 的常量）
 const PREVIEW_PATH: &str = "/api/v1/zcode-plan/billing/preview";
@@ -506,31 +522,31 @@ pub fn outcome_hold(outcome: &ClaimOutcome) -> NextAttempt {
     }
 }
 
-/// 探测当前可领取的套餐。
-///
-/// `jwt` 为空时按上游语义发**匿名探测**（参考实现：匿名 preview 不带头）。
-/// 匿名也能看到「有没有活动」，因此调度可以在登录态失效时继续探测；
-/// 但真正领取必须有 JWT（见 [`claim`]）。
-///
-/// `device_mid` **事实上是必需的**（2026-09-28 起上游这么要求，见模块头）：
-/// 调用方（`api::zcode_claim`）保证传进来的一定是 UUID 形态的稳定标识，
-/// 这里只在真的没有时才省略那个头 —— 那种情况会稳定拿到 3001，
-/// 而那正是「谁漏了这一步」的信号，不该由本函数偷偷补一个随机值（现编的值
-/// 每次都不一样，风控看到的是「同一个账号天天换设备」）。
+/// 账号预览不能证明活动不存在或套餐已领取；匿名目录使用独立探测标识。
 async fn preview_billing(
     region: Region,
     jwt: &str,
     device_mid: Option<&str>,
     proxy: Option<&ResolvedProxy>,
 ) -> Result<Option<Vec<ClaimablePlan>>, GatewayError> {
+    preview_billing_with_version(region, jwt, device_mid, proxy, &app_version()).await
+}
+
+async fn preview_billing_with_version(
+    region: Region,
+    jwt: &str,
+    device_mid: Option<&str>,
+    proxy: Option<&ResolvedProxy>,
+    version: &str,
+) -> Result<Option<Vec<ClaimablePlan>>, GatewayError> {
     let url = format!(
         "{}{PREVIEW_PATH}?app_version={}&platform={}",
         region.zcode_origin(),
-        urlencode(&app_version()),
+        urlencode(version),
         urlencode(platform())
     );
     let mut headers: Vec<(String, String)> = Vec::new();
-    // 匿名探测：一个头都不带（**不是**带一个空 Bearer）
+    // 匿名探测不能携带空 Bearer 或账号凭证。
     if !jwt.trim().is_empty() {
         headers.push(("Authorization".to_string(), format!("Bearer {}", jwt.trim())));
     }

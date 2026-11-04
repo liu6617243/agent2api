@@ -323,6 +323,7 @@ pub async fn checkin(ctx: &PluginCtx, account: &str) -> Result<CheckinResult, Ga
                         "豆包工作签到已提交，回查未成功，稍后自动复核",
                     ),
                     retry_at: Some(crate::http::now_ms() + CLAIM_RETRY_MS),
+                    details: None,
                 });
             }
         }
@@ -341,6 +342,7 @@ pub async fn checkin(ctx: &PluginCtx, account: &str) -> Result<CheckinResult, Ga
                 message: Some("豆包工作签到成功".into()),
             },
             retry_at: None,
+            details: None,
         });
     }
 
@@ -352,6 +354,7 @@ pub async fn checkin(ctx: &PluginCtx, account: &str) -> Result<CheckinResult, Ga
             "豆包工作签到未确认到账，稍后自动复核",
         ),
         retry_at: Some(crate::http::now_ms() + CLAIM_RETRY_MS),
+        details: None,
     })
 }
 
