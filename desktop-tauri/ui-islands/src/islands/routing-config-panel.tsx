@@ -122,7 +122,9 @@ export function RoutingConfigPanel({ editor, scope, now, onScope, onAccount, onS
     const on = (profile.providerScope === 'all' || profile.providers.includes(provider)) && !profile.disabledProviders.includes(provider)
     return on && workspace.accounts.some(account => providerOf(account) === provider && account.enabled !== false)
   }
-  const hasAccounts = (provider: string) => workspace.accounts.some(account => providerOf(account) === provider)
+  // 路由只排「真能转发」的账号：账号页关掉的账号不进选路，也不该在这里占位。
+  // 一家如果账号全被关，等价于「没有账号」→ 归进收起组，点「显示无账号」才看得到。
+  const hasAccounts = (provider: string) => workspace.accounts.some(account => providerOf(account) === provider && account.enabled !== false)
   // 没有账号的提供商不参与选路，默认收起；搜索时仍然展开匹配项，避免「搜不到」。
   const emptyProviders = providers.filter(provider => !hasAccounts(provider))
   const providerRank = (provider: string) => providerLive(provider) ? 0 : hasAccounts(provider) ? 1 : 2
@@ -171,9 +173,17 @@ export function RoutingConfigPanel({ editor, scope, now, onScope, onAccount, onS
     if (!next.accountOrder[provider]) next.accountOrder[provider] = workspace.accounts.filter(account => providerOf(account) === provider).map(account => account.id)
   }
   const toggleProvider = (provider: string, on: boolean) => mutate(next => {
-    ensure(next, provider)
+    // 只在「勾上」时补 providers / accountOrder。取消勾选时若仍调 ensure，
+    // 会先把 provider 塞进 providers、随后又被过滤掉，账号顺序里就留下一个
+    // 悬空键 —— 网关 validate_shape 要求 accountOrder 的 key 必须在 providers
+    // 里，于是保存被 400「账号顺序中的提供商「x」不在当前路由中」拒掉。
+    if (on) ensure(next, provider)
     if (next.providerScope === 'all') next.disabledProviders = on ? next.disabledProviders.filter(id => id !== provider) : [...new Set([...next.disabledProviders, provider])]
-    else next.providers = on ? [...new Set([...next.providers, provider])] : next.providers.filter(id => id !== provider)
+    else {
+      next.providers = on ? [...new Set([...next.providers, provider])] : next.providers.filter(id => id !== provider)
+      // 移出名单时连带清掉该家的账号顺序，否则同样触发上面那条校验。
+      if (!on) delete next.accountOrder[provider]
+    }
   })
   const toggleAccount = (id: string, on: boolean) => mutate(next => {
     next.excludedAccounts = on ? next.excludedAccounts.filter(value => value !== id) : [...new Set([...next.excludedAccounts, id])]
@@ -284,12 +294,15 @@ export function RoutingConfigPanel({ editor, scope, now, onScope, onAccount, onS
 
           {!listedProviders.length ? <Empty>
             <span>{query ? t('没有匹配的提供商或账号')
-              : workspace.accounts.length ? t('当前范围的提供商都没有账号，先在账号页添加')
-                : t('还没有账号，先在账号页添加；有账号的提供商才会出现在这里')}</span>
+              : !workspace.accounts.length ? t('还没有账号，先在账号页添加；有账号的提供商才会出现在这里')
+                : workspace.accounts.some(account => account.enabled !== false) ? t('当前范围的提供商都没有账号，先在账号页添加')
+                  : t('账号全部禁用')}</span>
             {!query && !workspace.accounts.length ? <Button variant='link' size='sm' onClick={() => host().wbApp?.showPage('accounts')}>{t('去账号页添加')}</Button> : null}
           </Empty> : null}
           {listedProviders.map(provider => {
-            const accounts = workspace.accounts.filter(account => providerOf(account) === provider)
+            // 关闭的账号不参与选路，也不画进名单 —— 否则「1 个账号 · 0 启用」会一直占位。
+            const allAccounts = workspace.accounts.filter(account => providerOf(account) === provider)
+            const accounts = allAccounts.filter(account => account.enabled !== false)
             const order = [...new Set([...(profile.accountOrder[provider] || []), ...accounts.map(account => account.id)])].filter(id => accounts.some(account => account.id === id))
             const on = (profile.providerScope === 'all' || profile.providers.includes(provider)) && !profile.disabledProviders.includes(provider)
             if (!accounts.length) return <section key={provider} className={cn('routing-config-provider is-empty', !on && 'is-off')}
@@ -299,7 +312,8 @@ export function RoutingConfigPanel({ editor, scope, now, onScope, onAccount, onS
                 <Checkbox checked={on} disabled={locked} aria-label={label(provider)} onCheckedChange={value => toggleProvider(provider, value === true)} />
                 <span className='routing-config-rank'>—</span>
                 <span className='routing-provider-mark routing-letter'>{label(provider).slice(0, 1).toUpperCase()}</span>
-                <span className='routing-provider-name'><b>{label(provider)}</b><span>{t('还没有账号')}</span></span>
+                <span className='routing-provider-name'><b>{label(provider)}</b>
+                  <span>{allAccounts.length ? t('账号全部禁用') : t('还没有账号')}</span></span>
                 {!on ? <Badge shape='tag' variant='secondary'>{t('未参与')}</Badge> : null}
               </header>
             </section>
@@ -312,7 +326,6 @@ export function RoutingConfigPanel({ editor, scope, now, onScope, onAccount, onS
             const open = opened.has(provider)
             const unavailable = workspace.providers.find(item => item.id === provider)?.available === false
             const target = drag.state?.target === provider
-            const enabledCount = accounts.filter(account => account.enabled !== false).length
             return <section key={provider} className={cn('routing-config-provider', !on && 'is-off', !live && 'is-parked',
               drag.state?.id === provider && 'is-dragging', target && (drag.state?.after ? 'drop-after' : 'drop-before'))}
               data-cfg-provider={provider} data-disabled={!on}>
@@ -330,7 +343,7 @@ export function RoutingConfigPanel({ editor, scope, now, onScope, onAccount, onS
                     ? `${t('{n} 个账号', { n: accounts.length })} · ${live ? t('第 {n} 顺位', { n: rank + 1 })
                       : on ? t('暂无可用账号') : unavailable ? t('模型绑定不可用') : t('未参与本范围')}`
                     : t('还没有账号')}</span></span>
-                {!live && accounts.length ? <Badge shape='tag' variant='secondary'>{enabledCount ? t('未参与') : t('账号全部禁用')}</Badge> : null}
+                {!live && accounts.length ? <Badge shape='tag' variant='secondary'>{t('未参与')}</Badge> : null}
                 {sorted ? <Badge shape='tag' variant='secondary' title={manualOrderBlockedMessage(rules)}>{groupSortSummary(rules)}</Badge> : null}
                 <IconButton name='arrowUp' title={t('提高优先级')} disabled={locked || !live || groupIndex === 0} onClick={() => moveProvider(provider, -1)} />
                 <IconButton name='arrowDown' title={t('降低优先级')} disabled={locked || !live || groupIndex >= peers.length - 1} onClick={() => moveProvider(provider, 1)} />
@@ -364,7 +377,7 @@ export function RoutingConfigPanel({ editor, scope, now, onScope, onAccount, onS
                   </div>
                 })}
                 {!order.length ? <p className='routing-config-note'>{t('该提供商没有账号，请先到账号页添加。')}</p> : null}
-              </div> : <p className='routing-config-collapsed' onClick={() => toggleOpen(provider)}>{t('{n} 个账号 · {on} 启用 · {off} 禁用', { n: accounts.length, on: enabledCount, off: accounts.length - enabledCount })}</p>}
+              </div> : <p className='routing-config-collapsed' onClick={() => toggleOpen(provider)}>{t('{n} 个账号', { n: accounts.length })}</p>}
             </section>
           })}
         </div>
