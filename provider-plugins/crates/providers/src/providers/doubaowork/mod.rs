@@ -210,6 +210,21 @@ impl Provider for DoubaoWorkProvider {
         })
     }
 
+    /// 透传 `retry_at`：默认实现是 `checkin().map(Into::into)`，会把
+    /// 「稍后自动复核」的时刻丢掉（见 `rewards::checkin_with_retry` 的说明）。
+    fn checkin_with_options<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        account: &'a str,
+        _manual: bool,
+    ) -> SendFuture<'a, agent2api_provider_sdk::CheckinResult> {
+        Box::pin(async move {
+            rewards::checkin_with_retry(ctx, account)
+                .await
+                .map_err(crate::errors::GatewayError::into_control_message)
+        })
+    }
+
     fn claim_status<'a>(
         &'a self,
         ctx: &'a PluginCtx,

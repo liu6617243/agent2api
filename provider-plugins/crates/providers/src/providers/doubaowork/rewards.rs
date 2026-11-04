@@ -250,7 +250,20 @@ async fn refetch(
 /// `retry_at` 是「稍后自动复核」的时刻 —— 必须一路带到网关
 /// （`claim.retryAt` → `auto_checkin::retry`），否则「没确认到账」的那一场
 /// 只能等用户手点，这正是此前的症状。
-pub async fn checkin(ctx: &PluginCtx, account: &str) -> Result<CheckinResult, GatewayError> {
+/// 与 `Provider::checkin` 的契约对齐：只要报告本身。
+/// `retry_at` 这类附加信息走 [`checkin_with_retry`]（由 `checkin_with_options` 转发），
+/// 否则「回查未确认」的那一场会丢掉自动复核时刻。
+pub async fn checkin(
+    ctx: &PluginCtx,
+    account: &str,
+) -> Result<proto::CheckinReport, GatewayError> {
+    Ok(checkin_with_retry(ctx, account).await?.report)
+}
+
+pub async fn checkin_with_retry(
+    ctx: &PluginCtx,
+    account: &str,
+) -> Result<CheckinResult, GatewayError> {
     let _guard = claim_lock().lock().await;
     let (_, credentials, client) = api::account(ctx, account, false).await?;
     let Some((group, value)) = detail(&client, &credentials).await? else {
