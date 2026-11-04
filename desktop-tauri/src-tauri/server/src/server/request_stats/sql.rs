@@ -70,15 +70,16 @@ pub(super) use raw::{
 /// `requests` 的列顺序（所有 SELECT 都按这个顺序取，`decode_request` 依赖它；
 /// 不写 `SELECT *` 是为了「加列时读侧要显式跟上」这件事在 diff 里可见）
 ///
-/// 末尾两列（`attempt_details` / `sensitive_hits`）是 schema v2 新增的 JSON 文本列
-/// （见 `db/schema.rs` 的 `V2_SCHEMA`）。它们必须排在**最后**：`decode_request`
-/// 按序号取值，而「加列」这件事只有在末尾才不牵动前面的序号 —— 中间插一列会让
-/// 所有后续字段的序号整体挪一位，那种改动在整个文件里看不出错，只会静默取错值。
+/// **新列一律追加在末尾**：`decode_request` 按序号取值，只有追加才不会牵动
+/// 前面字段的序号（中间插一列会让所有后续字段整体挪一位，那种改动在整个文件里
+/// 看不出错，只会静默取错值）。因此后加的列都在最后：
+///   - `attempt_details` / `sensitive_hits`（schema v2 的 JSON 文本列）；
+///   - `credit`（schema v23 的积分消耗，可空 REAL）。
 pub(super) const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
      client_reasoning, upstream_reasoning, phase, phase_started_at, is_test, route, client, \
-     api_key_id, api_key_name, api_key_source";
+     api_key_id, api_key_name, api_key_source, credit";
 
 /// 报表窄列查询的列顺序 —— **与 `db::schema` 的 `idx_requests_summary` 列序一致**
 /// （索引是 `ts, is_test` 前缀 + 这里的后 5 列），改任一侧都要回来对一眼。
@@ -165,6 +166,9 @@ pub(super) fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reques
                 source: row.get(28)?,
             },
         },
+        // 末列是 schema v23 加的（积分消耗）；旧行 / 没上报的行是 NULL ——
+        // 读成 None，与「上报了 0」分开（前端前者显示「—」）。
+        credit: row.get(29)?,
     })
 }
 
@@ -334,21 +338,41 @@ pub(super) fn count_matching(
     Ok(count.max(0) as usize)
 }
 
-/// 命中筛选条件的**进行中**行数（`QueryResult.running`）。
+/// 列表页一次要的三个计数（总条数 / 命中条数 / 其中进行中）—— **一次扫描**。
 ///
-/// 一条 COUNT：在筛选计划上追加 `status = 0` —— 与列表共用同一份 WHERE，
-/// 「这批筛选里还有几条没跑完」才是列表页徽标要的口径。
-pub(super) fn count_running(
+/// 原先三条独立 `COUNT(*)`：每条都在自己的 WHERE 上扫一遍表，而列表页每秒
+/// 轮询一次，明细上百万行时等于每秒三遍全表。这里把三个计数写成同一个
+/// `SELECT` 里的 `COUNT(*)` 与两个 `SUM(CASE ...)`，扫描次数从三降到一。
+///
+/// 每个 `CASE` 都要各自一组绑定参数（SQLite 不保证跨表达式复用），所以绑定
+/// 值按「命中」与「命中且 status=0」各复制一份。
+pub(super) fn counts(
     conn: &Connection,
     plan: &FilterPlan,
-) -> rusqlite::Result<usize> {
-    let sql = if plan.where_sql.is_empty() {
-        "SELECT COUNT(*) FROM requests WHERE status = 0".to_string()
-    } else {
-        format!("SELECT COUNT(*) FROM requests{} AND status = 0", plan.where_sql)
-    };
-    let count: i64 = conn.query_row(&sql, params_from_iter(plan.binds.iter()), |row| row.get(0))?;
-    Ok(count.max(0) as usize)
+) -> rusqlite::Result<(usize, usize, usize)> {
+    let filter = plan
+        .where_sql
+        .strip_prefix(" WHERE ")
+        .unwrap_or("1");
+    let sql = format!(
+        "SELECT COUNT(*), \
+         COALESCE(SUM(CASE WHEN ({filter}) THEN 1 ELSE 0 END), 0), \
+         COALESCE(SUM(CASE WHEN ({filter}) AND status = 0 THEN 1 ELSE 0 END), 0) \
+         FROM requests"
+    );
+    let mut binds = Vec::with_capacity(plan.binds.len() * 2);
+    binds.extend(plan.binds.iter().cloned());
+    binds.extend(plan.binds.iter().cloned());
+    let (total, matched, running): (i64, i64, i64) = conn.query_row(
+        &sql,
+        params_from_iter(binds.iter()),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok((
+        total.max(0) as usize,
+        matched.max(0) as usize,
+        running.max(0) as usize,
+    ))
 }
 
 /// 筛选下拉的候选清单：明细里出现过的模型名与 provider id（各按出现次数降序）。
@@ -814,7 +838,7 @@ pub(super) fn update_running_request(
          client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19, \
          client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL, \
          is_test = ?22, route = ?23, client = ?24, \
-         api_key_id = ?25, api_key_name = ?26, api_key_source = ?27 \
+         api_key_id = ?25, api_key_name = ?26, api_key_source = ?27, credit = ?28 \
          WHERE id = ?1 AND status = 0",
         params![
             entry.id,
@@ -848,6 +872,7 @@ pub(super) fn update_running_request(
             entry.source.api_key.id,
             entry.source.api_key.name,
             entry.source.api_key.source,
+            entry.credit,
         ],
     )
 }
@@ -874,9 +899,9 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
          first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
          cache_read_tokens, provider, client_model, upstream_model, attempt_details, \
          sensitive_hits, client_reasoning, upstream_reasoning, is_test, route, client, \
-         api_key_id, api_key_name, api_key_source) \
+         api_key_id, api_key_name, api_key_source, credit) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
         params![
             entry.id,
             entry.ts,
@@ -905,6 +930,7 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
             entry.source.api_key.id,
             entry.source.api_key.name,
             entry.source.api_key.source,
+            entry.credit,
         ],
     )?;
     Ok(())

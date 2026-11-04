@@ -75,11 +75,8 @@ pub fn default_time() -> String {
 ///     `freepoint/taskComplete`，见 `providers::kuku::checkin`）。接口幂等，
 ///     重复领取只返回 reward_point=0；业务会话由换发的 genflowpro STOKEN
 ///     保障（`kuku::engine`）。
-///   - **OfficeAce 果办**：**已移出本链**（2026-11-01）。上游取消了每日签到
-///     活动（`subscribe_status=UNSUBSCRIBED`，`bonus_skus` 里那一条消失），
-///     再 claim 一律 `403 OfficeAce.11020604 未订购套餐`。以前它还在这条链上，
-///     每天多打一次注定被拒的请求，并把「凭据已失效」误报给用户。它的新手福利
-///     卡仍在（读奖励账本，无副作用），参与判定见 `billing::checkin::supports_checkin`。
+///   - **OfficeAce 果办**：**一次调用**领当天全部奖励（每日签到 + 一次性新人礼
+///     是同一条上游动作）。实现已搬到提供商插件，幂等由上游保证。
 ///   - **CodeArts**：当日**ops 福利**（实现已搬到插件，`checkin.claim` 走
 ///     `welfare.claim`）。它与别家的形态差别最大（三个接口、两套状态、一个
 ///     幂等键），所以 2026-10 之前一直**不进**这条链、只在签到中心留一颗手动
@@ -104,7 +101,7 @@ pub fn default_time() -> String {
 /// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分
 /// 查询但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 18] = [
+pub const CHECKIN_PROVIDERS: [&str; 19] = [
     "workbuddy",
     "workbuddy-intl",
     "raccoon",
@@ -115,21 +112,7 @@ pub const CHECKIN_PROVIDERS: [&str; 18] = [
     "trae",
     "loomy",
     "kuku",
-    // OfficeAce 果办**已移出本链**（2026-11-01，按用户要求）。
-    // 上游取消了果办的每日签到活动：`GET /v1/subscription` 回
-    // `subscribe_status=UNSUBSCRIBED`，`bonus_skus` 里「每日签到」那一条消失；
-    // 再打 `POST /v1/subscription/bonus/claim` 一律
-    // `403 OfficeAce.11020604 未订购套餐`。它留在本链的唯一后果是每天落一条
-    // 注定失败的记录、把签到进度分母撑大，并在签到台显示一句误导性的
-    // 「控制面凭据已失效：请重新登录一次」（凭据其实完全正常，见插件
-    // `officeace::subscription::call` 里那段误报修正）。
-    //
-    // ⚠️ 只改这里**不够**：插件还申报着 `CheckinInfo`，而 `checkin_providers()`
-    // 会把「装了插件且申报了签到能力位」的家追加回来。两处必须一致 ——
-    // 插件侧 `Capabilities::checkin` 与 `CheckinInfo::daily` 已同时置 false。
-    // 它在签到中心的说明变成「本家没有每日签到，福利在下方对应卡片里」，
-    // 新手福利卡（读 `bonus_skus` 账本，无副作用）照常可用。
-    // 上游哪天恢复该活动，把这一行与插件那两位一起改回即可。
+    "officeace",
     // 追加在**末尾**：这个数组的顺序就是界面复选框与签到中心分组行的顺序，
     // 插在中间会让所有存量用户的清单顺序变一下（没有功能影响，但没必要动）。
     "codearts",
@@ -251,12 +234,8 @@ pub const PROVIDERS_VERSION: i64 = 6;
 /// 版本 3 = 智谱清言；版本 4 = ModelScope 的两个站点与 AtomCode；
 /// 版本 5 = LobsterAI（两条 provider PR 各自用了一个号，合起来取并集）；
 /// 版本 6 = ZCode 的两个站点（签到 = 领当天赠送套餐）。
-///
-/// ⚠️ 本表**只对 [`CHECKIN_PROVIDERS`] 里现存的 id 生效**（见
-/// [`providers_added_after`]），所以「从清单里摘掉一家」必须连同这里的
-/// 登记一起去掉 —— 留着不会被补回来，但会误导后来读代码的人以为它还在范围内。
-/// `officeace` 已于 2026-11-01 摘除（上游取消每日签到活动，见清单里的说明）。
-const PROVIDERS_ADDED_IN: [(&str, i64); 8] = [
+const PROVIDERS_ADDED_IN: [(&str, i64); 9] = [
+    ("officeace", 2),
     ("codearts", 2),
     ("chatglm", 3),
     ("modelscope", 4),
@@ -290,21 +269,12 @@ pub fn providers_added_after(version: i64) -> Vec<String> {
 /// 不在标签里堆字。Qoder 拆家（2026-10）后注册名就是「Qoder 中国版 /
 /// 国际版」，不再需要这里的覆盖。其余几家不需要后缀：小浣熊没有版本区分，
 /// AutoClaw 两地的签到链路都存在且同形 —— 展示名已带「国内版 / 国际版」。
-pub fn provider_label(id: &str) -> String {
-    // ── 先问插件，再问内置表（顺序不能反）──────────────────────
-    // 3.3.0 起绝大多数家由插件服务，它们的名字只存在于 `pack.json` 的
-    // `label` 里（`core::plugin_host::provider_label` 就是读那个）。只查下面
-    // 那张编译期常量表的话，插件家会一路回退成**裸 id** —— 签到中心那一行
-    // 标题、范围复选框、报错文案里全是 `minimax` 这种内部标识，与账号页
-    // 显示的名字对不上（用户会以为这是两个不同的提供商）。
-    if let Some(label) = crate::server::core::plugin_host::provider_label(id) {
-        return label;
-    }
+pub fn provider_label(id: &str) -> &str {
     crate::server::core::providers::PROVIDERS
         .iter()
         .find(|meta| meta.id == id)
-        .map(|meta| meta.label.to_string())
-        .unwrap_or_else(|| id.to_string())
+        .map(|meta| meta.label)
+        .unwrap_or(id)
 }
 
 /// 归一化配置里的提供商清单：只认 CHECKIN_PROVIDERS 里的 id（去重、保持顺序），

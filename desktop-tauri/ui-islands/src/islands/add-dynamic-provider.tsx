@@ -1,10 +1,10 @@
 /** 未在内置表单登记的运行时 provider：动态方法、纯文本说明与旧插件兼容入口。 */
 import * as React from 'react'
 import {
-  Alert, AlertDescription, AlertTitle, Button, Dialog, DialogBody, DialogContent,
-  DialogHeader, DialogSection, DialogTitle, Input, Label, SegmentedControl,
+  Alert, AlertDescription, AlertTitle, Button, Input, Label, SegmentedControl,
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Spinner, Textarea,
 } from '@ui'
+import { AddFoot, AddGroup } from './add-account-kit'
 import { t } from '../i18n'
 import { MAX_NAME_LENGTH } from './add-account-configs'
 import {
@@ -49,7 +49,8 @@ function legacyMethods(provider: RuntimeProviderRecord | undefined): MethodsStat
     const kind = textOf(raw.kind)
     const method: Method = {
       id: `legacy:${index}`, type: 'unsupported', prompts: [], localOnly: false,
-      manualCallback: false, callbackInput: 'url', label: textOf(raw.label) || textOf(raw.button) || kind,
+      manualCallback: false, callbackInput: 'url', embeddedOnly: false,
+      label: textOf(raw.label) || textOf(raw.button) || kind,
       instructions: textOf(raw.hint) || textOf(raw.placeholder),
     }
     if (kind === 'browser') {
@@ -82,7 +83,7 @@ function legacyMethods(provider: RuntimeProviderRecord | undefined): MethodsStat
   if (!methods.some(method => method.type === 'manual')) {
     methods.push({
       id: 'manual:compat', type: 'manual', label: t('手动凭证 JSON（兼容入口）'),
-      prompts: [], localOnly: false, manualCallback: false, callbackInput: 'url', instructions: '',
+      prompts: [], localOnly: false, manualCallback: false, callbackInput: 'url', embeddedOnly: false, instructions: '',
     })
   }
   return {
@@ -123,13 +124,18 @@ function apiProxySelection(proxy: ReturnType<typeof readProxyDraft>): unknown {
 }
 
 export function DynamicProviderBlock({
-  provider, label, active, version,
-}: { provider: string; label: string; active: boolean; version: number }): React.ReactElement {
+  provider, label, active, version, footerHost,
+}: {
+  provider: string
+  label: string
+  active: boolean
+  version: number
+  footerHost: HTMLElement | null
+}): React.ReactElement {
   const prefix = `${React.useId()}-dynamic-login`
   const [methodsState, setMethodsState] = React.useState<MethodsState>({
     phase: 'loading', methods: [], instructions: '', reason: '',
   })
-  const [reload, setReload] = React.useState(0)
   const [selected, setSelected] = React.useState('')
   const [values, setValues] = React.useState<Record<string, Record<string, string>>>({})
   const [credentialJson, setCredentialJson] = React.useState('')
@@ -138,7 +144,6 @@ export function DynamicProviderBlock({
   const [mode, setMode] = React.useState<'external' | 'embedded'>('external')
   const [saving, setSaving] = React.useState(false)
   const [error, setError] = React.useState('')
-  const [helpOpen, setHelpOpen] = React.useState(false)
   const [progress, setProgress] = React.useState<LoginProgress>({})
   const [hasCallback, setHasCallback] = React.useState(false)
   const [callbackBusy, setCallbackBusy] = React.useState(false)
@@ -156,7 +161,6 @@ export function DynamicProviderBlock({
   const savingRef = React.useRef(false)
   const requestingRef = React.useRef(false)
   const loadedRef = React.useRef(false)
-  const lastReload = React.useRef(reload)
   const method = methodsState.methods.find(item => item.id === selected) || methodsState.methods[0]
   const methodAvailable = method && methodsState.phase !== 'loading' && method.type !== 'unsupported'
   const selectedRef = React.useRef(method?.id)
@@ -187,6 +191,9 @@ export function DynamicProviderBlock({
   React.useEffect(() => {
     clearCallback(true)
     if (!active) {
+      // 关掉弹窗即作废这次读取；下次打开会重新问插件要登录方式
+      //（原来的「重新读取登录方式」按钮已移除，靠这里保证每次打开都是新清单）。
+      loadedRef.current = false
       setCallbackError('')
       progressRef.current = {}
       setProgress({})
@@ -198,7 +205,7 @@ export function DynamicProviderBlock({
 
   React.useEffect(() => {
     if (!active || savingRef.current || requestingRef.current || loginView.waiting) return
-    if (lastReload.current === reload && loadedRef.current && runtimeProviderOf(provider)) return
+    if (loadedRef.current && runtimeProviderOf(provider)) return
     let current = true
     const previousSelection = selectedRef.current
     const previousInputs = snapshot.current.inputs
@@ -216,7 +223,6 @@ export function DynamicProviderBlock({
     }
     requestingRef.current = true
     loadedRef.current = false
-    lastReload.current = reload
     setMethodsState(previous => ({ ...previous, phase: 'loading', reason: '' }))
     void (async () => {
       try {
@@ -234,7 +240,7 @@ export function DynamicProviderBlock({
     })()
     return () => { current = false; requestingRef.current = false }
     // 等待状态由共享引擎掌管，不以等待态重建方法或重新发起登录。
-  }, [provider, active, version, reload])
+  }, [provider, active, version])
 
   React.useEffect(() => {
     alive.current = true
@@ -252,8 +258,10 @@ export function DynamicProviderBlock({
           progressRef.current = {}
           setProgress({})
           const inputs = readInputs(current.method, current.inputs)
+          // 插件申报 embeddedOnly 时一律走内嵌窗口（不信任残留的 mode 状态）。
+          const mode = current.method.embeddedOnly ? 'embedded' : current.mode
           // 旧 browser 声明没有索引，只走已存在的默认网页登录入口。
-          return startLogin(provider, undefined, current.mode, undefined,
+          return startLogin(provider, undefined, mode, undefined,
             current.method.methodIndex === undefined ? undefined : {
               methodIndex: current.method.methodIndex, inputs, proxy: readProxyDraft(current.proxyDraft),
             })
@@ -455,15 +463,10 @@ export function DynamicProviderBlock({
   const instructionLines = [methodsState.instructions, method?.instructions,
     progress.instructions, progress.hint].filter((line): line is string => Boolean(line))
   const instructions = [...new Set(instructionLines)].join('\n')
-  const helpTitle = t('账号登录帮助（account login）')
   const commonFields = method && method.type !== 'unsupported' && !legacyBrowser
 
   return <div className='add-provider-block' hidden={!active}>
-    <DialogSection>
-      <div className='flex flex-wrap items-center justify-between gap-2'>
-        <h3>{t('账号登录方式')}</h3>
-        <Button variant='ghost' size='sm' onClick={() => setHelpOpen(true)}>{helpTitle}</Button>
-      </div>
+    <AddGroup label={t('账号登录方式')}>
       {methodsState.phase === 'loading' ? <p role='status'><Spinner /> {t('正在读取插件登录方式…')}</p>
         : methodsState.reason ? <Alert variant={methodsState.phase === 'error' ? 'destructive' : 'warning'}>
           <AlertTitle>{methodsState.phase === 'error' ? t('无法读取登录方式') : t('登录方式说明')}</AlertTitle>
@@ -485,11 +488,7 @@ export function DynamicProviderBlock({
           </SelectItem>)}</SelectContent>
         </Select>
       ) : null}
-      {methodAvailable ? <Button variant='outline' size='sm' className='self-start'
-        disabled={locked} onClick={() => setReload(value => value + 1)}>
-        {t('重新读取登录方式')}
-      </Button> : null}
-    </DialogSection>
+    </AddGroup>
 
     {instructions || progress.userCode ? <Alert>
       <AlertTitle>{t('登录指引 / 设备码授权')}</AlertTitle>
@@ -499,9 +498,8 @@ export function DynamicProviderBlock({
       </AlertDescription>
     </Alert> : null}
 
-    {method && methodsState.phase !== 'loading' ? <DialogSection>
-      <h3>{methodLabel(method)}</h3>
-      {method.type === 'oauth' && !method.localOnly ? <p>{t('填写账号登录所需信息并发起授权；等待、取消与失败原因由共享登录桥处理，设备码和操作指引会显示在上方。')}</p> : null}
+    {method && methodsState.phase !== 'loading' ? <AddGroup label={methodLabel(method)}>
+      {method.type === 'oauth' && !method.localOnly ? <p>{t('填写信息后发起授权，进度与失败原因会显示在这里。')}</p> : null}
       {method.type === 'api' ? <p>{t('API 方法提交给插件的账号规范化入口；不会用该密钥发起 OAuth 登录。')}</p> : null}
       {method.localOnly ? <Alert variant='warning'>
         <AlertTitle>{t('需要网关本机环境')}</AlertTitle>
@@ -564,22 +562,24 @@ export function DynamicProviderBlock({
       </> : null}
       {legacyBrowser ? <p>{t('旧版浏览器登录暂不接收备注名和登录代理，请添加后在账号设置中调整。')}</p> : null}
       {method.type === 'oauth' && !legacyBrowser && !method.prompts.some(prompt => prompt.key === 'name')
-        ? <p>{t('此 OAuth 方法未声明备注名字段，账号名由插件获取；添加后可在账号设置中修改。')}</p> : null}
-      {method.type === 'oauth' && !method.localOnly && shared().workbuddyDesktop?.platform !== 'web' ? <>
+        ? <p>{t('账号名由插件自动获取，添加后可修改。')}</p> : null}
+      {method.type === 'oauth' && !method.localOnly && !method.embeddedOnly && shared().workbuddyDesktop?.platform !== 'web' ? <>
         <Label>{t('打开方式')}</Label>
         <SegmentedControl aria-label={t('网页登录的打开方式')} value={mode} disabled={locked}
           options={[{ value: 'external', label: t('系统浏览器') }, { value: 'embedded', label: t('内嵌窗口') }]}
           onValueChange={setMode} />
       </> : null}
-      {method.type === 'oauth' ? <div className='flex flex-wrap items-center gap-2'>
+      {method.type === 'oauth' ? <AddFoot host={footerHost} active={active}
+        note={<span id={`${prefix}-hint`} className='detail whitespace-pre-wrap break-words'>{loginView.hint}</span>}>
         <Button id={`${prefix}-start`} disabled={locked || Boolean(method.reason)} onClick={startOauth}>
           {loginView.waiting ? <Spinner /> : null}{loginView.label}
         </Button>
         <Button id={`${prefix}-cancel`} variant='outline' hidden={!loginView.waiting}
           onClick={cancelOauth}>{t('取消等待')}</Button>
-        <span id={`${prefix}-hint`} className='detail whitespace-pre-wrap break-words'>{loginView.hint}</span>
-      </div> : method.type !== 'unsupported' ? <Button className='self-start' disabled={locked || Boolean(method.reason)}
-        onClick={() => void submit()}>{saving ? <Spinner /> : null}{saving ? t('添加中…') : t('添加账号')}</Button> : null}
+      </AddFoot> : method.type !== 'unsupported' ? <AddFoot host={footerHost} active={active}>
+        <Button disabled={locked || Boolean(method.reason)}
+          onClick={() => void submit()}>{saving ? <Spinner /> : null}{saving ? t('添加中…') : t('添加账号')}</Button>
+      </AddFoot> : null}
       {manualWaiting ? <div className='flex flex-col gap-2'>
         <Label htmlFor={`${prefix}-callback`}>{callbackType === 'code'
           ? t('授权码或令牌（原样提交）') : t('完整回调地址（原样提交）')}</Label>
@@ -601,35 +601,7 @@ export function DynamicProviderBlock({
       {error ? <Alert variant='destructive'><AlertTitle>{t('添加失败')}</AlertTitle>
         <AlertDescription className='whitespace-pre-wrap break-words'>{error}</AlertDescription>
       </Alert> : null}
-    </DialogSection> : null}
-    {!methodAvailable && methodsState.phase !== 'loading' ? <Button variant='outline' size='sm' className='self-start'
-      disabled={locked} onClick={() => setReload(value => value + 1)}>{t('重新读取登录方式')}</Button> : null}
+    </AddGroup> : null}
     {error && !methodAvailable ? <Alert variant='destructive'><AlertDescription>{error}</AlertDescription></Alert> : null}
-
-    <Dialog open={helpOpen && active} onOpenChange={setHelpOpen}>
-      <DialogContent overlayForceRender>
-        <DialogHeader><DialogTitle>{helpTitle}</DialogTitle></DialogHeader>
-        <DialogBody>
-          <p className='text-xs leading-relaxed text-subtle'>
-            {t('先选择插件声明的账号登录方式，再填写必需字段。OAuth 由共享登录桥负责等待、取消和错误；API 凭证通过账号规范化入口添加。')}
-          </p>
-          {methodsState.methods.map(item => <DialogSection key={item.id}>
-            <h3>{methodLabel(item)}</h3>
-            {item.instructions ? <p className='whitespace-pre-wrap break-words'>{item.instructions}</p> : null}
-            {item.reason ? <p>{item.reason}</p> : null}
-          </DialogSection>)}
-          {instructions ? <Alert><AlertTitle>{t('插件登录指引')}</AlertTitle>
-            <AlertDescription className='whitespace-pre-wrap break-words'>{instructions}</AlertDescription>
-          </Alert> : null}
-          <p className='text-xs leading-relaxed text-subtle'>
-            {t('设备码授权时，请按网关给出的指引在官方页面确认设备授权码。没有授权地址不等于失败，可能需要在网关本机客户端完成操作；请以共享登录桥返回的状态为准。')}
-          </p>
-          <Button variant='outline' className='self-start' onClick={() => {
-            setHelpOpen(false)
-            shared().wbApp?.showPage?.('plugins')
-          }}>{t('查看提供商插件')}</Button>
-        </DialogBody>
-      </DialogContent>
-    </Dialog>
   </div>
 }

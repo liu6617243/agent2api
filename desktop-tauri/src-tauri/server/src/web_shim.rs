@@ -400,11 +400,20 @@ pub fn shim_js() -> &'static str {
     if (hosts != null && (!Array.isArray(hosts) || hosts.some(function (host) {
       return typeof host !== 'string' || !host.trim().replace(/^\*\./, '').replace(/\.$/, '');
     }))) throw new Error('登录域名白名单格式无效');
-    var permittedHost = !Array.isArray(hosts) || hosts.length === 0 || hosts.some(function (host) {
-      if (typeof host !== 'string') return false;
-      var allowed = host.trim().toLowerCase().replace(/^\*\./, '').replace(/\.$/, '');
-      return allowed && (parsed.hostname.toLowerCase() === allowed
-        || parsed.hostname.toLowerCase().endsWith('.' + allowed));
+    var regularHosts = [];
+    var loopbackPages = [];
+    (Array.isArray(hosts) ? hosts : []).forEach(function (host) {
+      if (typeof host !== 'string') return;
+      var text = host.trim().toLowerCase();
+      // 插件申报的本机登录页（明确带端口，只认回环主机）
+      var page = /^(127\.0\.0\.1|localhost|\[::1\]):(\d+)$/.exec(text);
+      if (page) { loopbackPages.push({ host: page[1], port: page[2] }); return; }
+      var allowed = text.replace(/^\*\./, '').replace(/\.$/, '');
+      if (allowed) regularHosts.push(allowed);
+    });
+    var permittedHost = !Array.isArray(hosts) || regularHosts.length === 0 || regularHosts.some(function (allowed) {
+      return parsed.hostname.toLowerCase() === allowed
+        || parsed.hostname.toLowerCase().endsWith('.' + allowed);
     });
     var callbackHttp = parsed.protocol === 'http:'
       && ['localhost', '127.0.0.1', '[::1]'].indexOf(parsed.hostname) >= 0
@@ -412,7 +421,11 @@ pub fn shim_js() -> &'static str {
         return target.protocol === parsed.protocol && target.hostname === parsed.hostname
           && target.port === parsed.port && target.pathname === parsed.pathname;
       });
-    if (!permittedHost || (parsed.protocol !== 'https:' && !callbackHttp)) {
+    var loopbackPage = parsed.protocol === 'http:'
+      && loopbackPages.some(function (page) {
+        return parsed.hostname.toLowerCase() === page.host && (parsed.port || '80') === page.port;
+      });
+    if (!permittedHost || (parsed.protocol !== 'https:' && !callbackHttp && !loopbackPage)) {
       throw new Error('登录链接不是允许的 HTTPS 站点或合法本机回调地址');
     }
     return value; // 校验不重写原文，保留授权地址中的编码、顺序与签名。
@@ -1608,10 +1621,11 @@ pub fn shim_js() -> &'static str {
     setModelState: function (payload) { return call('POST', '/api/models/state', payload); },
     // 第 4 / 第 5 个参数（思考等级 / 映射开关）都按「有没有传」决定是否进请求体：
     // 后端按「请求体里有没有这个键」区分三态，undefined 的键不会进 JSON
-    addModelMapping: function (alias, target, provider, reasoning, enabled) {
+    addModelMapping: function (alias, target, provider, reasoning, enabled, create) {
       var payload = { alias: alias, target: target, provider: provider };
       if (reasoning !== undefined) payload.reasoning = reasoning;
       if (enabled !== undefined) payload.enabled = enabled;
+      if (create !== undefined) payload.create = create;
       return call('POST', '/api/models/mappings', payload);
     },
     removeModelMapping: function (alias, target, provider) {
@@ -1690,6 +1704,7 @@ pub fn shim_js() -> &'static str {
     getRoutingSticky: function (model) { return call('GET', '/api/routing/sticky' + toQuery({ model: model })); },
     clearRoutingSticky: function (payload) { return call('POST', '/api/routing/sticky/clear', payload || {}); },
     getRoutingReplays: function (query) { return call('GET', '/api/routing/replays' + toQuery(query)); },
+    getRoutingFlow: function (query) { return call('GET', '/api/routing/flow' + toQuery(query)); },
     getRoutingTrace: function (query) { return call('GET', '/api/routing/trace' + toQuery(query)); },
     getRoutingTraceRequest: function (query) { return call('GET', '/api/routing/trace/request' + toQuery(query)); },
     setRoutingConfig: function (patch) { return call('PUT', '/api/routing', patch || {}); },
@@ -2142,6 +2157,10 @@ pub fn shim_js() -> &'static str {
     // ── 排队等待（次数 / 单次秒数）──
     getQueue: function () { return call('GET', '/api/queue'); },
     saveQueue: function (patch) { return call('PUT', '/api/queue', patch); },
+    // ── 会话图片压缩（开关 + 长边 / 质量 / 阈值三项）──
+    // 与桌面桥（src/bridge.rs 的 getImageCompress / saveImageCompress）逐字同形。
+    getImageCompress: function () { return call('GET', '/api/image-compress'); },
+    saveImageCompress: function (patch) { return call('PUT', '/api/image-compress', patch); },
     // ── 验证码令牌池（ZCode 活动套餐通道的补货节奏）──
     getCaptchaPool: function () { return call('GET', '/api/zcode/captcha-pool'); },
     saveCaptchaPool: function (patch) { return call('PUT', '/api/zcode/captcha-pool', patch); },

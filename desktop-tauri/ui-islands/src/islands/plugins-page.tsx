@@ -1,4 +1,5 @@
 import * as React from 'react'
+import { mountOnPage } from '../island-lazy'
 import { createRoot } from 'react-dom/client'
 import {
   Badge, Button, Card, CardFooter, CardHeader, Collapsible, CollapsibleContent,
@@ -209,7 +210,6 @@ function PluginsPage(): React.ReactElement {
       </CardHeader>
       <div className='p-4'>
         <Input ref={fileRef} type='file' accept='.zip,application/zip' className='hidden' onChange={event => void onFile(event)} />
-        <p className='mb-3 text-[12px] text-subtle'>{packSizeLimitMessage(maxPackBytes)}</p>
         {error || syncError ? <p className='mb-3 text-[12px] text-destructive'>{error || syncError}</p> : null}
         {busy === 'file' ? <div className='mb-3 flex flex-col gap-2'>
           <span className='text-[12px] text-subtle'>{t('正在读取、校验并安装插件包…')}</span>
@@ -303,8 +303,7 @@ function mount(): void {
   createRoot(section).render(<PluginsPage />)
 }
 
-if (document.querySelector(PAGE_SELECTOR)) mount()
-else document.addEventListener('DOMContentLoaded', mount, { once: true })
+mountOnPage('plugins', PAGE_SELECTOR, mount)
 
 declare global {
   interface Window { wbPluginsPage?: { load(): Promise<void> } }

@@ -1,7 +1,17 @@
+import type { AssistantTextFile } from './assistant-files'
 import type { Translate } from './assistant-read-types'
 
 export type ImageAsset = { id: string; url: string; mime: string; width: number; height: number }
-export type ImageToolContext = { session: string; images: string[]; confirmed: boolean; apiKey?: string; apiKeyName?: string; signal?: AbortSignal }
+export type ImageToolContext = {
+  session: string
+  images: string[]
+  /** 最近一条带附件的用户消息里的 JSON / .info 文件（账号导入工具用） */
+  files?: AssistantTextFile[]
+  confirmed: boolean
+  apiKey?: string
+  apiKeyName?: string
+  signal?: AbortSignal
+}
 export type ImageToolResult = { text: string; summary: string; images: ImageAsset[] }
 export type ImageToolApi = (path: string, body: unknown, signal?: AbortSignal, apiKey?: string) => Promise<unknown>
 
@@ -68,8 +78,8 @@ export function createAssistantImageTools(api: ImageToolApi, t: Translate): Assi
     label: editing ? t('编辑图片') : t('生成图片'),
     kind: 'run',
     desc: editing
-      ? '用自然语言编辑图片或按参考图生成新图，走标准 Images 编辑链路。先用 list_models 选择 supports_image_editing=true 的模型（Loomy、Antigravity 或 ModelScope）。images 可写 attachment:1 等当前参考图编号，或之前图片工具返回的 assistant-image:ID；不填时使用最近上传或生成的图片。若无图，请让用户上传。只支持 PNG/JPEG/WebP 参考图，不支持 mask、input_fidelity、流式。会真实消耗额度，不自动重发不确定结果。工具返回的图片已在界面显示，只报告结果，不要编造本地文件路径。'
-      : '根据文本生成图片，走标准 Images 生成链路。先用 list_models 选择 kind=image、supports_image_generation=true 的模型（小浣熊、Loomy、Antigravity 或 ModelScope）。会真实消耗额度，默认只生成 1 张；仅用户要求时才增加数量。不自动重发不确定结果。工具返回的图片已在界面显示，只报告结果，不要编造本地文件路径。',
+      ? '用自然语言编辑图片或按参考图生成新图，走标准 Images 编辑链路。先用 list_models 选择 supports_image_editing=true 的模型（Loomy、Antigravity、ModelScope 或 WorkBuddy）。images 可写 attachment:1 等当前参考图编号，或之前图片工具返回的 assistant-image:ID；不填时使用最近上传或生成的图片。若无图，请让用户上传。只支持 PNG/JPEG/WebP 参考图，不支持 mask、input_fidelity、流式。会真实消耗额度，不自动重发不确定结果。工具返回的图片已在界面显示，只报告结果，不要编造本地文件路径。'
+      : '根据文本生成图片，走标准 Images 生成链路。先用 list_models 选择 kind=image、supports_image_generation=true 的模型（小浣熊、Loomy、Antigravity、ModelScope 或 WorkBuddy）。会真实消耗额度，默认只生成 1 张；仅用户要求时才增加数量。不自动重发不确定结果。工具返回的图片已在界面显示，只报告结果，不要编造本地文件路径。',
     params: {
       type: 'object',
       properties: {

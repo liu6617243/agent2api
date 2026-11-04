@@ -49,6 +49,11 @@ pub mod accounts_usage;
 pub mod assistant;
 pub mod assistant_history;
 pub mod assistant_images;
+// 工具服务（「工具服务」页）：列表 / 开关 / 超时 / 上游提供商 / 视觉配置 /
+// 本机接入的管理面，以及对外运行时端点（Skill / MCP / REST）。上游配置与
+// 编排在 `core::tool_services`，见那两个文件模块头
+pub mod tools;
+pub mod tool_runtime;
 mod image_input;
 // 整库备份 / 恢复（设置页「整库备份 / 恢复」，SQL 文本形态；核心在
 // `db::backup`，替换语义与账号 JSON 导入的 merge 是两条独立通道）
@@ -118,6 +123,8 @@ pub mod models;
 pub mod onboarding;
 pub mod panel;
 pub mod pipeline;
+mod live_progress;
+mod record_persist;
 // 提供商插件包的管理面（列表 / 安装 / 卸载 / 启停）：插件是用户安装的，
 // 这一组端点就是「装插件」的唯一入口，见该文件模块头
 pub mod plugins;
@@ -132,12 +139,18 @@ pub mod protocol;
 pub mod proxies;
 pub mod qoder_umid;
 pub mod queue_api;
+// 会话图片压缩设置（GET/PUT /api/image-compress）：开关 + 长边 / 质量 / 阈值三项，
+// 实施点在 `core::upstream::payload` 的 send_body（只作用在对话链路，生图不经过），
+// 见该文件模块头
+pub mod image_compress;
 pub mod retry_api;
+pub(crate) mod request_prepare;
 // 开发者角色兼容开关（GET/PUT /api/developer-role-compat）：与 /api/sanitize
 // 同形的单开关端点，转换实施点在 `core::upstream::payload` 的 send_body，
 // 见该文件模块头
 pub mod role_compat;
 pub mod routing_api;
+pub mod routing_flow;
 pub mod routing_trace;
 pub mod routing_workspace;
 pub mod sanitize;

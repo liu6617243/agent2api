@@ -1,14 +1,17 @@
 // 稳定 ID 仍用于存量账号；Rust 执行体恢复前不开放添加和调用。
+// Kiro 已由「提供商增强」插件实现（2026-11），与后端
+// `core/providers/availability.rs` 的 SUSPENDED_IDS 同步移出。
 export const SUSPENDED_PROVIDER_IDS: ReadonlySet<string> = new Set([
   'cursor',
-  'kiro',
   'devin',
   'factory',
   'zed',
   'grok',
   'minimax-code',
   'minimax-code-global',
-  'qwenwork',
+  // 千问办公国际版：登录链路被上游挡住（只认它自己的回调地址），
+  // 添加不了账号，先从可见列表摘掉；国内版 (`qwenwork`) 不受影响。
+  'qwenwork-intl',
   'qwenwork-enterprise',
   'kimi-work',
   'opendesign',

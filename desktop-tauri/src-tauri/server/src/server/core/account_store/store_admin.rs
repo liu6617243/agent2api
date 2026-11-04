@@ -36,6 +36,8 @@
 //! 要么全不成 —— 中断留下「部分账号改了 id、部分没改」的中间态会让同一批
 //! 账号散在两个 provider 组里。
 
+use std::collections::{HashMap, HashSet};
+
 use serde_json::{json, Map, Value};
 
 use crate::server::config;
@@ -50,6 +52,22 @@ use crate::server::core::account_store::store::AccountStore;
 use crate::server::core::account_store::store_util::{token_tail_of, truncate_chars};
 use crate::server::core::providers::{provider_index, DEFAULT_PROVIDER_ID};
 use crate::server::logging;
+
+/// ── 限额冷却的参数（2026-11 参考 magpie / CLIProxyAPI 的做法）──────────
+/// 上游给的恢复时间再短也不低于它：亚秒级的 `Retry-After` 会让账号在同一轮
+/// 请求里就解封、被重新选中、再撞一次（CLIProxyAPI #5265 的重试风暴）。
+const RATE_LIMIT_FLOOR_MS: f64 = 30_000.0;
+/// 上游没给恢复时间时的兜底冷却，也是退避的基数（沿用旧行为的 10 分钟，
+/// 首撞仍是它；连续撞按 [`RATE_LIMIT_CAP_MS`] 封顶增长）。
+const RATE_LIMIT_FALLBACK_MS: f64 = 10.0 * 60_000.0;
+/// 退避上限：连续撞时冷却的最长值。
+const RATE_LIMIT_CAP_MS: f64 = 30.0 * 60_000.0;
+/// 遗忘窗口：冷却结束后这么久内又撞算「同一次」连击（次数 +1）；更久之后
+/// 再撞算新的一轮，从头计（避免零星抖动累积成大退避）。
+const RATE_LIMIT_FORGET_MS: f64 = 30.0 * 60_000.0;
+/// 上游**明确给的**恢复时刻的宽松上限：防上游手滑给出离谱值（magpie 的
+/// `longestQuota` 同理）。它只用于「上游明确值」，兜底退避另有更低的上限。
+const RATE_LIMIT_GIVEN_MAX_MS: f64 = 8.0 * 24.0 * 60.0 * 60_000.0;
 
 impl AccountStore {
     // ─── 凭证回写与限额标记 ──────────────────────────────────
@@ -85,11 +103,28 @@ impl AccountStore {
             .is_ok()
     }
 
+    pub fn suspend_upstream_account(&self, id: &str, reason: &str) -> Result<(), String> {
+        let guard = self.guard();
+        let mut record = self.record_by_id(&guard, id).ok_or_else(|| "账号不存在".to_string())?;
+        record.set_enabled(false);
+        record.set("upstreamBlockedReason", Value::String(truncate_chars(reason, 300)));
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record)).map_err(|error| error.to_string())
+    }
+
+    pub fn cooldown_upstream_account(&self, id: &str, until: i64, reason: &str) -> Result<(), String> {
+        let guard = self.guard();
+        let mut record = self.record_by_id(&guard, id).ok_or_else(|| "账号不存在".to_string())?;
+        if until <= logging::now_ms() { return Ok(()); }
+        record.set("upstreamCooldownUntil", Value::from(until));
+        record.set("upstreamBlockedReason", Value::String(truncate_chars(reason, 300)));
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record)).map_err(|error| error.to_string())
+    }
+
     /// 账号是否被标记为「需要重新登录」（凭证维护据此跳过）。
     pub fn needs_relogin(&self, id: &str) -> bool {
-        let _guard = self.guard();
-        self.record_by_id(&_guard, id)
-            .and_then(|record| record.get("needsRelogin").and_then(Value::as_bool))
+        self.read_record(id).and_then(|record| record.get("needsRelogin").and_then(Value::as_bool))
             .unwrap_or(false)
     }
 
@@ -172,14 +207,30 @@ impl AccountStore {
 
     /// 记录账号对某模型的限额状态（上游 429 / code 6004）。
     ///
-    /// resetAt 为恢复时间戳；缺失时给 10 分钟兜底冷却，避免短时间内反复撞限额。
+    /// ── 冷却时长怎么定（四条纪律，2026-11 参考 magpie / CLIProxyAPI）──────
+    /// 1. **只延不缩**：新冷却不得缩短一条还没结束的旧冷却 —— 一条 1 分钟的 429
+    ///    冷却盖掉片刻前半小时的额度冷却，账号一解封就被重新选中、再撞、再落条
+    ///    短冷却，一轮一轮循环（magpie #3289 的原形，也是本仓 #451 的症状）。
+    ///    唯一例外见第 4 条。
+    /// 2. **下限**：上游给的恢复时间再短也不低于 [`RATE_LIMIT_FLOOR_MS`] ——
+    ///    亚秒级的 `Retry-After` 会让账号在同一轮请求里就解封（CLIProxyAPI #5265）。
+    /// 3. **退避**：上游没给恢复时间时按连击次数指数退避（[`RATE_LIMIT_FALLBACK_MS`]
+    ///    ×2ⁿ，封顶 [`RATE_LIMIT_CAP_MS`]）。连击 = 上一条冷却结束后
+    ///    [`RATE_LIMIT_FORGET_MS`] 内又撞；更久之后再撞算新的一轮，从头计。
+    /// 4. **来源优先**：上游**明确给的**恢复时刻优先于**我们猜的**（退避 / 兜底）
+    ///    —— 猜测只是上游话语的替身，上游真给了就以它为准（哪怕更早）。
+    ///
+    /// resetAt 为恢复时间戳；缺失时按第 3 条退避（首撞仍是旧的 10 分钟兜底）。
     ///
     /// ── 冷却键的最终形态：provider × 账号 × 模型（Agent2API W2b-T3 确认）──
-    /// 落盘位置是 `accounts[i].rateLimits[model] = {status, code, resetAt, message, at}`，
+    /// 落盘位置是 `accounts[i].rateLimits[model] = {status, code, resetAt, message, at, strikes, guessed}`，
     /// 即**冷却键挂在账号记录内部**，而每条账号记录只属于一个 provider
     /// （`record.provider()` 是单值）。所以「provider 维度」已经天然成立，
     /// **不需要改数据结构**：`accounts[i]` 这一个下标就同时确定了 provider 与账号，
     /// 加上 `rateLimits` 里的模型名，键即 `(provider, account_id, model)`。
+    /// （`strikes` / `guessed` 是本次新增的两个内部字段：连击次数、本次冷却是否
+    /// 来自「上游没给时间」的猜测。旧记录没有它们时按 0 / false 读，即「首撞、
+    /// 非猜测」，退化为只延不缩 + 10 分钟兜底。）
     ///
     /// 选路时候选集合跨提供商（全局队列），但限额判定仍是「这条账号记录对这个
     /// 模型」—— 记录内的键天然不会串到别的账号上。
@@ -197,16 +248,62 @@ impl AccountStore {
         // 就把 20 条账号记录整份重写一遍，而它只是给其中一条加一个 rateLimits 键。
         let mut record = self.record_by_id(&_guard, id)?;
         let now = logging::now_ms();
-        let reset = match reset_at {
-            Some(value) if value.is_finite() && value > now as f64 => value,
-            _ => now as f64 + 10.0 * 60.0 * 1000.0,
+        let now_f = now as f64;
+        let prev = record
+            .get("rateLimits")
+            .and_then(|limits| limits.get(model))
+            .cloned();
+        // 上游**明确给的**恢复时刻（晚于当下才算数；过去的时刻没有意义）
+        let given = reset_at.filter(|value| value.is_finite() && *value > now_f);
+        // 上一条冷却及其连击计数（旧记录缺这两个字段时按 0 / false 读）
+        let prev_reset_at = prev
+            .as_ref()
+            .and_then(|entry| entry.get("resetAt"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let prev_guess = prev
+            .as_ref()
+            .and_then(|entry| entry.get("guessed"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // 连击：上一条冷却（还没结束或刚结束不久）之后 FORGET 窗口内又撞 → +1
+        let strikes = if prev.is_some() && now_f - prev_reset_at <= RATE_LIMIT_FORGET_MS {
+            prev.as_ref()
+                .and_then(|entry| entry.get("strikes"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(1)
+        } else {
+            1
+        };
+        // 本次冷却的结束时刻（未与旧冷却合并前）
+        let fresh = match given {
+            // 上游明确给的：只做下限与宽松上限，其余尊重上游
+            Some(given_at) => {
+                given_at.clamp(now_f + RATE_LIMIT_FLOOR_MS, now_f + RATE_LIMIT_GIVEN_MAX_MS)
+            }
+            // 没给：指数退避（2ⁿ 用不着太深，30 步已远超上限）
+            None => {
+                let steps = (strikes.saturating_sub(1)).min(30) as i32;
+                let backoff = RATE_LIMIT_FALLBACK_MS * 2f64.powi(steps);
+                now_f + backoff.clamp(RATE_LIMIT_FLOOR_MS, RATE_LIMIT_CAP_MS)
+            }
+        };
+        // 只延不缩（第 1 条），除非这次是上游明确值、而旧那条只是我们猜的
+        // （第 4 条：上游的话语取代猜测的替身，哪怕更早）
+        let until = if given.is_some() && prev_guess {
+            fresh
+        } else {
+            fresh.max(prev_reset_at)
         };
         let entry = json!({
             "status": if status == 0 { 429 } else { status },
             "code": code.map(Value::from).unwrap_or(Value::Null),
-            "resetAt": json_number(reset),
+            "resetAt": json_number(until),
             "message": truncate_chars(message, 300),
             "at": now,
+            "strikes": strikes,
+            "guessed": given.is_none(),
         });
         let mut limits = match record.get("rateLimits") {
             Some(Value::Object(map)) => map.clone(),
@@ -228,6 +325,11 @@ impl AccountStore {
     ///
     /// 冷却键形态见 `mark_rate_limited`：键在账号记录内，provider 由账号唯一确定。
     pub fn clear_rate_limit(&self, id: &str, model: &str) -> bool {
+        if !self.route_account(id).is_some_and(|account| {
+            account.get("rateLimits").and_then(|limits| limits.get(model)).is_some()
+        }) {
+            return false;
+        }
         let _guard = self.guard();
         let Some(mut record) = self.record_by_id(&_guard, id) else {
             return false;
@@ -260,11 +362,13 @@ impl AccountStore {
         let count = match record.get("rateLimits") {
             Some(Value::Object(limits)) => limits.len(),
             _ => 0,
-        };
+        } + usize::from(record.get("upstreamCooldownUntil").is_some());
         if count == 0 {
             return 0;
         }
         record.remove("rateLimits");
+        record.remove("upstreamCooldownUntil");
+        if record.enabled() { record.remove("upstreamBlockedReason"); }
         record.set_updated_at(logging::now_ms());
         if self
             .with_conn(&_guard, |conn| sql::update_in_place(conn, &record))
@@ -273,6 +377,25 @@ impl AccountStore {
             return 0;
         }
         count
+    }
+
+    /// 刷新核对用的凭证指纹：`expiresAt` 与 `updatedAt`（毫秒）。
+    ///
+    /// `refresh_access_token` 返回 Ok 只说明「这次调用没报错」—— 适配器完全可能
+    /// 什么都没刷到就返回成功（AutoClaw 实测连续 28 小时空转，issue #407）。
+    /// 调用方在刷新前后各取一次这个指纹，两者都没推进就按空刷处理。
+    ///
+    /// 用两个字段而不是只看 `expiresAt`：过期时间在记录顶层不一定存在
+    /// （小浣熊在 JWT 的 `exp`、部分家根本不写），而任何一次真正的写回都会
+    /// 推进 `updatedAt`。
+    pub fn credential_stamp(&self, id: &str) -> Option<(f64, f64)> {
+        let _guard = self.guard();
+        let record = self.record_by_id(&_guard, id)?;
+        let expires_at = record
+            .get("expiresAt")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        Some((expires_at, record.updated_at() as f64))
     }
 
     /// 一次性迁移：清掉**按请求名（映射别名）记下的限额键**（幂等，可重复调用）。
@@ -431,6 +554,68 @@ impl AccountStore {
             return Vec::new();
         }
         cleaned
+    }
+
+    /// Trae 历史模型 ID 清理：账号上的限额冷却键、限制器条件里的模型名
+    /// 按目录缓存给出的旧名映射改成原始 ID。
+    ///
+    /// 只处理 provider 为 `trae` 的记录；**只改映射里确实出现过的旧名**，
+    /// 不按后缀猜——上游真名恰好以 `-solo` 结尾时不能被误伤。
+    /// 一次读、一次差异写（与 `migrate_startup` 同一取向）；没有改动时不落库。
+    pub fn migrate_trae_model_ids(&self, mapping: &HashMap<String, String>) -> usize {
+        if mapping.is_empty() {
+            return 0;
+        }
+        let _guard = self.guard();
+        let mut state = self.load(&_guard);
+        let now = logging::now_ms();
+        let mut changed = 0usize;
+        for record in state.accounts.iter_mut() {
+            if !record.provider().eq_ignore_ascii_case("trae") {
+                continue;
+            }
+            let mut touched = false;
+            if let Some(Value::Object(limits)) = record.get("rateLimits").cloned() {
+                let mut next = Map::new();
+                for (key, value) in limits {
+                    let base = mapping.get(&key.trim().to_ascii_lowercase());
+                    if base.is_some() {
+                        touched = true;
+                    }
+                    next.entry(base.cloned().unwrap_or(key)).or_insert(value);
+                }
+                if touched {
+                    if next.is_empty() {
+                        record.remove("rateLimits");
+                    } else {
+                        record.set("rateLimits", Value::Object(next));
+                    }
+                }
+            }
+            for field in ["limiterGroups", "limiters"] {
+                let Some(mut value) = record.get(field).cloned() else {
+                    continue;
+                };
+                if rewrite_models_arrays(&mut value, mapping) {
+                    record.set(field, value);
+                    touched = true;
+                }
+            }
+            if touched {
+                record.set_updated_at(now);
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            if let Err(error) = self.save(&state, &_guard) {
+                logging::log(
+                    "[Accounts]",
+                    &format!("❌ Trae 旧模型 ID 迁移落库失败（下次启动会重试）: {error}"),
+                );
+                return 0;
+            }
+        }
+        changed
     }
 
     /// 记录账号**今天已签到**（登录页那枚按钮据此置灰）。
@@ -1035,5 +1220,49 @@ impl AccountStore {
                 None
             }
         }
+    }
+}
+
+/// 递归改写 `limiterGroups` / `limiters` 里所有 `models` 数组，并去重。
+fn rewrite_models_arrays(value: &mut Value, mapping: &HashMap<String, String>) -> bool {
+    match value {
+        Value::Object(object) => {
+            let mut changed = false;
+            for (key, child) in object.iter_mut() {
+                if key == "models" {
+                    if let Some(items) = child.as_array_mut() {
+                        for item in items.iter_mut() {
+                            if let Some(text) = item.as_str() {
+                                if let Some(base) =
+                                    mapping.get(&text.trim().to_ascii_lowercase())
+                                {
+                                    *item = Value::String(base.clone());
+                                    changed = true;
+                                }
+                            }
+                        }
+                        let before = items.len();
+                        let mut seen = HashSet::new();
+                        items.retain(|item| {
+                            item.as_str()
+                                .map(|text| seen.insert(text.to_ascii_lowercase()))
+                                .unwrap_or(true)
+                        });
+                        changed |= items.len() != before;
+                    }
+                } else if rewrite_models_arrays(child, mapping) {
+                    changed = true;
+                }
+            }
+            changed
+        }
+        Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= rewrite_models_arrays(item, mapping);
+            }
+            changed
+        }
+        _ => false,
     }
 }
