@@ -1,0 +1,521 @@
+//! Accio 对话转发（会话式转发入口的实现主体）。
+//!
+//! ── 一次转发分三步（与 Qoder 同一分工）──────────────────────
+//!   构造（[`build_plan`]）→ 发送（[`send`]）→ 翻译（[`drive_stream`] /
+//!   [`drive_aggregate`]）。产出是编排层认识的 `ForwardOutcome`，因此网关的其余
+//!   链路（脱敏、记账、错误写出、换号）零改动。
+//!
+//! ── 为什么走会话式转发入口（`is_stateful`）────────────────────
+//! 无状态路径假设「请求体由通用层序列化后原样发出、响应是 OpenAI 的 SSE」。
+//! Accio 两条都不满足：请求体是 Gemini 风格的信封（`contents` / `tools` /
+//! `token`，见 `protocol.rs`），响应是 ADK 自己的帧（`content.parts` /
+//! `turn_complete`，见 `stream.rs`）。通用层的透传既发不出正确的请求体，
+//! 也翻译不了回来的帧。
+//!
+//! ── 流内业务错误为什么要判两次 ────────────────────────────────
+//! 上游的业务错误**不体现在 HTTP 状态码上**（常是 200 + 帧里的 `error_code`）。
+//! 因此：
+//!   - **首帧预读**（[`prefetch_stream_head`]）：把第一个内容帧拦在返回之前，
+//!     错误帧转成带状态码的 `Err` 交回编排层换号（此刻还没下发任何字节，
+//!     换号无损）；
+//!   - **流内**（[`drive_stream`] 的每帧）：中途才冒出来的额度/鉴权错误在
+//!     错误现场落冷却（编排层已经退出，看不到它了）。
+//!
+//! ── 硬约束 ──────────────────────────────────────────────────
+//! release 是 `panic=abort`：零 unwrap/expect/panic；不持锁穿越 await
+//! （凭证进来前取好快照）。
+
+use serde_json::{json, Value};
+
+
+use crate::http as egress;
+use agent2api_provider_protocol::WireProxy as ResolvedProxy;
+use agent2api_provider_sdk::{ConversationSink, PluginCtx};
+use crate::telemetry::RequestTelemetry;
+use crate::errors::GatewayError;
+use crate::logging;
+
+use super::credentials::Credentials;
+use super::endpoints;
+use super::protocol::{self, UpstreamKind};
+use super::stream::{self, Delta, Frame, FrameStream};
+
+/// 会话式转发用到的翻译器（`mod.rs` 构造它）
+pub use super::stream::Translator;
+
+/// 一次转发的完整计划（构造阶段不含网络，可在账号循环里对每个候选账号各跑一次）
+pub struct ChatPlan {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    /// 客户端请求的模型名（下发帧的 `model` 字段）
+    pub model_name: String,
+    /// 上游模型 code（日志用）
+    pub upstream_key: String,
+    /// 要不要下发思考内容（上游声明支持思考且档位不是「关」）。
+    ///
+    /// `#[allow(dead_code)]`：请求体里的 `thinkingConfig` 已经由
+    /// `protocol::build_body` 按同一个判据写好了，转发链不再二次读取它。
+    /// 留着是为了让 `ChatPlan` 是**完整可读**的一次调用描述（排障时看一眼
+    /// 就知道这次到底要不要思考，不必再去翻 body）。
+    #[allow(dead_code)]
+    pub thinking: bool,
+    /// 本次请求 id（`sg_k` 由它算出来，日志里对得上）。
+    ///
+    /// `#[allow(dead_code)]`：`url` 里已经带上了 `sg_k`，日志也直接打 `url`；
+    /// 这个字段是给「排障时要看原始 requestId」留的读数。
+    #[allow(dead_code)]
+    pub request_id: String,
+}
+
+/// 客户端请求体 → 一次上游调用的完整计划。
+pub fn build_plan(
+    credentials: &Credentials,
+    body: &Value,
+    model_name: &str,
+    effort: Option<&str>,
+) -> Result<ChatPlan, GatewayError> {
+    let entry = super::models::resolve(model_name, credentials.region).ok_or_else(|| {
+        GatewayError::with_status(400, format!(
+            "模型不存在: {model_name}。Accio 可用模型见 GET /v1/models"
+        ))
+        .with_code("model_not_found")
+    })?;
+    let upstream_key = entry
+        .get("upstreamKey")
+        .or_else(|| entry.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if upstream_key.is_empty() {
+        return Err(GatewayError::with_status(502, "Accio 模型目录缺少上游标识"));
+    }
+    let efforts: Vec<String> = entry
+        .get("reasoningEfforts")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    // 档位按模型自己声明的集合收敛（发一个它没声明的档位要么被忽略要么 400）
+    let resolved_effort = effort.and_then(|level| protocol::resolve_effort(level, &efforts));
+    // 档位落点由目录条目的 `protocol` 决定（见 `models::EffortPlacement`）
+    let placement = super::models::EffortPlacement::from_entry(&entry);
+
+    let built = protocol::build_upstream_body(
+        body,
+        &upstream_key,
+        &credentials.access_token,
+        resolved_effort.as_deref(),
+        placement,
+    );
+    let request_id = built
+        .body
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mut headers = vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("Accept".to_string(), "text/event-stream".to_string()),
+        ("User-Agent".to_string(), endpoints::ADAPTER_USER_AGENT.to_string()),
+        ("x-language".to_string(), endpoints::ACCEPT_LANGUAGE.to_string()),
+        // 两个版本头共用一份取值（`ACCIO_APP_VERSION` 可覆盖），别各写各的
+        ("x-app-version".to_string(), endpoints::app_version()),
+        ("x-package-region".to_string(), credentials.region.package_region().to_string()),
+        // **必带**：缺了它上游不报错，而是回一段「当前版本已不再支持，请升级」
+        // 的普通文本（HTTP 200 + 正常帧形态），会被当成模型输出吐给下游。
+        // 见 `endpoints::DEFAULT_APP_KEY`。
+        ("appKey".to_string(), endpoints::app_key()),
+    ];
+    // 设备指纹（utdid）：**必带**。上游把它当风控基线，缺了会回 HTTP 200 +
+    // HTML 拦截页（bixi-intl 的 punish 脚本），症状是「空响应 / 模型不回复」。
+    // 一律走 `utdid()` —— 记录缺 deviceId 时给一个按账号派生的稳定值。
+    headers.push(("utdid".to_string(), credentials.utdid()));
+    // 浏览器会话的伴随标识：有就带上（与官方客户端同形），没有也照发
+    if !credentials.sgcookie.is_empty() {
+        headers.push(("sgcookie".to_string(), credentials.sgcookie.clone()));
+    }
+    headers.push(("version".to_string(), endpoints::app_version()));
+
+    let body_bytes = serde_json::to_vec(&built.body)
+        .map_err(|_| GatewayError::with_status(500, "Accio 请求体序列化失败"))?;
+    Ok(ChatPlan {
+        url: protocol::generate_content_url(&endpoints::llm_base(), &request_id),
+        headers,
+        body: body_bytes,
+        model_name: model_name.to_string(),
+        upstream_key,
+        thinking: built.thinking,
+        request_id,
+    })
+}
+
+/// 发一次上游请求（不读体，交给调用方决定怎么消费）。
+pub async fn send(
+    plan: &ChatPlan,
+    proxy: Option<&ResolvedProxy>,
+) -> Result<reqwest::Response, GatewayError> {
+    let client = egress::stream_client(proxy, "direct");
+    let mut builder = client.post(&plan.url).body(plan.body.clone());
+    for (key, value) in &plan.headers {
+        builder = builder.header(key, value);
+    }
+    // `WireProxy` 没有 `label` 字段（网关那份有）：用完整 URL 拼一个同样
+    // 可读的描述，排障时够用。
+    let via = match proxy {
+        Some(proxy) => format!("经代理 {}", proxy.to_url()),
+        None => "直连".to_string(),
+    };
+    let budget = std::time::Duration::from_millis(
+        crate::timeouts::current().headers_ms(),
+    );
+    match tokio::time::timeout(budget, builder.send()).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) if error.is_timeout() => Err(GatewayError::with_status(
+            502,
+            format!(
+                "Accio 连接中超时({}秒，出口 {via})",
+                crate::timeouts::current().connect_ms() / 1000
+            ),
+        )),
+        Ok(Err(error)) => Err(GatewayError::with_status(
+            502,
+            format!("Accio 上游请求失败（{via}）: {}", egress::describe_chain(&error)),
+        )),
+        Err(_elapsed) => Err(GatewayError::with_status(
+            502,
+            format!("Accio 等待响应超时({}秒，出口 {via})", budget.as_secs()),
+        )),
+    }
+}
+
+/// 失败响应 → 客户端可用错误（流内错误另走 [`drive_stream`]）。
+pub async fn http_error(status: u16, response: reqwest::Response) -> GatewayError {
+    let text = response.text().await.unwrap_or_default();
+    let detail: String = text.chars().take(300).collect();
+    let kind = protocol::classify_upstream_error(status, &text);
+    let mapped = match kind {
+        // 额度用尽 → 429（编排层据此换号）
+        UpstreamKind::Quota => 429,
+        // 凭证失效 → 401（编排层据此刷新后重试一次）
+        UpstreamKind::Auth => 401,
+        UpstreamKind::Other => 502,
+    };
+    let message = if detail.is_empty() {
+        format!("上游返回 {status}")
+    } else {
+        format!("上游返回 {status}: {detail}")
+    };
+    GatewayError::with_status(mapped, message).with_optional_code(Some(i64::from(status)))
+}
+
+/// 流式链路的限额记账素材（错误发生时用；handler 返回后流还在跑，所以带着走）。
+///
+/// ── 迁移时改了什么 ────────────────────────────────────────
+/// 网关那份持 `AccountStore`（同步写账号库）。插件里对应的是
+/// `ctx.store_mark_limited(...)` —— 一次 RPC，异步。而 `prefetch_stream_head`
+/// 与 `drive_stream` 都在热路径上，把整条链改成 async 会让 diff 淹没真正的
+/// 逻辑改动。所以这里持一个**已解析好的目标**（账号 id + 模型），记账动作
+/// 由调用方在拿到 `PluginCtx` 的地方做（见 `adapter::conversation`）。
+///
+/// 换句话说：本类型只回答「该给谁记」，不负责「怎么记」。
+#[derive(Clone)]
+pub struct LimitContext {
+    pub account_id: String,
+    pub model: String,
+}
+
+impl LimitContext {
+    /// 本次限额记账的目标（账号 id 为空 = 不记）。
+    pub fn target(&self) -> Option<(&str, &str)> {
+        if self.account_id.is_empty() {
+            None
+        } else {
+            Some((self.account_id.as_str(), self.model.as_str()))
+        }
+    }
+}
+
+/// 把「这个账号对模型限额」记进账号库（冷却键与编排层同源）。
+///
+/// `reset_at` 给 `None`：上游没给结构化恢复时间，存储层落兜底时长。
+pub(crate) async fn record_limited(ctx: &PluginCtx, limit: &LimitContext, message: &str) {
+    let Some((account_id, model)) = limit.target() else {
+        return;
+    };
+    if let Err(error) = ctx.store_mark_limited(account_id, model, None).await {
+        logging::verbose(
+            "[Accio]",
+            &format!("标记账号限额失败（不影响本次转发）：{error}"),
+        );
+        return;
+    }
+    logging::log(
+        "[Accio]",
+        &format!("⚠️ 账号 {account_id} 对模型 {model} 已限额，进入冷却：{message}"),
+    );
+}
+
+/// 一帧的错误 → 网关错误（额度类带 429、鉴权类带 401）
+fn frame_error(frame: &Frame) -> GatewayError {
+    let text = frame.error_text();
+    let kind = protocol::classify_upstream_error(200, &text);
+    let status = match kind {
+        UpstreamKind::Quota => 429,
+        UpstreamKind::Auth => 401,
+        UpstreamKind::Other => 502,
+    };
+    GatewayError::with_status(status, format!("Accio 上游错误：{text}")).with_code("accio_upstream")
+}
+
+/// 面向客户端的 chunk 构造（流式）
+fn chunk_frame(
+    translator: &Translator,
+    delta: Value,
+    finish_reason: Value,
+) -> Value {
+    json!({
+        "id": translator.response_id(),
+        "object": "chat.completion.chunk",
+        "created": translator.created(),
+        "model": translator.model_out(),
+        "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }],
+    })
+}
+
+/// 把一批 delta 翻成下发的 SSE 帧
+fn frames_for_deltas(translator: &mut Translator, deltas: &[Delta]) -> Option<String> {
+    let mut out = String::new();
+    if !deltas.is_empty() && translator.take_role_frame() {
+        out.push_str(&stream::sse_frame(&chunk_frame(
+            translator,
+            json!({ "role": "assistant", "content": "" }),
+            Value::Null,
+        )));
+    }
+    for delta in deltas {
+        let payload = match delta {
+            Delta::Content(text) => json!({ "content": text }),
+            Delta::Reasoning(text) => json!({ "reasoning_content": text }),
+            Delta::ToolCall { index, id, name, arguments } => {
+                let mut function = serde_json::Map::new();
+                if let Some(name) = name {
+                    function.insert("name".to_string(), Value::String(name.clone()));
+                }
+                if let Some(arguments) = arguments {
+                    function.insert("arguments".to_string(), Value::String(arguments.clone()));
+                }
+                let mut call = serde_json::Map::new();
+                call.insert("index".to_string(), json!(index));
+                if let Some(id) = id {
+                    call.insert("id".to_string(), Value::String(id.clone()));
+                    call.insert("type".to_string(), Value::String("function".to_string()));
+                }
+                call.insert("function".to_string(), Value::Object(function));
+                json!({ "tool_calls": [Value::Object(call)] })
+            }
+        };
+        out.push_str(&stream::sse_frame(&chunk_frame(translator, payload, Value::Null)));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn usage_frames(translator: &Translator) -> String {
+    translator.usage().map(|usage| stream::sse_frame(&json!({
+        "id": translator.response_id(),
+        "object": "chat.completion.chunk",
+        "created": translator.created(),
+        "model": translator.model_out(),
+        "choices": [],
+        "usage": usage,
+    }))).unwrap_or_default()
+}
+
+/// 收尾帧（finish_reason + usage）
+fn tail_frames(translator: &mut Translator) -> String {
+    let mut out = String::new();
+    out.push_str(&stream::sse_frame(&chunk_frame(
+        translator,
+        json!({}),
+        Value::String(translator.final_finish_reason()),
+    )));
+    out.push_str(&usage_frames(translator));
+    out.push_str(&stream::sse_done());
+    out
+}
+
+fn failure_frames(translator: &Translator, error: &GatewayError) -> String {
+    let mut out = usage_frames(translator);
+    out.push_str(&stream::sse_frame(&json!({
+        "error": { "message": error.message, "type": "upstream_error" },
+    })));
+    out.push_str(&stream::sse_done());
+    out
+}
+
+/// 首帧预读：没有有效正文、思考或具名工具调用时，不能发出成功响应头。
+///
+/// 预读与续传持有同一个解码器，保留同块后续事件与跨块未完成事件。
+pub(super) async fn prefetch_stream_head(
+    ctx: &PluginCtx,
+    response: reqwest::Response,
+    limit: &LimitContext,
+) -> Result<(Vec<Frame>, FrameStream), GatewayError> {
+    let mut source = FrameStream::new(response);
+    let mut frames = Vec::new();
+    let mut usage = None;
+    let mut tool_bytes = 0usize;
+    while let Some(mut frame) = source.next().await? {
+        if frame.is_error() {
+            let error = frame_error(&frame);
+            if error.status_code == 429 {
+                record_limited(ctx, limit, &error.message).await;
+            }
+            return Err(error);
+        }
+        if frame.has_output() {
+            if let Some(usage) = usage {
+                frames.push(Frame { usage: Some(usage), ..Frame::default() });
+            }
+            frames.push(frame);
+            return Ok((frames, source));
+        }
+        if let Some(next) = frame.usage.take() {
+            usage = Some(next);
+        }
+        let finished = frame.turn_complete;
+        frame.parts.retain(|part| matches!(part, stream::Part::FunctionCall { .. }));
+        if !frame.parts.is_empty() {
+            tool_bytes = frame.parts.iter().fold(tool_bytes, |size, part| {
+                match part {
+                    stream::Part::FunctionCall { id, name, args } => size.saturating_add(id.len() + name.len() + args.len()),
+                    _ => size,
+                }
+            });
+            if tool_bytes > 1024 * 1024 || frames.len() >= 1024 {
+                return Err(GatewayError::with_status(502, "Accio 首帧前的工具参数过大，已中断"));
+            }
+            frames.push(frame);
+        }
+        if finished { break; }
+    }
+    Err(source.no_output_error())
+}
+
+/// 流式：逐帧翻译并下发（在 spawn 的后台任务里跑）。
+pub async fn drive_stream(
+    ctx: &PluginCtx,
+    mut source: FrameStream,
+    mut translator: Translator,
+    telemetry: std::sync::Arc<RequestTelemetry>,
+    limit: LimitContext,
+    sink: &mut ConversationSink<'_>,
+    prefetched: Vec<Frame>,
+) -> Result<(), GatewayError> {
+    let mut prefetched = prefetched.into_iter();
+    loop {
+        let frame = match prefetched.next() {
+            Some(frame) => Some(frame),
+            None => match source.next().await {
+                Ok(frame) => frame,
+                Err(error) => {
+                    telemetry.note_error(&error.message);
+                    let _ = sink.send(failure_frames(&translator, &error).as_bytes()).await;
+                    return Err(error);
+                }
+            },
+        };
+        let Some(frame) = frame else { break };
+        if frame.is_error() {
+            let error = frame_error(&frame);
+            if error.status_code == 429 {
+                record_limited(ctx, &limit, &error.message).await;
+            }
+            if let Some(usage) = frame.usage {
+                translator.consume(&Frame { usage: Some(usage), ..Frame::default() }, Some(&telemetry));
+            }
+            telemetry.note_error(&error.message);
+            let _ = sink.send(failure_frames(&translator, &error).as_bytes()).await;
+            return Err(error);
+        }
+        let deltas = translator.consume(&frame, Some(&telemetry));
+        if let Some(text) = frames_for_deltas(&mut translator, &deltas) {
+            sink.send(text.as_bytes()).await
+                .map_err(|error| GatewayError::with_status(499, error))?;
+        }
+        if frame.turn_complete { break; }
+    }
+    if !translator.has_output() {
+        let error = source.no_output_error();
+        let _ = sink.send(failure_frames(&translator, &error).as_bytes()).await;
+        return Err(error);
+    }
+    sink.send(tail_frames(&mut translator).as_bytes()).await
+        .map_err(|error| GatewayError::with_status(499, error))
+}
+
+/// 非流式：拉完整条流再聚合成一个 `chat.completion`。
+pub async fn drive_aggregate(
+    ctx: &PluginCtx,
+    response: reqwest::Response,
+    mut translator: Translator,
+    telemetry: std::sync::Arc<RequestTelemetry>,
+    limit: &LimitContext,
+) -> Result<Value, GatewayError> {
+    let mut source = FrameStream::new(response);
+    while let Some(frame) = source.next().await? {
+        if frame.is_error() {
+            let error = frame_error(&frame);
+            if error.status_code == 429 {
+                record_limited(ctx, limit, &error.message).await;
+            }
+            return Err(error);
+        }
+        translator.consume(&frame, Some(&telemetry));
+        if frame.turn_complete { break; }
+    }
+    if !translator.has_output() {
+        return Err(source.no_output_error());
+    }
+    Ok(completion_body(&translator))
+}
+
+/// 聚合产出的完整响应（OpenAI `chat.completion`）
+fn completion_body(translator: &Translator) -> Value {
+    let mut message = serde_json::Map::new();
+    message.insert("role".to_string(), Value::String("assistant".to_string()));
+    let content = translator.content();
+    message.insert(
+        "content".to_string(),
+        if content.is_empty() { Value::Null } else { Value::String(content.to_string()) },
+    );
+    let reasoning = translator.reasoning();
+    if !reasoning.is_empty() {
+        message.insert("reasoning_content".to_string(), Value::String(reasoning.to_string()));
+    }
+    let tool_calls = translator.final_tool_calls();
+    if !tool_calls.is_empty() {
+        message.insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+    let mut body = json!({
+        "id": translator.response_id(),
+        "object": "chat.completion",
+        "created": translator.created(),
+        "model": translator.model_out(),
+        "choices": [{
+            "index": 0,
+            "message": Value::Object(message),
+            "finish_reason": translator.final_finish_reason(),
+        }],
+    });
+    if let Some(usage) = translator.usage() {
+        body["usage"] = usage;
+    }
+    body
+}
+
+/// 响应 id（与另外几家同形：`chatcmpl-` + 24 位随机）
+pub fn response_id() -> String {
+    let uuid = crate::ids::new_conversation_id().replace('-', "");
+    let short: String = uuid.chars().take(24).collect();
+    format!("chatcmpl-{short}")
+}
