@@ -23,6 +23,7 @@ import {
 import { accountName, formatExpiry, formatRelative, isRateLimited } from '../lib/format'
 import { expiryAtOf, hasCreditExpiry, hasExpiryReading, isLongLivedCredential, supportsUsage } from '../lib/providerFacts'
 import { usageIndex, usageText } from '../lib/usage'
+import { useDisplayClock } from '../../../ui-shared/use-display-clock'
 import { credentialExpiryRowsOf, credentialExpiryText } from '../../../ui-shared/credential-expiry'
 import { creditExpiryOfUsage } from '../../../ui-shared/usage-readings'
 import { upstreamCooldownOf, upstreamSuspendedReasonOf } from '../../../ui-shared/account-upstream-state'
@@ -419,6 +420,7 @@ function AccountRow({
   onToggle: (next: boolean) => void
   busy: boolean
 }) {
+  const now = useDisplayClock()
   const limited = isRateLimited(account)
   const cooldown = upstreamCooldownOf(account)
   const suspendedReason = upstreamSuspendedReasonOf(account)
@@ -456,7 +458,7 @@ function AccountRow({
     : !creditMode && isLongLivedCredential(account.provider) ? t('长期有效')
       : hasExpiryReading(account.provider) ? formatExpiry(expiresAt) : ''
   // 余额：只有这家有查询能力时才占一行；快照里没有这一行 = 还没查过
-  const usageView = usageText(usageRow)
+  const usageView = usageText(usageRow, now)
   const showUsage = supportsUsage(account)
   const usageColor =
     usageView.kind === 'bad'
@@ -479,7 +481,7 @@ function AccountRow({
       <Button size='default' variant='ghost'
         type='button'
         onClick={onOpen}
-        style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 11, background: 'none', border: 0, padding: 0, textAlign: 'left' }}
+        style={{ flex: 1, minWidth: 0, height: 'auto', display: 'flex', alignItems: 'center', gap: 11, background: 'none', border: 0, padding: 0, textAlign: 'left' }}
       >
         <span style={{ width: 20, flex: 'none', fontSize: 11, color: 'var(--m-text-3)', fontVariantNumeric: 'tabular-nums', textAlign: 'center' }}>
           #{rank}
@@ -518,6 +520,12 @@ function AccountRow({
               <span style={{ flex: 'none', color: usageView.failureStatus ? 'var(--m-text-3)' : usageColor }} title={usageView.detail}>· {usageView.text}</span>
             ) : null}
           </div>
+          {showUsage && usageView.expiry ? (
+            <div className='mt-1.5 text-xs text-warning whitespace-normal break-words' title={usageView.expiry.detail}>
+              <Badge tone='warn'>{usageView.expiry.badge}</Badge>
+              {usageView.expiry.today ? <span className='ml-1.5'>{usageView.expiry.today}</span> : null}
+            </div>
+          ) : null}
           {showUsage && usageView.failureStatus ? (
             <div className='text-xs text-destructive whitespace-normal break-words mt-1' title={usageView.failureDetail}>
               {usageView.failureStatus}
