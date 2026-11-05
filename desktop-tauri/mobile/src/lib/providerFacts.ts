@@ -2,6 +2,7 @@
  * 按提供商区分的事实（有效期字段 / 标识字段 / 长期有效 / 余额能力）。
  *
  * ── 事实来源：插件申报，不是客户端查表 ──────────────────────
+ *
  * 「有效期落在哪个键」按家不同：WorkBuddy 写 `expiresAt`，小浣熊写
  * `tokenExpiresAt`，OrcaTerm 写 `tokenExpireAt`（少一个 s），KukuAI 压根没有
  * 这个字段。这些**全是上游事实**，原先在桌面端与手机端各存一份手写表 ——
@@ -15,7 +16,14 @@
  * ── 兜底 ────────────────────────────────────────────────────
  * 旧插件不申报（`accountFeatures` 里没有这一家）时走 `FALLBACK`：
  * 两个键都看、取先有值的那个。宁可兜底，也不要因为漏登记而少一行读数。
+ *
+ * ── 「有效期」有两种口径（2026-11-05）────────────────────────
+ * 申报了 `credit_expiry` 的家，这一格回答的是「**最先作废的那笔积分**还有多久」
+ * （`expiryAtOf` 走 `creditExpiryOfUsage`）；其余家仍是凭证到期。
+ * 与桌面端 `ExpiryCell` 同一判据、同一份计算。
  */
+
+import { creditExpiryOfUsage } from '../../../ui-shared/usage-readings'
 
 /** 一个提供商的账号行参数（与协议里 `AccountFeatures` 同形，只取手机端用到的） */
 export type ProviderFacts = {
@@ -25,6 +33,11 @@ export type ProviderFacts = {
   identifier: readonly string[]
   /** 主凭证长期有效（没有固定到期时刻） */
   longLived: boolean
+  /**
+   * `credits[]` 里带**逐份到期时刻**（`expireAt`）—— 有效期列改按
+   * 「距最先到期的积分批次」显示（见 `expirySourceOf`）。
+   */
+  creditExpiry: boolean
   /** 这家有没有余额查询能力 */
   usage: boolean
 }
@@ -64,6 +77,7 @@ function normalize(raw: Record<string, unknown>): ProviderFacts {
     expiry: keyList(raw.expiry),
     identifier: keyList(raw.identifier, FALLBACK.identifier),
     longLived: raw.long_lived === true,
+    creditExpiry: raw.credit_expiry === true,
     usage: raw.usage === true,
   }
 }
@@ -79,6 +93,7 @@ const FALLBACK: ProviderFacts = {
   expiry: ['expiresAt', 'tokenExpiresAt'],
   identifier: ['userId'],
   longLived: false,
+  creditExpiry: false,
   usage: false,
 }
 
@@ -174,4 +189,46 @@ export function hasExpiry(provider: string | undefined): boolean {
  */
 export function isLongLivedCredential(provider: string | undefined): boolean {
   return providerFacts(provider).longLived
+}
+
+/**
+ * 这家的「有效期」该读**积分批次**还是**凭证**（`supportsCreditExpiry` 的同义位）。
+ *
+ * 申报了 `credit_expiry` 的家（MiniMax / WorkBuddy 两家 / Trae / OfficeAce /
+ * 豆包办公）按「距最先到期的积分批次」显示 —— 与桌面端 `ExpiryCell` 的
+ * 第 ① 段同一判据、同一份计算（`creditExpiryOfUsage`）。其余家照旧读凭证到期。
+ */
+export function hasCreditExpiry(provider: string | undefined): boolean {
+  return providerFacts(provider).creditExpiry
+}
+
+/** 这一行到底该不该渲染有效期读数：两种口径任一成立即可。 */
+export function hasExpiryReading(provider: string | undefined): boolean {
+  return hasCreditExpiry(provider) || hasExpiry(provider)
+}
+
+/**
+ * 有效期时间戳（毫秒，0 = 读不到）。**按家分派口径**：
+ *
+ *   · 申报了 `credit_expiry` → 最早到期的积分批次（要传这一行的余额读数）；
+ *   · 其余家 → 凭证到期时刻（`expiryOf`，原口径不变）。
+ *
+ * 积分口径**不回落**令牌到期：access token 那个约一小时的读数是网关自己续期用
+ * 的，摆进「有效期」会被读成「这个账号快没了」。读不到就返回 0，由调用方
+ * 显示「—」。
+ */
+export function expiryAtOf(
+  account: {
+    provider?: string
+    expiresAt?: number
+    tokenExpiresAt?: number
+    [key: string]: unknown
+  },
+  usage?: unknown,
+  session?: { accountFeatures?: Record<string, unknown> } | null,
+): number {
+  if (providerFacts(account.provider, session).creditExpiry) {
+    return creditExpiryOfUsage(usage) ?? 0
+  }
+  return expiryOf(account, session)
 }

@@ -51,6 +51,35 @@ pub fn supports_credit_expiry(provider: &str) -> bool {
         .unwrap_or_else(|| matches!(provider, "workbuddy" | "workbuddy-intl" | "trae" | "officeace"))
 }
 
+/// 一次性取「账号 id → 最早**未过期**积分到期时刻」（毫秒）的快照。
+///
+/// 返回表里 `None` 与「表里没有这个 id」是同一件事：**测不出有效期**。
+/// 三种情况都归到 `None`，语义上也确实都测不出：
+///   1. 该家不支持积分到期（`supports_credit_expiry` 为假，从未写过事实）；
+///   2. 事实是空表（没有可用的积分包，或积分包都是 unlimited / 快照 / 按日额度，
+///      见 [`credit_expiries`] 过滤掉的那几类）；
+///   3. 事实里的到期时刻全部已过（积分已作废，不再为它排队）。
+///
+/// ── 为什么选路也读这一份，而不是自己解析 `usage.credits` ─────────
+/// 账号页「积分到期」列显示的到期时刻（`sorting` 里的 `creditExpiresAt`）与
+/// 这里出自同一个函数、同一份内存事实。若选路另写一套解析，界面说「3 天后
+/// 到期」而转发把该账号当「测不出」排在后面 —— 用户看到的就是自相矛盾。
+///
+/// 锁只在这一层持有：调用方拿到快照后随意遍历，不在持锁期间做排序。账号
+/// 规模是几十量级，整表克隆（值都是 `Option<i64>`）比逐账号取锁更划算。
+pub fn credit_expiries_at(now: i64) -> HashMap<String, Option<i64>> {
+    let Ok(facts) = credit_slot().lock() else {
+        return HashMap::new();
+    };
+    facts
+        .iter()
+        .map(|(id, expiries)| {
+            let soonest = expiries.iter().copied().find(|expiry| *expiry > now);
+            (id.clone(), soonest)
+        })
+        .collect()
+}
+
 pub fn rules_for(provider: &str, settings: &AccountSortSettings) -> Vec<AccountSortRule> {
     settings.get(provider).cloned().unwrap_or_else(|| vec![
         AccountSortRule::Credit { on: supports_credit_expiry(provider), dir: CreditSortDirection::Soon },

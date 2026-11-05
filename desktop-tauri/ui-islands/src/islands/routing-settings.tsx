@@ -42,8 +42,9 @@ export function RoutingSettingsDialog({ workspace, onClose, protectionOnly = fal
           <Field><FieldLabel>{t('路由策略')}</FieldLabel><FieldContent>
             <SegmentedControl aria-label={t('路由策略')} value={draft.routingStrategy} disabled={busy} options={[
               { value: 'order', label: t('顺序优先') }, { value: 'rotate', label: t('负载均衡') }, { value: 'provider', label: t('家内轮询') },
+              { value: 'credit', label: t('积分到期优先') },
             ]} onValueChange={value => update('routingStrategy', value)} />
-            <FieldDescription>{draft.routingStrategy === 'order' ? t('优先使用队首账号，不可用时顺延。') : draft.routingStrategy === 'provider' ? t('提供商保持优先顺序，同一提供商的账号轮流承接。') : t('可用账号按请求轮换；开启会话粘性时同一会话优先留在原账号。')}</FieldDescription>
+            <FieldDescription>{draft.routingStrategy === 'order' ? t('优先使用队首账号，不可用时顺延。') : draft.routingStrategy === 'provider' ? t('提供商保持优先顺序，同一提供商的账号轮流承接。') : draft.routingStrategy === 'credit' ? t('先烧 7 天内到期的积分（越早到期越先用）；没有临期的先摊在测不出有效期的账号上，最后才用 7 天以外到期的。') : t('可用账号按请求轮换；开启会话粘性时同一会话优先留在原账号。')}</FieldDescription>
           </FieldContent></Field>
           <Field><FieldLabel>{t('会话粘性')}</FieldLabel><FieldContent>
             <SegmentedControl aria-label={t('会话粘性')} value={draft.routingSticky} disabled={busy} options={[

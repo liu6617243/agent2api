@@ -212,6 +212,7 @@
   "允许局域网内的设备访问网关": "Permitir que dispositivos na LAN acessem o gateway",
   "允许无 Key 裸跑": "Permitir execução sem chaves",
   "允许浏览器里的页面跨来源调用网关（/v1/*）": "Permitir que páginas do navegador chamem o gateway de outra origem (/v1/*)",
+  "先烧 7 天内到期的积分（越早到期越先用，不烧就作废）；没有临期的，先摊在测不出有效期的账号上（那一档内部按负载均衡轮换）；最后才动 7 天以外才到期的积分。": "Use primeiro os créditos que expiram em até 7 dias (o vencimento mais próximo primeiro — senão são perdidos). Se não houver créditos próximos do vencimento, distribua a carga entre as contas cuja validade não pode ser medida (essa faixa alterna em rodízio). Os créditos que expiram em mais de 7 dias ficam por último.",
   "全局配置": "Configuração global",
   "全部已配置": "Tudo já configurado",
   "全部数据（账号、事件日志、请求记录、调试报文、设置）保存在配置目录下的 agent2api.db 这一个 SQLite 数据库里。备份时只需拷贝这个文件；更换保存位置请设置环境变量 AGENT2API_PROXY_HOME 后重启程序。": "",

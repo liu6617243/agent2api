@@ -253,7 +253,7 @@ export function RoutingConfigPanel({ editor, scope, now, onScope, onAccount, onS
         <div className='field'><Label>{t('路由策略')}</Label>
           <RoutingSelect label={t('路由策略')} value={profile.strategy || '__inherit'} disabled={locked}
             options={[...(scope ? [['__inherit', t('继承全局：{value}', { value: strategyLabel(workspace.globalSettings?.routingStrategy || workspace.settings.routingStrategy) })] as [string, string]] : []),
-              ['order', t('顺序优先')], ['rotate', t('负载均衡')], ['provider', t('家内轮询')]]}
+              ['order', t('顺序优先')], ['rotate', t('负载均衡')], ['provider', t('家内轮询')], ['credit', t('积分到期优先')]]}
             onChange={value => mutate(next => { next.strategy = value === '__inherit' ? undefined : value })} />
         </div>
         <div className='field'><Label>{t('会话粘滞')}</Label>

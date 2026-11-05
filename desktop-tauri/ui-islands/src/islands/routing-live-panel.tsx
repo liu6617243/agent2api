@@ -31,7 +31,13 @@ export function RoutingLivePanel({ workspace, model, loading, error, dirty, glob
   const customized = Boolean(workspace?.customized)
   const queue = workspace?.queue
   const available = queue?.ordered || []
-  const blocked = queue?.blocked || []
+  // 账号页关掉的账号不进队列预演（2026-11-05，与中间名单同口径）：禁用是用户
+  // 亲手关的，重新启用前**必然**不参与；「被跳过」回答的是「现在为什么走不了」，
+  // 轮不到这个必然答案占一行。临时跳过（限流冷却 / 并发已满 / 无凭证 / 限制器）
+  // 照旧保留 —— 那些才是预演要预告的「现在走不了、之后会自动回来」。
+  // 后端 plan_route 仍把禁用账号算进 blocked（转发判据与请求回放共用那份数据），
+  // 这里只在展示层滤掉：AI 助手的「查询路由队列」仍能看到完整跳过原因。
+  const blocked = (queue?.blocked || []).filter(entry => entry.state !== 'disabled')
   const next = available[0]
   const badge = dirty
     ? { dot: 'warning' as const, text: t('按已保存配置') }

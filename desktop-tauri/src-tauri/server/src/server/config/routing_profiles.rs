@@ -125,8 +125,8 @@ pub fn normalize_model(model: &str) -> Result<String, String> {
 }
 
 pub fn validate_shape(profile: &RoutingProfile) -> Result<(), String> {
-    if profile.strategy.as_deref().is_some_and(|value| !["order", "rotate", "provider"].contains(&value)) {
-        return Err("路由策略必须为 order、rotate 或 provider".to_string());
+    if profile.strategy.as_deref().is_some_and(|value| !["order", "rotate", "provider", "credit"].contains(&value)) {
+        return Err("路由策略必须为 order、rotate、provider 或 credit".to_string());
     }
     if profile.sticky.as_deref().is_some_and(|value| !["auto", "session", "turn", "off"].contains(&value)) {
         return Err("会话粘滞必须为 auto、session、turn 或 off".to_string());

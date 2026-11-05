@@ -198,3 +198,35 @@ export function recordReadingsOf(
     return [String(pack.name || '').trim(), view, window].filter(Boolean).join(' · ')
   })
 }
+
+/**
+ * **最早一份「还能用」的积分包的到期时刻**（毫秒）；读不到就是 null。
+ *
+ * ── 谁在用 ──────────────────────────────────────────────────
+ * 桌面端账号页与手机端的「有效期」列（申报了 `creditExpiry` 的家），以及桌面端
+ * 「按积分到期排序」。三处必须算出同一个答案，所以实现只此一份：桌面端的
+ * `creditExpiryOf` 与后端的 `account_order::credit_expiries` 都照着这份口径。
+ *
+ * ── 「还能用」的两个条件 ────────────────────────────────────
+ *   · **剩余不为 0**：花完的包不该再提示；
+ *   · **未过期**：已作废的包按上游口径已经清零，拿它算「距到期还有多久」是假消息。
+ *
+ * ── 哪些行不参与 ────────────────────────────────────────────
+ * `snapshot`（钱包余额 / 计数器快照）、`record`（收支流水一笔）、`daily`（每日
+ * 回满，它的 expireAt 是周期边界而非作废时刻）、`unlimited`（没有花完的概念）。
+ * 判据走**后端给的标记**，与 `creditRowsOf` 的展示判据同源。
+ *
+ * 「剩余读不到」时不猜：只有明确读到 0 才排除（与 creditRowsOf 的 exhausted 同一取向）。
+ */
+export function creditExpiryOfUsage(value: unknown, now = Date.now()): number | null {
+  let best: number | null = null
+  for (const pack of creditPacksOf(value)) {
+    if (pack.snapshot === true || pack.record === true || pack.daily === true || pack.unlimited === true) continue
+    const expire = usageNumberOrNull(pack.expireAt)
+    if (expire === null || expire <= 0 || expire <= now) continue
+    const remain = usageNumberOrNull(pack.remain)
+    if (remain !== null && remain <= 0) continue
+    if (best === null || expire < best) best = expire
+  }
+  return best
+}

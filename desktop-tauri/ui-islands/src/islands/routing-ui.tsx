@@ -54,7 +54,9 @@ export function formatDuration(ms?: number | null): string {
 export function timeText(ts: number): string { return new Date(ts).toLocaleString() }
 export function strategyLabel(strategy?: string): string {
   return strategy === 'rotate' || strategy === 'usage' ? t('负载均衡')
-    : strategy === 'provider' ? t('家内轮询') : t('顺序优先')
+    : strategy === 'provider' ? t('家内轮询')
+    : strategy === 'credit' ? t('积分到期优先')
+    : t('顺序优先')
 }
 export function stickyLabel(sticky?: string): string {
   return sticky === 'session' ? t('会话内') : sticky === 'off' ? t('关闭')

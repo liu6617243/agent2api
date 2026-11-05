@@ -17,7 +17,7 @@ import {
   type UsageRow,
 } from '../api/gateway'
 import { accountName, activeLimits, formatExpiry, formatRelative, formatStamp, isRateLimited } from '../lib/format'
-import { expiryOf, hasExpiry, isLongLivedCredential, supportsUsage } from '../lib/providerFacts'
+import { expiryAtOf, expiryOf, hasCreditExpiry, hasExpiryReading, isLongLivedCredential, supportsUsage } from '../lib/providerFacts'
 import { mergeUsageRow, usageIndex, usageText } from '../lib/usage'
 import { credentialExpiryRowsOf, credentialExpiryText } from '../../../ui-shared/credential-expiry'
 import { upstreamCooldownOf, upstreamSuspendedReasonOf } from '../../../ui-shared/account-upstream-state'
@@ -160,7 +160,7 @@ export function AccountSheet({
   const limits = account ? activeLimits(account) : []
   const cooldown = upstreamCooldownOf(account)
   const suspendedReason = upstreamSuspendedReasonOf(account)
-  const expiresAt = account ? expiryOf(account) : 0
+  const expiresAt = account ? expiryAtOf(account, usageRow) : 0
   const credentialRows = account ? credentialExpiryRowsOf(account, expiresAt) : []
   const usageView = usageText(usageRow)
   const usageColor =
@@ -280,7 +280,7 @@ export function AccountSheet({
               </div>
 
               <MetricGrid className='m-kv'>
-                {credentialRows.length || hasExpiry(account.provider) ? (
+                {credentialRows.length || hasExpiryReading(account.provider) ? (
                   <MetricCard className='m-kv-cell'>
                     <div className='k'>{t('有效期')}</div>
                     {credentialRows.length ? <div className='flex flex-col gap-1.5'>
@@ -292,7 +292,8 @@ export function AccountSheet({
                         </span>
                       </div>)}
                     </div> : <div className='v'>
-                      {isLongLivedCredential(account.provider) ? t('长期有效') : formatExpiry(expiresAt)}
+                      {/* 积分口径的家不适用「长期有效」（它读的是积分批次，不是凭证） */}
+                      {!hasCreditExpiry(account.provider) && isLongLivedCredential(account.provider) ? t('长期有效') : formatExpiry(expiresAt)}
                     </div>}
                   </MetricCard>
                 ) : null}
@@ -490,6 +491,13 @@ export function AccountSheet({
   )
 }
 
+/**
+ * 状态徽章**读凭证到期**，不读积分批次（与「有效期」格刻意不同口径）。
+ *
+ * 徽章回答的是「这个账号此刻能不能用」：凭证断了就整条记录失效，那才是「已过期」。
+ * 积分批次到期丢的是钱、不是可用性 —— 它归「有效期」格讲。两处混用会让一个
+ * 积分快过期的账号被标成「已过期」，而它其实还能正常转发。
+ */
 function statusTone(account: Account): 'ok' | 'warn' | 'bad' | 'mute' {
   if (account.needsRelogin || upstreamSuspendedReasonOf(account)) return 'bad'
   if (!account.enabled) return 'mute'

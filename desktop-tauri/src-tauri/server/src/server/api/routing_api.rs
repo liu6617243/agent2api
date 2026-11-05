@@ -56,6 +56,7 @@ pub async fn put_routing(State(_state): State<ServerState>, body: Bytes) -> Resp
             config::ROUTING_STRATEGY_ORDER,
             config::ROUTING_STRATEGY_ROTATE,
             config::ROUTING_STRATEGY_PROVIDER,
+            config::ROUTING_STRATEGY_CREDIT,
         ];
         if !known.contains(&text) {
             return errors::management_error(
@@ -227,6 +228,14 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
     // 任何会话的计时，也不该消耗下一次轮转。家内轮询的各家游标同理，所以
     // 两种轮转策略都传 `None`：面板看到的是「各家都从第 0 位起」的静态序。
     let (sunk, resting, open) = state.upstream().route_queue_facts(now);
+    // 面板同样按真实事实画「积分到期优先」的档位（否则预览顺序与实际转发分叉）。
+    // 取的是同一份内存快照，只是这里**不推进**轮转游标（预演不该消耗位次），
+    // 所以「测不出有效期」那一档在面板里从按优先级排的第一个开始展示。
+    let credit_expires_at = if settings.strategy == config::RouteStrategy::Credit {
+        crate::server::core::account_order::credit_expiries_at(now)
+    } else {
+        HashMap::new()
+    };
     let meta = routing::PlanMeta {
         strategy: settings.strategy,
         sunk: &sunk,
@@ -236,6 +245,7 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
         cursor: None,
         provider_cursors: None,
         sticky_account: None,
+        credit_expires_at: &credit_expires_at,
     };
     let plan = routing::plan_route(&scoped, &keys, &counts, &[], now, &meta);
     let entry_json = |entry: &routing::PlanEntry| {

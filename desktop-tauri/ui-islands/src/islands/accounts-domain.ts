@@ -38,6 +38,7 @@ import { providerFeatures, type ProviderFeatures } from './accounts-features'
 import { t } from '../i18n'
 import { limiterHit } from './accounts-limiter-model'
 import { accountReloginText } from './accounts-authorization'
+import { creditExpiryOfUsage } from '../../../ui-shared/usage-readings'
 import { upstreamCooldownOf, upstreamSuspendedReasonOf } from '../../../ui-shared/account-upstream-state'
 
 // 能力表与插件申报的读取在 accounts-features.ts（那边的模块头说明了查询顺序）。
@@ -702,40 +703,17 @@ export function supportsCreditDetail(account: AccountRecord | null | undefined):
 /**
  * **账号最早一份「还能用」的积分包到期时刻**（毫秒）；读不到就是 `null`。
  *
- * 「还能用」= 未过期 + 剩余不为 0：已经作废的包不参与「快到期优先」，
- * 否则一个上个月就过期的账号会永远霸占组首。
+ * 实现搬到 `ui-shared/usage-readings.ts` 的 `creditExpiryOfUsage`（2026-11-05）：
+ * 手机端的「有效期」列要按同一口径显示，两端共用一个函数才不会算出两个答案。
+ * 这里保留这个名字与签名 —— 账号页、分组设置、排序都按它调用，且它多接一个
+ * `UsageEntry` 类型（比 `unknown` 更严），是调用点认的契约。
  *
- * ── 数据从哪来 ────────────────────────────────────────────────
- * 余额读数（`UsageEntry`）里的 `credits[]`：后端逐份给出面额 / 已用 / 剩余 /
- * 领取 / 到期（见 `billing::usage` 的 `credit_packs_from`）。只有登记了
- * `creditDetail` 能力的家才会产出这个数组，其余家自然读到 `null`。
- *
- * ── 非到期积分包要跳过（与 creditRowsOf 的展示判据同源）────────
- *   · `snapshot: true` —— 钱包余额或计数器读数，不是一份有到期的积分包。
- *   · `daily: true` —— 每日回满而不是到期作废，它的 expireAt 是周期边界
- *     （今天 24 点）；拿它参与排序会让日额度账号天天霸占组首。
- *   · `record: true` —— 流水一笔（收支记录），不是一份还有余额的包。
- *   · `unlimited: true` —— 没有「花完」的概念。
- * 这些形态在 `creditRowsOf` 里也有对应判据（那边决定「要不要折进已用完」），
- * 两处问的是同一件事：这份包现在还值不值得关心。
+ * 口径细节（「还能用」= 未过期 + 剩余不为 0、跳过流水 / 快照 / 每日重置 /
+ * 不限量、剩余读不到时不猜）全部写在 `creditExpiryOfUsage` 的文档里，
+ * 与 `creditRowsOf` 的展示判据同源。
  */
 export function creditExpiryOf(entry: UsageEntry, now = Date.now()): number | null {
-  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null
-  const data = entry as Record<string, unknown>
-  const packs = Array.isArray(data.credits) ? data.credits as Array<Record<string, unknown>> : []
-  let best: number | null = null
-  for (const pack of packs) {
-    if (!pack || typeof pack !== 'object') continue
-    if (pack.snapshot === true || pack.record === true || pack.daily === true || pack.unlimited === true) continue
-    const expire = Number(pack.expireAt)
-    if (!Number.isFinite(expire) || expire <= 0 || expire <= now) continue
-    const remain = pack.remain
-    // 剩余读到 0 就是花完了；读不到（缺键）时不猜 —— 与 creditRowsOf 的 exhausted
-    // 判据同一取向：两侧都读不到就不下结论，宁可让它参与排序
-    if (remain !== null && remain !== undefined && remain !== '' && Number(remain) <= 0) continue
-    if (best === null || expire < best) best = expire
-  }
-  return best
+  return creditExpiryOfUsage(entry, now)
 }
 
 /**

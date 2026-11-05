@@ -517,6 +517,10 @@ pub struct PlanMeta<'a> {
     pub provider_cursors: Option<&'a HashMap<String, usize>>,
     /// 粘性命中的账号 id（`None` = 无命中）
     pub sticky_account: Option<&'a str>,
+    /// 积分到期快照（账号 id → 最早未过期的积分到期时刻，毫秒；`None` 或缺失 =
+    /// 测不出有效期）。只有 `RouteStrategy::Credit` 读它，其余策略传空表即可
+    /// —— 数据来源见 `account_order::credit_expiries_at`。
+    pub credit_expires_at: &'a HashMap<String, Option<i64>>,
 }
 
 /// 时间戳 → 「HH:MM」短文案（原因句里用，按**操作者本机时区** —— 与请求
@@ -539,7 +543,12 @@ fn clock_text(reset_at: i64, now: i64) -> String {
 }
 
 /// 把可用候选按策略排出先后（不处理垫底 / 休息 / 熔断那三层修饰）。
-fn base_order(candidates: &[Value], strategy: RouteStrategy, meta: &PlanMeta<'_>) -> Vec<Value> {
+fn base_order(
+    candidates: &[Value],
+    strategy: RouteStrategy,
+    meta: &PlanMeta<'_>,
+    now: i64,
+) -> Vec<Value> {
     let mut sorted: Vec<Value> = candidates.to_vec();
     sorted.sort_by(compare_by_priority);
     match strategy {
@@ -558,7 +567,82 @@ fn base_order(candidates: &[Value], strategy: RouteStrategy, meta: &PlanMeta<'_>
                 .collect()
         }
         RouteStrategy::Provider => provider_order(sorted, meta),
+        RouteStrategy::Credit => credit_order(sorted, meta, now),
     }
+}
+
+/// 「7 天内到期」的门槛（毫秒）—— 积分到期优先的规则 ① / ③ 的分界线。
+const CREDIT_EXPIRY_SOON_MS: i64 = 7 * 24 * 3600 * 1000;
+
+/// 一个账号在「积分到期优先」里的档位与档内排序键。
+///
+/// 返回 `(tier, expiry)`，**tier 越小越先用**：
+///   - `0` 规则 ①：7 天内到期 —— 不烧就作废，最先用；档内按 `expiry` 升序
+///     （规则 ②：剩余时间最短的先烧）；
+///   - `1` 规则 ③：**测不出有效期** —— 多半是长期 / 不过期积分，放着不心疼，
+///     排在临期之后但排在「还很久才到期」之前；档内 `expiry` 恒 0（无意义）；
+///   - `2` 规则 ③的余下部分：测得出、但离到期还有 7 天以上 —— 最后才动，
+///     档内同样按 `expiry` 升序（先烧早到期的长期积分）。
+///
+/// 「测不出」的三种成因（该家不支持到期、没有可用积分包、到期时刻已过）在
+/// 数据层被合并成 `None`，见 `account_order::credit_expiries_at` —— 选路这里
+/// 不必也不该再分辨，它们的选路含义完全一致：**没有「即将作废」的压力**。
+fn credit_rank(account: &Value, meta: &PlanMeta<'_>, now: i64) -> (u8, i64) {
+    // 快照是选路前一刻取的，这里再按 now 滤一次过期：`plan_route` 可能排两次
+    // （粘性命中后重排），两次之间差的那几毫秒不该让一个刚作废的积分还排头名。
+    let expiry = account_id(account)
+        .and_then(|id| meta.credit_expires_at.get(id))
+        .copied()
+        .flatten()
+        .filter(|expiry| *expiry > now);
+    match expiry {
+        Some(expiry) if expiry - now <= CREDIT_EXPIRY_SOON_MS => (0, expiry),
+        Some(expiry) => (2, expiry),
+        None => (1, 0),
+    }
+}
+
+/// 积分到期优先的排序：三档按 tier 串起来，档内各有各的排法。
+///
+/// ── 为什么档内排序是**稳定**的 `sort_by_key` ──────────────────
+/// 传进来的 `sorted` 已按优先级升序（与另外三种策略同一地基）。稳定排序让
+/// 「到期时刻相同」的账号保留优先级先后，结果可复现 —— 否则同一份数据每次
+/// 排出来可能不一样，排障时看到的顺序就不可信了。
+///
+/// ── 规则 ④ 为什么落在「测不出」这一档，且用的是 `cursor` ────────
+/// 用户的原话是「多个无法测算有效期的供应商，则按照原有的负载均衡方式轮换」。
+/// 这一档的账号之间**没有任何到期事实可依据**，按优先级钉死会让排第 1 的那个
+/// 一直扛（正是「负载均衡」当初要解决的问题），所以这里复用同一把轮转游标、
+/// 同一个取模口径（`meta.cursor % 档内人数`），只是作用范围收窄到本档。
+///
+/// 轮换粒度是**账号**而不是「家」：本仓「负载均衡」的环一直是账号级的，
+/// 「原有的负载均衡方式」指的就是它；每家只有一个账号时（常见形态）两者等价。
+fn credit_order(sorted: Vec<Value>, meta: &PlanMeta<'_>, now: i64) -> Vec<Value> {
+    let mut soon: Vec<Value> = Vec::new();
+    let mut unknown: Vec<Value> = Vec::new();
+    let mut later: Vec<Value> = Vec::new();
+    for account in sorted {
+        match credit_rank(&account, meta, now) {
+            (0, _) => soon.push(account),
+            (1, _) => unknown.push(account),
+            _ => later.push(account),
+        }
+    }
+    // 档内都按到期时刻升序（规则 ②：剩余时间最短的先烧）。两处都内联闭包而
+    // 不先 `let` 出来复用：先声明再传两遍时，闭包的参数生命周期容易退化成
+    // 单一具名生命周期，`sort_by_key` 需要的是对任意 `&T` 都成立的 `FnMut`，
+    // 那样会报「implementation of FnMut is not general enough」。
+    soon.sort_by_key(|account: &Value| credit_rank(account, meta, now).1);
+    later.sort_by_key(|account: &Value| credit_rank(account, meta, now).1);
+    let len = unknown.len();
+    if len > 1 {
+        let start = meta.cursor.unwrap_or(0) % len;
+        let rotated: Vec<Value> = (0..len)
+            .map(|offset| unknown[(start + offset) % len].clone())
+            .collect();
+        unknown = rotated;
+    }
+    soon.into_iter().chain(unknown).chain(later).collect()
 }
 
 /// 家内轮询的排序：候选先按**家**分段，段之间按「段内最优账号的优先级」升序
@@ -627,6 +711,46 @@ pub fn provider_sizes(accounts: &[Value]) -> Vec<(String, usize)> {
         }
     }
     sizes
+}
+
+/// 「积分到期优先」的原因句：把这条账号落在哪一档、凭什么排在这说清楚。
+///
+/// 原因句是排障时唯一要读的东西（见 `a_sibling_in_the_same_family_is_not_explained_by_a_higher_priority_family`
+/// 那条用例的注释），所以三档各说各的事实，不说模板话。
+fn credit_reason(account: &Value, meta: &PlanMeta<'_>, now: i64, position: usize) -> String {
+    match credit_rank(account, meta, now) {
+        (0, expiry) => {
+            if position == 1 {
+                format!("积分 {} 到期，7 天内作废，先用它", clock_text(expiry, now))
+            } else {
+                format!(
+                    "排在第 {position} 位：积分 {} 到期；前面还有更早到期的账号没烧完",
+                    clock_text(expiry, now)
+                )
+            }
+        }
+        (1, _) => {
+            if position == 1 {
+                "测不出积分有效期（长期或不过期），当前没有临期积分可烧，先摊在它上面".to_string()
+            } else {
+                format!("排在第 {position} 位：测不出有效期，同档账号按负载均衡轮换")
+            }
+        }
+        _ => {
+            let expiry = credit_rank(account, meta, now).1;
+            if position == 1 {
+                format!(
+                    "积分 {} 到期，7 天以外，没有临期积分时先用它",
+                    clock_text(expiry, now)
+                )
+            } else {
+                format!(
+                    "排在第 {position} 位：积分 {} 到期（7 天以外），让位于临期与测不出有效期的账号",
+                    clock_text(expiry, now)
+                )
+            }
+        }
+    }
 }
 
 /// 生成一份完整的选路计划（转发选路与队列端点共用的**唯一**排序实现）。
@@ -705,7 +829,7 @@ pub fn plan_route(
     // 429」，退避解决的是「反复失败反复撞」—— 它们在顺序优先下同样成立；
     // 若只对负载均衡生效，默认策略下这两个开关就是摆设。稳定排序保证
     // 同档内的先后仍由策略的基础序决定（顺序优先下 = 位次）。
-    let mut arranged = base_order(&ordered, meta.strategy, meta);
+    let mut arranged = base_order(&ordered, meta.strategy, meta, now);
 
     // ── 粘性命中的可用账号提到最前（它可用，请求就会走它 —— 排序必须如实反映）
     //
@@ -807,6 +931,9 @@ pub fn plan_route(
                             format!("排在第 {position} 位：等优先级更高的家轮完或失败才到它")
                         }
                     }
+                    RouteStrategy::Credit => {
+                        credit_reason(&account, meta, now, position)
+                    }
                 }
             };
             if meta.sunk.contains_key(&id) {
@@ -849,6 +976,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// 一份「所有账号都测不出版期」的空快照：与转发侧拿不到事实时同一口径。
+    fn no_credit() -> &'static HashMap<String, Option<i64>> {
+        static EMPTY: std::sync::OnceLock<HashMap<String, Option<i64>>> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(HashMap::new)
+    }
+
     /// 家内轮询的一份最小 meta：只带各家游标，其余状态为空。
     fn provider_meta<'a>(
         cursors: &'a HashMap<String, usize>,
@@ -864,6 +997,7 @@ mod tests {
             cursor: None,
             provider_cursors: Some(cursors),
             sticky_account: None,
+            credit_expires_at: no_credit(),
         }
     }
 
@@ -1008,6 +1142,7 @@ mod tests {
             cursor: None,
             provider_cursors: None,
             sticky_account: Some("a3"),
+            credit_expires_at: no_credit(),
         };
         let plan = plan_route(&accounts, &keys, &counts, &[], 1_700_000_000_000, &meta);
         let order: Vec<&str> = plan.ordered.iter().map(|entry| entry.id.as_str()).collect();
@@ -1044,6 +1179,7 @@ mod tests {
             cursor: None,
             provider_cursors: Some(&cursors),
             sticky_account: Some("b1"),
+            credit_expires_at: no_credit(),
         };
         let plan = plan_route(&accounts, &keys, &counts, &[], 1_700_000_000_000, &meta);
         let order: Vec<&str> = plan.ordered.iter().map(|entry| entry.id.as_str()).collect();
@@ -1072,6 +1208,7 @@ mod tests {
             cursor: None,
             provider_cursors: None,
             sticky_account: Some("a2"),
+            credit_expires_at: no_credit(),
         };
         let plan = plan_route(&accounts, &keys, &counts, &[], 1_700_000_000_000, &meta);
         let order: Vec<&str> = plan.ordered.iter().map(|entry| entry.id.as_str()).collect();
@@ -1120,6 +1257,7 @@ mod tests {
             cursor: None,
             provider_cursors: Some(&cursors),
             sticky_account: None,
+            credit_expires_at: no_credit(),
         };
         let plan = plan_route(&accounts, &keys, &counts, &[], 1_700_000_000_000, &meta);
         let order: Vec<&str> = plan.ordered.iter().map(|entry| entry.id.as_str()).collect();
@@ -1155,10 +1293,161 @@ mod tests {
             cursor: None,
             provider_cursors: None,
             sticky_account: None,
+            credit_expires_at: no_credit(),
         };
         let plan = plan_route(&accounts, &keys, &counts, &[], 1_700_000_000_000, &meta);
         let order: Vec<&str> = plan.ordered.iter().map(|entry| entry.id.as_str()).collect();
         assert_eq!(order, vec!["a1", "a2", "b1", "b2"]);
+    }
+
+    // ─── 积分到期优先（credit）───────────────────────────────
+    //
+    // 用户给的四条规则逐条钉成用例（2026-11-04 需求原文）：
+    //   ① 7 天内到期的积分优先使用；
+    //   ② 多个 7 天内到期的，按剩余时间最短优先；
+    //   ③ 有效期都大于 7 天时，优先用测不出有效期的；
+    //   ④ 多个测不出有效期的，按原有的负载均衡方式轮换。
+
+    const NOW: i64 = 1_700_000_000_000;
+    const DAY: i64 = 24 * 3600 * 1000;
+
+    fn credit_meta<'a>(
+        cursor: Option<usize>,
+        expiries: &'a HashMap<String, Option<i64>>,
+        empty_numbers: &'a HashMap<String, i64>,
+        empty_ids: &'a std::collections::HashSet<String>,
+    ) -> PlanMeta<'a> {
+        PlanMeta {
+            strategy: RouteStrategy::Credit,
+            sunk: empty_numbers,
+            resting: empty_numbers,
+            open: empty_ids,
+            limiter_blocked: empty_ids,
+            cursor,
+            provider_cursors: None,
+            sticky_account: None,
+            credit_expires_at: expiries,
+        }
+    }
+
+    fn credit_order_of(accounts: &[Value], expiries: &HashMap<String, Option<i64>>, cursor: Option<usize>) -> Vec<String> {
+        let empty_numbers: HashMap<String, i64> = HashMap::new();
+        let empty_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let counts: HashMap<String, usize> = HashMap::new();
+        let meta = credit_meta(cursor, expiries, &empty_numbers, &empty_ids);
+        let plan = plan_route(accounts, &CooldownKeys::new("test-model"), &counts, &[], NOW, &meta);
+        plan.ordered.iter().map(|entry| entry.id.clone()).collect()
+    }
+
+    /// 规则 ①②：临期在前，且到期越早越靠前 —— 即使它的优先级最靠后。
+    #[test]
+    fn credits_expiring_within_7_days_go_first_soonest_expiry_leading() {
+        let accounts = vec![
+            account("long", "A", 100),   // 优先级最高，但 30 天后才到期
+            account("mid", "A", 110),    // 5 天后到期
+            account("soon", "A", 120),   // 2 天后到期（优先级最低）
+        ];
+        let expiries = HashMap::from([
+            ("long".to_string(), Some(NOW + 30 * DAY)),
+            ("mid".to_string(), Some(NOW + 5 * DAY)),
+            ("soon".to_string(), Some(NOW + 2 * DAY)),
+        ]);
+        // 顺序优先会给 long/mid/soon；积分到期优先必须把 soon 提到最前
+        assert_eq!(credit_order_of(&accounts, &expiries, None), vec!["soon", "mid", "long"]);
+    }
+
+    /// 规则 ③：都超过 7 天时，测不出有效期的排在「还很久」的前面。
+    ///
+    /// 这条是用户的原意：测不出多半意味着长期 / 不过期积分，烧它不吃亏；
+    /// 而「还有 30 天才到期」的积分留着更值钱。
+    #[test]
+    fn unmeasurable_validity_outranks_credits_that_expire_far_later() {
+        let accounts = vec![
+            account("far", "A", 100),     // 优先级最高，但 30 天后到期
+            account("unknown", "A", 110), // 测不出
+        ];
+        let expiries = HashMap::from([
+            ("far".to_string(), Some(NOW + 30 * DAY)),
+            ("unknown".to_string(), None),
+        ]);
+        assert_eq!(credit_order_of(&accounts, &expiries, None), vec!["unknown", "far"]);
+    }
+
+    /// 缺键与显式 `None` 同一含义：都算「测不出」。
+    ///
+    /// 快照是「按家是否支持到期」筛过的，不支持到的家压根不进表 —— 若把
+    /// 「表里没有」当成「到期为 0」，这些账号会被误判成已过期而排到最后。
+    #[test]
+    fn a_missing_entry_is_the_same_as_an_unmeasurable_one() {
+        let accounts = vec![account("absent", "A", 100), account("far", "A", 110)];
+        let expiries = HashMap::from([("far".to_string(), Some(NOW + 30 * DAY))]);
+        assert_eq!(credit_order_of(&accounts, &expiries, None), vec!["absent", "far"]);
+    }
+
+    /// 已经过期的到期时刻 = 积分已作废 = 测不出（不再为它排队）。
+    #[test]
+    fn an_already_passed_expiry_counts_as_unmeasurable() {
+        let accounts = vec![account("stale", "A", 100), account("far", "A", 110)];
+        let expiries = HashMap::from([
+            ("stale".to_string(), Some(NOW - DAY)),
+            ("far".to_string(), Some(NOW + 30 * DAY)),
+        ]);
+        // stale 已过期 → 落到「测不出」档，仍排在 far 之前（规则 ③）
+        assert_eq!(credit_order_of(&accounts, &expiries, None), vec!["stale", "far"]);
+    }
+
+    /// 规则 ④：多个测不出有效期的账号，按负载均衡轮换（游标推进位次）。
+    #[test]
+    fn unmeasurable_accounts_rotate_with_the_load_balancing_cursor() {
+        let accounts = vec![
+            account("u1", "A", 100),
+            account("u2", "A", 110),
+            account("u3", "A", 120),
+        ];
+        let expiries: HashMap<String, Option<i64>> = HashMap::new();
+        // 游标 0 → 从优先级第 1 位起
+        assert_eq!(credit_order_of(&accounts, &expiries, Some(0)), vec!["u1", "u2", "u3"]);
+        // 游标 1 → 环转一格
+        assert_eq!(credit_order_of(&accounts, &expiries, Some(1)), vec!["u2", "u3", "u1"]);
+        // 游标 4 → 4 % 3 = 1，同样落回 u2 起（不许越界）
+        assert_eq!(credit_order_of(&accounts, &expiries, Some(4)), vec!["u2", "u3", "u1"]);
+    }
+
+    /// 规则 ④ 只作用于「测不出」那一档：临期档**不**随游标转动。
+    ///
+    /// 否则同一个 2 天后到期的账号会因为游标推进而被推到第二位，等于拿
+    /// 「不烧就作废」的积分去给轮换让路 —— 与规则 ①② 直接冲突。
+    #[test]
+    fn the_cursor_never_reorders_credits_that_are_about_to_expire() {
+        let accounts = vec![
+            account("soon", "A", 100),
+            account("u1", "A", 110),
+            account("u2", "A", 120),
+        ];
+        let expiries = HashMap::from([("soon".to_string(), Some(NOW + 2 * DAY))]);
+        // 无论游标几，临期的 soon 恒在第 1 位；只有后面的 u1/u2 换位
+        assert_eq!(credit_order_of(&accounts, &expiries, Some(0)), vec!["soon", "u1", "u2"]);
+        assert_eq!(credit_order_of(&accounts, &expiries, Some(1)), vec!["soon", "u2", "u1"]);
+        assert_eq!(credit_order_of(&accounts, &expiries, Some(2)), vec!["soon", "u1", "u2"]);
+    }
+
+    /// 7 天整是**含**的（`<=`）：差一毫秒就掉到最后一档，这条边界要钉住。
+    #[test]
+    fn exactly_seven_days_still_counts_as_soon() {
+        let accounts = vec![account("edge", "A", 100), account("unknown", "A", 110)];
+        let expiries = HashMap::from([("edge".to_string(), Some(NOW + 7 * DAY))]);
+        assert_eq!(credit_order_of(&accounts, &expiries, None), vec!["edge", "unknown"]);
+    }
+
+    /// 策略 id 往返 + 未知值兜底：`credit` 不能被 `from_id` 吞成 `order`。
+    #[test]
+    fn the_credit_strategy_round_trips_through_its_config_id() {
+        assert_eq!(RouteStrategy::from_id("credit"), RouteStrategy::Credit);
+        assert_eq!(RouteStrategy::Credit.as_str(), "credit");
+        // 轮转类策略要吃游标；顺序优先不吃
+        assert!(RouteStrategy::Credit.uses_cursor());
+        assert!(RouteStrategy::Rotate.uses_cursor());
+        assert!(!RouteStrategy::Order.uses_cursor());
     }
 }
 

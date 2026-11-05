@@ -1110,6 +1110,14 @@ pub const ROUTING_STRATEGY_ROTATE: &str = "rotate";
 /// 与「负载均衡」的差别在**轮转的边界**：这里家的先后固定（由优先级定），
 /// 只有家内换人 —— 适合「想优先用某几家、又不愿把某一家的某个账号焊死」。
 pub const ROUTING_STRATEGY_PROVIDER: &str = "provider";
+/// 积分到期优先（`credit`）：先烧临期积分，再烧测不出有效期的，最后才动长期积分。
+///
+/// 四挡判据（`routing::credit_order` 是实现）：
+///   ① 7 天内到期 → 最优先，且到期越早越靠前（不烧就作废）；
+///   ② 无法测算有效期 → 次之（多半是长期 / 不过期的积分，放着不心疼）；
+///   ③ 有效期都还在 7 天以外 → 排最后，同样按到期时刻升序；
+///   ④ 第 ② 挡内部沿用「负载均衡」的轮换（同一档的账号没有先后可言，摊开用）。
+pub const ROUTING_STRATEGY_CREDIT: &str = "credit";
 
 pub const STICKY_OFF: &str = "off";
 pub const STICKY_TURN: &str = "turn";
@@ -1128,8 +1136,9 @@ pub const ROUTING_BREAKER_MAX_SUCCESS: i64 = 10;
 
 /// 路由策略（`RouteStrategy` 的 Rust 形态；配置里存 `as_str`）
 ///
-/// 三档：顺序优先（队列第 1 位接走所有请求）、负载均衡（逐请求轮换）、
-/// 家内轮询（家之间按优先级、同一家内部轮流用各账号）。
+/// 四档：顺序优先（队列第 1 位接走所有请求）、负载均衡（逐请求轮换）、
+/// 家内轮询（家之间按优先级、同一家内部轮流用各账号）、
+/// 积分到期优先（先烧临期积分，测不出有效期的次之）。
 /// 「余额优先（usage）」已下线（2026-10，按用户要求移除）—— 见 `from_id` 的兜底说明。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteStrategy {
@@ -1137,6 +1146,9 @@ pub enum RouteStrategy {
     Rotate,
     /// 家内轮询（本仓新增，上游没有）：轮转的边界收在「家」里面
     Provider,
+    /// 积分到期优先（本仓新增，上游没有）：按「离过期还有多久」排，见
+    /// [`ROUTING_STRATEGY_CREDIT`] 的四挡判据
+    Credit,
 }
 
 impl RouteStrategy {
@@ -1145,6 +1157,7 @@ impl RouteStrategy {
             Self::Order => ROUTING_STRATEGY_ORDER,
             Self::Rotate => ROUTING_STRATEGY_ROTATE,
             Self::Provider => ROUTING_STRATEGY_PROVIDER,
+            Self::Credit => ROUTING_STRATEGY_CREDIT,
         }
     }
 
@@ -1156,9 +1169,19 @@ impl RouteStrategy {
     pub fn from_id(value: &str) -> Self {
         match value {
             ROUTING_STRATEGY_PROVIDER => Self::Provider,
+            ROUTING_STRATEGY_CREDIT => Self::Credit,
             ROUTING_STRATEGY_ROTATE | "usage" => Self::Rotate,
             _ => Self::Order,
         }
+    }
+
+    /// 本策略是否靠轮转摊负载（会消耗 `route_state` 的游标）。
+    ///
+    /// 顺序优先不用；家内轮询与负载均衡各用一把环；积分到期优先只**在
+    /// 「到期时间相同」的那一档内部**轮换（规则 ④），所以它同样要吃游标 ——
+    /// 否则同档账号会永远按优先级固定下来，那就不是「负载均衡」了。
+    pub fn uses_cursor(&self) -> bool {
+        !matches!(self, Self::Order)
     }
 }
 

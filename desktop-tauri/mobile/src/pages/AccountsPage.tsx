@@ -21,9 +21,10 @@ import {
   type UsageSnapshot,
 } from '../api/gateway'
 import { accountName, formatExpiry, formatRelative, isRateLimited } from '../lib/format'
-import { expiryOf, hasExpiry, isLongLivedCredential, supportsUsage } from '../lib/providerFacts'
+import { expiryAtOf, hasCreditExpiry, hasExpiryReading, isLongLivedCredential, supportsUsage } from '../lib/providerFacts'
 import { usageIndex, usageText } from '../lib/usage'
 import { credentialExpiryRowsOf, credentialExpiryText } from '../../../ui-shared/credential-expiry'
+import { creditExpiryOfUsage } from '../../../ui-shared/usage-readings'
 import { upstreamCooldownOf, upstreamSuspendedReasonOf } from '../../../ui-shared/account-upstream-state'
 import { providerLabel } from '../lib/providers'
 import { usePolling } from '../lib/usePolling'
@@ -84,10 +85,10 @@ export function AccountsPage() {
 
   /** 这家有没有「有效期」概念、是不是长期有效、到期时刻 —— 筛选与行渲染共用 */
   const expiryInfo = (account: Account) => {
-    const at = expiryOf(account)
+    const at = expiryAtOf(account, usageById.get(account.id))
     return {
       at,
-      has: hasExpiry(account.provider),
+      has: hasExpiryReading(account.provider),
       longLived: isLongLivedCredential(account.provider),
       expired: at > 0 && at <= Date.now(),
     }
@@ -114,7 +115,7 @@ export function AccountsPage() {
       return haystack.includes(keyword)
     })
     const expiryOfAccount = (account: Account) => {
-      const at = expiryOf(account)
+      const at = expiryAtOf(account, usageById.get(account.id))
       return {
         at,
         longLived: isLongLivedCredential(account.provider),
@@ -421,7 +422,8 @@ function AccountRow({
   const limited = isRateLimited(account)
   const cooldown = upstreamCooldownOf(account)
   const suspendedReason = upstreamSuspendedReasonOf(account)
-  const expiresAt = expiryOf(account)
+  // 有效期按家分派口径：申报了 creditExpiry 的家读「最先到期的积分批次」，其余读凭证
+  const expiresAt = expiryAtOf(account, usageRow)
   const expired = expiresAt > 0 && expiresAt <= Date.now()
   const tone = account.needsRelogin || suspendedReason
     ? 'bad'
@@ -446,11 +448,13 @@ function AccountRow({
               ? t('已过期')
               : t('正常')
   // 有效期：这家没有这个概念时不显示，而不是显示「—」（少一行噪音）；
-  // 长期有效的家写「长期有效」—— 与「—」（读不到到期时间）是两件事
-  const credentialRows = credentialExpiryRowsOf(account, expiresAt)
-  const expiryText = credentialRows.length ? '' : isLongLivedCredential(account.provider)
-    ? t('长期有效')
-    : hasExpiry(account.provider) ? formatExpiry(expiresAt) : ''
+  // 长期有效的家写「长期有效」—— 与「—」（读不到到期时间）是两件事。
+  // 积分口径的家两种「长期有效」都不适用（它读的是积分批次，不是凭证）。
+  const creditMode = hasCreditExpiry(account.provider)
+  const credentialRows = creditMode ? [] : credentialExpiryRowsOf(account, expiresAt)
+  const expiryText = credentialRows.length ? ''
+    : !creditMode && isLongLivedCredential(account.provider) ? t('长期有效')
+      : hasExpiryReading(account.provider) ? formatExpiry(expiresAt) : ''
   // 余额：只有这家有查询能力时才占一行；快照里没有这一行 = 还没查过
   const usageView = usageText(usageRow)
   const showUsage = supportsUsage(account)

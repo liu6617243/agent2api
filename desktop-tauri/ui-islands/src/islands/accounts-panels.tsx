@@ -43,7 +43,7 @@ import {
   TableRow, TableCell, TableHeader, TableHead as UiTableHead } from '@ui'
 import { formatTime, numberText, poolItemLabel, POOL_VALUE_PREFIX, shared, type AccountRecord, type LimiterRule, type TokenReading, type UsageEntry } from './accounts-shared'
 import {
-  accountTags, activeLimits, balanceBlockedOf,
+  accountTags, activeLimits, balanceBlockedOf, creditExpiryOf,
   displayNameOf, expiryMillis, formatIntervalSeconds, formatResetText,
   formatTokenCount, identifierKeyOf, identifierOf, isDesktopAccount, isEnabled, isFreePlan, planBadgeLabel,
   providerFeatures,
@@ -627,7 +627,27 @@ export function LimitsCell({ account, onClear }: {
 /* ─── 有效期 / 连接数 / 余额列 ──────────────── */
 
 /**
- * 有效期：按「这家有没有版本概念」选字段（workbuddy 是 expiresAt，其余是
+ * 有效期。**两种口径，按能力位分派**：
+ *
+ * ── ① 积分到期口径（申报了 `creditExpiry` 的家）────────────────
+ * 这一列回答的是「**最先作废的那笔积分**离现在还有多久」。上游的积分是**分批**
+ * 发放、各批独立计时（MiniMax 官方口径：每笔签到积分从领取当天算 30 天，
+ * 新签到不延长旧批次），所以「有效期」在这一家天然不是单一时刻，而是**最近
+ * 到期的那一批**。网页端「积分明细」把同一个值直接摆在「有效期」列里
+ * （实测 2026-11-10 的账号显示 `2026-11-13 00:00`，即最早那批的作废时刻），
+ * 这里与网页端对齐。
+ *
+ * 读数走域层 `creditExpiryOf`（读 `usage.credits[].expireAt`，跳过流水 / 快照 /
+ * 每日重置 / 不限量，并且跳过已过期与剩余为 0 的批次）—— **与「按积分到期
+ * 排序」是同一个函数**，两处不可能算出不同的答案。
+ *
+ * 读不到就显示「—」，不回落令牌倒计时（2026-11-05 定的口径）：access token
+ * 那个约一小时的读数是**网关自己续期用的**，摆在「有效期」列里会被读成
+ * 「这个账号快没了」，而这正是这家最容易误判的地方。宁可显示「—」并在
+ * title 里说清是「还没查过余额」还是「没有会到期的批次」。
+ *
+ * ── ② 凭证到期口径（其余家，即原来的实现）────────────────────
+ * 按「这家有没有版本概念」选字段（workbuddy 是 expiresAt，其余是
  * tokenExpiresAt），与域层的 tokenExpiryOf 同口径。文案收短成「30 天后」，
  * 完整句留在 title —— 列宽有限。
  *
@@ -637,7 +657,7 @@ export function LimitsCell({ account, onClear }: {
  * 面板就红着显示「已过期」。归一规则与理由写在 accounts-domain.ts 那一处，
  * 后端 `providers::trae::Credential::expires_at_ms` 是同一个口径。
  *
- * ── 「长期有效」与「—」是两件事 ────────────────────────────
+ * ── 「长期有效」与「—」是两件事（只属口径 ②）──────────────────
  * 主凭证本来就没有到期时刻的家（Antigravity 的 Google refresh token、智谱清言、
  * ModelScope、Command Code）显示「长期有效」—— 它回答的是「要不要担心过期」。
  * 而「—」只表示「这条记录里读不到到期时间」（KukuAI 的 BDUSS 就是这种：读不出
@@ -645,6 +665,7 @@ export function LimitsCell({ account, onClear }: {
  */
 export function ExpiryCell({ account }: { account: AccountRecord }) {
   const features = providerFeatures(providerOf(account))
+  if (features.creditExpiry) return <CreditExpiryCell account={account} />
   const expiresAt = features.edition ? expiryMillis(account.expiresAt) : tokenExpiryOf(account)
   const rows = credentialExpiryRowsOf(account, expiresAt)
   if (rows.length) return <div className='flex flex-col items-center gap-1'>
@@ -663,6 +684,48 @@ export function ExpiryCell({ account }: { account: AccountRecord }) {
   // 直接拼会留下一个空的「（）」
   const full = formatTime(expiresAt)
   return <span title={full ? t('{text}过期（{full}）', { text, full }) : t('{text}过期', { text })}>{text}</span>
+}
+
+/**
+ * 积分到期口径的有效期格（见 {@link ExpiryCell} 的第 ① 段）。
+ *
+ * ── 文案为什么用「天后」而不用绝对时刻 ────────────────────────
+ * 与口径 ② 共用同一套相对读数（`n 分钟后 / n 小时后 / n 天后`），一行扫过去
+ * 才有可比性。绝对时刻（`11-13 00:00`）放进 title：网页端给的是绝对时刻，
+ * 但账号页要一眼看出「哪几个账号的钱快没了」，相对时间才是这个问题的答案。
+ *
+ * ── 三种「—」的区分放在 title 里 ────────────────────────────
+ * 界面上都是「—」，但原因分三种，排查时靠悬停分清：
+ *   · 从来没查过余额（`credits[]` 不存在）；
+ *   · 查过，但明细里没有会到期的批次（全是流水 / 每日重置 / 已用完）；
+ *   · 查失败了 —— 直接复用失败原因（与余额列是同一句话），不另编一句。
+ *
+ * `creditExpiryOf` 已经把「已过期」的批次滤掉了（见它的文档），所以正常路径
+ * 读到的永远是**未来**时刻；`left <= 0` 只是「算完到渲染之间恰好跨过到期点」
+ * 的一线兜底。
+ */
+function CreditExpiryCell({ account }: { account: AccountRecord }) {
+  const entry = usageEntryOf(account)
+  const expiresAt = creditExpiryOf(entry)
+  if (expiresAt === null) {
+    const failure = usageFailureOf(entry)
+    if (failure) return <span className='muted' title={failure.message}>—</span>
+    const queried = entry !== undefined && entry !== null && typeof entry === 'object'
+    return (
+      <span className='muted'
+        title={queried ? t('余额明细里没有会到期的积分批次') : t('还没查过余额；查到带到期时间的积分批次后这里会显示距最先到期的时间')}>—</span>
+    )
+  }
+  const left = expiresAt - Date.now()
+  if (left <= 0) return <Badge variant='destructive' shape='tag'>{t('已过期')}</Badge>
+  const text = left < 3600e3 ? t('{n} 分钟后', { n: Math.max(1, Math.round(left / 60e3)) })
+    : left < 48 * 3600e3 ? t('{n} 小时后', { n: (left / 3600e3).toFixed(1) })
+      : t('{n} 天后', { n: Math.floor(left / 24 / 3600e3) })
+  const full = formatTime(expiresAt)
+  const title = full
+    ? t('最先到期的积分批次：{text}后作废（{full}）；每一批积分独立计时', { text, full })
+    : t('最先到期的积分批次：{text}后作废', { text })
+  return <span title={title}>{text}</span>
 }
 
 /**

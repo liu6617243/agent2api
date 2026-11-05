@@ -230,9 +230,17 @@ fn select_target_account_sync(
     // 消耗一格环位」对两种轮转是同一个口径；差别只在它取的是**每家各一个**
     // 起始位（见 `rotate_take_per_provider`）。
     let may_rotate = tried_ids.is_empty() && pinned.is_none();
-    let wants_rotation = may_rotate && settings.strategy != config::RouteStrategy::Order;
+    // 积分到期优先也要推进游标，但它只把游标用在「测不出有效期」那一档内部
+    // （规则 ④：同档账号按原有的负载均衡方式轮换），见 `routing::credit_order`。
+    let wants_rotation = may_rotate && settings.strategy.uses_cursor();
     let take_rotation = || match settings.strategy {
         config::RouteStrategy::Rotate => (
+            Some(service.route.rotate_take(keys.request_model())),
+            None,
+        ),
+        // 积分到期优先：与负载均衡共用同一把环（同一张游标表、同一个键），
+        // 因为它的轮换语义就是「本档内按负载均衡轮」。
+        config::RouteStrategy::Credit => (
             Some(service.route.rotate_take(keys.request_model())),
             None,
         ),
@@ -255,6 +263,13 @@ fn select_target_account_sync(
     } else {
         (None, None)
     };
+    // 积分到期快照：只在本策略下取（一次加锁 + 整表克隆，其余策略用不上），
+    // 两次 `plan_route` 共用同一份 —— 中途重排只该换轮转起点，不该换到期事实。
+    let credit_expires_at = if settings.strategy == config::RouteStrategy::Credit {
+        crate::server::core::account_order::credit_expiries_at(now)
+    } else {
+        std::collections::HashMap::new()
+    };
     let mut plan = routing::plan_route(
         &accounts, keys, &counts, tried_ids, now,
         &routing::PlanMeta {
@@ -266,6 +281,7 @@ fn select_target_account_sync(
             cursor,
             provider_cursors: provider_cursors.as_ref(),
             sticky_account: snap.sticky_hit.as_deref(),
+            credit_expires_at: &credit_expires_at,
         },
     );
     // 粘性命中项没有排到第 1 位：这一次请求用不上它，照常消耗一格环位重排。
@@ -286,6 +302,7 @@ fn select_target_account_sync(
                 cursor,
                 provider_cursors: provider_cursors.as_ref(),
                 sticky_account: snap.sticky_hit.as_deref(),
+                credit_expires_at: &credit_expires_at,
             },
         );
     }
@@ -763,6 +780,13 @@ pub(super) fn pick_next_account(
     // 空会话键使 sticky_lookup 直接返回 None，其余快照（垫底 / 休息 / 熔断）
     // 照常参与排序
     let snap = service.route.snapshot("", now, 0);
+    // 顺延同样要按「积分到期」排：否则一条请求撞了限流后，换号链会退回到
+    // 「按优先级挑下一个」——它可能正是刚被排到后面的那个长期积分账号。
+    let credit_expires_at = if settings.strategy == config::RouteStrategy::Credit {
+        crate::server::core::account_order::credit_expiries_at(now)
+    } else {
+        std::collections::HashMap::new()
+    };
     let meta = routing::PlanMeta {
         strategy: settings.strategy,
         sunk: &snap.sunk,
@@ -772,6 +796,7 @@ pub(super) fn pick_next_account(
         cursor: None,
         provider_cursors: None,
         sticky_account: None,
+        credit_expires_at: &credit_expires_at,
     };
     let plan = routing::plan_route(&candidates, keys, &counts, tried_ids, now, &meta);
     plan.ordered.into_iter().next().map(|entry| entry.account)
