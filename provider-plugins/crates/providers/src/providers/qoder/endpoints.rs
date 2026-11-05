@@ -566,6 +566,13 @@ pub const EXCHANGE_PATH: &str = "/api/v1/jobToken/exchange";
 pub const USER_INFO_PATH: &str = "/api/v1/userinfo";
 pub const USAGE_PATH: &str = "/api/v2/quota/usage";
 
+/// 积分**批次明细**（网页 BFF，`web_origin()` 那台主机；`openapi` 上没有这条路径）。
+///
+/// `USAGE_PATH` 只返回聚合值（`addOnQuota.total/used/remaining`），逐批的
+/// `remaining_value` / `expires_at` 只有这里给。代价是它**只认网页会话 cookie**
+/// —— 实测 `Bearer` 一律 401，所以调用方必须先有 `Credentials::session_cookie`。
+pub const WEB_CREDITS_PATH: &str = "/api/v2/me/usages/big_model_credits";
+
 
 /// 千问办公的账号上下文（用户资料 + 计划 + 额度都在这一份里）。
 pub const ACCOUNT_CONTEXT_PATH: &str =

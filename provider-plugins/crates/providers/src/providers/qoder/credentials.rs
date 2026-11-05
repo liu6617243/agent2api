@@ -45,6 +45,13 @@ pub struct Credentials {
     pub email: String,
     pub name: String,
     pub machine_id: String,
+    /// 网页会话 cookie（可选，只有需要「积分批次明细」时才用得上）。
+    ///
+    /// `openapi` 的额度接口（`/api/v2/quota/usage`）只给聚合值，拿不到每批
+    /// 各剩多少、各自什么时候过期；那份明细只在**网页 BFF** 上，且只认
+    /// 网页会话（实测：`Bearer` → 401，`openapi` 同路径 → 404）。所以这个
+    /// 字段由用户从浏览器复制提供，缺省为空 = 不查明细、只显示聚合余额。
+    pub session_cookie: String,
 }
 
 impl Credentials {
@@ -94,6 +101,13 @@ impl Credentials {
             email: text(payload, &["email"]).chars().take(320).collect(),
             name: text(payload, &["nickname", "name", "username"]).chars().take(100).collect(),
             machine_id,
+            // 可选字段：只认显式的三个名字，不用泛化的 `cookie`
+            // （账号记录里可能出现无关的 cookie 字段，认错会拿它去打网页接口）。
+            session_cookie: text(payload, &["sessionCookie", "session_cookie", "webCookie"])
+                .trim()
+                .chars()
+                .take(8192)
+                .collect(),
         };
         if parts.len() == 1 && !refresh.is_empty() {
             credentials.refresh_token =

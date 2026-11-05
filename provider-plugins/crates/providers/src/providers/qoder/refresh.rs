@@ -103,6 +103,11 @@ async fn refresh_and_save(
     } else {
         refresh_via_open_api(credentials, site, proxy.as_ref()).await?
     };
+    // 网页会话 cookie 不是刷新产物（openapi 那条链根本不碰它），但它挂在
+    // `Credentials` 上，刷新后当次请求还要靠它读批次明细 —— 不复制过来的话
+    // 就会「每刷新一次，明细缺一次」。写回那一侧不受影响：`merge_secret` 以
+    // 既有记录为底，fresh 里没有这个键时原值保留。
+    fresh.session_cookie = credentials.session_cookie.clone();
     fresh.complete_identity()?;
     if fresh.user_id != credentials.user_id || fresh.site != credentials.site {
         return Err(GatewayError::with_status(400, "续期返回了不同账号，旧凭证未被覆盖"));

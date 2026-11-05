@@ -10,6 +10,16 @@
 //!   - `orgResourcePackage`：组织（团队）资源包。**字段形状与上面两个都不同**：
 //!     总量叫 `cap`（不是 `total`）、另外多一个 `available` 布尔标它是否真的可用。
 //!
+//! ── 批次明细要走另一条通道（2026-11-05）─────────────────────
+//! 上面三个桶都只给**聚合值**。官网「用量明细」展开的是逐个资源包（每批
+//! 100 credits、各自 30 天到期），那份明细只在网页 BFF：
+//! `GET {web_origin}/api/v2/me/usages/big_model_credits`
+//! → `resource_package_quota.quota_detail[]`（`remaining_value` + `expires_at`）。
+//! 它**只认网页会话 cookie**（Bearer → 401、openapi 同路径 → 404），因此由
+//! `Credentials::session_cookie` 驱动，缺省就不查 —— 见 `web_credit_packs`。
+//! 拿到之后追加进 `credits[]`（带 `expireAt`），账号页「有效期」列才有得显示；
+//! 没有它时只剩聚合行，前端算不出到期时间、那一列空着（本次修复前的状态）。
+//!
 //! ── 千问办公读的是另一份文档 ────────────────────────────────
 //! 它的账号上下文（`/api/v1/adapter/user/account-context`）里给
 //! `plan`（套餐名 + 下次刷新日）与 `quota`（总量 / 已用 / 剩余），
@@ -196,6 +206,102 @@ fn credit_row(
         row.insert("unit".to_string(), Value::String(unit.to_string()));
     }
     Some(Value::Object(row))
+}
+
+/// 用**网页会话**读积分批次明细 → `credits[]` 的批次行。
+///
+/// ── 为什么要另一条通道 ──────────────────────────────────────
+/// `openapi` 的 [`endpoints::USAGE_PATH`] 只给聚合值（`addOnQuota` 的
+/// total / used / remaining），拿不到「每批各剩多少、各自什么时候过期」。
+/// 那份明细只在网页 BFF：
+///
+/// ```text
+/// GET {web_origin}/api/v2/me/usages/big_model_credits
+///   Cookie: qoder_session_cookie=<网页会话>
+///   → resource_package_quota.quota_detail[]:
+///       { limit_value, used_value, remaining_value, expires_at, source, status }
+/// ```
+///
+/// 实测它**只认网页 cookie**：Bearer → 401，`openapi` 同路径 → 404。所以
+/// 只有账号记录里额外带了 `sessionCookie` 才走这一步，没有就返回空、只显示
+/// 聚合余额（那是 USAGE_PATH 给的）。
+///
+/// ── 只保留还有余额的批次 ────────────────────────────────────
+/// 实测本机 25 个批次里 20 个已经余 0（用完但尚未过期）。它们既不影响
+/// 「还能花多少」，也不该参与「最先到期」的判断（余 0 的批次过期无感），
+/// 全塞进 `credits[]` 只会把余额面板撑成 25 行。
+///
+/// 任何失败都返回空：明细是锦上添花，不能因为它把聚合余额一起弄丢。
+async fn web_credit_packs(
+    credentials: &Credentials,
+    proxy: Option<&ResolvedProxy>,
+) -> Vec<Value> {
+    let cookie = credentials.session_cookie.trim();
+    if cookie.is_empty() {
+        return Vec::new();
+    }
+    let origin = credentials.site.web_origin();
+    let headers = vec![
+        ("Cookie".to_string(), cookie.to_string()),
+        ("Accept".to_string(), "application/json".to_string()),
+        // 网页 BFF 的前端固定发这几个（抓包逐字复刻），缺 csrf 头会被判非法请求
+        (
+            "X-Csrf-Token".to_string(),
+            "_echo_csrf_using_sec_fetch_site_".to_string(),
+        ),
+        ("X-Requested-With".to_string(), "XMLHttpRequest".to_string()),
+        (
+            "Referer".to_string(),
+            format!("{origin}/account/usage?client=qoder&sourceType=IDE"),
+        ),
+    ];
+    let response = match auth::request(
+        "GET",
+        &format!("{origin}{}", endpoints::WEB_CREDITS_PATH),
+        None,
+        &headers,
+        proxy,
+    )
+    .await
+    {
+        Ok(response) if response.ok => response,
+        // cookie 过期 / 网络失败都静默降级（401 就是过期，用户没重贴之前
+        // 这条通道一直不可用，不该每轮都报错）
+        _ => return Vec::new(),
+    };
+    let Some(payload) = response.payload.as_ref() else {
+        return Vec::new();
+    };
+    let batches = payload
+        .pointer("/resource_package_quota/quota_detail")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut rows = Vec::new();
+    for batch in batches {
+        let remain = number(batch.get("remaining_value")).unwrap_or(0.0);
+        if remain <= 0.0 {
+            continue;
+        }
+        let mut row = Map::new();
+        row.insert("name".to_string(), Value::String("资源包".to_string()));
+        row.insert("remain".to_string(), json!(remain));
+        if let Some(total) = number(batch.get("limit_value")) {
+            row.insert("total".to_string(), json!(total));
+        }
+        if let Some(used) = number(batch.get("used_value")) {
+            row.insert("used".to_string(), json!(used));
+        }
+        if let Some(unit) = batch.get("unit").and_then(Value::as_str) {
+            row.insert("unit".to_string(), Value::String(unit.to_string()));
+        }
+        // 到期时刻是**毫秒**时间戳（`creditExpiryOfUsage` 按毫秒读；0 = 没有到期日）
+        if let Some(expires) = number(batch.get("expires_at")).filter(|value| *value > 0.0) {
+            row.insert("expireAt".to_string(), json!(expires));
+        }
+        rows.push(Value::Object(row));
+    }
+    rows
 }
 
 /// 订阅到期时间；哨兵值、0 与 null 都按「没有到期时间」处理（不显示）。
@@ -422,6 +528,21 @@ pub async fn query(
     }
     let raw = auth::payload(response, "额度查询")?;
     let mut document = usage_document(&raw);
+    // 批次明细（可选，见 `web_credit_packs`）。只在渲染前追加，**不参与
+    // `available` 的计算** —— 余额口径仍然只认 USAGE_PATH 的聚合值，
+    // 明细只负责让「有效期」列有得显示。
+    let packs = web_credit_packs(&credentials, proxy.as_ref()).await;
+    if !packs.is_empty() {
+        if let Some(object) = document.as_object_mut() {
+            let mut rows = object
+                .get("credits")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            rows.extend(packs);
+            object.insert("credits".to_string(), Value::Array(rows));
+        }
+    }
     let mut subscription = Map::new();
     if let Some(name) = plan_name(&credentials, proxy.as_ref()).await {
         subscription.insert("planName".to_string(), Value::String(name));
