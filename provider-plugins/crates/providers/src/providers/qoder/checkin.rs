@@ -141,17 +141,29 @@ async fn claim_from(
 
     let mut claimable: Option<&Value> = None;
     let mut claimed = false;
+    // 窗口边界只算一次（循环里每行都重算没必要，也避免 now 漂移）
+    let now = crate::http::now_ms();
+    let window = daily_window_start();
     for row in rows {
         if row.get("actionType").and_then(Value::as_str) != Some(ACTION_CLAIM_BENEFIT) {
             continue;
         }
-        let now = crate::http::now_ms();
         if campaign_time(row.get("startAt")).is_some_and(|start| start > now)
             || campaign_time(row.get("endAt")).is_some_and(|end| end <= now) {
             continue;
         }
-        if site == Site::QoderIntl
-            && campaign_time(row.get("startAt")).is_some_and(|start| start < daily_window_start()) {
+        // ── 只认「**今天这一期**」的活动（两地都要，2026-11-05 修正）────
+        // 活动窗口是「今天 10:00 → 次日 09:59」。所以上午 10:00 之前拉到的
+        // CLAIMED 其实属于**昨天**那期 —— 把它当成「今日已领取」会落
+        // `alreadyCompleted`，账号被标记成今天已签，10:00 开启的新一期当天
+        // 再也不会被尝试，每天白丢 100 credits（实测：09:36 手动签到报
+        // 「今日已领取」，当天 10:00 后不再有任何领取动作）。
+        // 判据 = `startAt` 不早于今天 10:00；早于它的一律当作上一期跳过。
+        if campaign_time(row.get("startAt")).is_some_and(|start| start < window) {
+            continue;
+        }
+        if site == Site::QoderIntl && now < window {
+            // 国际版控制面在窗口开启前可能连活动都不下发，这里保持原有早退
             continue;
         }
         match row.get("claimStatus").and_then(Value::as_str) {
@@ -176,9 +188,19 @@ async fn claim_from(
         campaign_id
     );
     let mut headers = endpoints::sash_headers(&credentials.access_token);
-    if site == Site::QoderIntl {
+    // ── 两地都带机器指纹（2026-11-05 修正）──────────────────────
+    // 抓包（reqable，Qoder CN 0.4.4）实证：**中国版客户端的 campaigns / claim
+    // 同样带整套 `cosy-machine*`**（machineid / machinecode / machinetoken /
+    // machinetype / machineos / machinehostname），不只是国际版。
+    // 原先只在 `Site::QoderIntl` 叠头，中国版只发 5 个基本头 —— 领取接口
+    // 缺设备身份时可能「记账为 CLAIMED 但不实际发放额度」，与用户反馈的
+    // 「签到后积分不增加」一致。缺 UMID 组件时 `augment_headers` 会退化成
+    // 「只有 Cosy-Version / MachineOS / MachineId」，不影响原有可用路径。
+    {
         let uid = list.get("uid").and_then(Value::as_str).unwrap_or("").trim().to_string();
-        let (augmented, _) = risk::augment_headers(headers, site, &uid).await;
+        // 缺组件时的说明在这里用不上：两地即便没叠上 machineToken/Code/Type，
+        // 领取链路本身也不因此失败（退化为「只有机器 id」的头束）。
+        let (augmented, _note) = risk::augment_headers(headers, site, &uid).await;
         headers = augmented;
     }
     let claim = claim_campaign(&url, &credentials, proxy.as_ref(), &headers).await?;
@@ -357,6 +379,20 @@ fn no_claim(site: Site, claimed: bool, risk_note: Option<String>) -> Value {
     }
     // 中国版没有活动是账号侧状态（实测 Free 套餐账号如此，Pro/试用账号才有），
     // 明确说「没有可领的」而不是报错。
+    //
+    // ── 但「窗口还没开」不能走这条（2026-11-05 修正）──────────────
+    // 上一期已领、这一期还没到 10:00 时，上面会把上一期整行跳过 → 走到这里。
+    // 若直接回「当前没有可领取的签到活动」，网关会当成终态不再重试，今天
+    // 那 100 credits 就白丢了。所以窗口未开时给中性 `inactive` + `retryAt`，
+    // 到点自动再来（与 `auto_checkin` 的 qoder 专属窗口 10:01 对齐）。
+    if crate::http::now_ms() < daily_window_start() {
+        return json!({
+            "success": false,
+            "outcome": "inactive",
+            "retryAt": daily_window_start(),
+            "msg": "每日积分活动窗口还没开启（每天 10:00 开启），到点自动重试",
+        });
+    }
     json!({
         "success": false,
         "outcome": "inactive",
