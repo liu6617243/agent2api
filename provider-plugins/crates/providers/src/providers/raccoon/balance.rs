@@ -124,9 +124,9 @@ pub(super) async fn query_usage(ctx: &PluginCtx, account_id: &str) -> Result<Val
 
     // 逐份明细（账号页「积分明细」弹层的输入）：与上面 `wallets` 走**同一张
     // `WALLET_LABELS`、同一口径**（`to_int` 读不到数值就跳过这一行）—— 字段表只有
-    // 一份，两处各抄一份迟早会漂。上游只给余额一个数（没有面额 / 已用 / 到期时刻），
-    // 所以每行只有 `name` 与 `remain`：缺的键**不写**（写 0 会让界面把「没读到」
-    // 画成「只剩 0」）。
+    // 一份，两处各抄一份迟早会漂。余额接口只给**池子级**的数（没有面额 / 已用 /
+    // 到期时刻），所以每行只有 `name` 与 `remain`：缺的键**不写**（写 0 会让界面
+    // 把「没读到」画成「只剩 0」）。到期时刻在下方的批次行里补（来自收入账单）。
     // 「每日积分」**不标 `daily`**：本文件与同目录其它文件里都没有「这份余额按天
     // 重置」的依据（每日积分走的是签到链路按天发放的那笔，不是余额清零）；缺一个
     // 标记只是少一句提示，编一个会让人以为余额明天回满。
@@ -140,6 +140,17 @@ pub(super) async fn query_usage(ctx: &PluginCtx, account_id: &str) -> Result<Val
             }))
         })
         .collect();
+
+    // 批次明细（带到期时刻）：收入账单里每一笔「发放」都带 `expire_at` ——
+    // 客户端「积分明细」页显示的「有效期至 11-11 24:00」就是它。追加进
+    // `credits[]` 之后，账号页「有效期」列才能算出「最先到期的那笔还有多久」；
+    // 没有它时这一列对小浣熊恒为空（余额只有池子级的数，没有时间）。
+    //
+    // 读失败静默跳过：余额本身已经在手，明细不该把它一起拖垮。
+    let mut credits = credits;
+    if let Ok(items) = income_bills(&origin, &credentials.token, &org_headers).await {
+        credits.extend(grant_packs(&items));
+    }
 
     // 订阅失败只记原因，不阻断余额展示（见上）
     let (subscription, subscription_error) = match request_json(
@@ -367,6 +378,61 @@ fn daily_grant(item: &Value, today: &str) -> Option<Value> {
         "at": at.get(11..19).unwrap_or(""),
         "expireAt": item.get("expire_at"),
     }))
+}
+
+/// 收入账单里的「发放」记录 → `credits[]` 的批次行（带**毫秒** `expireAt`）。
+///
+/// ── 为什么没有 `remain` ────────────────────────────────────
+/// 上游的发放记录只有**发放额**（`points`）和到期时刻（`expire_at`），
+/// 「这一笔还剩多少」不给 —— 客户端自己的积分明细页也只显示「+300」。
+/// 剩余是**池子级**的（`daily_points` 一个数），要摊到具体批次上就得先假设
+/// 消耗顺序，那是编数。所以批次行只写 `total`（发放额）与 `expireAt`：
+/// 界面显示「X 天后到期」，不显示「还剩 N 分」。
+///
+/// 只保留**未过期**且 `points > 0` 的：已作废的批次对「还有多久到期」没有
+/// 意义，留在明细里只是噪音（实测 20 条收入里前 13 条早已过期）。
+fn grant_packs(items: &[Value]) -> Vec<Value> {
+    let now = crate::http::now_ms();
+    let mut rows = Vec::new();
+    for item in items {
+        let Some(expire) = expire_at_millis(item) else {
+            continue;
+        };
+        if expire <= now {
+            continue;
+        }
+        let points = to_int(item.get("points")).unwrap_or(0);
+        if points <= 0 {
+            continue;
+        }
+        let name = item
+            .get("event_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("积分发放");
+        // 附上发放日：否则明细里会排出一串同名行（全是「每日积分发放」）
+        let label = match bill_date(item) {
+            Some(date) if date.len() >= 10 => format!("{name} · {}", &date[5..10]),
+            _ => name.to_string(),
+        };
+        rows.push(json!({
+            "name": label,
+            "total": points,
+            "expireAt": expire,
+        }));
+    }
+    rows
+}
+
+/// `expire_at`（RFC3339 字符串，如 `2026-11-11T23:59:59+08:00`）→ 毫秒时间戳。
+///
+/// 必须转成数字：前端 `creditExpiryOfUsage` 按**毫秒数字**读 `expireAt`，
+/// 直接塞字符串进去会被 `Number(...)` 判成 `NaN`，等于这一行没有到期时间。
+fn expire_at_millis(item: &Value) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(item.get("expire_at").and_then(Value::as_str)?)
+        .ok()
+        .map(|value| value.timestamp_millis())
 }
 
 /// 数值取整（源实现 `toInt`：非有限值给 None，有限值取 floor）。
