@@ -43,7 +43,7 @@ import {
   TableRow, TableCell, TableHeader, TableHead as UiTableHead } from '@ui'
 import { formatTime, numberText, poolItemLabel, POOL_VALUE_PREFIX, shared, type AccountRecord, type LimiterRule, type TokenReading, type UsageEntry } from './accounts-shared'
 import {
-  accountTags, activeLimits, balanceBlockedOf, creditExpiryOf,
+  accountTags, activeLimits, balanceBlockedOf, creditExpiryBatchOf,
   displayNameOf, expiryMillis, formatIntervalSeconds, formatResetText,
   formatTokenCount, identifierKeyOf, identifierOf, isDesktopAccount, isEnabled, isFreePlan, planBadgeLabel,
   providerFeatures,
@@ -705,20 +705,27 @@ export function ExpiryCell({ account }: { account: AccountRecord }) {
  * 才有可比性。绝对时刻（`11-13 00:00`）放进 title：网页端给的是绝对时刻，
  * 但账号页要一眼看出「哪几个账号的钱快没了」，相对时间才是这个问题的答案。
  *
+ * ── 为什么同时显示「这一批有多少分」 ──────────────────────────
+ * 只给「10 天后」的话，还剩 20 分的批次与还剩 8,000 分的批次长得一模一样，
+ * 但处置优先级完全不同 —— 用户真正要判断的是「**有多少钱要没了**」。
+ * 所以主文本写成「10 天后 · 1,000 积分」：时间在前（扫一眼看紧迫度），
+ * 分数在后（跟着就知道轻重）。分数取**该批次自己的** `remain`，不是顶层
+ * `available`（那是全部批次之和）。
+ *
  * ── 三种「—」的区分放在 title 里 ────────────────────────────
  * 界面上都是「—」，但原因分三种，排查时靠悬停分清：
  *   · 从来没查过余额（`credits[]` 不存在）；
  *   · 查过，但明细里没有会到期的批次（全是流水 / 每日重置 / 已用完）；
  *   · 查失败了 —— 直接复用失败原因（与余额列是同一句话），不另编一句。
  *
- * `creditExpiryOf` 已经把「已过期」的批次滤掉了（见它的文档），所以正常路径
+ * `creditExpiryBatchOf` 已经把「已过期」的批次滤掉了（见它的文档），所以正常路径
  * 读到的永远是**未来**时刻；`left <= 0` 只是「算完到渲染之间恰好跨过到期点」
  * 的一线兜底。
  */
 function CreditExpiryCell({ account }: { account: AccountRecord }) {
   const entry = usageEntryOf(account)
-  const expiresAt = creditExpiryOf(entry)
-  if (expiresAt === null) {
+  const batch = creditExpiryBatchOf(entry)
+  if (batch === null) {
     const failure = usageFailureOf(entry)
     if (failure) return <span className='muted' title={failure.message}>—</span>
     const queried = entry !== undefined && entry !== null && typeof entry === 'object'
@@ -727,16 +734,28 @@ function CreditExpiryCell({ account }: { account: AccountRecord }) {
         title={queried ? t('余额明细里没有会到期的积分批次') : t('还没查过余额；查到带到期时间的积分批次后这里会显示距最先到期的时间')}>—</span>
     )
   }
+  const expiresAt = batch.expireAt
   const left = expiresAt - Date.now()
   if (left <= 0) return <Badge variant='destructive' shape='tag'>{t('已过期')}</Badge>
   const text = left < 3600e3 ? t('{n} 分钟后', { n: Math.max(1, Math.round(left / 60e3)) })
     : left < 48 * 3600e3 ? t('{n} 小时后', { n: (left / 3600e3).toFixed(1) })
       : t('{n} 天后', { n: Math.floor(left / 24 / 3600e3) })
+  // 该批次的剩余积分与单位。剩余读不到就不显示分数（不猜），只留时间。
+  // 单位：批次自带的优先，没有才用顶层的（`creditExpiryUnitOf` 负责 `totalLeft → 积分`
+  // 这类归一，与余额列同一口径）。
+  const points = batch.remain === null ? '' : numberText(batch.remain)
+  const unit = batch.unit || creditExpiryUnitOf(entry)
+  const unitLabel = unit ? usageUnitLabel(unit, t) : ''
+  const pointsText = points ? (unitLabel ? `${points} ${unitLabel}` : points) : ''
   const full = formatTime(expiresAt)
-  const title = full
-    ? t('最先到期的积分批次：{text}后作废（{full}）；每一批积分独立计时', { text, full })
-    : t('最先到期的积分批次：{text}后作废', { text })
-  return <span title={title}>{text}</span>
+  const title = pointsText
+    ? full
+      ? t('最先到期的积分批次：{text}作废（{full}）；该批剩余 {points}；每一批积分独立计时', { text, full, points: pointsText })
+      : t('最先到期的积分批次：{text}作废；该批剩余 {points}；每一批积分独立计时', { text, points: pointsText })
+    : full
+      ? t('最先到期的积分批次：{text}作废（{full}）；每一批积分独立计时', { text, full })
+      : t('最先到期的积分批次：{text}作废', { text })
+  return <span title={title}>{pointsText ? t('{text} · {points}', { text, points: pointsText }) : text}</span>
 }
 
 /**

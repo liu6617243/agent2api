@@ -35,7 +35,7 @@ export type UsageView = {
  * 刻意不 import `lib/format` 的同名能力：那个模块依赖页面层，反过来被
  * 数据层引用会绕出循环；这里只服务余额一种口径，自己写一份更稳。
  */
-function compact(value: unknown): string {
+export function compact(value: unknown): string {
   // null / 空串不能被 Number() 悄悄翻成 0：那会把「读不到」显示成「可用 0」
   const num = usageNumberOrNull(value)
   if (num === null) return '—'

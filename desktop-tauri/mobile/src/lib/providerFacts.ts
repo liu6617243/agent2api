@@ -23,7 +23,7 @@
  * 与桌面端 `ExpiryCell` 同一判据、同一份计算。
  */
 
-import { creditExpiryOfUsage } from '../../../ui-shared/usage-readings'
+import { creditExpiryOfUsage, creditExpiryBatchOfUsage, type CreditExpiryBatch } from '../../../ui-shared/usage-readings'
 
 /** 一个提供商的账号行参数（与协议里 `AccountFeatures` 同形，只取手机端用到的） */
 export type ProviderFacts = {
@@ -217,6 +217,30 @@ export function hasExpiryReading(provider: string | undefined): boolean {
  * 的，摆进「有效期」会被读成「这个账号快没了」。读不到就返回 0，由调用方
  * 显示「—」。
  */
+/**
+ * 取「余额读数」本体。
+ *
+ * 调用点传进来的通常是余额快照行（`UsageRow`），余额对象在它的 `usage` 字段里；
+ * 但也可能是裸的余额对象。两种都认 —— 少了这一步，积分口径的到期时刻会**恒为 0**
+ * （`creditExpiryOfUsage` 读的是 `credits[]`，而行对象上没有这个键）。
+ */
+function balanceOf(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value
+  const row = value as Record<string, unknown>
+  if (row.usage && typeof row.usage === 'object' && !Array.isArray(row.usage)) return row.usage
+  return row
+}
+
+/**
+ * 有效期时间戳（毫秒，0 = 读不到）。**按家分派口径**：
+ *
+ *   · 申报了 `credit_expiry` → 最早到期的积分批次（要传这一行的余额读数）；
+ *   · 其余家 → 凭证到期时刻（`expiryOf`，原口径不变）。
+ *
+ * 积分口径**不回落**令牌到期：access token 那个约一小时的读数是网关自己续期用
+ * 的，摆进「有效期」会被读成「这个账号快没了」。读不到就返回 0，由调用方
+ * 显示「—」。
+ */
 export function expiryAtOf(
   account: {
     provider?: string
@@ -228,7 +252,25 @@ export function expiryAtOf(
   session?: { accountFeatures?: Record<string, unknown> } | null,
 ): number {
   if (providerFacts(account.provider, session).creditExpiry) {
-    return creditExpiryOfUsage(usage) ?? 0
+    return creditExpiryOfUsage(balanceOf(usage)) ?? 0
   }
   return expiryOf(account, session)
+}
+
+/**
+ * 积分口径的「最先到期批次」—— 到期时刻 + **该批剩余积分** + 单位。
+ *
+ * 与 {@link expiryAtOf} 同源（同一份 `creditExpiryBatchOfUsage`），但多带出
+ * 这一批还剩多少分：只给「3 天后」的话，剩 20 分与剩 8,000 分长得一样，
+ * 处置优先级却完全不同。
+ *
+ * 凭证口径的家返回 `null`（它们没有「积分批次」这回事）。
+ */
+export function creditExpiryBatchOf(
+  account: { provider?: string; [key: string]: unknown },
+  usage?: unknown,
+  session?: { accountFeatures?: Record<string, unknown> } | null,
+): CreditExpiryBatch | null {
+  if (!providerFacts(account.provider, session).creditExpiry) return null
+  return creditExpiryBatchOfUsage(balanceOf(usage))
 }

@@ -21,11 +21,12 @@ import {
   type UsageSnapshot,
 } from '../api/gateway'
 import { accountName, formatExpiry, formatRelative, isRateLimited } from '../lib/format'
-import { expiryAtOf, hasCreditExpiry, hasExpiryReading, isLongLivedCredential, supportsUsage } from '../lib/providerFacts'
-import { usageIndex, usageText } from '../lib/usage'
+import { expiryAtOf, creditExpiryBatchOf, hasCreditExpiry, hasExpiryReading, isLongLivedCredential, supportsUsage } from '../lib/providerFacts'
+import { usageIndex, usageText, compact } from '../lib/usage'
 import { useDisplayClock } from '../../../ui-shared/use-display-clock'
 import { credentialExpiryRowsOf, credentialExpiryText } from '../../../ui-shared/credential-expiry'
-import { creditExpiryOfUsage } from '../../../ui-shared/usage-readings'
+import { usageUnitLabel } from '../../../ui-shared/usage-readings'
+import { creditExpiryUnitOf } from '../../../ui-shared/credit-expiry'
 import { upstreamCooldownOf, upstreamSuspendedReasonOf } from '../../../ui-shared/account-upstream-state'
 import { providerLabel } from '../lib/providers'
 import { usePolling } from '../lib/usePolling'
@@ -454,9 +455,24 @@ function AccountRow({
   // 积分口径的家两种「长期有效」都不适用（它读的是积分批次，不是凭证）。
   const creditMode = hasCreditExpiry(account.provider)
   const credentialRows = creditMode ? [] : credentialExpiryRowsOf(account, expiresAt)
+  // 积分口径：把「最先到期那一批还剩多少分」跟在时间后面 —— 只给「10 天后」的话，
+  // 剩 20 分与剩 8,000 分长得一样，处置优先级却完全不同。
+  const creditBatch = creditMode ? creditExpiryBatchOf(account, usageRow) : null
+  const creditPoints = creditBatch && creditBatch.remain !== null
+    ? (() => {
+      const unit = creditBatch.unit || creditExpiryUnitOf(usageRow?.usage)
+      const label = unit ? usageUnitLabel(unit, t) : ''
+      const value = compact(creditBatch.remain)
+      return label ? `${value} ${label}` : value
+    })()
+    : ''
   const expiryText = credentialRows.length ? ''
     : !creditMode && isLongLivedCredential(account.provider) ? t('长期有效')
-      : hasExpiryReading(account.provider) ? formatExpiry(expiresAt) : ''
+      : hasExpiryReading(account.provider)
+        ? (creditPoints
+          ? t('{text} · {points}', { text: formatExpiry(expiresAt), points: creditPoints })
+          : formatExpiry(expiresAt))
+        : ''
   // 余额：只有这家有查询能力时才占一行；快照里没有这一行 = 还没查过
   const usageView = usageText(usageRow, now)
   const showUsage = supportsUsage(account)

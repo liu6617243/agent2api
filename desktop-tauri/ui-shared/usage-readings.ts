@@ -219,14 +219,68 @@ export function recordReadingsOf(
  * 「剩余读不到」时不猜：只有明确读到 0 才排除（与 creditRowsOf 的 exhausted 同一取向）。
  */
 export function creditExpiryOfUsage(value: unknown, now = Date.now()): number | null {
-  let best: number | null = null
+  return creditExpiryBatchOfUsage(value, now)?.expireAt ?? null
+}
+
+/**
+ * 最先到期的「还能用」积分批次 —— 到期时刻 + **该批剩余多少** + 单位。
+ *
+ * ── 为什么把「这一批有多少分」一起带出来 ───────────────────────
+ * 「有效期」列原本只回答「什么时候过期」。但用户真正要判断的是
+ * 「**有多少钱要没了**」—— 一个 3 天后过期、只剩 20 分的批次，与一个
+ * 3 天后过期、还剩 8,000 分的批次，处置方式完全不同。所以到期时刻与
+ * 剩余积分必须成对出现，不能只给时刻。
+ *
+ * ── 剩余数从哪来 ──────────────────────────────────────────────
+ * 批次行自带的 `remain`（与 `total` / `used` 同一组）。顶层 `available`
+ * 是**全部批次之和**，不是这一批 —— 用它会把「总余额」当成「要过期的那批」，
+ * 数字看着大、其实无关。
+ *
+ * ── 单位：批次自己的优先，顶层兜底 ─────────────────────────────
+ * 批次行有的自带 `unit`（如 minimax 的「积分」），有的没有（workbuddy 的批次
+ * 只有 name/remain/expireAt）→ 顶层 `unit` 兜底；两处都没有就留空，由调用方
+ * 决定是省略单位还是写「分」。
+ *
+ * ── 与 {@link creditExpiryOfUsage} 的口径必须一致 ────────────────
+ * 判据完全同一份（跳过流水/快照/每日重置/不限量、排除已过期与剩余为 0 的批次），
+ * 只是多带两个字段。两者任何时候都要选出**同一批** —— 所以下面让
+ * `creditExpiryOfUsage` 变成这个函数的薄封装，而不是各写一遍遍历。
+ */
+export type CreditExpiryBatch = {
+  /** 该批次的作废时刻（毫秒） */
+  expireAt: number
+  /** 该批次的剩余积分；读不到就是 `null`（不猜） */
+  remain: number | null
+  /** 该批次的单位；批次与顶层都没给就是空串 */
+  unit: string
+  /** 该批次的名称（同一时刻可能有多个批次同名），用于 title */
+  name: string
+}
+
+/**
+ * 选出最先到期的「还能用」积分批次。
+ *
+ * 判据与 {@link creditExpiryOfUsage} 完全一致（那里有逐条口径说明），
+ * 这里只多带出该批次的剩余积分与单位。
+ */
+export function creditExpiryBatchOfUsage(value: unknown, now = Date.now()): CreditExpiryBatch | null {
+  let best: CreditExpiryBatch | null = null
   for (const pack of creditPacksOf(value)) {
     if (pack.snapshot === true || pack.record === true || pack.daily === true || pack.unlimited === true) continue
     const expire = usageNumberOrNull(pack.expireAt)
     if (expire === null || expire <= 0 || expire <= now) continue
     const remain = usageNumberOrNull(pack.remain)
     if (remain !== null && remain <= 0) continue
-    if (best === null || expire < best) best = expire
+    if (best !== null && expire >= best.expireAt) continue
+    best = {
+      expireAt: expire,
+      remain,
+      // **只放批次自己的单位**：顶层单位的归一口径（`totalLeft → 积分`、
+      // `credits → 积分`）在 `credit-expiry.ts` 的 `creditExpiryUnitOf` 里，
+      // 由调用方做「批次没有就用顶层」的兜底 —— 两边各填一次必然走偏。
+      unit: typeof pack.unit === 'string' ? pack.unit.trim() : '',
+      name: typeof pack.name === 'string' ? pack.name : '',
+    }
   }
   return best
 }

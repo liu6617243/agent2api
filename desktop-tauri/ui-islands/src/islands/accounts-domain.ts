@@ -38,7 +38,7 @@ import { providerFeatures, type ProviderFeatures } from './accounts-features'
 import { t } from '../i18n'
 import { limiterHit } from './accounts-limiter-model'
 import { accountReloginText } from './accounts-authorization'
-import { creditExpiryOfUsage } from '../../../ui-shared/usage-readings'
+import { creditExpiryOfUsage, creditExpiryBatchOfUsage, type CreditExpiryBatch } from '../../../ui-shared/usage-readings'
 import { upstreamCooldownOf, upstreamSuspendedReasonOf } from '../../../ui-shared/account-upstream-state'
 
 // 能力表与插件申报的读取在 accounts-features.ts（那边的模块头说明了查询顺序）。
@@ -714,6 +714,22 @@ export function supportsCreditDetail(account: AccountRecord | null | undefined):
  */
 export function creditExpiryOf(entry: UsageEntry, now = Date.now()): number | null {
   return creditExpiryOfUsage(entry, now)
+}
+
+/**
+ * 最先到期的「还能用」积分批次：**到期时刻 + 该批剩余积分 + 单位**。
+ *
+ * 「有效期」列要同时回答「什么时候过期」与「有多少分要过期」——
+ * 只给时刻的话，3 天后过期剩 20 分与 3 天后过期剩 8,000 分长得一模一样，
+ * 但处置方式完全不同。剩余数取**该批次自己的** `remain`，不是顶层
+ * `available`（那是全部批次之和）。
+ *
+ * 口径与 {@link creditExpiryOf} 完全同一份（实现见
+ * `ui-shared/usage-readings.ts` 的 `creditExpiryBatchOfUsage`），
+ * 两者永远选出同一批。
+ */
+export function creditExpiryBatchOf(entry: UsageEntry, now = Date.now()): CreditExpiryBatch | null {
+  return creditExpiryBatchOfUsage(entry, now)
 }
 
 /**
