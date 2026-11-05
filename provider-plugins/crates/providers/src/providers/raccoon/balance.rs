@@ -310,57 +310,35 @@ fn normalize_subscription(data: &Value) -> Value {
     })
 }
 
-async fn daily_bills(
+/// 拉取**收入类**积分账单（`type=income`）—— 签到判据的唯一数据源。
+///
+/// ── 为什么必须是收入视图，而不是「翻全量流水」──────────────────
+/// 判据要回答的是「**今天这笔每日发放有没有入账**」，而这笔账在全部流水里
+/// 占比极小：每次对话消耗都记一条 `desktop` 流水，活跃账号一天几百条，
+/// 每日发放那条几分钟内就被挤出窗口。实测（2026-11-05 本机账号）：
+///
+/// | 查询 | 请求数 | 耗时 | 今日 daily_grant |
+/// |---|---|---|---|
+/// | `type=all` 每页 20 翻 6 页（旧实现） | 最多 6 | 最坏 45 s | **翻不到**（在第 8 页） |
+/// | `type=income` 单页 20（本函数） | **1** | **0.22 s** | 第一页第 2 条 |
+///
+/// 上游 `type` 只认 `all` / `income`（其余取值 HTTP 400），`income` 精确过滤出
+/// 「发放 / 奖励」类。每日发放按自然日一条，20 条覆盖最近约 19 天，因此
+/// **不翻页**：翻页是给全量视图的补救手段，换成收入视图后就不该再存在 ——
+/// 那等于用「多翻几页」去兜一个「查错了视图」的问题。
+async fn income_bills(
     origin: &str,
     token: &str,
     headers: &[(String, String)],
-    today: &str,
 ) -> Result<Vec<Value>, GatewayError> {
-    let mut cursor = String::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut items = Vec::new();
-    for _ in 0..5 {
-        let query = {
-            let mut params = url::form_urlencoded::Serializer::new(String::new());
-            params.append_pair("paging.limit", &GRANT_CHECK_LIMIT.to_string());
-            params.append_pair("type", "all");
-            if !cursor.is_empty() {
-                params.append_pair("cursor", &cursor);
-            }
-            params.finish()
-        };
-        let path = format!("/api/web/points/v2/bills?{query}");
-        let data =
-            request_json_ex(origin, "GET", &path, token, headers, GRANT_CHECK_TIMEOUT_MS).await?;
-        let page = data
-            .get("items")
-            .and_then(Value::as_array)
-            .ok_or_else(|| GatewayError::with_status(502, "积分账单响应缺少 items"))?;
-        let reached_previous_day = page
-            .iter()
-            .any(|item| bill_date(item).is_some_and(|date| date.as_str() < today));
-        items.extend(page.iter().cloned());
-        if reached_previous_day || page.is_empty() {
-            break;
-        }
-        let next = data
-            .get("next_cursor")
-            .or_else(|| data.get("cursor"))
-            .or_else(|| data.pointer("/paging/next_cursor"))
-            .or_else(|| data.pointer("/paging/cursor"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let has_more = data
-            .get("has_more")
-            .or_else(|| data.pointer("/paging/has_more"))
-            .and_then(Value::as_bool)
-            .unwrap_or(!next.is_empty());
-        if !has_more || next.is_empty() || !seen.insert(next.to_string()) {
-            break;
-        }
-        cursor = next.to_string();
-    }
-    Ok(items)
+    let path = format!("/api/web/points/v2/bills?paging.limit={INCOME_BILLS_LIMIT}&type=income");
+    let data =
+        request_json_ex(origin, "GET", &path, token, headers, GRANT_CHECK_TIMEOUT_MS).await?;
+    let items = data
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| GatewayError::with_status(502, "积分账单响应缺少 items"))?;
+    Ok(items.to_vec())
 }
 
 fn bill_date(item: &Value) -> Option<String> {
@@ -410,22 +388,29 @@ fn to_int(value: Option<&Value>) -> Option<i64> {
 // ─── 每日「签到」（桌面登录积分发放）─────────────────────────
 //
 // 小浣熊没有 WorkBuddy 那种「每日签到」接口；它的每日奖励走的是**桌面端
-// 登录积分**链路：官方桌面客户端每次启动会打两个接口，服务端据此按天发放
-// 每日积分（1.x 源实现 account-balance.mjs / account-routes.mjs 的
-// desktop-grant 已验证）。这里复刻同一条链路作为「签到」：
-//   ① GET  /api/web/office/v3/setting_info —— **每日积分的发放触发器**
-//      （按天幂等），发放通知在响应的 point_grant_popups / point_grant_toast；
-//   ② GET  /api/web/points/v1/bills —— 核对今日实际入账，作为权威结果
-//      （账单接口慢，limit=20 实测约 9 秒，用独立超时兜底；失败降级，
-//      不影响 ① 的领取本身）。
+// 登录积分**链路：官方桌面客户端每次启动会打 setting_info，服务端据此按天
+// 发放每日积分。这里复刻同一条链路作为「签到」：
+//   ① GET /api/web/points/v2/bills?type=income —— 查**今天的发放有没有入账**
+//      （判据，见 `income_bills` 的说明：一页即命中，0.2 s）
+//   ② GET /api/web/office/v3/setting_info —— 每日积分的**发放触发器**
+//      （按天幂等；仅在 ① 显示今天还没入账时才打）
+//
+// 判据放在「收入视图」而不是「全量流水」上，是 2026-11-05 的修正：全量视图
+// 里每次对话消耗都占一条流水，活跃账号一天几百条，每日发放那条几分钟就被挤
+// 出窗口 —— 当时的实现只翻 6 页（120 条）就放弃，于是**明明已领到却报「尚未
+// 确认领取」**（实测 11-05 当天那条在第 8 页）。收入视图只含发放/奖励，一页
+// 20 条覆盖最近约 19 天，今天的必在第一页。
 //
 // 同一条 grant 接口里的**首次**桌面登录奖励（一次性 3000，新手福利）原先是
 // 本函数的第①步，已拆到新手任务分组（`onboarding.rs`，与 Loomy 同一入口），
 // 不再随每日签到执行 —— 一次性动作混进每日调度，之后每一轮都会白打一次。
 
-/// 账单核对的拉取条数与超时（源实现 GRANT_CHECK_LIMIT / GRANT_CHECK_TIMEOUT_MS）
-const GRANT_CHECK_LIMIT: usize = 20;
-const GRANT_CHECK_TIMEOUT_MS: u64 = 25_000;
+/// 收入视图的拉取条数。每日发放按自然日一条 → 20 条覆盖最近约 19 天，
+/// 足够覆盖「今天」且不必翻页（翻页是给全量视图的补救手段，收入视图不需要）。
+const INCOME_BILLS_LIMIT: usize = 20;
+/// 收入视图的超时。全量视图实测约 9 s/页，收入视图实测 **0.22 s**（2026-11-05），
+/// 10 s 已是宽松上限；失败只影响「能不能读到分值」，不影响发放本身。
+const GRANT_CHECK_TIMEOUT_MS: u64 = 10_000;
 
 /// 客户端身份头：官方桌面端启动时带的两个头（源实现 grantDesktopLoginPoints）。
 /// 每日签到（setting_info）与新手任务的首次登录奖励（`onboarding.rs`）共用。
@@ -471,57 +456,65 @@ pub async fn claim_daily_grant(ctx: &PluginCtx, account_id: &str) -> Result<Valu
     let mut org_headers = Vec::new();
     super::headers::append_org(&mut org_headers, &credentials.org_code)
         .map_err(|message| GatewayError::with_status(400, message))?;
-    let previous = match daily_bills(&origin, &credentials.token, &org_headers, &today).await {
+    // ① 先查今天的发放有没有入账（收入视图，一页即命中，见 `income_bills`）。
+    //    已入账 = 今天已经领过了 —— 这是**状态**，不是「在流水里翻到了什么」。
+    let previous = match income_bills(&origin, &credentials.token, &org_headers).await {
         Ok(items) => Some(
             items
-                .into_iter()
-                .filter_map(|item| daily_grant(&item, &today))
+                .iter()
+                .filter_map(|item| daily_grant(item, &today))
                 .collect::<Vec<_>>(),
         ),
         Err(error) if error.status_code == 401 => return Err(error),
+        // 查不到就当作「未知」：不阻断流程，交给下面的触发 + 复核
         Err(_) => None,
     };
     let already_completed = previous.as_ref().is_some_and(|items| !items.is_empty());
 
-    // ① 每日积分发放触发器（按天幂等）。失败必须体现在结果里 ——
-    //    这步不成功当日就没有发放，账单核对会给出「今日未见入账」
-    let mut settings_headers = desktop_client_headers();
-    super::headers::append_org(&mut settings_headers, &credentials.org_code)
-        .map_err(|message| GatewayError::with_status(400, message))?;
-    settings_headers.push(("X-Raccoon-Language".to_string(), "zh".to_string()));
-    let settings_path = if credentials.org_code.is_empty() {
-        "/api/web/office/v3/setting_info"
+    // ② 今天还没入账才触发发放（setting_info 按天幂等）。
+    //    已入账时整段跳过：触发本来也不会重复发放，但少一次上游请求，
+    //    也不必为一次「早就领过」的签到去讨要官方客户端的发放通知。
+    let settings = if already_completed {
+        json!({ "popups": [], "toast": Value::Null })
     } else {
-        "/api/web/org/user/office/v1/setting_info"
-    };
-    let settings = match request_json_ex(
-        &origin,
-        "GET",
-        settings_path,
-        &credentials.token,
-        &settings_headers,
-        REQUEST_TIMEOUT_MS,
-    )
-    .await
-    {
-        Ok(data) => {
-            // 发放通知原样透出（结构与上游一致，界面不深入解析）
-            json!({
-                "popups": data.get("point_grant_popups").cloned().unwrap_or(Value::Null),
-                "toast": data.get("point_grant_toast").cloned().unwrap_or(Value::Null),
-            })
+        let mut settings_headers = desktop_client_headers();
+        super::headers::append_org(&mut settings_headers, &credentials.org_code)
+            .map_err(|message| GatewayError::with_status(400, message))?;
+        settings_headers.push(("X-Raccoon-Language".to_string(), "zh".to_string()));
+        let settings_path = if credentials.org_code.is_empty() {
+            "/api/web/office/v3/setting_info"
+        } else {
+            "/api/web/org/user/office/v1/setting_info"
+        };
+        match request_json_ex(
+            &origin,
+            "GET",
+            settings_path,
+            &credentials.token,
+            &settings_headers,
+            REQUEST_TIMEOUT_MS,
+        )
+        .await
+        {
+            Ok(data) => {
+                // 发放通知原样透出（结构与上游一致，界面不深入解析）
+                json!({
+                    "popups": data.get("point_grant_popups").cloned().unwrap_or(Value::Null),
+                    "toast": data.get("point_grant_toast").cloned().unwrap_or(Value::Null),
+                })
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
     };
 
-    // ② 账单核对今日入账（慢接口独立超时；失败降级为 grantsError）。
+    // ③ 复核今日入账（同一个收入视图）。已入账时直接用 ① 的结果，省一次请求。
     // 「今天」按**北京时间**（上游自然日即 UTC+8 零点，见 `core::beijing`），
     // 不跟机器时区：海外 / 容器部署下跟本地时区走会把 16 小时的账单认成昨天，
     // 让「今日积分 +N」与「今天已领过」的判定整体错位（issue #138）。
     let (grants, grants_error) = if already_completed {
         (previous.unwrap_or_default(), None)
     } else {
-        match daily_bills(&origin, &credentials.token, &org_headers, &today).await {
+        match income_bills(&origin, &credentials.token, &org_headers).await {
             Ok(items) => (
                 items
                     .iter()
@@ -538,22 +531,32 @@ pub async fn claim_daily_grant(ctx: &PluginCtx, account_id: &str) -> Result<Valu
         .iter()
         .map(|item| to_int(item.get("points")).unwrap_or(0))
         .sum::<i64>();
+    // 「查过、今天确实没有入账」与「没查到」是两回事：前者是上游给出的确定
+    // 状态（可能今天额度已用完），后者是核对失败（网络/接口），下次还能再试。
+    // 上游把这两者混在一个 `success=false` 里时，调用方只能靠猜文案 —— 这里
+    // 显式分出来，`checkin_report_of` 就不必再 `contains("未见")`。
+    let unsettled = !already_completed && granted_today == 0 && grants_error.is_none();
     let mut msg_parts: Vec<String> = Vec::new();
     if granted_today > 0 {
-        msg_parts.push(format!("今日积分 +{granted_today}"));
+        msg_parts.push(if already_completed {
+            format!("今日已领取 +{granted_today}")
+        } else {
+            format!("今日积分 +{granted_today}")
+        });
     } else if grants_error.is_some() {
-        // 账单核对失败拿不到权威结果，不谎报成功
+        // 核对失败拿不到权威结果，不谎报成功
         msg_parts.push("未能核对今日入账".to_string());
     } else {
-        msg_parts.push("今日未见积分入账，尚未确认领取".to_string());
+        msg_parts.push("今日发放未入账".to_string());
     }
     if let Some(error) = grants_error.as_deref() {
-        msg_parts.push(format!("账单核对失败：{error}"));
+        msg_parts.push(format!("入账核对失败：{error}"));
     }
 
     Ok(json!({
         "success": granted_today > 0,
         "alreadyCompleted": already_completed,
+        "unsettled": unsettled,
         "msg": msg_parts.join("；"),
         "grantsToday": grants,
         "settings": settings,

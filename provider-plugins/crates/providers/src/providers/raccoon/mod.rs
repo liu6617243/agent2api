@@ -671,12 +671,18 @@ fn checkin_report_of(claim: &Value) -> proto::CheckinReport {
         })
         .filter(|points| *points > 0)
         .map(|points| format!("{points} 积分"));
-    let text = message.clone().unwrap_or_default();
+    // 状态一律读结构化字段 —— 文案是给人看的，改一个字就断的判据不算判据
+    // （旧版靠 `contains("未见")` 认态，本次调整文案就会让 outcome 整体漂移）。
+    let unsettled = claim.get("unsettled").and_then(Value::as_bool) == Some(true);
+    let unverified = claim.get("grantsError").is_some_and(|value| !value.is_null());
     let outcome = if claim.get("alreadyCompleted").and_then(Value::as_bool) == Some(true) {
+        // 今天早先已经领过（收入视图里已有今天的发放记录）
         proto::CheckinOutcome::Done
     } else if success {
         proto::CheckinOutcome::Claimed
-    } else if text.contains("未见") || text.contains("未能核对") {
+    } else if unsettled || unverified {
+        // unsettled = 查过、今天确实没入账；unverified = 没查到。
+        // 两者都不是「签到动作本身失败」，归 Inactive 交给调度侧决定要不要再来。
         proto::CheckinOutcome::Inactive
     } else {
         proto::CheckinOutcome::Failed
