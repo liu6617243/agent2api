@@ -149,7 +149,9 @@ pub(super) async fn query_usage(ctx: &PluginCtx, account_id: &str) -> Result<Val
     // 读失败静默跳过：余额本身已经在手，明细不该把它一起拖垮。
     let mut credits = credits;
     if let Ok(items) = income_bills(&origin, &credentials.token, &org_headers).await {
-        credits.extend(grant_packs(&items));
+        // `daily_points` 是「每日积分」池的余额 —— `grant_packs` 拿它按到期日
+        // 升序摊出每批还剩多少（见那个函数的说明）
+        credits.extend(grant_packs(&items, to_int(points.get("daily_points"))));
     }
 
     // 订阅失败只记原因，不阻断余额展示（见上）
@@ -380,20 +382,30 @@ fn daily_grant(item: &Value, today: &str) -> Option<Value> {
     }))
 }
 
-/// 收入账单里的「发放」记录 → `credits[]` 的批次行（带**毫秒** `expireAt`）。
+/// 收入账单里的「发放」记录 → `credits[]` 的批次行（带毫秒 `expireAt` 与 `remain`）。
 ///
-/// ── 为什么没有 `remain` ────────────────────────────────────
-/// 上游的发放记录只有**发放额**（`points`）和到期时刻（`expire_at`），
-/// 「这一笔还剩多少」不给 —— 客户端自己的积分明细页也只显示「+300」。
-/// 剩余是**池子级**的（`daily_points` 一个数），要摊到具体批次上就得先假设
-/// 消耗顺序，那是编数。所以批次行只写 `total`（发放额）与 `expireAt`：
-/// 界面显示「X 天后到期」，不显示「还剩 N 分」。
+/// ── 剩余是怎么来的 ────────────────────────────────────────
+/// 上游**不给**「这一批还剩多少」，但能算出来：
+///
+/// 1. 客户端的消耗规则原文是「**同类内按到期日/入账时间排序**」—— 即先到期先扣；
+/// 2. 余额接口的 `daily_points` 就是这些未过期批次的池子余额；
+/// 3. 于是 `已消耗 = Σ未过期批次发放额 − daily_points`，再按到期日升序逐批扣。
+///
+/// 实测校验（2026-11-05 23:46）：7 批 × 300 = 2100，`daily_points = 1885`，
+/// 已消耗 215 → 最早那批（10-30 发放）应剩 85；同一时刻账单里正躺着一条
+/// `daily_expire`：「每日积分到期清零 -85，grant_at 2026-10-30，expire_at 11-05 23:59」
+/// —— **逐字对上**，所以这个摊法不是猜的。
+///
+/// 拿不到 `daily_points` 时**不写 `remain`**（只给时间）：宁可少一个数，
+/// 也不编一个「还剩满额」。
 ///
 /// 只保留**未过期**且 `points > 0` 的：已作废的批次对「还有多久到期」没有
 /// 意义，留在明细里只是噪音（实测 20 条收入里前 13 条早已过期）。
-fn grant_packs(items: &[Value]) -> Vec<Value> {
+fn grant_packs(items: &[Value], daily_balance: Option<i64>) -> Vec<Value> {
     let now = crate::http::now_ms();
-    let mut rows = Vec::new();
+    // (到期毫秒, 发放额, 展示名)。先收集再排序：账单是**倒序**（最新在前），
+    // 直接按账单顺序摊消耗会把余量算到错误的那一批上。
+    let mut batches: Vec<(i64, i64, String)> = Vec::new();
     for item in items {
         let Some(expire) = expire_at_millis(item) else {
             continue;
@@ -416,11 +428,38 @@ fn grant_packs(items: &[Value]) -> Vec<Value> {
             Some(date) if date.len() >= 10 => format!("{name} · {}", &date[5..10]),
             _ => name.to_string(),
         };
-        rows.push(json!({
-            "name": label,
-            "total": points,
-            "expireAt": expire,
-        }));
+        batches.push((expire, points, label));
+    }
+    batches.sort_by_key(|(expire, _, _)| *expire);
+
+    let mut rows = Vec::new();
+    match daily_balance {
+        Some(balance) => {
+            let total: i64 = batches.iter().map(|(_, points, _)| *points).sum();
+            // 仅当池子余额**小于**发放总额时才有消耗；大于等于时按 0 处理
+            // （多出来的是别的池子串味或上游延迟，不该反推出负消耗）
+            let mut used = (total - balance).max(0);
+            for (expire, points, label) in batches {
+                let take = used.min(points);
+                used -= take;
+                rows.push(json!({
+                    "name": label,
+                    "total": points,
+                    "remain": points - take,
+                    "expireAt": expire,
+                }));
+            }
+        }
+        None => {
+            // 拿不到池子余额就不摊剩余：宁可只显示时间，也不编「还剩满额」
+            for (expire, points, label) in batches {
+                rows.push(json!({
+                    "name": label,
+                    "total": points,
+                    "expireAt": expire,
+                }));
+            }
+        }
     }
     rows
 }
