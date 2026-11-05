@@ -122,6 +122,19 @@ pub async fn query_usage(ctx: &PluginCtx, account: &str) -> Result<Value, Gatewa
     let mut wallets: Vec<Value> = Vec::new();
     let now = crate::http::now_ms();
     if let Some(items) = details {
+        // ── 批次没取全要如实说（2026-11-05）────────────────────────
+        // 上游**只认 `page_size`（上限 100）且没有翻页能力**（见
+        // `endpoints::credit_url` 的实测记录）。批次超过 100 时这里拿到的
+        // 就是**残缺**的：余额偏小，且漏掉的恰是最先过期的那几批。
+        // 这时**不能**让读数假装完整 —— 记一笔，把差额如实报出去。
+        if let Some(declared) = payload.get("total_count").and_then(Value::as_i64) {
+            let got = items.len() as i64;
+            if got < declared {
+                crate::logging::verbose("[MiniMax]", &format!(
+                    "积分批次未取全：上游声明 {declared} 批，实到 {got} 批（page_size 上限 100 且无翻页）—— 余额与「最先过期」都可能不准"
+                ));
+            }
+        }
         for item in items {
             let remaining = number_of(item, "remaining_amount");
             total += remaining;

@@ -120,6 +120,20 @@ pub fn signin_claim_url() -> String {
 }
 
 /// 余额明细端点完整地址（`balance.rs` 查询用）
+///
+/// ── `page_size=100` 不是可选项，是**必需的**（2026-11-05 实测）─────────
+/// 不带参数时上游只回**前 20 条**，而 `total_count` 给的是**全量**批次数
+/// （本账号 26 批）→ Σ `remaining_amount` 漏掉最老那几批，余额比官网少
+/// （实测 12,624 vs 官网 14,299，**差 1,675**）。
+///
+/// 上游**没有翻页能力**：`page` / `page_index` / `pageNo` / `offset` / `start`
+/// / `from` / `skip` / `cursor` / `index` 一整批试下来，返回的都是同一页；
+/// **只认 `page_size`**。而 `page_size` **上限 100**（≥200 直接 HTTP 400）。
+/// 批次超过上限时取不全 —— `balance.rs` 会比对 `total_count` 并如实提示。
+///
+/// 顺带记一笔：详情按**到期降序**排（`page_size=100` 时首条是最晚到期那条），
+/// 所以漏掉的恰好是**最先过期**的几批 —— 既让余额偏小，也让「最先过期」的
+/// 提示落在错的批次上。
 pub fn credit_url() -> String {
-    format!("{}{CREDIT_PATH}", api_base_url())
+    format!("{}{}?page=1&page_size=100", api_base_url(), CREDIT_PATH)
 }
