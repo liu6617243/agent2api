@@ -207,7 +207,16 @@ pub async fn prepare_account(payload: &Value, site: Site) -> Result<Credentials,
     }
     let pat = credentials::secret(payload, &["pat", "personalAccessToken", "personal_token"])?;
     if !pat.is_empty() {
-        return exchange_pat(&pat, site, None).await;
+        let mut credentials = exchange_pat(&pat, site, None).await?;
+        // 同一次粘贴里若还带了网页会话 cookie，必须在这里接上。
+        //
+        // PAT 那条链（`exchange_pat`）整个是「令牌换令牌」，它构造的
+        // `Credentials` 里 `session_cookie` 恒为空 —— 于是「我贴了 PAT 又贴了
+        // cookie、想直接看到积分批次明细」会静默退化成「只有聚合余额」，
+        // 而且记录里看起来一切正常（`to_value()` 照样回写一个空值）。
+        // 字段名集合与 `Credentials::from_payload` 保持同一份，别各认一套。
+        credentials.session_cookie = credentials::session_cookie_of(payload);
+        return Ok(credentials);
     }
     let mut credentials = Credentials::from_payload(payload)?;
     credentials.set_site(site);

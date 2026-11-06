@@ -263,11 +263,22 @@ impl Provider for QoderProvider {
         // 账号行：四站能力一致（各家都要申报，漏一个会让那家掉进兜底）。
         //   `credit_detail` —— Qoder 三个桶各一行（套餐额度 / 个人资源包 /
         //     组织资源包）；千问办公是「积分 + 三档池」各一行。
+        //   `credit_expiry` —— 「有效期」列按**积分批次**读，不按凭证到期读。
+        //     Qoder 的积分是「每天领 100、30 天有效」的一叠资源包，每批各有
+        //     `expires_at`（见 `balance.rs` 的 `web_credit_packs`）；不申报这一位，
+        //     那一列会退回读访问令牌的 `expiresAt`，显示成「凭证还剩几天」——
+        //     与「哪笔钱先过期」完全无关。漏了它就是 raccoon 那次「8 天后」的同一个坑。
+        //     **但只给 Qoder 两个站点开**：`meta()` 是四站共用的，而千问办公的
+        //     `qwenwork_document()` 逐行都不带 `expireAt`（`credit_row(..., None, ...)`
+        //     的到期位一律传 None，只有 `subscription.expireAt` 那个套餐续期时刻）。
+        //     给它开这一位，`CreditExpiryCell` 会因为「没有会到期的批次」而恒显示
+        //     「—」，把原本能看的凭证到期也弄丢 —— 比不开更糟。
         //   `edition` —— 公开形态带 `edition` 供徽章显示。
         //   `email_as_name` —— 本家账号以邮箱报名字。
         .with_account_features(proto::AccountFeatures {
             usage: true,
             credit_detail: true,
+            credit_expiry: !self.site.is_qwenwork(),
             edition: true,
             identifier: vec!["uid".to_string(), "userId".to_string()],
             expiry: vec!["expiresAt".to_string()],

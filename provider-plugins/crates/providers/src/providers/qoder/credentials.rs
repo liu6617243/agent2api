@@ -35,6 +35,9 @@ pub const REFRESH_MARGIN_MS: i64 = 5 * 60 * 1000;
 /// 「到期那一刻恰好有流量」。代价是每 7 天多一次续期请求，可忽略。
 pub const QWENWORK_REFRESH_MARGIN_MS: i64 = 60 * 60 * 1000;
 
+/// 网页会话 cookie 的长度上限（字符）。与 `from_payload` 的截断口径一致。
+pub const MAX_COOKIE_LENGTH: usize = 8192;
+
 #[derive(Clone)]
 pub struct Credentials {
     pub site: Site,
@@ -103,11 +106,8 @@ impl Credentials {
             machine_id,
             // 可选字段：只认显式的三个名字，不用泛化的 `cookie`
             // （账号记录里可能出现无关的 cookie 字段，认错会拿它去打网页接口）。
-            session_cookie: text(payload, &["sessionCookie", "session_cookie", "webCookie"])
-                .trim()
-                .chars()
-                .take(8192)
-                .collect(),
+            // 多行粘贴在这里压成单行，理由见 `normalize_cookie()` 的文档。
+            session_cookie: session_cookie_of(payload),
         };
         if parts.len() == 1 && !refresh.is_empty() {
             credentials.refresh_token =
@@ -195,8 +195,60 @@ impl Credentials {
             "email": text_or_null(&self.email),
             "nickname": text_or_null(&self.name),
             "machineId": text_or_null(&self.machine_id),
+            // 网页会话 cookie：**必须原样回写**。它不是刷新产物（openapi 那条链
+            // 根本不碰它），却是 `web_credit_packs` 读积分批次明细的唯一凭证。
+            // 早期版本漏了这一项，后果是「用户粘贴时带了 cookie、落库时被丢掉」，
+            // 于是批次明细永远读不出来、有效期列永远空着 —— 排查起来会一路怀疑
+            // 上游接口，因为记录里看起来「什么都没少」。
+            "sessionCookie": text_or_null(&self.session_cookie),
         })
     }
+}
+
+/// 从 payload 里取网页会话 cookie 并规整成**可单行进 HTTP 头**的形态。
+///
+/// 两个入口（`from_payload` / PAT 分支）共用这一份，别再各写一套。
+/// 字段名只认显式的三个：账号记录里可能出现无关的 `cookie` 键，认错会拿它去
+/// 打网页接口。
+///
+/// 名字带 `_of` 是为了不和 `Credentials::session_cookie` 那个同名字段混淆。
+pub fn session_cookie_of(payload: &Value) -> String {
+    normalize_cookie(&text(payload, &["sessionCookie", "session_cookie", "webCookie"]))
+}
+
+/// 把一段原始 cookie 文本压成**单行**（`a=1; b=2`）。
+///
+/// 为什么要压平换行：用户最常见的来源是浏览器的「Copy as cURL」或整段请求头，
+/// 那里 `Cookie:` 后面常跟若干行 `name=value;`。换行原样塞进 `Cookie` 头会让
+/// 请求行在第一个 `\r\n` 处断掉 —— 上游回 401/400，而 `web_credit_packs` 对
+/// 失败是**静默降级**（返回空、界面只少几行明细），用户完全看不出是粘贴格式
+/// 的锅。压成一行、分号补全后，两种粘贴形态都能用。
+///
+/// 读取侧也过这一遍（不只是写入侧）：早期版本可能已经把多行串落了库，
+/// 只在写入处规整的话，那些老记录要重新添加一次才能恢复。
+pub fn normalize_cookie(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    // 每行去空白 → 剥掉可能连头名一起复制的 `Cookie:` → 丢空行 →
+    // 行尾没有 `;` 的补一个 → 空格连接。
+    let body = raw
+        .lines()
+        .map(str::trim)
+        .map(|line| {
+            let line = line
+                .strip_prefix("Cookie:")
+                .or_else(|| line.strip_prefix("cookie:"))
+                .unwrap_or(line);
+            line.trim()
+        })
+        .filter(|line| !line.is_empty())
+        .map(|line| if line.ends_with(';') { line.to_string() } else { format!("{line};") })
+        .collect::<Vec<_>>()
+        .join(" ");
+    // 末尾那个 `;` 是合法的（`a=1; b=2;` 与 `a=1; b=2` 等价），去掉更整洁。
+    body.trim_end_matches(';').trim().chars().take(MAX_COOKIE_LENGTH).collect()
 }
 
 /// 从 payload 的兼容字段（`mode` / `edition`）解析站点。

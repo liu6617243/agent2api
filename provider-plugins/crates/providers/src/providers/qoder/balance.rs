@@ -236,13 +236,17 @@ async fn web_credit_packs(
     credentials: &Credentials,
     proxy: Option<&ResolvedProxy>,
 ) -> Vec<Value> {
-    let cookie = credentials.session_cookie.trim();
+    // 老记录里可能存着多行粘贴（早期只在写入侧 trim，没压平换行）；读取侧再过
+    // 一遍，免得那些账号必须重新添加一次才恢复。见 `credentials::normalize_cookie`。
+    // 用全路径：这个函数把参数也命名为 `credentials`，写 `credentials::` 会让人
+    // 误以为是那个绑定上的方法。
+    let cookie = super::credentials::normalize_cookie(&credentials.session_cookie);
     if cookie.is_empty() {
         return Vec::new();
     }
     let origin = credentials.site.web_origin();
     let headers = vec![
-        ("Cookie".to_string(), cookie.to_string()),
+        ("Cookie".to_string(), cookie),
         ("Accept".to_string(), "application/json".to_string()),
         // 网页 BFF 的前端固定发这几个（抓包逐字复刻），缺 csrf 头会被判非法请求
         (
