@@ -196,6 +196,13 @@ export type AccountRecord = {
   isGuest?: boolean
   hasBalanceToken?: boolean
   /**
+   * Qoder 系（两个地区）：记录里有没有非空的**网页会话 cookie**（后端
+   * `plugin_public::credential_fields` 派生）。设置弹窗用它显示「已配置 /
+   * 未配置」与有无「清除」按钮 —— **值本身绝不透出**（那是能读网页 BFF 的
+   * 完整会话，与令牌同级）。
+   */
+  hasSessionCookie?: boolean
+  /**
    * 自定义账号：记录里有没有非空 `apiKey`（设置弹窗据此决定输入框的提示文案与
    * 有无「清除」按钮）。**值本身绝不透出**，后端只给这个布尔。
    */

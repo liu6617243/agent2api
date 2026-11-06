@@ -604,6 +604,23 @@ export function accountEdition(account: AccountRecord | null | undefined): 'cn' 
   return account?.edition === 'intl' ? 'intl' : 'cn'
 }
 
+/**
+ * 这个账号能不能手动补一条**网页会话 cookie**（Qoder 两家独有）。
+ *
+ * 为什么不是能力位：cookie 不改变账号的能力（转发一直可以），它只是让
+ * 「逐批积分到期」那一列有读数（插件 `qoder/balance.rs::web_credit_packs`
+ * 读网页 BFF，PAT 那条链拿不到）。所以设置弹窗按这个判据决定**是否渲染
+ * 输入框**，而不是拿它去关掉什么功能。
+ *
+ * 判据是 provider id（与后端 `account_store::is_qoder_family` 同一口径）：
+ * 两个地区的 cookie 键名与用法一致，只是站点主机不同。cookie 值本身永不
+ * 下发（后端只给 `hasSessionCookie` 布尔），输入框因此恒为空。
+ */
+export function supportsSessionCookie(account: AccountRecord | null | undefined): boolean {
+  const provider = providerOf(account)
+  return provider === 'qoder' || provider === 'qoder-intl'
+}
+
 /** ZCode 的两条上游通道取值（与后端 `providers::zcode` 的常量逐字一致） */
 export const ZCODE_PLAN_CODING = 'coding-plan'
 export const ZCODE_PLAN_START = 'start-plan'

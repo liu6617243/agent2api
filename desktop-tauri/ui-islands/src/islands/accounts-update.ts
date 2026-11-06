@@ -70,6 +70,9 @@ export function accountPatchConfirmed(account: AccountRecord, patch: Record<stri
         && sameValue(normalizedGroups(account.limiterGroups), normalizedGroups(value as LimiterGroup[]))
     }
     if (key === 'balanceToken') return account.hasBalanceToken === (value !== null && value !== '')
+    // Qoder 的网页会话 cookie：与余额凭证同一口径 —— 只回读「有没有」这个布尔
+    // （值永不下发）。传 null / 空串 = 清除，非空 = 已写入。
+    if (key === 'sessionCookie') return account.hasSessionCookie === (value !== null && value !== '')
     if (key === 'apiKey') return account.hasApiKey === (value !== null && value !== '')
     // 账号级上游地址覆盖项：null / 空串 = 清除（公开形态里就不再出现这个键）
     if (key === 'baseUrl') {

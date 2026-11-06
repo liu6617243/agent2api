@@ -3,7 +3,7 @@
 import * as React from 'react'
 import {
   Badge, BadgeDot, Button, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader,
-  DialogTitle, Input, NavList, NavItem, Sidebar, Switch,
+  DialogTitle, Input, NavList, NavItem, Sidebar, Switch, Textarea,
   Field, FieldDescription, FieldLabel,
 } from '@ui'
 import '../styles/accounts-settings-dialog.css'
@@ -13,8 +13,8 @@ import {
   type AccountRecord, type LimiterGroup,
 } from './accounts-shared'
 import {
-  displayNameOf, providerFeatures, providerOf, supportsPlanChannel, supportsUsage,
-  isOpencodeZenProvider, zcodePlanOf,
+  displayNameOf, providerFeatures, providerOf, supportsPlanChannel, supportsSessionCookie,
+  supportsUsage, isOpencodeZenProvider, zcodePlanOf,
 } from './accounts-domain'
 import { PlanChannelField } from './accounts-zcode-plan'
 import {
@@ -45,6 +45,20 @@ function labelOf(account: AccountLike | null | undefined): string {
   return displayNameOf(account) || account?.id || ''
 }
 
+/**
+ * cookie 草稿 → 要不要提交。
+ *
+ * 「留空 = 不修改」是这个输入框的契约（原值不回显，见后端 `hasSessionCookie`）：
+ * 把空当作清除的话，用户每次保存别的设置都会顺手删掉配好的 cookie。所以这里
+ * 只把**真的填了东西**当成改动，清除交给那个显式按钮。
+ *
+ * 尾部的分号也剥掉再判：用户常整段粘 `a=1; b=2;`，只剩分号时后端压平后是空串
+ * —— 那会被解释成「清除」，成了一次意图外的撤销，还让回读校验判成「未确认」。
+ */
+function cookieDraftValue(raw: string): string {
+  return raw.trim().replace(/;+$/, '').trim()
+}
+
 export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane = 'basic', routeContext }: {
   id: string; onClose: () => void
   initialAccount?: AccountRecord
@@ -57,6 +71,10 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   const [name, setName] = React.useState(account?.name || '')
   const [proxyDraft, setProxyDraft] = React.useState<ProxyDraft>(() => draftOfProxy(account?.proxy))
   const [balanceToken, setBalanceToken] = React.useState('')
+  // Qoder 的**网页会话 cookie** 草稿（只有两家 Qoder 有这一项；别家恒为空串，
+  // 那一段也不渲染）。空 = 不修改：值不回显（后端只给 `hasSessionCookie` 布尔），
+  // 清除走那个显式按钮 —— 与余额凭证同一形制。
+  const [cookieDraft, setCookieDraft] = React.useState('')
   // ZCode 的「使用哪个套餐」草稿（非 ZCode 账号恒为空串，那一段也不渲染）
   const [planChannel, setPlanChannel] = React.useState(() => zcodePlanOf(account))
   const [busy, setBusy] = React.useState(false)
@@ -147,6 +165,9 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   const target: AccountRecord = account
   const peers = peersOf(target, allAccounts())
   const isCatpaw = providerOf(target) === 'catpaw'
+  // Qoder 两家（中国版 / 国际版）：设置里比别家多一行「网页会话 cookie」
+  // （判据与后端 `account_store::is_qoder_family` 同一口径）
+  const isQoder = supportsSessionCookie(target)
   // 自定义账号：凭证段（API Key / 无需鉴权）只对它渲染。判据用 provider 前缀 ——
   // 与后端 `custom_account_provider` 一致（提供商被删后残留的账号同样该能改凭证）
   const isCustomAccount = providerOf(target).startsWith('custom-')
@@ -175,7 +196,9 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   const same = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right)
   const dirtyPanes: Record<PaneId, boolean> = {
     basic: enabled !== before.enabled || allowRouteSkip !== before.allowRouteSkip
-      || (name.trim() || before.name) !== before.name || concDraft !== before.concDraft,
+      || (name.trim() || before.name) !== before.name || concDraft !== before.concDraft
+      // 网页会话 cookie（Qoder）：输入框恒为空（原值不回显），填了就是待保存的改动
+      || Boolean(cookieDraftValue(cookieDraft)),
     credential: Boolean(balanceToken.trim() || apiKeyDraft.trim())
       || noAuthDraft !== before.noAuthDraft || planChannel !== before.planChannel,
     query: !same(usageDraft, before.usageDraft) || !same(balanceQueryDraft, before.balanceQueryDraft),
@@ -226,6 +249,36 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
       setAccount(saved)
       setBalanceToken('')
       toast(t('✅ 已清除余额查询凭证'))
+      try {
+        await refreshSavedAccounts()
+      } catch (error) {
+        toast(t('账号已保存，但列表刷新失败：{error}', { error: errorMessage(error) }), 'err')
+      }
+    } catch (error) {
+      toast(t('清除失败：{error}', { error: errorMessage(error) }), 'err')
+    } finally {
+      actionLock.current = false
+      setBusy(false)
+    }
+  }
+
+  /**
+   * 清除 Qoder 的网页会话 cookie（与余额凭证同一形制：立即落库的独立撤销动作）。
+   *
+   * cookie 过期后「有效期」列会退回按凭证到期算 —— 界面看得到后果；清除不
+   * 影响转发（PAT / 登录态那条链不读它）。
+   */
+  async function clearSessionCookie(): Promise<void> {
+    if (interactionBusy || actionLock.current) return
+    if (!await askConfirmation(t('清除网页会话 cookie？'),
+      t('确认后立即生效，不受底部保存按钮控制。「有效期」列将退回按凭证到期计算，转发不受影响。'), t('清除'), true)) return
+    actionLock.current = true
+    setBusy(true)
+    try {
+      const saved = await updateAccountConfirmed(id, { sessionCookie: null })
+      setAccount(saved)
+      setCookieDraft('')
+      toast(t('✅ 已清除网页会话 cookie'))
       try {
         await refreshSavedAccounts()
       } catch (error) {
@@ -439,6 +492,12 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
       // 输入框永远是空的；若把「空」解释成清除，用户每次保存设置都会把配好的凭证删掉）。
       // 清除走上面那个显式按钮。
       const balancePatch = isCatpaw && balanceToken.trim() ? { balanceToken: balanceToken.trim() } : {}
+      // Qoder 的网页会话 cookie：与上面同一形制 —— 空值 = 不修改（原值不回显，
+      // 把「空」当清除会让每次保存设置都删掉配好的 cookie），清除走那个显式按钮。
+      // 尾部只剩分号时也按「没填」处理：后端压平后是空串 = 清除，那会让这次保存
+      // 变成一次意图外的撤销（`accountPatchConfirmed` 也会因此判「结果未确认」）。
+      const cookieValue = cookieDraftValue(cookieDraft)
+      const cookiePatch = isQoder && cookieValue ? { sessionCookie: cookieValue } : {}
       // 套餐通道：只在**真的改了**时才带上（取值与后端 `zcode::normalize_plan`
       // 逐字一致）。带一个没变的键不会出错，但会让后端那句「套餐通道 → …」的
       // 变更提示在每次保存设置时都出现一次，看起来像刚改过
@@ -455,6 +514,7 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
         allowRouteSkip,
         proxy,
         ...balancePatch,
+        ...cookiePatch,
         ...planPatch,
         ...credentialPatch,
         ...concPatch,
@@ -466,6 +526,9 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
         throw new Error(t('账号更新结果未确认，请刷新后核对设置'))
       }
       setAccount(saved)
+      // cookie 已落库：草稿清空 —— 否则「提供商那一段失败而留在弹窗里」的后续
+      // 渲染会继续把已保存的 cookie 当成未保存的改动（保存按钮一直亮着）
+      if (cookiePatch.sessionCookie) setCookieDraft('')
       // 提供商那一段排在账号之后（账号是本弹窗的主角，先落库）。它失败时账号已经存下了，
       // 所以留在弹窗里把那句话说清楚 —— 笼统报成「保存失败」会把两件事混成一件
       if (providerPatch) {
@@ -599,6 +662,25 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
                             value={name} onChange={event => setName(event.currentTarget.value)} />
                         </Field>
                         <div className='acct-dlg-readonly'><span>{t('账号 ID')}</span><code>{target.id}</code></div>
+                        {isQoder ? <Field className='acct-dlg-field acct-dlg-cookie-field'>
+                          <div className='acct-dlg-field-head'>
+                            <FieldLabel htmlFor='account-session-cookie'>{t('网页会话 cookie')}</FieldLabel>
+                            <span className='acct-dlg-cookie-actions'>
+                              <Badge shape='tag' variant={account.hasSessionCookie === true ? 'success' : 'secondary'}>
+                                {account.hasSessionCookie === true ? t('已配置') : t('未配置')}
+                              </Badge>
+                              {account.hasSessionCookie === true ? <Button variant='ghost' size='xs'
+                                disabled={interactionBusy} className='acct-dlg-clear'
+                                onClick={() => void clearSessionCookie()}>{t('清除')}</Button> : null}
+                            </span>
+                          </div>
+                          <Textarea id='account-session-cookie' rows={3} spellCheck={false} autoComplete='off'
+                            placeholder={account.hasSessionCookie === true
+                              ? t('已配置，留空则不修改')
+                              : t('qoder_session_cookie=…（整条 Cookie 串，可多行）')}
+                            value={cookieDraft} onChange={event => setCookieDraft(event.currentTarget.value)} />
+                          <FieldDescription>{t('用于读取每批积分的到期时间（「有效期」列）。浏览器登录后按 F12 → Application → Cookies 复制 qoder_session_cookie 那一行，整条 Cookie 串或多行粘贴都行。原值不会回显，填好后点「保存更改」生效。')}</FieldDescription>
+                        </Field> : null}
                         <Field className='acct-dlg-toggle-field'>
                           <div><FieldLabel htmlFor='account-enabled'>{t('启用账号')}</FieldLabel>
                             <FieldDescription>{t('关闭后不参与转发，余额查询不受影响。')}</FieldDescription>

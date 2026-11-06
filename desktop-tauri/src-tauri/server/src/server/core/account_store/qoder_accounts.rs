@@ -29,7 +29,47 @@ use crate::server::core::providers::qoder::endpoints::Region;
 
 use super::sql;
 use super::state::StoredAccount;
-use super::store::AccountStore;
+use super::store::{AccountStore, AccountStoreError};
+
+/// 网页会话 cookie 的落盘键（与插件侧 `qoder/credentials.rs` 的 `sessionCookie` 同值，
+/// 两边各自声明同一个字面量 —— 它是**落盘契约**，插件与网关没有代码依赖）。
+pub(crate) const SESSION_COOKIE_FIELD: &str = "sessionCookie";
+
+/// cookie 长度上限（与插件侧 `credentials::MAX_COOKIE_LENGTH` 同值）。
+const MAX_COOKIE_LENGTH: usize = 8192;
+
+/// 把一段原始 cookie 文本压成**可单行进 HTTP 头**的形态（`a=1; b=2`）。
+///
+/// 与插件侧 `credentials::normalize_cookie` **逐条同规则**：用户最常见的来源是
+/// 浏览器的「Copy as cURL」或整段请求头，那里 `Cookie:` 后面常跟若干行
+/// `name=value;`；换行原样塞进 `Cookie` 头会让请求在第一个 `\r\n` 处断掉，
+/// 而上游失败时插件是**静默降级**（明细返回空、界面只少几行），用户完全看不出
+/// 是粘贴格式的锅。网关侧也过这一遍，是因为写入路径在网关（PATCH 账号），
+/// 不能让「界面粘贴多行」与「插件读取」之间留一个只压一半的缺口。
+fn normalize_session_cookie(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    let body = raw
+        .lines()
+        .map(str::trim)
+        .map(|line| {
+            line.strip_prefix("Cookie:")
+                .or_else(|| line.strip_prefix("cookie:"))
+                .unwrap_or(line)
+                .trim()
+        })
+        .filter(|line| !line.is_empty())
+        .map(|line| if line.ends_with(';') { line.to_string() } else { format!("{line};") })
+        .collect::<Vec<_>>()
+        .join(" ");
+    body.trim_end_matches(';')
+        .trim()
+        .chars()
+        .take(MAX_COOKIE_LENGTH)
+        .collect()
+}
 
 fn explicit_region(fields: &Map<String, Value>) -> Option<Region> {
     let value = ["mode", "edition"].into_iter().find_map(|key| {
@@ -138,6 +178,121 @@ impl AccountStore {
             .map(|record| record.to_value())
     }
 
+    /// 设置 / 清除某条 Qoder 账号的**网页会话 cookie**（`sessionCookie`）。
+    ///
+    /// ── 为什么需要这个入口（而不是复用添加账号那条链）─────────────
+    /// cookie 不是刷新产物，也没有任何上游接口能把它换出来（`POST /api/v1/sessions`
+    /// 报 `CSRFInvalid`），它**只能由用户从浏览器复制**。而它又是「逐批积分到期
+    /// 时间」的唯一凭证（`qoder/balance.rs::web_credit_packs`，网页 BFF 只认它）。
+    /// 没有这个入口时，用户补一条 cookie 只能删掉账号重加一遍 —— 那会丢掉请求
+    /// 历史、优先级、限制器与代理配置，代价与「贴一行 cookie」完全不成比例。
+    ///
+    /// ── 两种记录形态（与 `update_catpaw_balance_token` 同一套）───────
+    ///   - **插件记录**（有 `pluginSecret`）：写进 secret 里的同名键 —— 插件
+    ///     `Credentials::from_payload` 读的就是它，写进去立刻生效；
+    ///   - **存量内置记录**：写记录顶层（插件摊平读取时同样认这个键）。
+    ///
+    /// ── 为什么字段名校验 / 压平都在这里做 ─────────────────────────
+    /// 这个值最终原样拼进 `Cookie` 头。多行粘贴（Copy as cURL）不压平会让请求在
+    /// 第一个 `\r\n` 处断掉，而插件对网页通道失败是静默降级 —— 用户会以为「贴了
+    /// 没生效」却找不到原因。所以写入侧就压成单行，读取侧插件那边还有一道
+    /// （兼容早期已经落了多行的记录）。
+    ///
+    /// `value` 语义：字符串（压平后非空）= 设置；`null` / 空串 = **清除**。
+    /// 与余额凭证同一口径，清除是一个显式动作而不是「留空即清除」。
+    pub fn update_qoder_session_cookie(
+        &self,
+        id: &str,
+        value: &Value,
+    ) -> Result<Vec<String>, AccountStoreError> {
+        let next: Option<String> = match value {
+            Value::Null => None,
+            other => {
+                let text = match other {
+                    Value::String(text) => text.clone(),
+                    _ => other.to_string(),
+                };
+                let cookie = normalize_session_cookie(&text);
+                if cookie.is_empty() {
+                    None
+                } else {
+                    Some(cookie)
+                }
+            }
+        };
+        // ── 插件记录：写进 `pluginSecret` ────────────────────────
+        // 判据是记录上**有没有** `pluginSecret`（与 CatPaw 那一段同一理由：这个
+        // 函数对存量内置记录也会摊平出一份，拿它当判据会把插件记录的写回也走成
+        // 「改写顶层」）。锁在这里先放开：`plugin_update_secret` 内部还要取同一把锁。
+        let plugin_secret = {
+            let guard = self.guard();
+            self.record_by_id(&guard, id)
+                .filter(|record| Region::from_provider_id(&record.provider()).is_some())
+                .filter(StoredAccount::has_plugin_secret)
+                .map(|record| record.get("pluginSecret").cloned().unwrap_or(Value::Null))
+        };
+        if let Some(secret) = plugin_secret {
+            let mut next_secret = secret.clone();
+            if let Some(object) = next_secret.as_object_mut() {
+                match &next {
+                    Some(cookie) => {
+                        object.insert(SESSION_COOKIE_FIELD.to_string(), Value::String(cookie.clone()));
+                    }
+                    None => {
+                        object.remove(SESSION_COOKIE_FIELD);
+                    }
+                }
+            }
+            match self.plugin_update_secret(id, &secret, &next_secret) {
+                Ok(true) => {
+                    return Ok(vec![match next {
+                        Some(_) => "网页会话 cookie 已更新".to_string(),
+                        None => "网页会话 cookie 已清除".to_string(),
+                    }])
+                }
+                // 期望值已变（插件在这一瞬间刷新并写回了新令牌）：让用户重试一次，
+                // 不要盲目覆盖 —— 覆盖掉的可能正是刚刷新出来的有效令牌
+                Ok(false) => {
+                    return Err(AccountStoreError::new("账号凭证已变化，请刷新后重试", 409))
+                }
+                Err(message) => return Err(AccountStoreError::new(message, 500)),
+            }
+        }
+        // ── 存量内置记录：写顶层字段 ────────────────────────────
+        let _guard = self.guard();
+        let mut record = self
+            .record_by_id(&_guard, id)
+            .filter(|record| Region::from_provider_id(&record.provider()).is_some())
+            .ok_or_else(|| AccountStoreError::not_found("账号不存在或不属于 Qoder"))?;
+        let current = record
+            .get(SESSION_COOKIE_FIELD)
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if current == next {
+            return Ok(Vec::new());
+        }
+        let mut changes = Vec::new();
+        match &next {
+            Some(cookie) => {
+                record.set(SESSION_COOKIE_FIELD, Value::String(cookie.clone()));
+                // 日志只说「已更新」，**不打印 cookie 本身**（与全仓的凭证处理一致）
+                changes.push("网页会话 cookie 已更新".to_string());
+            }
+            None => {
+                record.remove(SESSION_COOKIE_FIELD);
+                changes.push("网页会话 cookie 已清除".to_string());
+            }
+        }
+        record.set_updated_at(crate::server::logging::now_ms());
+        let name = record.name();
+        self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))?;
+        crate::server::logging::log(
+            "[Accounts]",
+            &format!("✏️  Qoder 账号已更新: {name}（{}）", changes.join("，")),
+        );
+        Ok(changes)
+    }
+
     pub fn to_qoder_public_account(&self, record: &StoredAccount) -> Value {
         // 地区先看 provider 身份（拆家后的权威来源），payload 里的 `mode` 只是
         // 旧数据的兼容读取 —— 记录缺 `mode` 时 `from_payload` 会默认 Global，
@@ -168,5 +323,36 @@ impl AccountStore {
         // 事实，由 `store_view::public_account` 在分派点注入（前者按适配器的
         // `supports_chat()`，后者按 `store_util::max_concurrent_public_for`）。
         Value::Object(public)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 多行粘贴（Copy as cURL / 整段请求头）必须压成**单行**的 `Cookie` 头形态：
+    /// 换行留在值里会让上游请求在第一个 `\r\n` 处断掉，而插件对网页通道失败是
+    /// 静默降级 —— 用户只会看到「有效期」列还是空的。
+    #[test]
+    fn a_multi_line_paste_becomes_one_cookie_header() {
+        let raw = "Cookie: arms_uid=abc;\nqoder_session_cookie=xyz;\n  other=1  \n";
+        assert_eq!(
+            "arms_uid=abc; qoder_session_cookie=xyz; other=1",
+            normalize_session_cookie(raw)
+        );
+        // 单行、只有一个键（页面引导用户复制的那一行）同样原样可用
+        assert_eq!(
+            "qoder_session_cookie=xyz",
+            normalize_session_cookie("qoder_session_cookie=xyz\n")
+        );
+        // 空 / 全空白 = 清除（调用方据此落 `None`）
+        assert_eq!("", normalize_session_cookie("  \n\t\n"));
+    }
+
+    /// 超长粘贴要截断到与插件侧同值的上限：这个值最终进 HTTP 头，头部没有长度保护。
+    #[test]
+    fn an_over_long_cookie_is_truncated() {
+        let raw = format!("qoder_session_cookie={}", "a".repeat(MAX_COOKIE_LENGTH + 100));
+        assert_eq!(MAX_COOKIE_LENGTH, normalize_session_cookie(&raw).chars().count());
     }
 }

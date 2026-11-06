@@ -39,6 +39,24 @@ pub(super) fn credential_fields(record: &StoredAccount, public: &mut Map<String,
         public.insert("hasBalanceToken".to_string(), Value::Bool(token.and_then(Value::as_str)
             .is_some_and(|token| !token.trim().is_empty())));
     }
+    // Qoder 系的**网页会话 cookie**：设置弹窗据此显示「已配置 / 未配置」与
+    // 有无「清除」按钮。值本身绝不下发（它是能读 BFF 的完整会话），只给这个布尔。
+    //
+    // 判据走 `is_qoder_family`（两个地区都算）：cookie 对两站的用法一致，都是
+    // 网页 BFF 的 `qoder_session_cookie`。值可能落在插件记录的 `pluginSecret`
+    // 里（新记录）或记录顶层（存量内置记录），两处都要认 —— 与上面 CatPaw 那段
+    // 同一款形状。
+    if super::is_qoder_family(&record.provider()) {
+        let cookie = match secret {
+            Some(fields) => fields.get(super::qoder_accounts::SESSION_COOKIE_FIELD),
+            None => record.get(super::qoder_accounts::SESSION_COOKIE_FIELD),
+        };
+        public.insert(
+            "hasSessionCookie".to_string(),
+            Value::Bool(cookie.and_then(Value::as_str)
+                .is_some_and(|cookie| !cookie.trim().is_empty())),
+        );
+    }
 
     // 只派生白名单标量，凭据对象不进入公开视图；陈旧快照不能压住新的到期时刻。
     let expiry = EXPIRY_KEYS.iter().flat_map(|key| {
@@ -84,6 +102,9 @@ pub(super) fn is_private_field(key: &str) -> bool {
         "pluginSecret" | "pluginPublic" | "pluginIdentity" | "accessToken" | "refreshToken"
         | "access_token" | "refresh_token" | "apiKey" | "api_key" | "password"
         | "balanceToken" | "workbuddyWebSession" | "access_key_id" | "secret_access_key" | "security_token" | "oauth_context"
+        // Qoder 的网页会话 cookie：能读网页 BFF 的完整会话，与令牌同级，绝不下发
+        // （界面只要 `hasSessionCookie` 这个布尔，见 `credential_fields`）
+        | "sessionCookie" | "session_cookie" | "webCookie"
     )
 }
 

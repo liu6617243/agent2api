@@ -57,7 +57,7 @@ use serde_json::{json, Map, Value};
 
 pub use super::accounts_batch::batch_accounts;
 
-use crate::server::core::account_store::AccountStoreError;
+use crate::server::core::account_store::{qoder_accounts, AccountStoreError};
 use crate::server::core::billing::checkin;
 use crate::server::core::proxies::ProxyConfigError;
 use crate::server::core::providers::adapter::adapter_for;
@@ -1336,6 +1336,36 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
         }
         match state.store().update_catpaw_balance_token(&id, value) {
             Ok(changes) => balance_changes = changes,
+            Err(error) => return store_error(error),
+        }
+    }
+    // Qoder 的**网页会话 cookie**（`sessionCookie`）：与 CatPaw 那一段同一处境 ——
+    // 只有 Qoder 系（两个地区）认这个键，它也不进通用的 `apply_patch`。
+    //
+    // ── 为什么需要这条 PATCH（而不只是添加账号时填）──────────────
+    // cookie 没有接口能换出来（`Bearer` → 401、`POST /api/v1/sessions` →
+    // `CSRFInvalid`），只能由用户从浏览器复制。它又是「逐批积分到期时间」的唯一
+    // 凭证（插件 `qoder/balance.rs::web_credit_packs` 读网页 BFF）。没有这条入口
+    // 时，cookie 过期后用户只能删账号重加 —— 会一并丢掉请求历史、优先级、限制器
+    // 与代理配置。有了它，账号设置弹窗里贴一行、点「保存更改」就够。
+    //
+    // 传 `null` / 空串 = 清除（语义与 `balanceToken` 一致，见
+    // `update_qoder_session_cookie`）；多行粘贴在写入侧压成单行，理由同那里。
+    if let Some(value) = patch.get(qoder_accounts::SESSION_COOKIE_FIELD) {
+        let provider = state.store().account_provider_of(&id);
+        if provider
+            .as_deref()
+            .is_none_or(|provider| !crate::server::core::account_store::is_qoder_family(provider))
+        {
+            // 「账号不存在」与「账号存在但不是 Qoder」分开说（与上面同一理由）
+            return if provider.is_some() {
+                management_error(400, "只有 Qoder 账号有网页会话 cookie（sessionCookie）")
+            } else {
+                store_error(AccountStoreError::new("账号不存在", 404))
+            };
+        }
+        match state.store().update_qoder_session_cookie(&id, value) {
+            Ok(changes) => balance_changes.extend(changes),
             Err(error) => return store_error(error),
         }
     }
