@@ -175,11 +175,19 @@ impl Provider for RaccoonProvider {
             // 账号行：`credit_detail` —— 四个钱包桶（每日积分 / 每月会员积分 /
             // 奖励积分 / 充值积分）各一行：上游只给余额一个数，没有面额 / 已用 /
             // 到期（缺的键不出），明细比读数多的只是「钱在哪个桶里」。
+            //   `credit_expiry` —— 调度器按到期日 FIFO 发出去的批次行都带毫秒
+            //     `expireAt`（见 balance.rs 的 `grant_packs`），所以「有效期」列
+            //     与「积分到期」排序都对它可用。
+            //     ⚠️ 这一位**必须申报**：插件申报的特征表会整张覆盖前端静态表
+            //     （`providerFeatures` 先读申报），漏了它这一列就退回凭证到期口径，
+            //     把小浣熊的 access token 到期（约 7 天）当成「积分有效期」显示 ——
+            //     2026-11-06 就是这么报上来的：今天有积分过期，界面却写「8 天后」。
             // 有效期键按两种记录形态都认：插件新落的账号写 `expiresAt`，
             // 升级上来的存量账号由网关旧投影写 `tokenExpiresAt`。
             .with_account_features(proto::AccountFeatures {
                 usage: true,
                 credit_detail: true,
+                credit_expiry: true,
                 identifier: vec!["userId".to_string(), "uid".to_string()],
                 expiry: vec!["expiresAt".to_string(), "tokenExpiresAt".to_string()],
                 ..Default::default()
