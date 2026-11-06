@@ -69,6 +69,25 @@ fn stream_idle() -> Duration {
     Duration::from_millis(crate::timeouts::current().stream_idle_ms())
 }
 
+/// 读流时的 `io::Error` → 给用户看的文案（三条读流路径共用）。
+///
+/// ── 为什么空闲超时不能加「中断」前缀 ────────────────────────
+/// 空闲守卫（[`stall::idle_guard`]）报的是**保护性判定**：上游静默超过了
+/// 预算，本网关主动收尾。它自带的那句「流式响应空闲超时(N秒)」说清了
+/// 「是等太久，不是网断了」；再套一层「上游流中断」会把人往「网络故障 /
+/// 服务端崩了」上引，排查方向直接跑偏。
+///
+/// 真正的传输中断（连接被重置、chunk 截断、TLS 断）才带前缀 —— 那才是
+/// 「流断了」。（与 Qoder 的 `piping.rs` 同一口径。）
+fn stream_error_message(error: &io::Error) -> String {
+    let text = error.to_string();
+    if text.starts_with(stall::IDLE_TIMEOUT_PREFIX) {
+        text
+    } else {
+        format!("Trae 上游流式传输中断: {text}")
+    }
+}
+
 /// 一次出站请求（URL + 头 + 已改写的 body）。
 pub struct Plan {
     pub url: String,
@@ -293,9 +312,8 @@ pub(crate) async fn prefetch_head(
     let mut stream = SoloStream::new(request_id(), logging::now_ms() / 1000);
     let mut frames: Vec<Frame> = Vec::new();
     while let Some(item) = source.next().await {
-        let chunk = item.map_err(|error| {
-            GatewayError::with_status(502, format!("Trae 上游流式传输中断: {error}"))
-        })?;
+        let chunk = item
+            .map_err(|error| GatewayError::with_status(502, stream_error_message(&error)))?;
         // ★ 一整段 chunk 处理完才返回 —— 中途 return 会把**同一段里后面的行**
         //   连同字节一起丢掉（那些行已经从 socket 读进来了，换手也换不回来）。
         //   上游经常把 `output`+`token_usage`+`done` 挤在同一段里，所以这不是
@@ -619,7 +637,10 @@ async fn drive_stream(
                         }
                     }
                 }
-                let message = format!("Trae 上游流中断: {error}");
+                // 空闲超时是**保护性判定**，不是传输中断：守卫自己写的那句
+                // 「流式响应空闲超时(N秒)」比「上游流中断: …」准确得多，也
+                // 不会让人误以为是网络问题（见 `stream_error_message`）。
+                let message = stream_error_message(&error);
                 telemetry.note_error(&message);
                 let failure = crate::sse::error_bytes(&message);
                 let _ = sink.send(&failure).await;
@@ -739,9 +760,8 @@ async fn drive_aggregate(
         let Some(item) = source.next().await else {
             break;
         };
-        let chunk = item.map_err(|error| {
-            GatewayError::with_status(502, format!("Trae 上游流式传输中断: {error}"))
-        })?;
+        let chunk = item
+            .map_err(|error| GatewayError::with_status(502, stream_error_message(&error)))?;
         for line in scanner.push(&chunk) {
             frames.extend(solo.feed_line(&line));
             if solo.completed() {
