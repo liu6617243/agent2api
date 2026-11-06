@@ -321,9 +321,27 @@ function qoderForm(spec: { provider: string; label: string; siteNote: string }):
       ],
     },
     manualTitle: t('使用个人访问令牌（PAT）'),
-    manualNote: t('在{label}的 Qoder 账号设置 → Integrations 生成 PAT（别填 Google / GitHub 的令牌）。两个地区的账号与凭证不通用。', { label }),
+    manualNoteHtml: t(
+      '在{label}的 Qoder 账号设置 → Integrations 生成 PAT（别填 Google / GitHub 的令牌）。两个地区的账号与凭证不通用。'
+      + '<br><br><b>想看到每批积分的到期时间</b>，还要在下面补一条网页会话 cookie：'
+      + '浏览器登录 <code>{site}</code> 后按 F12 → Application → Cookies，找到 '
+      + '<code>qoder_session_cookie</code> 那一行，把整条 Cookie 串贴进来'
+      + '（整段请求头 / Copy as cURL 那种多行粘贴也行，网关会自己压成一行）。'
+      + '逐批明细（每批剩多少、各自哪天作废）只在网页接口上，PAT 那条链拿不到；'
+      + '不填这一条时「有效期」列只能按凭证到期算。',
+      { label, site: siteNote },
+    ),
     fields: [
       { key: 'pat', label: 'Qoder PAT', rows: 3, placeholder: t('粘贴 Qoder 个人访问令牌（pt-…）') },
+      // 网页会话 cookie（可选）：`balance.rs::web_credit_packs` 读它拿逐批到期时间。
+      // 整条 Cookie 串（含 arms_uid 等）一起贴也行 —— 上游只认其中的
+      // `qoder_session_cookie`，多带的键不影响；只贴那一个键同样可用（实测都 200）。
+      // 字段名必须是 `sessionCookie`：`Credentials::from_payload` 只认
+      // `sessionCookie` / `session_cookie` / `webCookie` 三个名字。
+      {
+        key: 'sessionCookie', label: t('网页会话 cookie（可选）'), rows: 3, optional: true,
+        placeholder: t('qoder_session_cookie=…（整条 Cookie 串，可多行）'),
+      },
       { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空使用账号昵称或邮箱') },
     ],
   }
