@@ -45,7 +45,7 @@ impl Timeouts {
 
     /// 传输层「读超时」后备值（reqwest `read_timeout`，**逐次读重置**）。
     ///
-    /// ── 必须严格大于空闲守卫的预算 ──────────────────────────────
+    /// ── 为什么必须比空闲守卫晚一截 ──────────────────────────────
     /// 这条超时和 [`crate::stall::idle_guard`] 的读空闲守卫**量同一件事**
     /// （都是「多久没读到新字节」），一旦两者相等就是赛跑：
     ///
@@ -59,15 +59,20 @@ impl Timeouts {
     /// operation timed out` —— 既丢了数据（可能截断在半个 chunk 上），
     /// 又把守卫那条可读的「流式响应空闲超时(N秒)」盖成一句英文堆栈。
     ///
-    /// 因此这里给到守卫预算的**两倍**：正常僵死由守卫先判（文案可读、且
-    /// 收尾时已到手的字节不丢），传输层只是「守卫自己也没能唤醒」时的
-    /// 最后兜底。默认配置下 guard 300 秒 / 后备 600 秒，正是历史上这份
-    /// 代码各处注释写的「`egress` 默认 read_timeout 是 600 秒」那个形态。
+    /// ── 为什么是「加一截」而不是「乘 2」─────────────────────────
+    /// 不是每个 `stream_client` 的调用方都装了守卫（catpaw / kiro / kuku /
+    /// astudio 就直接读 `bytes_stream`），**对它们这条后备是唯一的僵死
+    /// 探测**。翻倍会把它们的「挂住」从 5 分钟拖到 10 分钟，是实打实的退步。
+    /// 加 [`BACKSTOP_MARGIN_MS`] 就够赢下赛跑了 —— 竞态只差一个调度粒度，
+    /// 60 秒的余量对 tokio 定时器而言等同于无穷。
     pub fn read_timeout_backstop_ms(&self) -> u64 {
         let guard = self.headers_ms().max(self.stream_idle_ms());
-        guard.saturating_mul(2)
+        guard.saturating_add(BACKSTOP_MARGIN_MS)
     }
 }
+
+/// 传输层后备比空闲守卫晚多少（见 [`Timeouts::read_timeout_backstop_ms`]）。
+pub const BACKSTOP_MARGIN_MS: u64 = 60_000;
 
 tokio::task_local! {
     static CURRENT: Timeouts;
@@ -84,7 +89,7 @@ pub(crate) async fn scope<F: Future>(timeouts: Timeouts, future: F) -> F::Output
 
 #[cfg(test)]
 mod tests {
-    use super::Timeouts;
+    use super::{Timeouts, BACKSTOP_MARGIN_MS};
 
     /// 传输层后备**必须**严格大于空闲守卫的预算。
     ///
@@ -95,7 +100,7 @@ mod tests {
     /// 这条断言就是那次线上问题的墓碑。
     #[test]
     fn backstop_outlives_idle_guard() {
-        for (headers, idle) in [(300, 300), (300, 60), (60, 300), (1, 1), (900, 120)] {
+        for (headers, idle) in [(300, 300), (300, 60), (60, 300), (1, 1), (900, 120), (5, 5)] {
             let timeouts = Timeouts {
                 connect_seconds: 30,
                 headers_seconds: headers,
@@ -110,9 +115,16 @@ mod tests {
         }
     }
 
-    /// 默认配置下后备是 600 秒 —— 与「给 SSE 长连接留的」那句老注释一致。
+    /// 后备只比守卫晚一个固定余量 —— 不能翻倍。
+    ///
+    /// 没装守卫的几家（catpaw / kiro / kuku / astudio）只能靠这条后备发现
+    /// 「上游挂住了」，余量给太大等于让用户多干等一倍时间。
     #[test]
-    fn default_backstop_is_ten_minutes() {
-        assert_eq!(Timeouts::default().read_timeout_backstop_ms(), 600_000);
+    fn backstop_margin_is_a_sixty_second_step() {
+        let timeouts = Timeouts::default();
+        let guard = timeouts.headers_ms().max(timeouts.stream_idle_ms());
+        assert_eq!(timeouts.read_timeout_backstop_ms(), guard + BACKSTOP_MARGIN_MS);
+        // 默认 300 秒守卫 → 360 秒后备（不是 600）
+        assert_eq!(timeouts.read_timeout_backstop_ms(), 360_000);
     }
 }
