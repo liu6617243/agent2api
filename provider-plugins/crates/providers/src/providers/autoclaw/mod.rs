@@ -187,14 +187,20 @@ impl Provider for AutoClawProvider {
         .with_models(models::list(region))
         // 账号行：两个地区能力完全一致，差别只在域名 —— 两项都必须申报，
         // 漏了哪一项那一家就掉进兜底（症状：余额入口消失、标识列显示成空）。
-        //   `credit_detail` —— 逐钱包余额各一行，另加一条「即将过期」（上游给的是
-        //     相对时长文案，原样带出，不换算成时刻）。
+        //   `credit_detail` —— 逐钱包余额各一行，另加逐批到期行与「即将过期」。
+        //   `credit_expiry` —— 逐批行带**毫秒** `expireAt`（`balance.rs` 的
+        //     `ledger_batches` 从账单流水的 `wallet_expires_at` 取，那是上游
+        //     真给的绝对时刻）。开了它明细才能显示「11-11 23:59 到期」并按
+        //     「快到期优先」排序 —— 与 Trae / 小浣熊 / MiniMax / OfficeAce
+        //     同一形态。**别只开 `credit_detail`**：那样明细里只有「N 天内」
+        //     （`points/expiring` 的相对时长），看起来像这一家不支持具体日期。
         //   `email_as_name` —— 只有国际版：国内版的账号名是手机号 / 昵称。
         //   `expiry` 按两种记录形态都认（插件写 `expiresAt`，旧投影写
         //     `tokenExpiresAt`）。
         .with_account_features(proto::AccountFeatures {
             usage: true,
             credit_detail: true,
+            credit_expiry: true,
             identifier: vec!["userId".to_string()],
             expiry: vec!["expiresAt".to_string(), "tokenExpiresAt".to_string()],
             email_as_name: region == Region::Intl,

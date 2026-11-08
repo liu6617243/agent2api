@@ -63,6 +63,22 @@ const POINTS_WALLET_LEGACY_PATH: &str =
 /// 即将过期积分路径（源实现 `POINTS_EXPIRING_PATH`）
 const POINTS_EXPIRING_PATH: &str = "/agent-assetmgr/api/v1/points/expiring?biz_app_id=autoclaw";
 
+/// 积分账单流水路径（客户端 `readCreditsLedgers` 的 path）。
+///
+/// ── 为什么必须多打这一条 ──────────────────────────────────────
+/// `points/expiring` 只给**聚合**结果：「1,846 积分将于 3 天内到期」——
+/// `expire_time_value` 是**相对天数**，不是时刻。别的家（小浣熊 / Trae /
+/// MiniMax / OfficeAce）的明细行都能显示「11-11 23:59 到期」，因为它们手里
+/// 有每一批的绝对到期时刻；AutoClaw 的 `wallets` 接口**不带到期字段**
+/// （`public_wallet_type` / `balance` / `priority` 而已），能拿到绝对时刻的
+/// 只有这里：账单流水里每笔 `credit` 都带 `wallet_expires_at`。
+/// 官方客户端就是这么做的（`readCreditsLedgers` + `wallet_expires_at`），
+/// 它**从不**调用 `points/expiring`。
+const POINTS_LEDGER_PATH: &str = "/agent-assetmgr/api/v1/ledgers_std";
+/// 账单流水单页条数（客户端默认 20、上限 100；取 50 覆盖更多批次，
+/// 少翻一次页就多一次命中「尚有余额的批次」的机会）
+const LEDGER_PAGE_SIZE: u32 = 50;
+
 /// 订阅信息路径（源实现 `getSubscribeInfo` 的 path）——**按地区分叉**。
 ///
 /// ── 为什么两地路径不同（从客户端产物里核对出来的）────────────
@@ -144,7 +160,7 @@ pub(super) async fn query_usage(
         .get("wallets")
         .cloned()
         .unwrap_or_else(|| Value::Array(Vec::new()));
-    // 逐份明细只读上面这份 `points`（钱包清单 + 即将过期），不再打一次上游接口
+    // 逐份明细读 `points`（钱包清单 + 即将过期 + 流水批次）
     let credits = credit_rows_from(&points);
     let mut raw = Map::new();
     raw.insert(
@@ -154,6 +170,13 @@ pub(super) async fn query_usage(
     if let Some(expiring) = points.get("expiring") {
         if !expiring.is_null() {
             raw.insert("expiring".to_string(), expiring.clone());
+        }
+    }
+    // 流水批次原样带出：字段名与上游一致（`wallet_expires_at` 是秒），
+    // 查「为什么这一行没有到期时间」时不必再打一次上游
+    if let Some(batches) = points.get("batches") {
+        if batches.as_array().is_some_and(|items| !items.is_empty()) {
+            raw.insert("batches".to_string(), batches.clone());
         }
     }
     if !subscription_error.is_null() {
@@ -337,10 +360,32 @@ async fn query_points(credentials: &AutoClawCredentials) -> Result<Value, Gatewa
         Err(_) => Value::Null,
     };
 
+    // ── 逐批到期时刻（账单流水）──────────────────────────────
+    // 与 `expiring` 同一取向：失败不阻塞余额展示 —— 它只是让明细行多一列
+    // 「几点到期」，没有它余额照样读得出来。
+    let batches = match userapi_get(
+        credentials,
+        &ledger_path(LEDGER_PAGE_SIZE),
+        "积分账单查询",
+    )
+    .await
+    {
+        Ok(payload) => {
+            let data = payload.get("data").cloned().unwrap_or(Value::Null);
+            if payload.get("code").and_then(Value::as_i64) == Some(0) {
+                ledger_batches(&data, total_balance_number(&total_balance))
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
     Ok(json!({
         "totalBalance": total_balance,
         "wallets": wallets,
         "expiring": expiring,
+        "batches": batches,
         "raw": raw,
     }))
 }
@@ -349,35 +394,44 @@ async fn query_points(credentials: &AutoClawCredentials) -> Result<Value, Gatewa
 
 /// `points`（[`query_points`] 的产物）→ 逐份明细行。
 ///
-/// 一行一份钱包，最后补一行「即将过期」：
+/// 一行一份钱包；拿到流水批次时追加**逐批到期行**；最后补一行「即将过期」：
 /// ```text
-///   name / remain          这一份是什么 / 还剩多少（上游给什么写什么）
-///   grantReason            来源一句话（只有「即将过期」行有：上游的展示串）
+///   name / remain / total / expireAt   这一份是什么 / 还剩多少 / 面额 / 到期时刻
+///   grantReason                        来源一句话（只有「即将过期」行有）
 /// ```
 ///
-/// ── 只有「剩余」一个数，缺了就不写这个键 ──────────────────────
-/// 上游不分开给面额与已用（`balance` 就是这一份还剩多少），所以 total / used
-/// 一律**不写这个键**；`remain` 也只在读到有限数时写 —— v2 的 `balance` 允许
+/// ── 为什么既有「批次行」又有「即将过期」行 ─────────────────────
+/// 两者答的是不同问题：批次行是**每一笔发放各自什么时候到期**（能显示
+/// 「11-11 23:59 到期」，与 Trae / 小浣熊 / MiniMax 的明细同一形态）；
+/// 「即将过期」是上游给的**聚合提醒**（「1,846 积分将于 3 天内到期」），
+/// 批次页覆盖不全时它仍然准确。都写不冲突 —— 前端按行渲染，`grantReason`
+/// 只是说明文字。
+///
+/// ── 只有「剩余」一个数时缺了就不写这个键 ──────────────────────
+/// 上游不分开给面额与已用（`balance` 就是这一份还剩多少），所以钱包行不写
+/// total / used；`remain` 也只在读到有限数时写 —— v2 的 `balance` 允许
 /// 是 null，那种行只出名字，界面显示「—」。写成 0 会让界面把「没读到」画成
 /// 「只剩 0」（前端 `Number(null) === 0`）。
 ///
 /// ── 顺序不做二次排序 ────────────────────────────────────────
-/// 钱包按上游 `priority` 升序（[`query_points`] 里已排好），这里原样保留 ——
-/// 再排一次会让界面上每次刷新的行序都在跳。「即将过期」是附加信息、不是一份
-/// 钱包，所以放在最后一行。
+/// 钱包按上游 `priority` 升序（[`query_points`] 里已排好），批次行按到期
+/// 升序（[`ledger_batches`] 里已排好），这里都原样保留 —— 再排一次会让界面上
+/// 每次刷新的行序都在跳。「即将过期」是附加信息、不是一份钱包，放最后。
 ///
 /// ── 「即将过期」为什么不换算成时刻 ─────────────────────────────
 /// `expireTimeValue` / `expireTimeType` 是**相对时长**（“7 天”），不是时刻；
-/// 拿它推 `expireAt` 等于替上游编一个时间。上游自己给的展示串（`text`，
-/// 如「800 积分将于 7 天后过期」）原样进 `grantReason`，界面拼在说明行末尾。
-/// 点数非正数（0 / 负数 / null）时整行不写：既没有可写的读数，也就没有
-/// 「即将过期」这件事。
+/// 拿它推 `expireAt` 等于替上游编一个时间。绝对时刻只从流水批次里取
+/// （那是上游真给的）。点数非正数（0 / 负数 / null）时整行不写。
 fn credit_rows_from(points: &Value) -> Vec<Value> {
     let mut rows: Vec<Value> = Vec::new();
     if let Some(wallets) = points.get("wallets").and_then(Value::as_array) {
         for wallet in wallets {
             rows.push(credit_row_of(wallet));
         }
+    }
+    // 逐批到期行（已经有了 `expireAt`，前端会显示具体日期与「N 天后」标签）
+    if let Some(batches) = points.get("batches").and_then(Value::as_array) {
+        rows.extend(batches.iter().cloned());
     }
     let expiring = points.get("expiring").filter(|value| !value.is_null());
     if let Some(points_left) = expiring
@@ -426,6 +480,155 @@ fn credit_row_of(wallet: &Value) -> Value {
         row.insert("remain".to_string(), json!(balance));
     }
     Value::Object(row)
+}
+
+// ── 逐批到期时刻（账单流水 → 明细行）──────────────────────
+
+/// 账单流水路径（`flow_direction=income` 只要发放，不要每次对话的消耗）。
+///
+/// `flow_direction` 与 `asset_type` 是客户端 `readLedgers` 的原参数名
+/// （`flowDirection==="all" ? {} : {flow_direction}`），取值 `all` / `income` /
+/// `expense`。**只要 income**：判据是「这些积分什么时候到期」，消耗流水里
+/// 没有到期时刻，翻进来只会把发放记录挤出这一页。
+fn ledger_path(page_size: u32) -> String {
+    // 单行拼接，不用 `\` 续行：续行会把下一行的缩进空格一并带进 URL
+    // （`page_size` 前多出几个空格 → 上游 400）。
+    let query = format!("asset_type=point&wallet_type=all&flow_direction=income&page_size={page_size}");
+    format!("{POINTS_LEDGER_PATH}?{query}")
+}
+
+/// 流水 `entries` → 逐批明细行（带毫秒 `expireAt`）。
+///
+/// ── 为什么每一行必须带 `expireAt` ─────────────────────────────
+/// 前端 `hV()` 只认**毫秒数字**：塞字符串会被 `Number(...)` 判成 `NaN`，
+/// 那一行就等于没有到期时间；而且超过 7 天的批次不显示「快到期」标签
+/// （`AR = 7 天`）。这里的时刻来自流水里的 `wallet_expires_at`，
+/// 单位是**秒**（客户端 `new Date(e * 1e3)`），所以这里乘 1000。
+///
+/// ── `remain` 是摊出来的，摊不出来就不写 ────────────────────────
+/// 上游**不给**「这一批还剩多少」，只给：① 每笔发放的面额 `amount`；
+/// ② 当前池子余额（`total_balance`）。于是按客户端自己的扣减顺序
+/// 「**同池内先到期先扣**」反推：
+///
+/// ```text
+///   已消耗 = Σ未过期批次面额 − 池子余额        （余额大于面额和时按 0 处理）
+///   再按到期日升序逐批扣，扣完为止
+/// ```
+///
+/// 与小浣熊（`raccoon/balance.rs` 的 `grant_packs`）同一手法 —— 那边已经
+/// 用「到期清零那条流水」实证过这个摊法，不是猜的。
+/// **余额比面额和还大**说明这一页没覆盖全部批次（`page_size` 之外还有旧的
+/// 发放），此时**不摊**、只写时间：宁可这一行显示「—」，也不编一个
+/// 「还剩满额」。同理，池子余额读不到（`None`）时也不摊。
+///
+/// 已过期（`expires <= now`）与非 `credit` 的流水整条跳过：作废的批次对
+/// 「还有几天到期」没有意义，留在明细里只是噪音。
+fn ledger_batches(data: &Value, pool_balance: Option<f64>) -> Vec<Value> {
+    let now = crate::http::now_ms();
+    let mut batches: Vec<(i64, f64, String)> = Vec::new();
+    if let Some(entries) = data.get("entries").and_then(Value::as_array) {
+        for entry in entries {
+            let Some(expire) = expire_at_ms(entry) else {
+                continue;
+            };
+            if expire <= now {
+                continue;
+            }
+            let Some(amount) = number_or_null(entry.get("amount")).filter(|value| *value > 0.0)
+            else {
+                continue;
+            };
+            batches.push((expire, amount, batch_label(entry)));
+        }
+    }
+    if batches.is_empty() {
+        return Vec::new();
+    }
+    // 流水是**倒序**（最新在前），摊消耗前必须先按到期日排好，
+    // 否则余量会算到错误的那一批上（同 raccoon 的说明）
+    batches.sort_by_key(|(expire, _, _)| *expire);
+
+    let mut used = pool_balance.and_then(|balance| {
+        let total: f64 = batches.iter().map(|(_, amount, _)| *amount).sum();
+        // 余额大于等于面额和 = 这一页没覆盖全（或上游延迟），不摊
+        (balance >= 0.0 && total >= balance).then(|| total - balance)
+    });
+
+    let mut rows = Vec::new();
+    for (expire, amount, label) in batches {
+        let mut row = Map::new();
+        row.insert("name".to_string(), json!(label));
+        row.insert("total".to_string(), json!(amount));
+        if let Some(left) = used.as_mut() {
+            let take = js_round((*left).min(amount));
+            *left -= take;
+            row.insert("remain".to_string(), json!((amount - take).max(0.0)));
+        }
+        row.insert("expireAt".to_string(), json!(expire));
+        rows.push(Value::Object(row));
+    }
+    rows
+}
+
+/// 流水一笔的到期时刻（毫秒）。
+///
+/// `wallet_expires_at` 单位是**秒**（客户端 `new Date(e * 1e3)` 才得到日期），
+/// 这里乘 1000。只认 `mutation_type == "credit"`（客户端 `Ato()` 同一判据）：
+/// 消耗流水的 `wallet_expires_at` 没有意义，混进来会造出一条假的到期行。
+fn expire_at_ms(entry: &Value) -> Option<i64> {
+    if entry.get("mutation_type").and_then(Value::as_str) != Some("credit") {
+        return None;
+    }
+    let seconds = number_or_null(entry.get("wallet_expires_at"))?;
+    if seconds <= 0.0 {
+        return None;
+    }
+    // 客户端 `VUe()` 用的是 `new Date(e * 1e3)`，即**秒**；照同一口径换算。
+    Some((seconds * 1000.0).round() as i64)
+}
+
+/// 流水一笔的展示名：上游描述 → 原因 → 「积分发放」，再缀上发放日。
+///
+/// 附日期是为了把同名行区分开 —— 奖励积分可能连着几天各发一笔，明细里
+/// 排出一串一模一样的「奖励积分」是看不出差别的（同 raccoon 的 `label`）。
+fn batch_label(entry: &Value) -> String {
+    let metadata = entry.get("metadata");
+    let name = metadata
+        .and_then(|value| value.get("description"))
+        .and_then(Value::as_str)
+        .or_else(|| entry.get("reason").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or("积分发放");
+    match grant_date(entry) {
+        Some(date) if date.len() >= 10 => format!("{name} · {}", &date[5..10]),
+        _ => name.to_string(),
+    }
+}
+
+/// 流水一笔的发放日（`occurred_at` → `created_at`，RFC3339 字符串）。
+fn grant_date(entry: &Value) -> Option<String> {
+    let raw = entry
+        .get("occurred_at")
+        .or_else(|| entry.get("created_at"))?
+        .as_str()?;
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(parsed.format("%Y-%m-%d").to_string());
+    }
+    raw.get(..10).map(str::to_string)
+}
+
+/// 四舍五入（积分可以带小数，`remain` 不该因为摊分冒出 `1e-13` 这种尾巴）。
+fn js_round(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+/// `total_balance`（可能是数字、也可能是数字字符串，还可能是 null）→ 有限数。
+///
+/// 只用于摊批次剩余（[`ledger_batches`] 的池子余额）：拿不到就当 `None`，
+/// 那边会走「只给时间、不摊剩余」的分支。
+fn total_balance_number(total: &Value) -> Option<f64> {
+    number_or_null(Some(total)).filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 /// v1 钱包实例按 `wallet_scope` 归类（源实现 `normalizeLegacyWallets`）。
