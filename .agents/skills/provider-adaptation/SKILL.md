@@ -1,6 +1,6 @@
 ---
 name: provider-adaptation
-description: Agent2API（workbuddy）仓库接入新提供商（provider）与验收适配完整度的规范 —— README「支持情况一览」六列的口径、必须登记的代码与前端落点、能力探测脚本的用法、静默失效排查、六份 README 同步。凡是涉及新增一家反代 Agent / 客户端 provider、审核这类 PR、判断某家「做完了没有」、改 providers/ 下的适配器或能力位（supports_*）、给签到清单加一家、或补 README 支持矩阵时，都先按本 Skill 执行 —— 即使对方没提「provider」「适配」这类字眼。
+description: Agent2API（workbuddy）仓库接入新提供商（provider）与验收适配完整度的规范 —— README「支持情况一览」六列的口径、必须登记的代码与前端落点、能力探测脚本的用法、静默失效排查、六份 README 同步、余额/积分明细的到期时间口径（为什么某家只显示「N 天内」而别家显示具体日期）、抓不到包时的排查顺序。凡是涉及新增一家反代 Agent / 客户端 provider、审核这类 PR、判断某家「做完了没有」、改 providers/ 下的适配器或能力位（supports_* / AccountFeatures）、给签到清单加一家、补 README 支持矩阵、或排查「余额/积分到期时间不对、看不到到期日期、抓包抓不到」时，都先按本 Skill 执行 —— 即使对方没提「provider」「适配」这类字眼。
 ---
 
 # Agent2API 提供商接入规范
@@ -302,3 +302,49 @@ node scripts/probe-provider.mjs \
 ## 9. 参考实现
 
 `git show 1576330` 是 ModelScope 接入的完整提交，48 个文件，正好覆盖第 2–4 节的每一类落点。拿不准该改哪些文件时，对着这个提交的 `--stat` 过一遍。
+
+## 10. 余额明细的「到期时间」——显示具体日期只需要三件事
+
+用户能看见的形态是两种，**别混**：
+
+| 形态 | 触发条件 | 例子 |
+|---|---|---|
+| 「11-11 23:59 到期」/「3 天后到期」标签 | `credits[]` 某行有**毫秒数字** `expireAt` | Trae / 小浣熊 / MiniMax / OfficeAce / WorkBuddy |
+| 只有「N 天内到期」一句说明 | 行里只有 `grantReason` 文案，没有 `expireAt` | （错误示范）AutoClaw 2026-11 之前 |
+
+### 10.1 三件事必须同时成立
+
+1. **后端真的拿到绝对时刻。** 上游给的是**相对时长**（「7 天内到期」`expire_time_value=3`）时，**不要**拿它推日期 —— 那等于替上游编时间（`autoclaw/balance.rs` 的 `credit_rows_from` 注释里有原话）。
+2. **写进 `credits[].expireAt`，且是毫秒数字。** 前端 `hV()`（`ui/islands/ui.js`）用 `Ss()` 读数，字符串会被 `Number()` 判成 `NaN` → 那一行等于没有到期时间。**秒要乘 1000**（AutoClaw / 官网客户端的 `wallet_expires_at` 是秒：`new Date(e*1e3)`）。
+3. **插件申报 `credit_expiry: true`。** 只申报 `credit_detail` 时前端不认定这家有到期列，明细里那行只按普通行渲染，**看不出「3 天后」标签**。AutoClaw 曾经只开 `credit_detail`，症状就是「别家都显示具体日期，它只显示 N 天内」。
+
+> 前端还有个 `AR = 7 * 864e5`：`expireAt` 超过 7 天的行**不挂「快到期」标签**（但仍显示日期）。所以「某行没有标签」不代表没有 `expireAt`。
+
+### 10.2 绝对时刻从哪来（按优先级）
+
+1. **钱包/批次接口自带**（`wallets[].expire_at`、`wallet_instances[].expire_at`）→ 直接用。
+2. **账单流水**（`ledgers` / `bills`）：每笔 `credit` 带到期时刻。AutoClaw 的 `wallet_expires_at`（秒）、小浣熊的 `expire_at`（RFC3339）都在这层。**官方客户端往往只走这条**（AutoClaw 客户端 `dist/main.cjs` 里 `points/expiring` 出现 0 次，只打 `wallets`/`wallet-instances`/`ledgers_std`）—— 顺手反查客户端产物，比猜接口快。
+3. **聚合的「即将过期」接口**（AutoClaw 的 `points/expiring`）**只能当补充**：它给的是相对时长 + 一句文案，答不了「几点到期」。
+
+流水里**只有发放（income / `mutation_type=credit`）才有到期含义**，消耗流水的到期字段是噪音。批次"还剩多少"上游通常不给，可按「同池内先到期先扣」反推（`raccoon/balance.rs::grant_packs` 有实证校验记录）；**反推不出来就只写时间、不写 `remain`**，不要编「还剩满额」。
+
+### 10.3 别拿「抓不到包」当「没有这个字段」
+
+Reqable / Charles 抓不到是**常态**，两个独立原因都会导致空结果，见到空抓包先排这两条再下结论：
+
+- **请求不走系统代理。** 本项目 `crates/providers/src/http.rs` 的 `send_raw(..., proxy=None, ...)` 走 `control_client(None, "direct")` → `builder.no_proxy()`（注释：「直连就是直连，不被机器环境悄悄改写」）。AutoClaw 官方客户端资产链路同样默认 `DIRECT`（`resolveProxy ?? (async()=>"DIRECT")`）。**要抓就走 TUN/增强模式**，或把 `AUTOCLAW_USERAPI_BASE_URL` 指向本地记录型反代（`region.rs::env_override`，前缀 `AUTOCLAW_` / `AUTOCLAW_INTL_`）。
+- **TLS 不读系统根证书。** `reqwest` 开的是 `rustls-tls` + `webpki-roots`（`crates/providers/Cargo.toml`，`Cargo.lock` 里没有 `rustls-native-certs`）→ 装了自签 CA 也不解密，握手直接失败。
+
+### 10.4 本机就有实证数据源，别去重打上游
+
+`~/.agent2api/agent2api.db`：
+
+```sql
+-- 上一次查到的余额原文（含 credits[]、raw.expiring、raw.batches）
+select usage, datetime(last_success_at/1000,'unixepoch','+8 hours')
+from account_usage_records where account_id='<id>';
+-- 账号（data 列是 enc1: 密文，别想直接解密）
+select id, provider from accounts where provider like '%autoclaw%';
+```
+
+`debug_traffic` 表**只有转发链路的报文**（`provider='autoclaw'` 的 132 条全是 `/chat/completions`，`url like '%assetmgr%'` 为 0）—— 余额/签到这类 userapi 请求不在其中，别在这张表里找。
