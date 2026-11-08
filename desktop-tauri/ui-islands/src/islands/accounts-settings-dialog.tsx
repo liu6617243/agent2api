@@ -165,9 +165,18 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   const target: AccountRecord = account
   const peers = peersOf(target, allAccounts())
   const isCatpaw = providerOf(target) === 'catpaw'
-  // Qoder 两家（中国版 / 国际版）：设置里比别家多一行「网页会话 cookie」
-  // （判据与后端 `account_store::is_qoder_family` 同一口径）
-  const isQoder = supportsSessionCookie(target)
+  // 认「网页会话 cookie」的家（Qoder 两家 + CodeArts）：设置里比别家多一行
+  // 「网页会话 cookie」（判据与后端 `account_store::supports_session_cookie` 同一口径）
+  const supportsCookie = supportsSessionCookie(target)
+  // 两家的 cookie 来源不同（站点、要抠的键都不同），所以占位与说明分开写 ——
+  // 共用一句「复制那一行」会让 CodeArts 用户去 qoder.com.cn 里找，找得到才怪。
+  const isCodearts = providerOf(target) === 'codearts'
+  const cookiePlaceholder = isCodearts
+    ? t('整条 Cookie 串（含 devclouddevuibjtcftk），可多行')
+    : t('qoder_session_cookie=…（整条 Cookie 串，可多行）')
+  const cookieDescription = isCodearts
+    ? t('用于读取每份积分的到期时间（「有效期」列）。浏览器登录 codearts.huaweicloud.com 后按 F12 → Application → Cookies 复制整条 Cookie 串（其中 devclouddevuibjtcftk 那一项会自动用作 csrf 头，不必单独贴）。原值不会回显，填好后点「保存更改」生效。')
+    : t('用于读取每批积分的到期时间（「有效期」列）。浏览器登录后按 F12 → Application → Cookies 复制 qoder_session_cookie 那一行，整条 Cookie 串或多行粘贴都行。原值不会回显，填好后点「保存更改」生效。')
   // 自定义账号：凭证段（API Key / 无需鉴权）只对它渲染。判据用 provider 前缀 ——
   // 与后端 `custom_account_provider` 一致（提供商被删后残留的账号同样该能改凭证）
   const isCustomAccount = providerOf(target).startsWith('custom-')
@@ -263,10 +272,10 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   }
 
   /**
-   * 清除 Qoder 的网页会话 cookie（与余额凭证同一形制：立即落库的独立撤销动作）。
+   * 清除网页会话 cookie（Qoder / CodeArts；与余额凭证同一形制：立即落库的独立撤销动作）。
    *
    * cookie 过期后「有效期」列会退回按凭证到期算 —— 界面看得到后果；清除不
-   * 影响转发（PAT / 登录态那条链不读它）。
+   * 影响转发（两家转发走的是令牌 / AK-SK 那条链，不读它）。
    */
   async function clearSessionCookie(): Promise<void> {
     if (interactionBusy || actionLock.current) return
@@ -492,12 +501,12 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
       // 输入框永远是空的；若把「空」解释成清除，用户每次保存设置都会把配好的凭证删掉）。
       // 清除走上面那个显式按钮。
       const balancePatch = isCatpaw && balanceToken.trim() ? { balanceToken: balanceToken.trim() } : {}
-      // Qoder 的网页会话 cookie：与上面同一形制 —— 空值 = 不修改（原值不回显，
-      // 把「空」当清除会让每次保存设置都删掉配好的 cookie），清除走那个显式按钮。
-      // 尾部只剩分号时也按「没填」处理：后端压平后是空串 = 清除，那会让这次保存
-      // 变成一次意图外的撤销（`accountPatchConfirmed` 也会因此判「结果未确认」）。
+      // 网页会话 cookie（Qoder / CodeArts）：与上面同一形制 —— 空值 = 不修改（原值
+      // 不回显，把「空」当清除会让每次保存设置都删掉配好的 cookie），清除走那个
+      // 显式按钮。尾部只剩分号时也按「没填」处理：后端压平后是空串 = 清除，那会让
+      // 这次保存变成一次意图外的撤销（`accountPatchConfirmed` 也会因此判「结果未确认」）。
       const cookieValue = cookieDraftValue(cookieDraft)
-      const cookiePatch = isQoder && cookieValue ? { sessionCookie: cookieValue } : {}
+      const cookiePatch = supportsCookie && cookieValue ? { sessionCookie: cookieValue } : {}
       // 套餐通道：只在**真的改了**时才带上（取值与后端 `zcode::normalize_plan`
       // 逐字一致）。带一个没变的键不会出错，但会让后端那句「套餐通道 → …」的
       // 变更提示在每次保存设置时都出现一次，看起来像刚改过
@@ -662,7 +671,7 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
                             value={name} onChange={event => setName(event.currentTarget.value)} />
                         </Field>
                         <div className='acct-dlg-readonly'><span>{t('账号 ID')}</span><code>{target.id}</code></div>
-                        {isQoder ? <Field className='acct-dlg-field acct-dlg-cookie-field'>
+                        {supportsCookie ? <Field className='acct-dlg-field acct-dlg-cookie-field'>
                           <div className='acct-dlg-field-head'>
                             <FieldLabel htmlFor='account-session-cookie'>{t('网页会话 cookie')}</FieldLabel>
                             <span className='acct-dlg-cookie-actions'>
@@ -677,9 +686,9 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
                           <Textarea id='account-session-cookie' rows={3} spellCheck={false} autoComplete='off'
                             placeholder={account.hasSessionCookie === true
                               ? t('已配置，留空则不修改')
-                              : t('qoder_session_cookie=…（整条 Cookie 串，可多行）')}
+                              : cookiePlaceholder}
                             value={cookieDraft} onChange={event => setCookieDraft(event.currentTarget.value)} />
-                          <FieldDescription>{t('用于读取每批积分的到期时间（「有效期」列）。浏览器登录后按 F12 → Application → Cookies 复制 qoder_session_cookie 那一行，整条 Cookie 串或多行粘贴都行。原值不会回显，填好后点「保存更改」生效。')}</FieldDescription>
+                          <FieldDescription>{cookieDescription}</FieldDescription>
                         </Field> : null}
                         <Field className='acct-dlg-toggle-field'>
                           <div><FieldLabel htmlFor='account-enabled'>{t('启用账号')}</FieldLabel>

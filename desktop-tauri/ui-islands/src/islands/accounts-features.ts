@@ -197,16 +197,24 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   'zcode-intl': { usage: true, creditDetail: true, claim: true, planChannel: true, edition: true, identifier: ['userId'], expiry: ['expiresAt'] },
   // CodeArts（华为云 AI 代码助手）。各位各有出处，别照着别家抄：
   // `usage: true` —— 套餐统计返回总积分与分项积分，读不到时不补零。
-  // `usageDetail: true` —— 余额列的明细弹层形态（套餐徽标 + 点击逐项读数）：本家
-  //   的计量表一行放不下，「可用 N 积分」是加总，两个权益不同的账号看不出差别。
+  // `creditDetail: true` —— 逐份积分包（面额 / 已用 / 剩余 / 领取 → 到期）：数据来自
+  //   网页门户 BFF（`package/credit/page` 的基础包/按需包 + `ops/credit/campaign/{id}`
+  //   的活动赠分），账号上贴了网页会话 cookie 才读得到；没贴时后端退回统计接口的
+  //   分项行（无到期时刻），入口照样点得开。
+  // `creditExpiry: true` —— 上面那些行带毫秒 `expireAt`（插件把上游两种 ISO 拼法
+  //   都归一成毫秒），所以「有效期」列与「按到期排序」有得读。
+  // `usageDetail` **不登记**：它与 `creditDetail` 是两条互斥的渲染路径，前者会把
+  //   余额格换成「套餐徽标 + 两行读数」并读 `wallets`，那就把用户挡在逐份弹层外面
+  //   （`accounts-panels.tsx` 先判 `usageDetail`）。本家真正稀缺的信息是「哪一批
+  //   什么时候作废」，那是 `credits[]` 才有的。
   // 「领福利」不在能力表里：入口已整体迁到「签到中心」（api::checkin_center 按
   //   provider 组装福利行，ui/codearts-welfare.js 的流程两边共用），账号页不再有
   //   这颗按钮 —— 判据只留后端一处，界面不再查表。
   // `edition: false` —— 没有版本/地区概念：region 固定在 cn-north-4 且必须与 token
-  //   签发地一致，不是用户可选项；`login_type`（WEB/IDE）也不是版本，别塞进这一列。
+  //   签发地一致，不是用户可选项；`login_type`（WEB/IDE）也不是版本。
   // `expiry: ['expiresAt']` —— 临时凭据约一小时到期，这一列对本家**是主要信息**。
   codearts: {
-    usage: true, usageDetail: true, edition: false,
+    usage: true, creditDetail: true, creditExpiry: true, edition: false,
     identifier: ['userId'], expiry: ['expiresAt'],
     concurrencyDefault: 3,
   },

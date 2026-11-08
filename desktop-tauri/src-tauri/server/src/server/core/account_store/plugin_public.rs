@@ -39,14 +39,17 @@ pub(super) fn credential_fields(record: &StoredAccount, public: &mut Map<String,
         public.insert("hasBalanceToken".to_string(), Value::Bool(token.and_then(Value::as_str)
             .is_some_and(|token| !token.trim().is_empty())));
     }
-    // Qoder 系的**网页会话 cookie**：设置弹窗据此显示「已配置 / 未配置」与
-    // 有无「清除」按钮。值本身绝不下发（它是能读 BFF 的完整会话），只给这个布尔。
+    // **网页会话 cookie**（`sessionCookie`）：设置弹窗据此显示「已配置 / 未配置」
+    // 与有无「清除」按钮。值本身绝不下发（它是能读 BFF 的完整会话），只给这个布尔。
     //
-    // 判据走 `is_qoder_family`（两个地区都算）：cookie 对两站的用法一致，都是
-    // 网页 BFF 的 `qoder_session_cookie`。值可能落在插件记录的 `pluginSecret`
-    // 里（新记录）或记录顶层（存量内置记录），两处都要认 —— 与上面 CatPaw 那段
-    // 同一款形状。
-    if super::is_qoder_family(&record.provider()) {
+    // 判据走 `supports_session_cookie`：Qoder 系（两个地区）的 cookie 是
+    // `qoder_session_cookie`（读 `big_model_credits` 的逐批到期），CodeArts 的
+    // 是华为云门户那串（读 `portal/snap-manager/v1/package/credit/page` 与
+    // `ops/credit/campaign/{id}` 的逐份作废时刻）。两者**落盘键相同**（插件侧
+    // 各自声明 `sessionCookie` 这个字面量），所以这一段不必按 provider 分支。
+    // 值可能落在插件记录的 `pluginSecret` 里（新记录）或记录顶层（存量内置记录），
+    // 两处都要认 —— 与上面 CatPaw 那段同一款形状。
+    if super::supports_session_cookie(&record.provider()) {
         let cookie = match secret {
             Some(fields) => fields.get(super::qoder_accounts::SESSION_COOKIE_FIELD),
             None => record.get(super::qoder_accounts::SESSION_COOKIE_FIELD),
@@ -102,8 +105,8 @@ pub(super) fn is_private_field(key: &str) -> bool {
         "pluginSecret" | "pluginPublic" | "pluginIdentity" | "accessToken" | "refreshToken"
         | "access_token" | "refresh_token" | "apiKey" | "api_key" | "password"
         | "balanceToken" | "workbuddyWebSession" | "access_key_id" | "secret_access_key" | "security_token" | "oauth_context"
-        // Qoder 的网页会话 cookie：能读网页 BFF 的完整会话，与令牌同级，绝不下发
-        // （界面只要 `hasSessionCookie` 这个布尔，见 `credential_fields`）
+        // 网页会话 cookie（Qoder 系 / CodeArts）：能读网页 BFF 的完整会话，与令牌
+        // 同级，绝不下发（界面只要 `hasSessionCookie` 这个布尔，见 `credential_fields`）
         | "sessionCookie" | "session_cookie" | "webCookie"
     )
 }

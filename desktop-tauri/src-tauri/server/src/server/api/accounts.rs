@@ -1339,15 +1339,19 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
             Err(error) => return store_error(error),
         }
     }
-    // Qoder 的**网页会话 cookie**（`sessionCookie`）：与 CatPaw 那一段同一处境 ——
-    // 只有 Qoder 系（两个地区）认这个键，它也不进通用的 `apply_patch`。
+    // **网页会话 cookie**（`sessionCookie`）：与 CatPaw 那一段同一处境 ——
+    // 只有认这个键的家（Qoder 系两个地区 + CodeArts）能写，它也不进通用的
+    // `apply_patch`。判据统一走 `supports_session_cookie`，与公开形态
+    // （`plugin_public::credential_fields`）和写入实现（`update_qoder_session_cookie`
+    // 里的归属校验）三处同一口径。
     //
     // ── 为什么需要这条 PATCH（而不只是添加账号时填）──────────────
-    // cookie 没有接口能换出来（`Bearer` → 401、`POST /api/v1/sessions` →
-    // `CSRFInvalid`），只能由用户从浏览器复制。它又是「逐批积分到期时间」的唯一
-    // 凭证（插件 `qoder/balance.rs::web_credit_packs` 读网页 BFF）。没有这条入口
-    // 时，cookie 过期后用户只能删账号重加 —— 会一并丢掉请求历史、优先级、限制器
-    // 与代理配置。有了它，账号设置弹窗里贴一行、点「保存更改」就够。
+    // cookie 没有接口能换出来（Qoder 的 `Bearer` → 401、`POST /api/v1/sessions` →
+    // `CSRFInvalid`；CodeArts 的 AK/SK 打 portal 路径 → 404），只能由用户从浏览器
+    // 复制。它又是「逐批积分到期时间」的唯一凭证（Qoder 读 `big_model_credits`，
+    // CodeArts 读 `portal/.../package/credit/page`）。没有这条入口时，cookie 过期
+    // 后用户只能删账号重加 —— 会一并丢掉请求历史、优先级、限制器与代理配置。
+    // 有了它，账号设置弹窗里贴一行、点「保存更改」就够。
     //
     // 传 `null` / 空串 = 清除（语义与 `balanceToken` 一致，见
     // `update_qoder_session_cookie`）；多行粘贴在写入侧压成单行，理由同那里。
@@ -1355,11 +1359,11 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
         let provider = state.store().account_provider_of(&id);
         if provider
             .as_deref()
-            .is_none_or(|provider| !crate::server::core::account_store::is_qoder_family(provider))
+            .is_none_or(|provider| !crate::server::core::account_store::supports_session_cookie(provider))
         {
-            // 「账号不存在」与「账号存在但不是 Qoder」分开说（与上面同一理由）
+            // 「账号不存在」与「账号存在但这家不认这个键」分开说（与上面同一理由）
             return if provider.is_some() {
-                management_error(400, "只有 Qoder 账号有网页会话 cookie（sessionCookie）")
+                management_error(400, "只有 Qoder / CodeArts 账号有网页会话 cookie（sessionCookie）")
             } else {
                 store_error(AccountStoreError::new("账号不存在", 404))
             };

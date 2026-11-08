@@ -332,6 +332,27 @@ pub(crate) fn is_qoder_family(provider_id: &str) -> bool {
         .is_some()
 }
 
+/// 这一家认不认「网页会话 cookie」（`sessionCookie`）这个附加字段。
+///
+/// ── 为什么需要这个合并判据（而不是各处直接写 `is_qoder_family`）──
+/// 这个字段的用途是「用**浏览器会话**去读网页 BFF 上那份逐批积分明细」——
+/// 上游只认 cookie，AK/SK 或 Bearer 打过去一律 404 / 401。目前两家有这个需求：
+///
+///   * **Qoder 系**（`qoder` / `qoder-intl`）：`big_model_credits` 的逐批
+///     `expires_at`（见插件 `qoder/balance.rs::web_credit_packs`）；
+///   * **CodeArts**（`codearts`）：`codearts.huaweicloud.com/portal` 上
+///     `package/credit/page` 与 `ops/credit/campaign/{id}` 的逐份
+///     `expiredTime` / `expireAt`（见插件 `codearts/credits.rs`）。它没有地区
+///     之分（region 固定 cn-north-4，不是用户可选项），所以是单 id 而不是 family。
+///
+/// 三处消费点（公开形态的 `hasSessionCookie`、`PATCH /api/accounts/{id}` 的写入
+/// 白名单、写入实现的归属校验）必须问同一个问题 —— 各写一份的话，加第三家时
+/// 漏掉其中一处的症状是「设置里能贴、保存返回 400」或者「保存成功但界面永远显示
+/// 未配置」，都不会报错。
+pub(crate) fn supports_session_cookie(provider_id: &str) -> bool {
+    is_qoder_family(provider_id) || provider_id == codearts_accounts::CODEARTS_PROVIDER_ID
+}
+
 /// 小浣熊 provider id（账号存储内部多处要用）。
 ///
 /// **从注册表推导**（W4a）：`providers::kind_id` 是 `const fn`，所以这里可以

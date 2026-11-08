@@ -1147,7 +1147,7 @@ function numberOrNull(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null
 }
 
-/* ─── 余额明细弹层（usageDetail 能力位的那几家，现役只有 CodeArts）─── */
+/* ─── 余额明细弹层（`usageDetail` 能力位；2026-11-08 起**没有一家申报**）─── */
 
 /** 明细弹层里的一行读数（`UsageDetailCell` 的渲染输入） */
 type UsageDetailRow = {
@@ -1324,8 +1324,14 @@ function usageDetailOf(entry: UsageEntry): UsageDetail | null {
  * 完整明细（每个桶、到期、可用合计）仍在悬停提示里，这里只抢最基本的两个问题：
  * 哪个套餐、还剩多少。
  *
- * ── 两行形态二：套餐徽标 + 明细弹层（`usageDetail` 能力位，CodeArts）──
+ * ── 两行形态二：套餐徽标 + 明细弹层（`usageDetail` 能力位）──
  * 套餐徽标说明权益，总积分读数可点击查看各项积分的构成。
+ *
+ * ⚠️ 2026-11-08 起**没有一家申报这一位**：CodeArts（最后一家）改走 `creditDetail`
+ * + `credits[]`，因为用户真正要的是「哪一批什么时候作废」，而那一列只在逐份明细里
+ * 有（见 `accounts-credit-detail.tsx` 的文件头）。这一支的代码留着 —— 它的形状
+ * （徽标 + 读数按钮 + 分项平铺）对「一行读数放不下、又不想逐份列」的家仍然成立，
+ * 删掉只会让下一个需要它的家重写一遍。
  */
 /**
  * 余额格里 Token 限制器的**第二行读数**：配了 Token 规则的账号显示
@@ -1420,8 +1426,8 @@ function UsageReadingCell({ account, entry }: { account: AccountRecord; entry: U
   ) : null
   const tokenSub = prominentTokenLimit(account)
   // 「待生效 N 份」徽章：注意力只在读数可用（ok / warn）时才有意义 —— 查询失败 /
-  // 未配置那几档连读数都没有，挂一条「领到了几份」反而更让人糊涂。usageDetail 那一支
-  // （CodeArts）没有套餐清单，不画。
+  // 未配置那几档连读数都没有，挂一条「领到了几份」反而更让人糊涂。CodeArts 那一支
+  // 没有套餐清单（`plans` 字段它不产出），所以这个徽章对它恒不出现。
   const pending = summary.kind === 'ok' || summary.kind === 'warn' ? pendingPlans(entry) : []
   const pendingBadge = pending.length ? (
     <Badge variant='warning' shape='tag' title={pendingPlansTitle(pending)}>

@@ -605,20 +605,24 @@ export function accountEdition(account: AccountRecord | null | undefined): 'cn' 
 }
 
 /**
- * 这个账号能不能手动补一条**网页会话 cookie**（Qoder 两家独有）。
+ * 这个账号能不能手动补一条**网页会话 cookie**（Qoder 两家 / CodeArts）。
  *
  * 为什么不是能力位：cookie 不改变账号的能力（转发一直可以），它只是让
- * 「逐批积分到期」那一列有读数（插件 `qoder/balance.rs::web_credit_packs`
- * 读网页 BFF，PAT 那条链拿不到）。所以设置弹窗按这个判据决定**是否渲染
- * 输入框**，而不是拿它去关掉什么功能。
+ * 「逐批积分到期」那一列有读数。两家读的是各自门户的 BFF，令牌那条链都拿不到：
+ *   * Qoder：`big_model_credits` 的逐批 `expires_at`
+ *     （插件 `qoder/balance.rs::web_credit_packs`）；
+ *   * CodeArts：`codearts.huaweicloud.com/portal` 上 `package/credit/page` 与
+ *     `ops/credit/campaign/{id}` 的逐份 `expiredTime` / `expireAt`
+ *     （插件 `codearts/credits.rs`；AK/SK 签名打 portal 路径回 404）。
+ * 所以设置弹窗按这个判据决定**是否渲染输入框**，而不是拿它去关掉什么功能。
  *
- * 判据是 provider id（与后端 `account_store::is_qoder_family` 同一口径）：
- * 两个地区的 cookie 键名与用法一致，只是站点主机不同。cookie 值本身永不
+ * 判据是 provider id（与后端 `account_store::supports_session_cookie` 同一口径）：
+ * 落盘键都是 `sessionCookie`，各家自己解析那条 cookie 串。cookie 值本身永不
  * 下发（后端只给 `hasSessionCookie` 布尔），输入框因此恒为空。
  */
 export function supportsSessionCookie(account: AccountRecord | null | undefined): boolean {
   const provider = providerOf(account)
-  return provider === 'qoder' || provider === 'qoder-intl'
+  return provider === 'qoder' || provider === 'qoder-intl' || provider === 'codearts'
 }
 
 /** ZCode 的两条上游通道取值（与后端 `providers::zcode` 的常量逐字一致） */
@@ -764,11 +768,16 @@ export function creditExpiryBatchOf(entry: UsageEntry, now = Date.now()): Credit
  *       毫秒 `expireAt`，并按到期升序排好
  *     · officeace —— `officeace/subscription.rs` 的套餐配额 / 奖励活动行都带
  *       `expireAt`（毫秒，`expire_ms > 0` 才写）
+ *     · codearts —— `codearts/credits.rs` 把网页门户的 `expiredTime`（基础包，
+ *       `+00:00` 形态）与 `expireAt`（活动福利，`Z` 形态）都归一成毫秒；
+ *       没贴网页会话 cookie 时退回统计接口的分项行，**那些行没有 `expireAt`** ——
+ *       于是这一列会显示「—」而不是假日期（能力位是静态声明，运行期按读数降级）
  *
  *   ❌ 有明细、但**明细里没有到期时间**（不进名单）：
  *     · raccoon —— 明细只有 `name` + `remain`（上游只给余额一个数）
  *     · zcode —— `credits_of` 只写 total/used/remain，纯比例窗口整行跳过
- *     · qoder —— 代码注释明确写着「不写 `expireAt` / `grantAt`：桶级没有这些字段」
+ *     · qoder —— 桶级口径没有时刻（网页 BFF 那条链才带 `expires_at`，
+ *       且只在账号贴了 `sessionCookie` 时才有）
  *     · loomy —— 永久积分 / 每日赠送两行，都没有到期
  *     · modelscope —— 魔粒余额两行，没有到期
  *     · lobsterai —— 测试明确断言「未核实格式的字段一律不写」

@@ -576,7 +576,8 @@ const CODEARTS: ProviderConfig = {
     webHint: WEB_LOGIN_PASTE_HINT,
   },
   manualTitle: t('粘贴登录凭据'),
-  manualNoteHtml: t('整份粘贴官方插件 / CLIProxyAPI 落盘的凭据 JSON（形如 <code>{"codearts_provider_credential":{…}}</code>，铺平的也行）。<br>必填：<code>access_key_id</code>、<code>secret_access_key</code>、<code>security_token</code>。<b>要能自动续期，必须连 <code>refresh_token</code> 与 <code>oauth_context</code> 一起粘</b> —— 临时凭据约一小时到期，缺这半块就续不回来，只能重新登录。'),
+  manualNoteHtml: t('整份粘贴官方插件 / CLIProxyAPI 落盘的凭据 JSON（形如 <code>{"codearts_provider_credential":{…}}</code>，铺平的也行）。<br>必填：<code>access_key_id</code>、<code>secret_access_key</code>、<code>security_token</code>。<b>要能自动续期，必须连 <code>refresh_token</code> 与 <code>oauth_context</code> 一起粘</b> —— 临时凭据约一小时到期，缺这半块就续不回来，只能重新登录。'
+    + '<br><br><b>想看到每份积分的到期时间</b>（「有效期」列与「积分明细」弹层里那一列），还要在下面补一条<b>网页会话 cookie</b>：浏览器登录 <code>codearts.huaweicloud.com</code> 后按 F12 → Application → Cookies，把整条 Cookie 串贴进来（多行 / Copy as cURL 那种也行，网关会自己压成一行）。逐份明细（每份剩多少、各自哪天作废）只在网页门户的接口上，AK/SK 签名那条链拿不到；不填这一条时明细退回按套餐分项显示，只是没有到期时刻。'),
   fields: [
     {
       key: 'credentialJson',
@@ -587,6 +588,15 @@ const CODEARTS: ProviderConfig = {
       placeholder: '{"codearts_provider_credential":{"access_key_id":"HSTA…","secret_access_key":"…",'
         + '"security_token":"…","expires_at":"2026-09-27T16:17:00.327Z","domain_id":"…","user_id":"…",'
         + '"user_name":"…","refresh_token":"eyJ…","oauth_context":{…}}}',
+    },
+    // 网页会话 cookie（可选）：`codearts/credits.rs` 读它拿逐份积分包的 `expireAt`。
+    // 字段名必须是 `sessionCookie` —— 与 Qoder 同一个落盘键，插件的
+    // `Credentials::from_payload` 只认 `sessionCookie` / `session_cookie` / `webCookie`。
+    // 整条 Cookie 串一起贴：`devclouddevuibjtcftk` 那一项会被插件抠出来当 `cftk`
+    // 头（缺它上游回 400 csrf validate fail），让用户单独再贴一遍没有道理。
+    {
+      key: 'sessionCookie', label: t('网页会话 cookie（可选）'), rows: 3, optional: true,
+      placeholder: t('整条 Cookie 串（含 devclouddevuibjtcftk），可多行'),
     },
     { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空使用凭据里的 user_name') },
   ],

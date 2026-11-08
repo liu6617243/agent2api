@@ -178,14 +178,21 @@ impl AccountStore {
             .map(|record| record.to_value())
     }
 
-    /// 设置 / 清除某条 Qoder 账号的**网页会话 cookie**（`sessionCookie`）。
+    /// 设置 / 清除某条账号的**网页会话 cookie**（`sessionCookie`）。
     ///
     /// ── 为什么需要这个入口（而不是复用添加账号那条链）─────────────
-    /// cookie 不是刷新产物，也没有任何上游接口能把它换出来（`POST /api/v1/sessions`
-    /// 报 `CSRFInvalid`），它**只能由用户从浏览器复制**。而它又是「逐批积分到期
-    /// 时间」的唯一凭证（`qoder/balance.rs::web_credit_packs`，网页 BFF 只认它）。
-    /// 没有这个入口时，用户补一条 cookie 只能删掉账号重加一遍 —— 那会丢掉请求
-    /// 历史、优先级、限制器与代理配置，代价与「贴一行 cookie」完全不成比例。
+    /// cookie 不是刷新产物，也没有任何上游接口能把它换出来（Qoder 的
+    /// `POST /api/v1/sessions` 报 `CSRFInvalid`；CodeArts 的 AK/SK 打 portal 路径
+    /// 回 404），它**只能由用户从浏览器复制**。而它又是「逐批积分到期时间」的唯一
+    /// 凭证（Qoder 读 `big_model_credits`，CodeArts 读 `portal/snap-manager/v1/
+    /// package/credit/page` + `ops/credit/campaign/{id}`）。没有这个入口时，用户补
+    /// 一条 cookie 只能删掉账号重加一遍 —— 那会丢掉请求历史、优先级、限制器与代理
+    /// 配置，代价与「贴一行 cookie」完全不成比例。
+    ///
+    /// ── 为什么函数名还叫 `qoder_*`（2026-11-08 扩到 CodeArts 之后）──
+    /// 它现在服务两家（判据见 `super::supports_session_cookie`），但**落盘键与
+    /// 压平规则两家逐字相同**，改名只会让调用点与文档一起漂。保持原名、把「谁认这个
+    /// 键」交给那一个判据函数，比造一个 `update_session_cookie` 再保留一个转发壳干净。
     ///
     /// ── 两种记录形态（与 `update_catpaw_balance_token` 同一套）───────
     ///   - **插件记录**（有 `pluginSecret`）：写进 secret 里的同名键 —— 插件
@@ -227,7 +234,7 @@ impl AccountStore {
         let plugin_secret = {
             let guard = self.guard();
             self.record_by_id(&guard, id)
-                .filter(|record| Region::from_provider_id(&record.provider()).is_some())
+                .filter(|record| super::supports_session_cookie(&record.provider()))
                 .filter(StoredAccount::has_plugin_secret)
                 .map(|record| record.get("pluginSecret").cloned().unwrap_or(Value::Null))
         };
@@ -262,8 +269,8 @@ impl AccountStore {
         let _guard = self.guard();
         let mut record = self
             .record_by_id(&_guard, id)
-            .filter(|record| Region::from_provider_id(&record.provider()).is_some())
-            .ok_or_else(|| AccountStoreError::not_found("账号不存在或不属于 Qoder"))?;
+            .filter(|record| super::supports_session_cookie(&record.provider()))
+            .ok_or_else(|| AccountStoreError::not_found("账号不存在或不属于认网页会话 cookie 的提供商"))?;
         let current = record
             .get(SESSION_COOKIE_FIELD)
             .and_then(Value::as_str)
@@ -288,7 +295,7 @@ impl AccountStore {
         self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))?;
         crate::server::logging::log(
             "[Accounts]",
-            &format!("✏️  Qoder 账号已更新: {name}（{}）", changes.join("，")),
+            &format!("✏️  {} 账号已更新: {name}（{}）", record.provider(), changes.join("，")),
         );
         Ok(changes)
     }
