@@ -91,6 +91,7 @@ impl AccountDraft {
             login_type,
             refresh_token,
             oauth_context,
+            session_cookie,
         } = self.credential;
         if access_key_id.trim().is_empty() || secret_access_key.trim().is_empty() {
             return Err("CodeArts 凭据缺少 access_key_id 或 secret_access_key".to_string());
@@ -117,6 +118,10 @@ impl AccountDraft {
             }
         }
         secret.insert("source".to_string(), Value::String(self.source.clone()));
+        // 网页会话 cookie（可选）：只在非空时写 —— 「空值不覆盖」那条纪律在这里
+        // 同样成立。用户重新粘贴一份只有 AK/SK 的凭据时，不该把上次贴的 cookie
+        // 洗掉（那会让有效期列悄悄退回「—」，而记录里看起来什么都没变）。
+        insert_text(&mut secret, super::credentials::SESSION_COOKIE_FIELD, &session_cookie);
         // ── 通用键名（与网关 `to_record_value` 逐字同口径）──────────
         // 网关的账号投影与「这个账号能不能用」的判定读的是这些通用键；
         // 插件家的公开视图由插件自己给，但**选路与启用判定**仍在网关侧读
@@ -212,6 +217,13 @@ pub(super) fn account_view(secret: &Value) -> Value {
     );
     public.insert("hasAccessToken".to_string(), Value::Bool(available));
     public.insert("hasRefreshToken".to_string(), Value::Bool(can_refresh));
+    // 网页会话 cookie **只给布尔**：它是能读整个 portal BFF 的完整会话，与令牌同级，
+    // 而这是账号列表接口（前端与局域网内的浏览器都能读到它）。界面只需要知道
+    // 「配没配」来决定显示「已配置 / 未配置」与那颗清除按钮。
+    public.insert(
+        "hasSessionCookie".to_string(),
+        Value::Bool(credential.as_ref().is_some_and(|value| !value.session_cookie.trim().is_empty())),
+    );
     public.insert(
         "refreshTokenExpiresAt".to_string(),
         credential.as_ref()

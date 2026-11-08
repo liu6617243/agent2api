@@ -15,13 +15,13 @@
 use std::collections::HashMap;
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::errors::GatewayError;
 
 use super::chat;
 use super::credentials::Credential;
-use super::{oauth, redact, signer};
+use super::{credits, oauth, redact, signer};
 
 /// 订阅统计（付费套餐计量表）。
 pub const STATISTICS_PATH: &str = "/snap-manager/v1/statistics/plugin";
@@ -264,9 +264,31 @@ fn quota_meter_label(name: &str) -> Option<String> {
     .to_string())
 }
 
-/// 套餐统计合成 `query_usage` 的归一化形状。
+/// 套餐统计合成 `query_usage` 的归一化形状（**不带逐批明细**的老入口）。
 ///
-/// `available` 只在有积分数值时给数，Token 用量不计入总积分。
+/// 只保留给「拿不到网页会话」的调用方与单测用；真跑时走
+/// [`usage_document_with`]，把 `credits[]` 一起带上。
+pub fn usage_document(statistics: Option<&Statistics>) -> Value {
+    usage_document_with(statistics, None)
+}
+
+/// 套餐统计 + 网页逐批明细 → `query_usage` 的归一化形状。
+///
+/// ── `credits[]` 从哪来（两种来源，按可靠性降序）─────────────
+///   1. `web`：portal BFF 的**逐份积分包**（带 `expireAt`），有就用它。
+///      这是「有效期」列唯一的数据来源 —— 统计接口只给聚合值，一时刻都拿不到。
+///   2. `web` 缺席（没贴 cookie / cookie 过期 / 上游改版）时**用统计接口的
+///      分项行合成**：面额 / 已用 / 剩余齐全，只是**没有到期时刻**。
+///
+/// 为什么第 2 条必须存在：`credit_detail` 是对界面的**承诺**（申报了就有逐份
+/// 读数）。没有 cookie 的账号如果 `credits[]` 整段缺席，那个入口点开就是空框 ——
+/// 比没有入口更糟。用聚合分项兜底至少把「钱分成几块、各剩多少」说清楚，
+/// 「什么时候作废」这一列则诚实地空着（`credit_expiry` 的读法本来就是
+/// 「读不到就不显示」，不是「显示 0」）。
+///
+/// `available` 仍**只认统计接口**：那是本家余额的唯一权威口径，网页汇总
+/// （`all_credit_package`）只在统计接口整个失败时兜底 —— 它俩实测同源同值，
+/// 但多一个来源参与求和就会多一种翻倍的可能（见下面那段包含关系说明）。
 ///
 /// 「套餐积分」是**汇总口径**不是独立分账：`usageTotalPackageCredit` 的剩余等于
 /// 各分项行之和（2026-10-14 实测 trial 账号：5172.57 = 基础包 172.57 + 按需 0 +
@@ -277,9 +299,10 @@ fn quota_meter_label(name: &str) -> Option<String> {
 /// 非零的账号，「基础包 + 赠送」两行之和 ≠ 汇总行，点名判据认不出包含关系、
 /// 翻倍照旧 —— 所以分项取「除汇总行外所有带剩余积分的行」。认不出包含关系
 /// （数值对不上 / 分项缺席）时不剔除：宁可照旧全加，也不凭猜丢掉一笔真实的钱。
-pub fn usage_document(statistics: Option<&Statistics>) -> Value {
+pub fn usage_document_with(statistics: Option<&Statistics>, web: Option<&credits::WebCredits>) -> Value {
     let mut wallets = Vec::new();
     let mut credit_left: Option<f64> = None;
+    let mut meter_rows: Vec<Value> = Vec::new();
     if let Some(statistics) = statistics {
         // 分项行的剩余之和：**除汇总行外**所有带 `credit_remaining` 的行
         // （有没有分项、有哪几族由上游的 metrics 决定，这里不点名）。
@@ -310,6 +333,12 @@ pub fn usage_document(statistics: Option<&Statistics>) -> Value {
                 "creditUsed": meter.credit_used,
                 "creditRemaining": meter.credit_remaining,
             }));
+            // 兜底用的逐份行（只在网页明细缺席时启用，见函数头第 2 条）。
+            // 汇总行也进明细：没有 cookie 时它是「总积分还剩多少」那一眼读数，
+            // 而弹层里多一行汇总并不误导（名字就叫「套餐积分」）。
+            if let Some(row) = meter_credit_row(meter) {
+                meter_rows.push(row);
+            }
             let Some(left) = meter.credit_remaining else { continue };
             let duplicated = meter.name == "usageTotalPackageCredit"
                 && parts_sum.is_some_and(|sum| (sum - left).abs() <= f64::EPSILON.max(left.abs() * 1e-6));
@@ -318,8 +347,15 @@ pub fn usage_document(statistics: Option<&Statistics>) -> Value {
             }
         }
     }
-    json!({
-        "available": credit_left,
+    // 网页汇总只作兜底：统计接口成功时它一个数都不参与。
+    let available = credit_left.or_else(|| web.and_then(|web| web.available));
+    // 逐批明细：网页优先（带 expireAt），缺席时退回聚合分项（无 expireAt）。
+    let credit_rows = match web {
+        Some(web) if !web.rows.is_empty() => web.rows.clone(),
+        _ => meter_rows,
+    };
+    let mut document = json!({
+        "available": available,
         "unit": "积分",
         "wallets": wallets,
         "subscription": statistics.map(|statistics| json!({
@@ -331,7 +367,55 @@ pub fn usage_document(statistics: Option<&Statistics>) -> Value {
         "raw": {
             "statistics": statistics.map(|statistics| serde_json::to_value(statistics).unwrap_or(Value::Null)),
         },
-    })
+    });
+    let Some(object) = document.as_object_mut() else { return document };
+    if !credit_rows.is_empty() {
+        object.insert("credits".to_string(), Value::Array(credit_rows));
+    }
+    if let Some(web) = web {
+        // 上游直给的 7 天窗口金额，留档对账用（前端自己按 expireAt 算，口径只留一处）。
+        if let Some(subscription) = object.get_mut("subscription").and_then(Value::as_object_mut) {
+            if let Some(amount) = web.expiring_amount {
+                subscription.insert("expiringAmount".to_string(), json!(amount));
+            }
+            subscription.insert("expiringWindowDays".to_string(), json!(7));
+        } else {
+            // 统计接口失败但网页读到了：套餐名等信息一个都没有，只把窗口与金额挂上。
+            let mut subscription = Map::new();
+            if let Some(amount) = web.expiring_amount {
+                subscription.insert("expiringAmount".to_string(), json!(amount));
+            }
+            subscription.insert("expiringWindowDays".to_string(), json!(7));
+            object.insert("subscription".to_string(), Value::Object(subscription));
+        }
+        if let Some(raw) = object.get_mut("raw").and_then(Value::as_object_mut) {
+            raw.insert("web".to_string(), web.raw());
+        }
+    }
+    document
+}
+
+/// 一个计量表 → `credits[]` 的兜底行（只在拿不到网页逐批明细时用）。
+///
+/// 三个数**缺就不写键**（与 `credits.rs` 的 `row_of` 同一条纪律：`Number(null)`
+/// 是 0，写 null 会把「没读到」画成「剩 0 / 共 0」）。**不写 `expireAt`** ——
+/// 统计接口没有到期时刻这个概念，凭空补一个会让「有效期」列显示假日期。
+fn meter_credit_row(meter: &Meter) -> Option<Value> {
+    if meter.credit_total.is_none() && meter.credit_used.is_none() && meter.credit_remaining.is_none() {
+        return None;
+    }
+    let mut row = Map::new();
+    row.insert("name".to_string(), Value::String(meter.label.clone()));
+    for (key, value) in [
+        ("total", meter.credit_total),
+        ("used", meter.credit_used),
+        ("remain", meter.credit_remaining),
+    ] {
+        if let Some(value) = value {
+            row.insert(key.to_string(), json!(value));
+        }
+    }
+    Some(Value::Object(row))
 }
 
 #[cfg(any())]

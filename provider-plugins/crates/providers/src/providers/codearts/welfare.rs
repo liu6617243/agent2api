@@ -672,6 +672,10 @@ pub async fn newbie_gift(ctx: &PluginCtx, account_id: &str, base: &str) -> Resul
 #[allow(dead_code)]
 /// 领取成功后顺手刷新一次余额（面板上「领完就能看到积分变了」）。
 /// 失败不影响领取结果 —— 余额是可选信息。
+///
+/// 与 `adapter::query_usage` 同一口径：统计接口是硬失败，逐批明细是软降级。
+/// 刚领到的那笔赠分就落在活动福利那条链上（`credits.rs` 的 campaign 通道），
+/// 所以这里也带上它 —— 不然「领完立刻刷新」看到的是旧的批次清单。
 pub async fn refresh_usage(ctx: &PluginCtx, account_id: &str, now_ms: i64) -> Value {
     let Ok(credential) = current_credential(ctx, account_id).await else {
         return Value::Null;
@@ -679,8 +683,10 @@ pub async fn refresh_usage(ctx: &PluginCtx, account_id: &str, now_ms: i64) -> Va
     let Ok(statistics) = balance::fetch_statistics(
         super::models::DEFAULT_BASE_URL, &credential, chat::DEFAULT_LANGUAGE, chat::DEFAULT_PLUGIN_VERSION,
     ).await else { return Value::Null };
+    let proxy = super::adapter::record_proxy(ctx, account_id).await.ok().flatten();
+    let web = super::credits::fetch(&credential, proxy.as_ref()).await;
     let _ = now_ms;
-    balance::usage_document(Some(&statistics))
+    balance::usage_document_with(Some(&statistics), web.as_ref())
 }
 
 #[cfg(any())]

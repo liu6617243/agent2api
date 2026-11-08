@@ -36,6 +36,10 @@ fn secrets_of(credential: &Credential) -> Vec<String> {
         credential.secret_access_key.clone(),
         credential.security_token.clone(),
         credential.refresh_token.clone(),
+        // 网页会话 cookie：它等价于「整个控制台的登录态」，能读 portal BFF 的
+        // 全部账单接口。portal 回的是门户 HTML（可能带回显的请求头），漏盖一次
+        // 就等于把账号交给所有能看到日志的人。
+        credential.session_cookie.clone(),
     ];
     if let Some(context) = credential.oauth_context.as_ref() {
         secrets.push(context.pkce_pair.code_verifier.clone());

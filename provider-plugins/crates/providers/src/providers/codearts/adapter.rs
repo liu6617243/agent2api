@@ -36,7 +36,7 @@ use super::chat;
 use super::credentials::Credential;
 use super::models;
 use super::session;
-use super::{accounts, authorization, balance, login, onboarding, refresh, welfare};
+use super::{accounts, authorization, balance, credits, login, onboarding, refresh, welfare};
 
 /// provider id（落盘契约，存量 id 不能改名）。
 pub const PROVIDER_ID: &str = "codearts";
@@ -183,7 +183,19 @@ impl Provider for CodeArtsProvider {
             .with_models(models::list())
             // 账号行：各位各有出处，别照着别家抄。
             //   `usage` —— 套餐统计提供总积分与分项积分。
-            //   `usage_detail` —— 余额列显示套餐与总积分，点击查看分项。
+            //   `credit_detail` —— 逐份积分包（面额 / 已用 / 剩余 / 领取 → 到期）：
+            //     数据来自网页控制台的 BFF（见 `credits.rs`），需要账号上额外贴一份
+            //     网页会话 cookie；没贴时退回统计接口的分项行（无 `expireAt`），
+            //     入口照样点得开，只是「有效期」列空着。
+            //   `credit_expiry` —— 上面那些行带**毫秒** `expireAt`（`credits.rs` 的
+            //     `iso_ms` 把上游两种 ISO 拼法都归一成毫秒），所以「有效期」列可以按
+            //     「快到期优先」排。
+            //   `usage_detail: false` —— **刻意关掉**：它与 `credit_detail` 是两条互斥的
+            //     渲染路径（前者把余额格换成「套餐徽标 + 两行读数」，读的是 `wallets`；
+            //     后者只加一个入口，读的是 `credits[]`）。本家真正稀缺的信息是「哪一批
+            //     什么时候作废」，那是 `credits[]` 才有的；留着 `usage_detail` 会把
+            //     用户挡在弹层外面（`accounts-panels.tsx` 先判 `usageDetail` 再走
+            //     `CreditDetailButton`）。
             //   `edition: false` —— 没有版本 / 地区概念：region 固定在 cn-north-4
             //     且必须与 token 签发地一致，不是用户可选项；`login_type`
             //     （WEB/IDE）也不是版本。
@@ -194,7 +206,8 @@ impl Provider for CodeArtsProvider {
             //   `default_limiters` —— 以总积分余额作为默认额度保护。
             .with_account_features(proto::AccountFeatures {
                 usage: true,
-                usage_detail: true,
+                credit_detail: true,
+                credit_expiry: true,
                 identifier: vec!["userId".to_string(), "uid".to_string()],
                 expiry: vec!["expiresAt".to_string()],
                 concurrency_default: Some(3),
@@ -851,13 +864,33 @@ async fn account_max_concurrent(ctx: &PluginCtx, account_id: &str) -> Option<u64
         .filter(|value| *value > 0)
 }
 
-/// 读取套餐统计，总积分是本家的额度来源。
+/// 读取套餐统计（总积分口径）+ 网页逐批明细（`credits[]`）。
+///
+/// ── 为什么两条通道**并发**发 ────────────────────────────────
+/// 统计接口走 AK/SK 签名（`snap-access`），逐批明细走网页会话 cookie
+/// （`codearts.huaweicloud.com/portal`），两条链互不依赖、各自要 1~3 个往返。
+/// 串行会把一次余额查询拖成两倍时长，而账号页一次刷新要过所有账号。
+///
+/// ── 失败语义：一条硬、一条软 ────────────────────────────────
+///   * 统计接口失败 → **照旧报错**（它是余额的唯一权威口径，读不到就是读不到，
+///     界面上要显示"查询失败"而不是"余额 0"）；
+///   * 逐批明细失败 → **静默降级**（没贴 cookie / cookie 过期 / 上游改版都会
+///     走这条路，用户没重贴之前没有任何动作可做）。明细缺席时
+///     `usage_document_with` 会用统计接口的分项行兜底，`credits[]` 依然有内容，
+///     只是没有 `expireAt`。
+///
+/// 代理解析失败**不**影响明细：`record_proxy` 在统计那条链上已经会报错，
+/// 这里再报一次只是重复；拿不到代理就当直连。
 async fn query_usage(ctx: &PluginCtx, account_id: &str) -> Result<Value, GatewayError> {
     let credential = welfare::current_credential(ctx, account_id).await?;
+    let proxy = record_proxy(ctx, account_id).await.ok().flatten();
     let statistics = balance::fetch_statistics(
         models::DEFAULT_BASE_URL, &credential, chat::DEFAULT_LANGUAGE, chat::DEFAULT_PLUGIN_VERSION,
-    ).await?;
-    Ok(balance::usage_document(Some(&statistics)))
+    );
+    let web = credits::fetch(&credential, proxy.as_ref());
+    let (statistics, web) = tokio::join!(statistics, web);
+    let statistics = statistics?;
+    Ok(balance::usage_document_with(Some(&statistics), web.as_ref()))
 }
 
 /// 把上游原文拼成统一文案的一截（空则不拼）。

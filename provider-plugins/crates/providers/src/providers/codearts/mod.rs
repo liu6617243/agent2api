@@ -54,6 +54,7 @@ pub(crate) mod balance;
 pub(crate) mod callback_server;
 pub(crate) mod chat;
 pub(crate) mod credentials;
+pub(crate) mod credits;
 pub(crate) mod dpop;
 pub(crate) mod login;
 pub(crate) mod models;

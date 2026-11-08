@@ -22,6 +22,18 @@ use serde_json::Value;
 /// `refresh.rs` 的 15 分钟提前量）。这条只是兜底，真正的判据是 `expires_at`。
 pub const MAX_TOKEN_LENGTH: usize = 8192;
 
+/// 网页会话 cookie 的长度上限（字符）。与 `MAX_TOKEN_LENGTH` 同量级 ——
+/// 一条完整的华为云控制台 Cookie 串实测 700 字符上下，8 KiB 足够容纳
+/// 「Copy as cURL」那种带几十个键的整段粘贴。
+pub const MAX_COOKIE_LENGTH: usize = 8192;
+
+/// 网页会话 cookie 的落盘键。
+///
+/// 与 Qoder 同值（`sessionCookie`）：后端的 PATCH 入口、公开视图的
+/// `hasSessionCookie`、前端输入框的 `key` 全都按这个名字找，两家共用一个键名
+/// 少一层翻译。⚠️ 这是**落盘契约**：改名会让存量账号的 cookie 读不到。
+pub const SESSION_COOKIE_FIELD: &str = "sessionCookie";
+
 /// P-256 私钥 JWK（`d` 是标量的 base64url，32 字节定长）。
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Jwk {
@@ -91,6 +103,14 @@ pub struct Credential {
     pub refresh_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_context: Option<OAuthContext>,
+    /// **网页会话 cookie**（可选）：只有它能让 `credits.rs` 读到逐批积分的到期
+    /// 时刻，AK/SK 那条签名链打不进 portal BFF（实测 404）。
+    ///
+    /// 它不是登录换来的、也没有任何接口能换出来 —— 只能由用户从浏览器复制。
+    /// 缺省就整条通道不查（见 `credits::fetch` 的第一道判据），账号页只剩聚合
+    /// 余额，与本次改动之前的行为一致。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_cookie: String,
 }
 
 impl Credential {
@@ -208,6 +228,10 @@ impl Credential {
             text_of(body, &["login_type"]),
             "WEB".to_string(),
         ]);
+        // 网页会话 cookie：显式三个键名（与 Qoder 同一份名单）。**读取侧也归一**
+        // —— 早期/别的入口可能已经把多行串落了库，只在写入处压平的话那些记录
+        // 要重新添加一次才能恢复。
+        credential.session_cookie = session_cookie_of(body);
         if !credential.valid() {
             return Err("CodeArts 凭据缺少 access_key_id 或 secret_access_key".to_string());
         }
@@ -239,6 +263,19 @@ impl Credential {
             "expiresAt".to_string(),
             self.expires_at_ms().map(Value::from).unwrap_or(Value::Null),
         );
+        // 网页会话 cookie 单独补一个通用键名：`from_payload` 认三个名字，
+        // 而 serde 序列化出来的键是 `session_cookie`（snake_case）。写 `sessionCookie`
+        // 是为了与 Qoder 的记录、后端 PATCH 入口、前端输入框**同名** —— 三家都按
+        // 这一个键找，少一层翻译就少一次「贴了却没生效」的排查。
+        //
+        // ⚠️ 早期漏写这一项的症状是「用户粘贴时带了 cookie、落库时被丢掉」，
+        // 于是逐批明细永远读不出来、有效期列永远空着，而记录里看起来什么都没少。
+        if !self.session_cookie.trim().is_empty() {
+            record.insert(
+                SESSION_COOKIE_FIELD.to_string(),
+                Value::String(self.session_cookie.clone()),
+            );
+        }
         Value::Object(record)
     }
 
@@ -254,6 +291,69 @@ fn text_of(value: &Value, keys: &[&str]) -> String {
         .map(str::trim)
         .unwrap_or_default()
         .to_string()
+}
+
+/// 从 payload 里取网页会话 cookie 并规整成**可单行进 HTTP 头**的形态。
+///
+/// 字段名只认显式的三个（与 Qoder 同一份名单）：账号记录里可能出现无关的
+/// `cookie` 键（别的家用它存别的东西），认错会拿它去打 portal BFF。
+///
+/// 名字带 `_of` 是为了不和 `Credential::session_cookie` 那个同名字段混淆。
+pub fn session_cookie_of(payload: &Value) -> String {
+    normalize_cookie(&text_of(payload, &[SESSION_COOKIE_FIELD, "session_cookie", "webCookie"]))
+}
+
+/// 把一段原始 cookie 文本压成**单行**（`a=1; b=2`）。
+///
+/// ── 为什么要压平换行 ────────────────────────────────────────
+/// 用户最常见的来源是浏览器 DevTools 的「Copy as cURL」或整段请求头，那里
+/// `Cookie:` 后面常跟若干行 `name=value;`。换行原样塞进 `Cookie` 头会让请求在
+/// 第一个 `\r\n` 处断掉 —— 上游回的是门户 HTML 首页（**HTTP 200**，不是 401），
+/// 而这条通道对失败是静默降级，用户完全看不出是粘贴格式的锅。
+///
+/// 读取侧也过这一遍（不只是写入侧）：早期版本可能已经把多行串落了库，
+/// 只在写入处规整的话，那些老记录要重新添加一次才能恢复。
+pub fn normalize_cookie(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    // 每行去空白 → 剥掉可能连头名一起复制的 `Cookie:` → 丢空行 →
+    // 行尾没有 `;` 的补一个 → 空格连接。
+    let body = raw
+        .lines()
+        .map(str::trim)
+        .map(|line| {
+            let line = line
+                .strip_prefix("Cookie:")
+                .or_else(|| line.strip_prefix("cookie:"))
+                .unwrap_or(line);
+            line.trim()
+        })
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            if line.ends_with(';') {
+                line.to_string()
+            } else {
+                format!("{line};")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    // 末尾那个 `;` 是合法的（`a=1; b=2;` 与 `a=1; b=2` 等价），去掉更整洁。
+    body.trim_end_matches(';').trim().chars().take(MAX_COOKIE_LENGTH).collect()
+}
+
+/// 从一条已归一的 cookie 串里取某个键的值（`None` = 没这个键）。
+///
+/// `cftk` 头要用 `devclouddevuibjtcftk` 的值，而它就在同一条 cookie 里 ——
+/// 让用户为同一件事贴两次没有道理（且两次一定会有一次贴错）。
+pub fn cookie_value<'a>(cookie: &'a str, key: &str) -> Option<&'a str> {
+    cookie.split(';').find_map(|pair| {
+        let pair = pair.trim();
+        let (name, value) = pair.split_once('=')?;
+        (name.trim() == key).then(|| value.trim()).filter(|value| !value.is_empty())
+    })
 }
 
 fn first_non_empty(values: &[String]) -> String {
