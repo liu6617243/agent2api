@@ -670,6 +670,10 @@ pub(crate) fn parse_ticket_credential(text: &str) -> Result<Credential, GatewayE
         // 故意留空：这条通道不给 refresh token，账号到期后必须重新登录（见 `poll_ticket`）
         refresh_token: String::new(),
         oauth_context: None,
+        // 同样留空：网页会话 cookie 是**用户手工贴的**，不在这条登录链路的产出里
+        // （ticket 只给 AK/SK + security token）。贴要么走「添加账号」表单，要么走
+        // 账号设置弹窗的 PATCH —— 两条都在网关侧，与这里无关。
+        session_cookie: String::new(),
     };
     if !credential.valid() || credential.security_token.trim().is_empty() {
         return Err(GatewayError::with_status(502, "CodeArts ticket 响应里的临时凭据不完整"));
