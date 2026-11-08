@@ -24,6 +24,16 @@
 //! ── 非 Windows ──────────────────────────────────────────────
 //! DPAPI 只有 Windows 有，macOS 走 Keychain（未实现）。这些平台上本模块
 //! 直接返回错误，由调用方回落到调试端口那条路径（行为与改造前一致）。
+//!
+//! ── 2026-11-08 补豆包客户端作为回退源 ─────────────────────────
+//! 与 `super::client`（设备号）同一个理由：本插件是「豆包工作」，但用户的
+//! 账号就是普通豆包账号，官方客户端常常是豆包（`%LOCALAPPDATA%\Doubao`）。
+//! 只装豆包的机器上 `DoubaoWork` 目录根本不存在 —— 改造前「导入本机登录态」
+//! 直接报「未找到客户端的数据目录」，用户只能手工贴 Cookie。这里把豆包
+//! 客户端一并作为候选（豆包工作优先），两客户端共用同一账号体系。
+//!
+//! ⚠️ 只读，绝不写回；两个客户端各自有自己的 `Local State`（os_crypt 密钥
+//! 不同），所以**密钥必须跟着各自的目录取**，不能跨目录混用。
 
 use std::path::{Path, PathBuf};
 
@@ -39,29 +49,43 @@ const MAX_COOKIE_BYTES: usize = 16 * 1024;
 /// 返回的 Cookie 条数上限（实测豆包域 30 余条）。
 const MAX_COOKIES: usize = 256;
 
-/// 客户端 `User Data` 目录（Chromium profile 的父目录）。
-fn user_data_dir() -> Option<PathBuf> {
+/// 各候选客户端的 `User Data` 目录（Chromium profile 的父目录），按优先级
+/// 排列：豆包工作（本插件的本体客户端）优先，读不到回退豆包主客户端。
+fn user_data_dirs() -> Vec<PathBuf> {
+    // ⚠️ 每个 cfg 块都以 `return` 收尾而不是当尾表达式：`#[cfg]` 挂在
+    // 「尾表达式块」上要 `stmt_expr_attributes`（实验特性），挂在语句块上
+    // 才稳定。改这里时保持这个形状。
     #[cfg(target_os = "windows")]
     {
-        let base = std::env::var_os("LOCALAPPDATA")?;
-        return Some(PathBuf::from(base).join("DoubaoWork").join("User Data"));
+        let Some(base) = std::env::var_os("LOCALAPPDATA") else {
+            return Vec::new();
+        };
+        let base = PathBuf::from(base);
+        return vec![
+            base.join("DoubaoWork").join("User Data"),
+            base.join("Doubao").join("User Data"),
+        ];
     }
     #[cfg(target_os = "macos")]
     {
-        let base = std::env::var_os("HOME")?;
-        return Some(
-            PathBuf::from(base)
-                .join("Library")
-                .join("Application Support")
-                .join("DoubaoWork"),
-        );
+        let Some(base) = std::env::var_os("HOME") else {
+            return Vec::new();
+        };
+        let base = PathBuf::from(base)
+            .join("Library")
+            .join("Application Support");
+        return vec![base.join("DoubaoWork"), base.join("Doubao")];
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| Some(PathBuf::from(std::env::var_os("HOME")?).join(".config")))?;
-        Some(base.join("DoubaoWork"))
+        let base = match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(dir) => PathBuf::from(dir),
+            None => match std::env::var_os("HOME") {
+                Some(home) => PathBuf::from(home).join(".config"),
+                None => return Vec::new(),
+            },
+        };
+        return vec![base.join("DoubaoWork"), base.join("Doubao")];
     }
 }
 
@@ -217,53 +241,70 @@ fn read_copy(path: &Path, key: &[u8]) -> Result<Vec<Value>, String> {
 /// （`accounts::credentials` 只管形状，不关心来源）。
 ///
 /// 多个 profile 时取第一个含 `sessionid` 的 —— 与「用户实际登录的那个窗口」一致。
+/// 多个客户端（豆包工作 / 豆包）时按 [`user_data_dirs`] 的顺序逐个试，第一个
+/// 拿得到 `sessionid` 的就用它。
 pub fn read() -> Result<Value, GatewayError> {
-    let user_data = user_data_dir().ok_or_else(|| {
-        GatewayError::with_status(400, "未找到豆包工作客户端的数据目录，请先安装并登录客户端")
-    })?;
-    let key = crate::crypto::os_crypt_aes_key(&local_state_path(&user_data)).map_err(|error| {
-        GatewayError::with_status(
-            400,
-            format!("无法解密客户端 Cookie（{error}）；可改用网页登录或粘贴 Cookie"),
-        )
-    })?;
-    let profiles = profiles(&user_data);
-    if profiles.is_empty() {
+    let dirs = user_data_dirs();
+    if dirs.is_empty() {
         return Err(GatewayError::with_status(
             400,
-            "豆包工作客户端没有可用的登录数据，请先登录客户端；也可使用网页登录或粘贴 Cookie",
+            "未找到豆包（工作）客户端的数据目录，请先安装并登录客户端；也可使用网页登录或粘贴 Cookie",
         ));
     }
     let mut first: Option<Vec<Value>> = None;
-    for profile in profiles {
-        let cookies = match read_profile(&profile, &key) {
-            Ok(cookies) => cookies,
+    let mut seen_dir = false;
+    for user_data in dirs {
+        // 目录不存在 = 这个客户端没装，静默跳下一个（不是错误）。
+        if !user_data.is_dir() {
+            continue;
+        }
+        seen_dir = true;
+        // ⚠️ 密钥必须跟着各自的目录取：两个客户端的 `Local State` 是不同的
+        // os_crypt 密钥，混用只会解出乱码（表现为「Cookie 全是空的」）。
+        let key = match crate::crypto::os_crypt_aes_key(&local_state_path(&user_data)) {
+            Ok(key) => key,
             Err(error) => {
                 crate::logging::verbose(
                     "[DoubaoWork]",
-                    &format!("读取 {} 失败：{error}", profile.display()),
+                    &format!("读取 {} 的 os_crypt 密钥失败：{error}", user_data.display()),
                 );
                 continue;
             }
         };
-        let has_session = cookies.iter().any(|cookie| {
-            matches!(cookie["name"].as_str(), Some("sessionid" | "sessionid_ss"))
-                && cookie["value"]
-                    .as_str()
-                    .is_some_and(|value| !value.is_empty())
-        });
-        if has_session {
-            return Ok(json!({ "cookies": cookies }));
-        }
-        if first.is_none() && !cookies.is_empty() {
-            first = Some(cookies);
+        for profile in profiles(&user_data) {
+            let cookies = match read_profile(&profile, &key) {
+                Ok(cookies) => cookies,
+                Err(error) => {
+                    crate::logging::verbose(
+                        "[DoubaoWork]",
+                        &format!("读取 {} 失败：{error}", profile.display()),
+                    );
+                    continue;
+                }
+            };
+            let has_session = cookies.iter().any(|cookie| {
+                matches!(cookie["name"].as_str(), Some("sessionid" | "sessionid_ss"))
+                    && cookie["value"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty())
+            });
+            if has_session {
+                return Ok(json!({ "cookies": cookies }));
+            }
+            if first.is_none() && !cookies.is_empty() {
+                first = Some(cookies);
+            }
         }
     }
     match first {
         Some(cookies) => Ok(json!({ "cookies": cookies })),
+        None if seen_dir => Err(GatewayError::with_status(
+            400,
+            "豆包（工作）客户端里没有找到有效登录态，请先在客户端登录；也可使用网页登录或粘贴 Cookie",
+        )),
         None => Err(GatewayError::with_status(
             400,
-            "豆包工作客户端里没有找到有效登录态，请先在客户端登录；也可使用网页登录或粘贴 Cookie",
+            "未找到豆包（工作）客户端的数据目录，请先安装并登录客户端；也可使用网页登录或粘贴 Cookie",
         )),
     }
 }

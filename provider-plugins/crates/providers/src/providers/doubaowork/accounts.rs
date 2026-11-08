@@ -29,6 +29,24 @@ fn session_of(secret: &Value) -> Option<String> {
         .cloned()
 }
 
+/// 从已拼好的 Cookie 头里抽会话标识（`api::endpoint` 给 `sign` 定缓存键用，
+/// 免得为拿一个键再走一遍 `pairs` 解析）。抽不到返回空串（= 全局份）。
+pub fn session_of_header(cookie_header: &str) -> String {
+    for part in cookie_header.split(';') {
+        let part = part.trim();
+        if let Some(value) = part.strip_prefix("sessionid=") {
+            return value.trim().to_string();
+        }
+    }
+    for part in cookie_header.split(';') {
+        let part = part.trim();
+        if let Some(value) = part.strip_prefix("sessionid_ss=") {
+            return value.trim().to_string();
+        }
+    }
+    String::new()
+}
+
 /// 客户端实时读到的 Cookie（读不到就是 `None`，不把「客户端没开」当错误）。
 ///
 /// 给 3 秒上限：客户端正常时 CDP 往返是毫秒级；客户端没开 / 没开调试端口时

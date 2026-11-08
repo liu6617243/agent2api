@@ -1,4 +1,4 @@
-//! 读本机豆包工作客户端的设备号。
+//! 读本机豆包（工作）客户端的设备号。
 //!
 //! ── 为什么转发必须带上它（2026-11-03 实测）──────────────────────
 //! 同一份 Cookie、同一台机器、同一个出口，只差这一个参数：
@@ -14,6 +14,16 @@
 //! ── 读不到怎么办 ────────────────────────────────────────────
 //! 客户端没装、文件不在、格式变了、值不合规，一律当"读不到"，行为与改造前
 //! 完全一致（没有设备号可带）。读这个文件绝不能把转发弄挂，所以全程失败即 None。
+//!
+//! ── 2026-11-08 补豆包客户端作为回退源 ─────────────────────────
+//! 本插件是「豆包工作」（aid=1044603），但用户的账号就是普通豆包账号，官方
+//! 客户端是豆包（`%LOCALAPPDATA%\Doubao`，aid=582478）—— 两客户端共用同一
+//! 账号体系，风控也认同一批受信设备。实测（2026-11-08）：只装豆包不装豆包
+//! 工作的机器上，DoubaoWork 目录根本不存在，插件一直裸奔（无设备号）；
+//! 豆包客户端 `Local State` 里的 `aha.device.device_id` 与官方客户端请求
+//! 抓包里的 `device_id` 完全一致。所以豆包工作读不到时回退读豆包客户端的 ——
+//! 风控视角里这是把请求挂回「用户真实在用的那台受信设备」，而不是一台
+//! 从没出现过的陌生设备（这正是 T+1 签到软惩罚的嫌疑来源，见 `sign.rs`）。
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -35,35 +45,52 @@ fn cache() -> &'static Mutex<Option<(std::time::Instant, Option<String>)>> {
     CACHE.get_or_init(Mutex::default)
 }
 
-/// 客户端的 `Local State` 路径（按平台惯例推；与 EchoBird 的客户端数据目录同源）。
-fn local_state() -> Option<PathBuf> {
+/// 各候选客户端的 `Local State` 路径，按优先级排列：豆包工作（本插件的本体
+/// 客户端）优先，读不到回退豆包主客户端 —— 两者共用账号体系与风控设备库
+/// （见模块头的 2026-11-08 注）。
+fn local_state_candidates() -> Vec<PathBuf> {
+    // ⚠️ 每个 cfg 块都以 `return` 收尾而不是当尾表达式：`#[cfg]` 挂在
+    // 「尾表达式块」上要 `stmt_expr_attributes`（实验特性），挂在语句块上
+    // 才稳定。改变量类型时保持这个形状，别顺手改成 `vec![…]` 结尾。
     #[cfg(target_os = "windows")]
     {
-        let base = std::env::var_os("LOCALAPPDATA")?;
-        return Some(
-            PathBuf::from(base)
-                .join("DoubaoWork")
+        let Some(base) = std::env::var_os("LOCALAPPDATA") else {
+            return Vec::new();
+        };
+        let base = PathBuf::from(base);
+        return vec![
+            base.join("DoubaoWork")
                 .join("User Data")
                 .join("Local State"),
-        );
+            base.join("Doubao").join("User Data").join("Local State"),
+        ];
     }
     #[cfg(target_os = "macos")]
     {
-        let base = std::env::var_os("HOME")?;
-        return Some(
-            PathBuf::from(base)
-                .join("Library")
-                .join("Application Support")
-                .join("DoubaoWork")
-                .join("Local State"),
-        );
+        let Some(base) = std::env::var_os("HOME") else {
+            return Vec::new();
+        };
+        let base = PathBuf::from(base)
+            .join("Library")
+            .join("Application Support");
+        return vec![
+            base.join("DoubaoWork").join("Local State"),
+            base.join("Doubao").join("Local State"),
+        ];
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| Some(PathBuf::from(std::env::var_os("HOME")?).join(".config")))?;
-        Some(base.join("DoubaoWork").join("Local State"))
+        let base = match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(dir) => PathBuf::from(dir),
+            None => match std::env::var_os("HOME") {
+                Some(home) => PathBuf::from(home).join(".config"),
+                None => return Vec::new(),
+            },
+        };
+        return vec![
+            base.join("DoubaoWork").join("Local State"),
+            base.join("Doubao").join("Local State"),
+        ];
     }
 }
 
@@ -79,7 +106,12 @@ fn usable(value: &str) -> Option<String> {
 }
 
 fn read() -> Option<String> {
-    let path = local_state()?;
+    local_state_candidates().into_iter().find_map(read_at)
+}
+
+/// 读单个 `Local State`：文件不存在 / 超限 / 解析失败都返回 `None`，交给
+/// 下一个候选。绝不因为某个文件异常把整个读取弄挂。
+fn read_at(path: PathBuf) -> Option<String> {
     let meta = std::fs::metadata(&path).ok()?;
     if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
         return None;
@@ -110,7 +142,7 @@ pub fn device_id() -> Option<String> {
     if found.is_some() {
         crate::logging::verbose(
             "[DoubaoWork]",
-            "已读到本机客户端的设备号，转发时会带上（上游风控认这个设备）",
+            "已读到本机客户端的设备号（豆包工作或豆包客户端），转发时会带上（上游风控认这个设备）",
         );
     }
     found

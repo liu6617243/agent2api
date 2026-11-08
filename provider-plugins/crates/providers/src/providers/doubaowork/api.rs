@@ -11,9 +11,38 @@ use super::PROVIDER_ID;
 use crate::errors::GatewayError;
 
 pub const BASE_URL: &str = "https://www.doubao.com";
+/// 官方客户端（豆包 PC，Chromium 内核）的 UA 形态。抓包（2026-11-08，
+/// 客户端 2.32.6）证实官方请求 UA 恰是「Chrome UA + `SamanthaDoubao/<版本>`
+/// 后缀」，无后缀的裸 Chrome UA 是「从未出现过的浏览器」—— 与签到 T+1
+/// 软惩罚（见 `sign` 模块头）的嫌疑链一致，请求时按 [`samantha_ua`] 补齐。
 pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 // 上游按 pc_version 下发模型菜单；只有 runtime_version 时会成功返回空菜单。
 const DEFAULT_CLIENT_VERSION: &str = "2.33.5";
+
+/// UA 补 `SamanthaDoubao/<版本>` 后缀（幂等）。
+///
+/// ── 为什么在这里补而不是要求重导入 ──────────────────────────
+/// 老快照（2026-11-03 那批「导入即快照」）存的是裸 Chrome UA；逐条让用户
+/// 重导入不现实。后缀版本号用账号快照里的 `clientVersion`（与 query 里的
+/// `pc_version` 同源 —— 官方两者就是同值），没有才退 [`DEFAULT_CLIENT_VERSION`]。
+/// 判据是「带不带后缀」，所以幂等：官方形态的 UA 原样放行。
+fn samantha_ua(credentials: &Value) -> String {
+    let base = credentials["userAgent"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(USER_AGENT)
+        .to_string();
+    if base.contains("SamanthaDoubao/") {
+        return base;
+    }
+    let version = credentials["clientVersion"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_CLIENT_VERSION);
+    format!("{base} SamanthaDoubao/{version}")
+}
 
 pub fn client(
     proxy: Option<&proto::WireProxy>,
@@ -92,17 +121,40 @@ pub fn encode(value: &str) -> String {
 
 pub fn headers(credentials: &Value) -> Result<Vec<(String, String)>, GatewayError> {
     let cookie = super::accounts::cookie_header(credentials)?;
+    let ua = samantha_ua(credentials);
+    // `sec-ch-ua` 的版本要跟 UA 里的 Chrome 主版本一致（官方客户端两者同源，
+    // 抓包里是 `Chrome/147` + `"Chromium";v="147"`）。UA 解不出主版本就退
+    // [`USER_AGENT`] 的 147 —— 此时 UA 本身也是裸的，两边至少自洽。
+    let chrome_major = ua
+        .split("Chrome/")
+        .nth(1)
+        .and_then(|rest| rest.split('.').next())
+        .map(str::to_string)
+        .unwrap_or_else(|| "147".into());
     Ok(vec![
         (header::COOKIE.as_str().into(), cookie),
         (header::ORIGIN.as_str().into(), BASE_URL.into()),
         (header::REFERER.as_str().into(), format!("{BASE_URL}/chat/")),
+        (header::USER_AGENT.as_str().into(), ua),
         (
-            header::USER_AGENT.as_str().into(),
-            credentials["userAgent"]
-                .as_str()
-                .unwrap_or(USER_AGENT)
-                .into(),
+            header::ACCEPT.as_str().into(),
+            "application/json, text/plain, */*".into(),
         ),
+        // 抓包（2026-11-08）里官方请求带的全套浏览器指纹头：UA 已补
+        // Samantha 后缀，这几个头一并补齐 —— 它们是服务端侧「这是真浏览器」
+        // 的旁证，缺了就是另一种「从没见过的客户端」。注意官方 `sec-fetch-site`
+        // 是 cross-site（客户端 webview 的跨源形态），别照抄成 same-origin 的
+        // 「标准浏览器」想当然值。
+        (
+            "sec-ch-ua".into(),
+            format!("\"Chromium\";v=\"{chrome_major}\", \"Not.A/Brand\";v=\"8\""),
+        ),
+        ("sec-ch-ua-mobile".into(), "?0".into()),
+        ("sec-ch-ua-platform".into(), "\"Windows\"".into()),
+        ("sec-fetch-site".into(), "cross-site".into()),
+        ("sec-fetch-mode".into(), "cors".into()),
+        ("sec-fetch-dest".into(), "empty".into()),
+        ("accept-language".into(), "zh-CN,zh;q=0.9".into()),
         ("Agw-Js-Conv".into(), "str".into()),
     ])
 }
@@ -141,8 +193,9 @@ pub fn endpoint(credentials: &Value, path: &str) -> Result<String, GatewayError>
         ("sys_region", "CN".into()),
     ];
     // 设备号：先用账号自己的（网页登录态里可能带 `device_id` Cookie），没有
-    // 就兜底读本机豆包工作客户端的 —— 风控认的是「这个账号在这台受信设备上」，
-    // 不读客户端的设备号，转发一定会被人机验证拦下（见 `client` 模块头的实测）。
+    // 就兜底读本机豆包工作客户端的，再读不到回退豆包客户端的（`client` 模块
+    // 头的 2026-11-08 注：两者共用风控设备库）—— 风控认的是「这个账号在这台
+    // 受信设备上」，不读客户端的设备号，转发一定会被人机验证拦下。
     let device = credentials["deviceId"]
         .as_str()
         .filter(|value| !value.is_empty())
@@ -162,12 +215,32 @@ pub fn endpoint(credentials: &Value, path: &str) -> Result<String, GatewayError>
     }
     if let Some(device) = device.as_deref() {
         query.push(("device_id", device.into()));
+        // 抓包里官方请求还带 `tea_uuid=<device_id>`（埋点 SDK 的设备标识），
+        // 与 device_id 同值 —— 一并带上，凑齐官方的设备三元组。
+        query.push(("tea_uuid", device.into()));
         query.push(("fp", format!("verify_{device}")));
     } else if let Some(fingerprint) = credentials["fingerprint"]
         .as_str()
         .filter(|value| !value.is_empty())
     {
         query.push(("fp", fingerprint.into()));
+    }
+    // msToken：官方每个请求的 URL 参数都带（响应经 `x-ms-token` 轮换，见
+    // `sign` 模块头）。放 query 末尾，与官方参数顺序一致。
+    //
+    // 会话键走 `accounts::cookie_header` 再抽：快照可能存成数组形态
+    // （`credentials.cookies`），那时 `cookieHeader` 已被 `credentials()` 移除，
+    // 直接读那个键会恒空 —— 而 `cookie_header` 会从数组拼回来。拼不出来
+    // （Cookie 本身非法）就留空，退全局份。
+    //
+    // **拿不到就整条不带**（`sign::ms_token` 返回 `None`）：msToken 是服务端
+    // 加密下发的载荷，自造一颗塞进去只会被当成坏令牌 —— 那正是本改造要消除
+    // 的东西。「不带」是改造前的形态，已被实测证明能过。
+    let session = super::accounts::cookie_header(credentials)
+        .map(|header| super::accounts::session_of_header(&header))
+        .unwrap_or_default();
+    if let Some(token) = super::sign::ms_token(&session) {
+        query.push(("msToken", token));
     }
     let query = query
         .iter()
@@ -327,6 +400,21 @@ pub async fn json_response(
         .send()
         .await
         .map_err(|error| GatewayError::with_status(502, crate::http::describe(&error)))?;
+    // 官方每个响应都经 `x-ms-token` 响应头下发下一颗令牌（抓包 2026-11-08
+    // 证实），接住回放即官方同一条轮换链路（见 `sign` 模块头）。`set-cookie`
+    // 里取不到会话键（官方这批响应只下发 `bd_sso_hi3jfd`），所以这里统一记
+    // 为全局份：`sign::ms_token` 的读取顺序是「会话份 → 全局份」，**都没有
+    // 就不带**（不自造，见 `sign` 模块头）。全局份兜所有账号的首轮请求；
+    // 某账号一旦用过全局份，它下一个响应里的新令牌又会刷新全局份 —— 相当于
+    // 全体账号共享一条官方轮换链，形态与官方客户端一致（官方本来就是一台
+    // 设备一颗令牌）。
+    if let Some(token) = response
+        .headers()
+        .get("x-ms-token")
+        .and_then(|value| value.to_str().ok())
+    {
+        super::sign::store_ms_token("", token);
+    }
     let status = response.status().as_u16();
     let mut bytes = Vec::new();
     while let Some(chunk) = response
