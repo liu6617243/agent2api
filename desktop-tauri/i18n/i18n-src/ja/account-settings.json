@@ -1,4 +1,5 @@
 {
+  "整条 Cookie 串（含 devclouddevuibjtcftk），可多行": "Cookie 文字列全体（devclouddevuibjtcftk を含む）。複数行可",
   "qoder_session_cookie=…（整条 Cookie 串，可多行）": "qoder_session_cookie=…（Cookie 文字列全体、複数行も可）",
   "{count} 个分区有未保存的更改": "{count} 個のセクションに未保存の変更があります",
   "{count} 个账号共用": "{count} 個のアカウントで共有",
@@ -55,6 +56,7 @@
   "清除查询凭证？": "照会用認証情報を削除しますか？",
   "清除网页会话 cookie？": "Web セッション Cookie を消去しますか？",
   "用于读取每批积分的到期时间（「有效期」列）。浏览器登录后按 F12 → Application → Cookies 复制 qoder_session_cookie 那一行，整条 Cookie 串或多行粘贴都行。原值不会回显，填好后点「保存更改」生效。": "各クレジットバッチの有効期限（「有効期限」列）の読み取りに使います。ブラウザーでログイン後、F12 → Application → Cookies で qoder_session_cookie の行をコピーしてください。Cookie 文字列全体でも複数行の貼り付けでも構いません。保存済みの値は表示されません。貼り付けて「変更を保存」を押すと反映されます。",
+  "用于读取每份积分的到期时间（「有效期」列）。浏览器登录 codearts.huaweicloud.com 后按 F12 → Application → Cookies 复制整条 Cookie 串（其中 devclouddevuibjtcftk 那一项会自动用作 csrf 头，不必单独贴）。原值不会回显，填好后点「保存更改」生效。": "各クレジットパッケージの有効期限（「有効期限」列）の読み取りに使います。ブラウザーで codearts.huaweicloud.com にログインし、F12 → Application → Cookies で Cookie 文字列全体をコピーしてください（devclouddevuibjtcftk の項目は CSRF ヘッダーとして自動的に使われるため、別途貼る必要はありません）。保存済みの値は表示されません。貼り付けて「変更を保存」を押すと反映されます。",
   "用明确的规则保护当前账号的额度。": "明確なルールでこのアカウントの利用枠を保護します。",
   "留空不修改，替换后点击「保存更改」生效。": "空欄のままなら変更しません。新しいキーは「変更を保存」を押すと反映されます。",
   "留空保留当前密钥，输入新密钥以替换": "空欄で既存のキーを維持、新しいキーを入力して変更",

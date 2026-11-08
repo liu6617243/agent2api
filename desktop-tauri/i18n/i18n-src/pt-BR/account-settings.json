@@ -1,4 +1,5 @@
 {
+  "整条 Cookie 串（含 devclouddevuibjtcftk），可多行": "A string de cookie inteira (incluindo devclouddevuibjtcftk); várias linhas permitidas",
   "qoder_session_cookie=…（整条 Cookie 串，可多行）": "qoder_session_cookie=… (a string de cookie inteira, várias linhas permitidas)",
   "{count} 个分区有未保存的更改": "Alterações não salvas em {count} seções",
   "{count} 个账号共用": "Compartilhado por {count} contas",
@@ -55,6 +56,7 @@
   "清除查询凭证？": "Limpar as credenciais de consulta?",
   "清除网页会话 cookie？": "Limpar o cookie de sessão web?",
   "用于读取每批积分的到期时间（「有效期」列）。浏览器登录后按 F12 → Application → Cookies 复制 qoder_session_cookie 那一行，整条 Cookie 串或多行粘贴都行。原值不会回显，填好后点「保存更改」生效。": "Usado para ler a data de expiração de cada lote de créditos (a coluna Validade). Depois de entrar pelo navegador, pressione F12 → Application → Cookies e copie a linha qoder_session_cookie. Colar a string de cookie inteira ou várias linhas funciona. O valor salvo nunca é exibido; cole um novo e clique em Salvar alterações.",
+  "用于读取每份积分的到期时间（「有效期」列）。浏览器登录 codearts.huaweicloud.com 后按 F12 → Application → Cookies 复制整条 Cookie 串（其中 devclouddevuibjtcftk 那一项会自动用作 csrf 头，不必单独贴）。原值不会回显，填好后点「保存更改」生效。": "Usado para ler a data de expiração de cada pacote de créditos (a coluna Validade). Entre em codearts.huaweicloud.com pelo navegador, pressione F12 → Application → Cookies e copie a string de cookie inteira (a entrada devclouddevuibjtcftk é usada automaticamente como cabeçalho CSRF, então não é preciso colar separadamente). O valor salvo nunca é exibido; depois de colar, clique em Salvar alterações.",
   "用明确的规则保护当前账号的额度。": "Proteja a cota desta conta com regras explícitas.",
   "留空不修改，替换后点击「保存更改」生效。": "Deixe em branco para manter a chave. Uma substituição entra em vigor após clicar em Salvar alterações.",
   "留空保留当前密钥，输入新密钥以替换": "Deixe em branco para manter a chave ou informe uma substituta",

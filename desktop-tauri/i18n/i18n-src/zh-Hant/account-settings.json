@@ -1,4 +1,5 @@
 {
+  "整条 Cookie 串（含 devclouddevuibjtcftk），可多行": "",
   "qoder_session_cookie=…（整条 Cookie 串，可多行）": "qoder_session_cookie=…（整條 Cookie 字串，可多行）",
   "{count} 个分区有未保存的更改": "{count} 個分區有未儲存的變更",
   "{count} 个账号共用": "{count} 個帳號共用",
@@ -55,6 +56,7 @@
   "清除查询凭证？": "清除查詢憑證？",
   "清除网页会话 cookie？": "清除網頁工作階段 cookie？",
   "用于读取每批积分的到期时间（「有效期」列）。浏览器登录后按 F12 → Application → Cookies 复制 qoder_session_cookie 那一行，整条 Cookie 串或多行粘贴都行。原值不会回显，填好后点「保存更改」生效。": "用於讀取每批積分的到期時間（「有效期」欄）。瀏覽器登入後按 F12 → Application → Cookies 複製 qoder_session_cookie 那一行，整條 Cookie 字串或多行貼上都行。原值不會回顯，填好後點「儲存變更」生效。",
+  "用于读取每份积分的到期时间（「有效期」列）。浏览器登录 codearts.huaweicloud.com 后按 F12 → Application → Cookies 复制整条 Cookie 串（其中 devclouddevuibjtcftk 那一项会自动用作 csrf 头，不必单独贴）。原值不会回显，填好后点「保存更改」生效。": "",
   "用明确的规则保护当前账号的额度。": "用明確的規則保護目前帳號的額度。",
   "留空不修改，替换后点击「保存更改」生效。": "留空不修改，替換後按一下「儲存變更」生效。",
   "留空保留当前密钥，输入新密钥以替换": "留空保留目前金鑰，輸入新金鑰以替換",
