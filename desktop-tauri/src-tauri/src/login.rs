@@ -2354,7 +2354,32 @@ async fn run_embedded_with_proxy(
             // 任务载荷（`{account, warning…}`）随成功结果透传：前端据此
             // 在「账号已添加」之后补一条警告（例如 KukuAI 的凭证未通过
             // 上游复核 —— 账号未开通 KukuAI 时就是这条路）。
-            PollOutcome::Done(payload) => break Ok(json!({ "ok": true, "payload": payload })),
+            PollOutcome::Done(payload) => {
+                // ── CodeArts：趁窗口还活着，把 SSO 票根顺手收下来 ────────
+                // 为什么要在这里做（而不是登录链路的产出里）：票根是
+                // `auth.huaweicloud.com` 域上的 `SSOTGC`，用户在这次登录窗口里
+                // 走完华为云 SSO 之后，它才被写进**这个窗口自己的** Cookie 存储
+                // —— 窗口用的是临时数据目录，本次登录之外无处可取（读系统浏览器
+                // 库那条路被 Chromium 的 v20 App-Bound Encryption 堵死，详见
+                // `crate::codearts_login` 的模块头）。
+                //
+                // 时机必须是**窗口销毁之前**（下面 `window.destroy()` 之后
+                // Cookie 存储随临时目录一起没了），所以不能挪到循环外面统一做。
+                //
+                // ⚠️ 写 warning 必须走 `as_object_mut`，**不能**写
+                // `payload["warning"] = …`：serde_json 的 `IndexMut for Value`
+                // 对非对象值是 `panic!("cannot access key …")`，而 release 是
+                // `panic=abort` —— 一次形状意外的 `/wait` 响应会把整个应用带走。
+                let mut payload = payload;
+                if provider == "codearts" && !payload_has_warning(&payload) {
+                    if let Some(warning) = capture_codearts_tgc(&window, &payload).await {
+                        if let Some(object) = payload.as_object_mut() {
+                            object.insert("warning".to_string(), json!(warning));
+                        }
+                    }
+                }
+                break Ok(json!({ "ok": true, "payload": payload }));
+            }
             // 任务已落定失败（state 校验失败 / 授权码已失效 / 换取凭证失败）：
             // 立刻透出真实文案。继续轮询只会把它盖成 5 分钟后的「等待超时」，
             // 用户看不到任何可行动的原因。
@@ -2397,7 +2422,11 @@ async fn submit_callback(login_state: &str, callback_url: &str) {
 /// 命令里直接调会与消息循环互相等待而**死锁**（tauri 文档的 Known issues，
 /// 现象正是「窗口停住、永不收尾」）。这里挪到 `spawn_blocking` 独立线程，
 /// 再包一层 3 秒超时兜底 —— 读不到就当失败，绝不卡死调用方。
-async fn read_window_cookies(
+///
+/// `pub(crate)`：`crate::codearts_login` 也用它（CodeArts 抓 SSO 票根）。
+/// **不要让那边另写一份** —— 超时与线程模型是这条链上唯一的死锁防线，
+/// 两份实现漂移一次就是一次「点登录后整个窗口卡死」的故障。
+pub(crate) async fn read_window_cookies(
     window: &tauri::WebviewWindow,
 ) -> Result<Vec<tauri::webview::Cookie<'static>>, String> {
     let window_owned = window.clone();
@@ -2494,6 +2523,76 @@ async fn submit_kuku_login(
         .await
         .map_err(|error| format!("网关收尾失败: {error}"))?;
     Ok(())
+}
+
+/// `/wait` 的成功载荷里是否已经带了警告（有就不覆盖 —— 后端写的警告更权威）。
+///
+/// 三处都看：根层（KukuAI 那条链就是从根层的 `warning` 透到前端的
+/// —— 见 `add-provider-blocks.tsx` 里读 `result.payload.warning` 那一段）、
+/// `session` 里（各家 `mark_adapter_login_done` 写摘要的位置）、以及
+/// `payload` 里（嵌套透传形态）。目前 CodeArts 这条链不会产出警告，这一层
+/// 纯粹是防御：将来任一条链加上 warning 时，自动抓票根不该把它盖掉。
+fn payload_has_warning(payload: &Value) -> bool {
+    let non_empty = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .is_some_and(|warning| !warning.trim().is_empty())
+    };
+    non_empty(payload.get("warning"))
+        || non_empty(payload.pointer("/session/warning"))
+        || non_empty(payload.pointer("/payload/warning"))
+}
+
+/// **CodeArts 专有**：登录刚刚落定成功时，趁登录窗口还在，从它的 Cookie 存储
+/// 里把 `SSOTGC` 票根读出来并写进账号。
+///
+/// ── 返回值语义（务必读）──────────────────────────────────────
+/// `Some(文案)` = **要告诉用户一件事**（抓到了但没存进去、或压根没抓到）。
+/// `None` = 没什么可说的（存进去了，或这次不需要提示）。
+///
+/// 为什么「没抓到」也要提示：这条链的期望是「网页登录一次，票根就自动配好」。
+/// 用户下次重启发现会话没了、又不知道票根是空的，只会以为是产品坏了。所以
+/// 抓不到时明说「没抓到，需要自己贴」—— 那正是账号设置弹窗里那个输入框的用途。
+///
+/// ── 失败为什么都不阻断登录 ───────────────────────────────────
+/// 票根是**可选增强**（没有它，会话 cookie 手工贴也照样能用一阵）。自动抓取
+/// 任何一步失败都只降级成一条 warning，账号本身已经落库了 —— 把一次成功的
+/// 登录变回失败是更坏的交换。
+async fn capture_codearts_tgc(
+    window: &tauri::WebviewWindow,
+    payload: &Value,
+) -> Option<String> {
+    let account_id = payload
+        .pointer("/session/accountUid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let Some(account_id) = account_id else {
+        eprintln!("[login] CodeArts 登录已完成，但载荷里没有账号 id：跳过自动抓取 SSO 票根");
+        return None;
+    };
+    let Some(tgc) = crate::codearts_login::capture(window).await else {
+        eprintln!("[login] CodeArts 登录窗口里没有 SSOTGC（本次未自动配好 SSO 票根）");
+        return Some(
+            "这次网页登录没有抓到 SSO 票根（SSOTGC），账号的「自动续会话」暂时不可用。\
+             不影响转发与余额查询；想让它自动续，可在账号设置里手工贴一次票根\
+             （它在 auth.huaweicloud.com 域，取法见弹窗里的说明）。"
+                .to_string(),
+        );
+    };
+    match crate::codearts_login::save(account_id, &tgc).await {
+        Ok(()) => {
+            eprintln!("[login] CodeArts 登录态已顺手写入 SSO 票根（账号 {account_id}）");
+            None
+        }
+        Err(error) => {
+            eprintln!("[login] CodeArts SSO 票根已抓到但未能写入账号：{error}");
+            Some(format!(
+                "这次登录抓到了 SSO 票根，但没能写进账号（{error}）。\
+                 不影响转发与余额查询；想让它自动续会话，可在账号设置里手工贴一次。"
+            ))
+        }
+    }
 }
 
 

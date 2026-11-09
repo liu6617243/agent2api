@@ -558,26 +558,31 @@ const CODEARTS: ProviderConfig = {
   // 浏览器面板看不到这个洞（platform()==='web' 时整段收起），只有 App 里会露。
   desktop: false,
   webLogin: {
-    noteHtml: t('打开华为云 CodeArts 的官方授权页登录：登录完成后官方页面会把浏览器带回<b>网关自己的</b> <code>/oauth/callback</code>，网关用一次性授权码换取临时凭据并加入账号列表。<br>网关跑在另一台机器上时，网页端会提示把地址栏中的最终回调地址直接粘贴回面板。'),
+    noteHtml: t('打开华为云 CodeArts 的官方授权页登录：登录完成后官方页面会把浏览器带回<b>网关自己的</b> <code>/oauth/callback</code>，网关用一次性授权码换取临时凭据并加入账号列表。<br>网关跑在另一台机器上时，网页端会提示把地址栏中的最终回调地址直接粘贴回面板。<br><b>内嵌窗口</b>登录成功后，壳侧会顺手把这个窗口里的 <b>SSO 票根（<code>SSOTGC</code>）</b>也收下来写进账号 —— 换电脑、重装之后不必再手工贴那一项。用<b>系统浏览器</b>登录时壳侧读不到浏览器的 Cookie，票根需要在账号设置里手工贴一次。'),
     button: t('打开 CodeArts 授权页'),
     busyText: t('等待 CodeArts 登录完成…'),
     modes: [
       {
         value: 'embedded',
         label: t('内嵌窗口（推荐）'),
-        hint: t('将打开内嵌窗口；登录完成后自动加入账号列表。关掉窗口即取消等待'),
+        hint: t('将打开内嵌窗口；登录完成后自动加入账号列表，并顺手配好 SSO 票根（换电脑后靠它自动续会话）。关掉窗口即取消等待'),
       },
       {
         value: 'external',
         label: t('系统浏览器'),
-        hint: t('将用系统默认浏览器打开授权页（会复用浏览器里已登录的华为云账号）；浏览器与网关不在同一台机器时，按上方说明把最终回调地址粘贴回面板'),
+        hint: t('将用系统默认浏览器打开授权页（会复用浏览器里已登录的华为云账号）。这条路上壳侧看不到浏览器的 Cookie，SSO 票根需要在账号设置里手工贴一次。浏览器与网关不在同一台机器时，按上方说明把最终回调地址粘贴回面板'),
       },
     ],
     webHint: WEB_LOGIN_PASTE_HINT,
   },
   manualTitle: t('粘贴登录凭据'),
-  manualNoteHtml: t('整份粘贴官方插件 / CLIProxyAPI 落盘的凭据 JSON（形如 <code>{"codearts_provider_credential":{…}}</code>，铺平的也行）。<br>必填：<code>access_key_id</code>、<code>secret_access_key</code>、<code>security_token</code>。<b>要能自动续期，必须连 <code>refresh_token</code> 与 <code>oauth_context</code> 一起粘</b> —— 临时凭据约一小时到期，缺这半块就续不回来，只能重新登录。'
-    + '<br><br><b>想看到每份积分的到期时间</b>（「有效期」列与「积分明细」弹层里那一列），还要在下面补一条<b>网页会话 cookie</b>：浏览器登录 <code>codearts.huaweicloud.com</code> 后按 F12 → Application → Cookies，把整条 Cookie 串贴进来（多行 / Copy as cURL 那种也行，网关会自己压成一行）。逐份明细（每份剩多少、各自哪天作废）只在网页门户的接口上，AK/SK 签名那条链拿不到；不填这一条时明细退回按套餐分项显示，只是没有到期时刻。'),
+  // 两段分开 t() 再拼：把两截字面量用 + 串起来时，**运行期的键是拼完的那一整串**，
+  // 而扫描器只认第一个字面量 —— 于是加了新段就会把整条 note 变成一个没有译文的新键，
+  // 前四种语言的现成译文凭空作废。拆成两句后老段落仍是那个老键（译文继续生效），
+  // 新增的只有 SSO 那一段。
+  manualNoteHtml: t('整份粘贴官方插件 / CLIProxyAPI 落盘的凭据 JSON（形如 <code>{"codearts_provider_credential":{…}}</code>，铺平的也行）。<br>必填：<code>access_key_id</code>、<code>secret_access_key</code>、<code>security_token</code>。<b>要能自动续期，必须连 <code>refresh_token</code> 与 <code>oauth_context</code> 一起粘</b> —— 临时凭据约一小时到期，缺这半块就续不回来，只能重新登录。<br><br><b>想看到每份积分的到期时间</b>（「有效期」列与「积分明细」弹层里那一列），还要在下面补一条<b>网页会话 cookie</b>：浏览器登录 <code>codearts.huaweicloud.com</code> 后按 F12 → Application → Cookies，把整条 Cookie 串贴进来（多行 / Copy as cURL 那种也行，网关会自己压成一行）。逐份明细（每份剩多少、各自哪天作废）只在网页门户的接口上，AK/SK 签名那条链拿不到；不填这一条时明细退回按套餐分项显示，只是没有到期时刻。')
+    + '<br><br>'
+    + t('<b>不想每次重启电脑都回来重贴 cookie</b>，就在下面再补一条 <b>SSO 票根（<code>SSOTGC</code>）</b>：门户签发的会话 cookie 是<b>会话级</b>的（没有 Max-Age / Expires，浏览器进程一退就没了），票根才是长期票 —— 插件拿它现场重铸会话。<b>用上面的「内嵌窗口」网页登录成功时，这一项会自动填好</b>，只有走了「系统浏览器」或者自动抓取失败（登录时上游没下发票根）才需要手工补。<br><b>注意：票根和上面那条 cookie 不在同一个域</b> —— 会话 cookie 在 <code>codearts.huaweicloud.com</code>，票根在 <code>auth.huaweicloud.com</code>（<code>Path=/authui/</code>），所以上面那条整串 cookie 里<b>没有</b>票根，别拿它往这个框里贴。手工补时的取法（三处任选其一，都在 <code>auth.huaweicloud.com</code> 上）：① 浏览器登录 <code>codearts.huaweicloud.com</code> 后 F12 → <b>Application</b> → <b>Cookies</b> → 展开 <code>https://auth.huaweicloud.com</code> → 复制 <code>SSOTGC</code> 那一行的 <b>Value</b>（整行带 Path / Domain 一起粘也行，网关会自己抠出值）；② <b>Network</b> 里点任意一条 <code>auth.huaweicloud.com</code> 请求 → <b>Request Headers</b> → 从 <code>Cookie</code> 复制 <code>SSOTGC=…</code> 那一段；③ Reqable 抓包里筛 <code>auth.huaweicloud.com</code>，同样看 <code>Cookie</code> 请求头。值形如 <code>TGTX--…-sso</code>（约 100 字符），形状不对会被直接拒。贴一次就够了，换电脑、重装之后也只需要这一项。'),
   fields: [
     {
       key: 'credentialJson',
@@ -597,6 +602,36 @@ const CODEARTS: ProviderConfig = {
     {
       key: 'sessionCookie', label: t('网页会话 cookie（可选）'), rows: 3, optional: true,
       placeholder: t('整条 Cookie 串（含 devclouddevuibjtcftk），可多行'),
+    },
+    // **SSO 票根**（`ssoTgc`，可选）：会话 cookie 的「种子」，这一家能不能跨重启
+    // 自己续会话全靠它。
+    //
+    // 为什么单列一项而不是让用户每次开机重贴 cookie：门户签发的会话 cookie 既没有
+    // Max-Age 也没有 Expires（会话级），浏览器进程一退就没了；而 `SSOTGC` 是统一
+    // 身份的长期票，插件用它走 `/authui/login?service=…` 现场重铸一条可用会话
+    // （见 `codearts/portal_session.rs`）。贴上之后，「有效期」列与积分明细在换电脑、
+    // 重启之后仍然能自己恢复。
+    //
+    // 字段名必须是 `ssoTgc`：插件 `Credentials::from_payload` 认
+    // `ssoTgc` / `sso_tgc` / `SSOTGC` / `tgc` 四个名字，网关侧 `is_private_field`
+    // 会把它从公开快照里剔掉（只留 `hasSsoTgc` 布尔）。
+    //
+    // **这一项现在会自动填**（2026-11-09 加）：内嵌窗口网页登录成功后，壳侧在
+    // `/wait` 回 `done` 那一拍、窗口销毁之前读它的 Cookie 存储，把
+    // `auth.huaweicloud.com` 域的 `SSOTGC` 取出来 PATCH 到账号上（见
+    // `src-tauri/src/codearts_login.rs`）。手工这一栏保留给三种情况：走了
+    // 「系统浏览器」登录（壳看不到浏览器的 Cookie 库）、登录那次上游没有下发
+    // 票根、或用户想换一张票根。字段**必须继续留着** —— 抓取失败时它是唯一出口。
+    //
+    // ⚠️ 占位符**不能**再写「整条 Cookie 串也行」（2026-11-09 用户实测踩到）：
+    // 票根在 `auth.huaweicloud.com`（`Path=/authui/`），上面那条会话 cookie 在
+    // `codearts.huaweicloud.com` —— 两个域两套 cookie，门户域的整条串里根本没有
+    // `SSOTGC`。旧占位符照着写，用户就把 `devclouddevuibjJ_SESSION_ID=…` 当票根
+    // 贴进来，界面显示「已配置」而插件永远换不到会话。占位符改成**票根的真实形状**，
+    // 让用户一眼能对自己手上那串东西。
+    {
+      key: 'ssoTgc', label: t('SSO 票根（可选，通常已自动填好）'), rows: 3, optional: true,
+      placeholder: t('TGTX--…-sso（只粘 SSOTGC 这一项的值）'),
     },
     { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空使用凭据里的 user_name') },
   ],

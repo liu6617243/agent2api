@@ -25,6 +25,7 @@ mod account_export;
 mod assistant_image;
 mod backend;
 mod bridge;
+mod codearts_login;
 mod commands;
 mod deepseek_login;
 mod doubaowork_login;

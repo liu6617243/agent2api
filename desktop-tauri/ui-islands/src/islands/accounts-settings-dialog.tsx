@@ -59,6 +59,42 @@ function cookieDraftValue(raw: string): string {
   return raw.trim().replace(/;+$/, '').trim()
 }
 
+/**
+ * 票根草稿 → 要不要提交。规则与 cookie 那条同形（留空 = 不修改），但要先抠出
+ * **纯值**再判空：用户可能整行粘 `SSOTGC=…; Path=/; Domain=…`，也可能只粘值。
+ *
+ * ── 为什么这里也要做一次归一 ────────────────────────────────
+ * 后端写入侧的 `normalize_tgc` 会把「只剩 `SSOTGC=` 没有值」归一成空串 = **清除**。
+ * 若前端把这种半截文本当成「填了东西」提交，回读校验（`accountPatchConfirmed`）
+ * 会看到 `hasSsoTgc === false` 而补丁值非空，判成「结果未确认」—— 用户看到的
+ * 是一句莫名其妙的错误，而实际发生的是删掉了他配好的票根。所以这里只做**判空
+ * 需要的那一步**（与后端同口径的两条分支），归一后的值原样当补丁发出去。
+ */
+function tgcDraftValue(raw: string): string {
+  const flat = raw.trim().replace(/;+$/, '').trim()
+  if (!flat) return ''
+  const at = flat.indexOf('SSOTGC=')
+  const tail = at >= 0 ? flat.slice(at + 'SSOTGC='.length) : flat
+  return (tail.split(/[;\s]/)[0] || '').trim()
+}
+
+/**
+ * 这个值**像不像**一条 `SSOTGC` 票根。判据与两处后端逐条同口径
+ * （网关 `codearts_accounts::looks_like_tgc`、插件 `credentials::looks_like_tgc`）：
+ * 以 `TGTX` 开头、以 `-sso` 结尾、长度 ≥ 16
+ * （实测形状 `TGTX--F1840439038-8498999-<64 hex>-sso`，约 100 字符）。
+ *
+ * ── 为什么前端要提前判一次（2026-11-09 用户实测踩到）───────
+ * 票根在 `auth.huaweicloud.com` 域（`Path=/authui/`），而「网页会话 cookie」那一条
+ * 在 `codearts.huaweicloud.com` 域 —— 两个域，所以**从门户复制的整条 cookie 串里
+ * 根本没有 `SSOTGC`**。用户按旧提示把整串贴进来，旧逻辑取第一个 `k=v` 就落盘，
+ * 界面显示「已配置」，插件拿它换票永远失败。后端现在会 400 拒掉，但等到点保存
+ * 才报错太晚、也太难懂 —— 这里在提交前就挡住，用同一句人话告诉他去哪个域拿什么。
+ */
+function looksLikeTgc(value: string): boolean {
+  return value.length >= 16 && value.startsWith('TGTX') && value.endsWith('-sso')
+}
+
 export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane = 'basic', routeContext }: {
   id: string; onClose: () => void
   initialAccount?: AccountRecord
@@ -75,6 +111,10 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   // 那一段也不渲染）。空 = 不修改：值不回显（后端只给 `hasSessionCookie` 布尔），
   // 清除走那个显式按钮 —— 与余额凭证同一形制。
   const [cookieDraft, setCookieDraft] = React.useState('')
+  // CodeArts 的**SSO 票根**（`SSOTGC`）草稿：会话 cookie 的「种子」。
+  // 空 = 不修改（值不回显，后端只给 `hasSsoTgc` 布尔），清除走显式按钮。
+  // 只有 CodeArts 有这一项，别家恒为空串、那一段也不渲染。
+  const [tgcDraft, setTgcDraft] = React.useState('')
   // ZCode 的「使用哪个套餐」草稿（非 ZCode 账号恒为空串，那一段也不渲染）
   const [planChannel, setPlanChannel] = React.useState(() => zcodePlanOf(account))
   const [busy, setBusy] = React.useState(false)
@@ -177,6 +217,29 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   const cookieDescription = isCodearts
     ? t('用于读取每份积分的到期时间（「有效期」列）。浏览器登录 codearts.huaweicloud.com 后按 F12 → Application → Cookies 复制整条 Cookie 串（其中 devclouddevuibjtcftk 那一项会自动用作 csrf 头，不必单独贴）。原值不会回显，填好后点「保存更改」生效。')
     : t('用于读取每批积分的到期时间（「有效期」列）。浏览器登录后按 F12 → Application → Cookies 复制 qoder_session_cookie 那一行，整条 Cookie 串或多行粘贴都行。原值不会回显，填好后点「保存更改」生效。')
+  // ── CodeArts 的 SSO 票根（`SSOTGC`）────────────────────────
+  // 这一段是「换电脑也能用」的关键：上面那条会话 cookie 是**会话级**的（门户
+  // 签发时没有 Max-Age/Expires，浏览器一退就没了），票根才是长期票 —— 插件拿它
+  // 走一遍 `/authui/login?service=…` 就能现场重铸会话（`codearts/portal_session.rs`）。
+  //
+  // 文案把「从哪个界面、哪个域、哪个键拿」写死：换机器时用户手上只有浏览器，
+  // 一句「复制票根」等于没说。三处都写了（Application 表格 / Request Headers /
+  // Reqable 抓包），因为三种浏览器与三种取证习惯都有人用。
+  // ── 文案的三条硬约束（改文案时不要破）──────────────────────
+  //   ① 必须写清「哪个域」：`auth.huaweicloud.com`，**不是** `codearts.huaweicloud.com`。
+  //      上面那条会话 cookie 在门户域，票根在统一身份域 —— 两个域两套 cookie，
+  //      在门户域里翻一辈子也翻不到 `SSOTGC`（这是用户 2026-11-09 实际卡住的地方）。
+  //   ② 必须写清「长什么样」：`TGTX--…-sso`，约 100 字符。用户据此一眼判断自己
+  //      复制的是票根还是别的东西。
+  //   ③ **不能**再说「整条 Cookie 串也行」：那串里没有票根。整行（带 Path / Domain）
+  //      粘贴仍然支持 —— 前提是那一行**就是 SSOTGC 那一行**。
+  //
+  // ④ 必须交代「通常已经自动填好了」（2026-11-09 加自动抓取）：内嵌窗口网页登录
+  //    成功后，壳侧趁窗口还在读它自己的 Cookie 存储，把票根写进账号（见
+  //    `src-tauri/src/codearts_login.rs`）。不写明这点的话，用户看到「已配置」
+  //    会以为是上次手工贴的，或者反过来以为自己漏了步骤而重复去浏览器里抠。
+  const tgcPlaceholder = t('TGTX--…-sso（只粘 SSOTGC 这一项的值）')
+  const tgcDescription = t('华为云统一身份的长期票根，作用域 auth.huaweicloud.com —— 注意它和上面那条网页会话 cookie 不在同一个域，因此从 codearts.huaweicloud.com 复制的整条 cookie 串里没有它。会话 cookie 是它现场铸出来的短期产物（浏览器一重启就丢），票根不会 —— 换电脑、重装之后有这一项，插件就能自己把会话续回来，不必每次开机都回浏览器里抠。用「内嵌窗口」网页登录时这一项会自动配好；只有走「系统浏览器」登录、或那次登录上游没下发票根时才需要手工补。取法（三处任选其一，都在 auth.huaweicloud.com 上）：① 浏览器登录 codearts.huaweicloud.com 后按 F12 → Application → Cookies → 展开 https://auth.huaweicloud.com → 复制 SSOTGC 那一行的 Value（整行带 Path / Domain 一起粘也行，网关会自己抠出值）；② 在 Network 里点任意一条 auth.huaweicloud.com 的请求 → Request Headers → 从 Cookie 里复制 SSOTGC=… 那一段；③ Reqable 抓包里筛 auth.huaweicloud.com，同样看 Cookie 请求头。值形如 TGTX--…-sso（约 100 字符）；粘别的会被拒并提示。原值不会回显。')
   // 自定义账号：凭证段（API Key / 无需鉴权）只对它渲染。判据用 provider 前缀 ——
   // 与后端 `custom_account_provider` 一致（提供商被删后残留的账号同样该能改凭证）
   const isCustomAccount = providerOf(target).startsWith('custom-')
@@ -206,8 +269,10 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   const dirtyPanes: Record<PaneId, boolean> = {
     basic: enabled !== before.enabled || allowRouteSkip !== before.allowRouteSkip
       || (name.trim() || before.name) !== before.name || concDraft !== before.concDraft
-      // 网页会话 cookie（Qoder）：输入框恒为空（原值不回显），填了就是待保存的改动
-      || Boolean(cookieDraftValue(cookieDraft)),
+      // 网页会话 cookie（Qoder / CodeArts）：输入框恒为空（原值不回显），填了就是待保存的改动
+      || Boolean(cookieDraftValue(cookieDraft))
+      // SSO 票根（CodeArts）：同一形制 —— 恒空输入框，填了才算改动
+      || Boolean(tgcDraftValue(tgcDraft)),
     credential: Boolean(balanceToken.trim() || apiKeyDraft.trim())
       || noAuthDraft !== before.noAuthDraft || planChannel !== before.planChannel,
     query: !same(usageDraft, before.usageDraft) || !same(balanceQueryDraft, before.balanceQueryDraft),
@@ -288,6 +353,37 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
       setAccount(saved)
       setCookieDraft('')
       toast(t('✅ 已清除网页会话 cookie'))
+      try {
+        await refreshSavedAccounts()
+      } catch (error) {
+        toast(t('账号已保存，但列表刷新失败：{error}', { error: errorMessage(error) }), 'err')
+      }
+    } catch (error) {
+      toast(t('清除失败：{error}', { error: errorMessage(error) }), 'err')
+    } finally {
+      actionLock.current = false
+      setBusy(false)
+    }
+  }
+
+  /**
+   * 清除 SSO 票根（只对 CodeArts；与上面几个同一形制：立即落库的独立撤销动作）。
+   *
+   * 后果要说清楚：票根一没，插件就再也不能自己重铸会话 —— 已有的会话 cookie 还能
+   * 用到它自己失效为止（通常是浏览器进程结束那一刻），之后「有效期」列与积分明细
+   * 会退回按凭证到期算。所以这不是一个「随手点掉」的按钮。
+   */
+  async function clearSsoTgc(): Promise<void> {
+    if (interactionBusy || actionLock.current) return
+    if (!await askConfirmation(t('清除 SSO 票根？'),
+      t('确认后立即生效，不受底部保存按钮控制。之后插件将无法再自动重铸网页会话，「有效期」与积分明细会在现有会话失效后停止更新（转发不受影响）。'), t('清除'), true)) return
+    actionLock.current = true
+    setBusy(true)
+    try {
+      const saved = await updateAccountConfirmed(id, { ssoTgc: null })
+      setAccount(saved)
+      setTgcDraft('')
+      toast(t('✅ 已清除 SSO 票根'))
       try {
         await refreshSavedAccounts()
       } catch (error) {
@@ -507,6 +603,21 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
       // 这次保存变成一次意图外的撤销（`accountPatchConfirmed` 也会因此判「结果未确认」）。
       const cookieValue = cookieDraftValue(cookieDraft)
       const cookiePatch = supportsCookie && cookieValue ? { sessionCookie: cookieValue } : {}
+      // SSO 票根（CodeArts）：同一形制 —— 空 = 不修改，清除走那个显式按钮。
+      // 只在 CodeArts 账号上提交（后端也按 provider 挡，见 `accounts.rs` 的
+      // `ssoTgc` 分支）。
+      //
+      // 形状不对时**在提交前就挡住**（后端同样会 400，但那时用户已经点了保存，
+      // 报错落在底部状态栏、屏幕上还开着表单 —— 这里挡能把光标留在那个输入框，
+      // 并用一句人话说明去哪个域拿什么）。
+      const tgcValue = tgcDraftValue(tgcDraft)
+      if (isCodearts && tgcValue && !looksLikeTgc(tgcValue)) {
+        selectPane('basic')
+        setStatus(<span className='text-destructive'>{t('SSO 票根形状不对：应形如 TGTX--…-sso（约 100 字符）。你贴的多半是 codearts.huaweicloud.com 的会话 cookie —— 票根在 auth.huaweicloud.com 域，见下方取法。')}</span>)
+        toast(t('SSO 票根形状不对，请按提示从 auth.huaweicloud.com 复制'), 'err')
+        return
+      }
+      const tgcPatch = isCodearts && tgcValue ? { ssoTgc: tgcValue } : {}
       // 套餐通道：只在**真的改了**时才带上（取值与后端 `zcode::normalize_plan`
       // 逐字一致）。带一个没变的键不会出错，但会让后端那句「套餐通道 → …」的
       // 变更提示在每次保存设置时都出现一次，看起来像刚改过
@@ -524,6 +635,7 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
         proxy,
         ...balancePatch,
         ...cookiePatch,
+        ...tgcPatch,
         ...planPatch,
         ...credentialPatch,
         ...concPatch,
@@ -538,6 +650,8 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
       // cookie 已落库：草稿清空 —— 否则「提供商那一段失败而留在弹窗里」的后续
       // 渲染会继续把已保存的 cookie 当成未保存的改动（保存按钮一直亮着）
       if (cookiePatch.sessionCookie) setCookieDraft('')
+      // 票根同理：已落库就清草稿，否则下次渲染会把已保存的值当成未保存的改动
+      if (tgcPatch.ssoTgc) setTgcDraft('')
       // 提供商那一段排在账号之后（账号是本弹窗的主角，先落库）。它失败时账号已经存下了，
       // 所以留在弹窗里把那句话说清楚 —— 笼统报成「保存失败」会把两件事混成一件
       if (providerPatch) {
@@ -689,6 +803,25 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
                               : cookiePlaceholder}
                             value={cookieDraft} onChange={event => setCookieDraft(event.currentTarget.value)} />
                           <FieldDescription>{cookieDescription}</FieldDescription>
+                        </Field> : null}
+                        {isCodearts ? <Field className='acct-dlg-field acct-dlg-cookie-field'>
+                          <div className='acct-dlg-field-head'>
+                            <FieldLabel htmlFor='account-sso-tgc'>{t('SSO 票根（换电脑后靠它续会话）')}</FieldLabel>
+                            <span className='acct-dlg-cookie-actions'>
+                              <Badge shape='tag' variant={account.hasSsoTgc === true ? 'success' : 'secondary'}>
+                                {account.hasSsoTgc === true ? t('已配置') : t('未配置')}
+                              </Badge>
+                              {account.hasSsoTgc === true ? <Button variant='ghost' size='xs'
+                                disabled={interactionBusy} className='acct-dlg-clear'
+                                onClick={() => void clearSsoTgc()}>{t('清除')}</Button> : null}
+                            </span>
+                          </div>
+                          <Textarea id='account-sso-tgc' rows={3} spellCheck={false} autoComplete='off'
+                            placeholder={account.hasSsoTgc === true
+                              ? t('已配置，留空则不修改')
+                              : tgcPlaceholder}
+                            value={tgcDraft} onChange={event => setTgcDraft(event.currentTarget.value)} />
+                          <FieldDescription>{tgcDescription}</FieldDescription>
                         </Field> : null}
                         <Field className='acct-dlg-toggle-field'>
                           <div><FieldLabel htmlFor='account-enabled'>{t('启用账号')}</FieldLabel>

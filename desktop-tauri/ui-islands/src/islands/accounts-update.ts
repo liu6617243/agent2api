@@ -73,6 +73,9 @@ export function accountPatchConfirmed(account: AccountRecord, patch: Record<stri
     // Qoder 的网页会话 cookie：与余额凭证同一口径 —— 只回读「有没有」这个布尔
     // （值永不下发）。传 null / 空串 = 清除，非空 = 已写入。
     if (key === 'sessionCookie') return account.hasSessionCookie === (value !== null && value !== '')
+    // CodeArts 的 SSO 票根（`ssoTgc`）：同一口径 —— 只回读「有没有」这个布尔，
+    // 值永不下发（后端 `plugin_public::is_private_field` 点名列了它）。
+    if (key === 'ssoTgc') return account.hasSsoTgc === (value !== null && value !== '')
     if (key === 'apiKey') return account.hasApiKey === (value !== null && value !== '')
     // 账号级上游地址覆盖项：null / 空串 = 清除（公开形态里就不再出现这个键）
     if (key === 'baseUrl') {

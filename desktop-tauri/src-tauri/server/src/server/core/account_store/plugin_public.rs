@@ -60,6 +60,25 @@ pub(super) fn credential_fields(record: &StoredAccount, public: &mut Map<String,
                 .is_some_and(|cookie| !cookie.trim().is_empty())),
         );
     }
+    // **SSO 票根**（`ssoTgc`）：CodeArts 独有 —— 会话 cookie 的「种子」。
+    //
+    // 会话 cookie 是会话级的（门户的 Set-Cookie 没有 Max-Age/Expires），浏览器一
+    // 重启就丢，且它与 cftk 严格配对、不能分开复用。`SSOTGC` 是长期票据（浏览器
+    // 重启后能自动登录回去靠的就是它），插件拿它现场重铸 cookie
+    // （见插件侧 `codearts/portal_session.rs`）。
+    //
+    // 值同样绝不下发，只给这个布尔 —— 界面据此显示「已配置 / 未配置」与清除按钮。
+    if record.provider() == super::codearts_accounts::CODEARTS_PROVIDER_ID {
+        let tgc = match secret {
+            Some(fields) => fields.get(super::codearts_accounts::SSO_TGC_FIELD),
+            None => record.get(super::codearts_accounts::SSO_TGC_FIELD),
+        };
+        public.insert(
+            "hasSsoTgc".to_string(),
+            Value::Bool(tgc.and_then(Value::as_str)
+                .is_some_and(|tgc| !tgc.trim().is_empty())),
+        );
+    }
 
     // 只派生白名单标量，凭据对象不进入公开视图；陈旧快照不能压住新的到期时刻。
     let expiry = EXPIRY_KEYS.iter().flat_map(|key| {
@@ -108,6 +127,9 @@ pub(super) fn is_private_field(key: &str) -> bool {
         // 网页会话 cookie（Qoder 系 / CodeArts）：能读网页 BFF 的完整会话，与令牌
         // 同级，绝不下发（界面只要 `hasSessionCookie` 这个布尔，见 `credential_fields`）
         | "sessionCookie" | "session_cookie" | "webCookie"
+        // SSO 票根（CodeArts）：比会话 cookie 更长寿 —— 拿到它就能反复铸出新会话，
+        // 等价于「长期登录态」。同样绝不下发（界面只要 `hasSsoTgc`）。
+        | "ssoTgc" | "sso_tgc" | "SSOTGC"
     )
 }
 

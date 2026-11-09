@@ -203,6 +203,16 @@ export type AccountRecord = {
    */
   hasSessionCookie?: boolean
   /**
+   * CodeArts：记录里有没有**华为云 SSO 票根**（`SSOTGC`，后端
+   * `plugin_public::credential_fields` 派生）。
+   *
+   * 它与 `hasSessionCookie` 是两个东西：会话 cookie 是门户当场签发、浏览器一重启
+   * 就丢的短期票据；票根是统一身份那张长期票，插件拿它现场重铸会话
+   * （`codearts/portal_session.rs`）。所以「换电脑只要贴一次票根」。
+   * **值本身绝不透出** —— 拿到它等于拿到长期登录态。
+   */
+  hasSsoTgc?: boolean
+  /**
    * 自定义账号：记录里有没有非空 `apiKey`（设置弹窗据此决定输入框的提示文案与
    * 有无「清除」按钮）。**值本身绝不透出**，后端只给这个布尔。
    */

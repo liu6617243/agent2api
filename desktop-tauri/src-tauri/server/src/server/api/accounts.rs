@@ -57,7 +57,7 @@ use serde_json::{json, Map, Value};
 
 pub use super::accounts_batch::batch_accounts;
 
-use crate::server::core::account_store::{qoder_accounts, AccountStoreError};
+use crate::server::core::account_store::{codearts_accounts, qoder_accounts, AccountStoreError};
 use crate::server::core::billing::checkin;
 use crate::server::core::proxies::ProxyConfigError;
 use crate::server::core::providers::adapter::adapter_for;
@@ -1369,6 +1369,40 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
             };
         }
         match state.store().update_qoder_session_cookie(&id, value) {
+            Ok(changes) => balance_changes.extend(changes),
+            Err(error) => return store_error(error),
+        }
+    }
+    // **SSO 票根**（`ssoTgc`，CodeArts 独有）：会话 cookie 的「种子」。
+    //
+    // ── 为什么需要这条入口 ──────────────────────────────────────
+    // 网页会话 cookie（上面那一段）是**会话级**的：华为云门户签发它时既没有
+    // Max-Age 也没有 Expires，浏览器进程一退就没了；而且它与 `devclouddevuibjtcftk`
+    // 严格配对，跨会话复用会被门户回 400 `csrf validate fail` —— 所以「保存一条
+    // cookie 一直用」在这家根本做不到。
+    //
+    // 真正长寿的是 `SSOTGC`（华为云统一身份的那张票根，作用域
+    // `auth.huaweicloud.com/authui/`）：浏览器重启后还能自动登录回门户，靠的就是它。
+    // 插件侧 `codearts/portal_session.rs` 拿它走一遍
+    // `/authui/login?service=…` → `ticket=ST-…` → 门户页，现场重铸一条可用会话。
+    // 于是这条入口的意义是：**换电脑 / 重装之后，贴一次票根就永久有效**，
+    // 不必每次开机都回浏览器里抠一条新 cookie。
+    //
+    // 传 `null` / 空串 = 清除（语义与 `sessionCookie` 一致）；多行粘贴、带
+    // `Cookie:` 前缀、整段 `SSOTGC=…; path=/` 都在写入侧归一成纯值
+    // （见 `codearts_accounts::normalize_tgc`，与插件侧同口径）。
+    if let Some(value) = patch.get(codearts_accounts::SSO_TGC_FIELD) {
+        let provider = state.store().account_provider_of(&id);
+        if provider
+            .as_deref()
+            .is_some_and(|provider| provider != codearts_accounts::CODEARTS_PROVIDER_ID)
+        {
+            return management_error(400, "只有 CodeArts 账号有 SSO 票根（ssoTgc）");
+        }
+        if provider.is_none() {
+            return store_error(AccountStoreError::new("账号不存在", 404));
+        }
+        match state.store().update_codearts_sso_tgc(&id, value) {
             Ok(changes) => balance_changes.extend(changes),
             Err(error) => return store_error(error),
         }
