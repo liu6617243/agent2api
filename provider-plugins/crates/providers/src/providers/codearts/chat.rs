@@ -712,6 +712,24 @@ pub fn upstream_http_error(
         message.push_str("（诊断体已截断）");
     }
     message = stream_fault::humanize_fault_message(message, model);
+    // ── 403 里有一半不是额度（2026-11-09 修）───────────────────────
+    // 下面那张表把 403 一律标成 `insufficient_quota`，是从参考实现逐字搬来
+    // 的口径。但 CodeArts 的 403 有两种：额度/权限（该标额度、该换号），以及
+    // **模型拒答**（`InferHub.ModelArts.81011.403` + 中文拒绝话术）—— 后者账号
+    // 完全健康，标成额度会让编排层去冷却一个没病的账号，而且客户端 SDK 拿到
+    // `insufficient_quota` 会直接停手重试。
+    //
+    // 判据必须与流内信封那条共用同一个函数（`stream_fault::looks_like_refusal`），
+    // 否则「同一个上游行为，走流内是一种处置、走状态码是另一种」。
+    // 状态码同时降到 **400**：403 在客户端语义里是「权限」，会诱导 SDK 停止
+    // 重试；内容拦截的诚实口径是「这份内容被拒了」。
+    let refusal = status == 403 && stream_fault::looks_like_refusal(&message);
+    if refusal {
+        // 内容拒答：状态降到 400，码换成编排层认的那一个。
+        // 不用 `with_status(403)`：403 在本家 `classify` 里等于额度，在客户端
+        // 语义里等于「权限」，两条都会把「内容被拒」误导成别的东西。
+        return GatewayError::with_status(400, message).with_code("content_blocked");
+    }
     let error = GatewayError::with_status(i32::from(status), message);
     // 与 `stream_fault::fault_to_error` 同一张表：客户端里有一批是按 `code` 而不是
     // 状态码分支的（`insufficient_quota` 决定要不要停手重试）。参考实现也是这么分的

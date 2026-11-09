@@ -236,26 +236,102 @@ pub fn stream_frame_fault(payload: &str) -> Option<StreamFault> {
         // 报 502 会让用户去查网关、也让编排层去换账号（换谁都会拒，白烧一份额度）。
         // 400 才是诚实的口径 —— 请求本身没毛病，是这次内容被模型拒了。
         400
+    } else if code.starts_with("InferHub.ModelArts.") && code.ends_with(".403") {
+        // `.403` 家族里**非**内容拒答的那些（`81114.403` 额度 / 权限，或带
+        // 「抱歉，额度不足」这种被 `quota_or_limit_hint` 排除掉的文案）。
+        // 2026-11-09 补：原来这里直接落到 502，理由是没有 `insufficient quota`
+        // 字样的 403 认不出来。但 `.403` 结尾本身就是上游给的性质 —— 报 502
+        // 会让编排层既不记冷却也不换号（与 §10.15 修的那个症状同源），
+        // 而这个码家族里 403 的两种含义都该罚账号（额度没了好等，权限没有换号
+        // 才对），只有内容拒答例外（上面那条已先判掉）。
+        403
     } else {
         502
     };
     Some(StreamFault { code, message, status })
 }
 
+/// 正文里是否带**额度 / 限流 / 余额**话术。
+///
+/// 这是 [`is_model_refusal`] 与 [`looks_like_refusal`] 共用的**否决条件**：
+/// 上游那两类文案同样以「抱歉」开头（「抱歉，您的额度不足」「抱歉，当前套餐
+/// 配额已用完」），只按拒绝话术判会把额度错误冒充成内容拒答。
+///
+/// 判错的代价极不对称：内容拒答**不罚账号、不记冷却**，于是那个真没额度的
+/// 账号会一直留在候选池里被反复选中 —— 这正是 §10.15 修掉的「28 秒内连打
+/// 8 次」的同一个症状。反过来把内容拒答误判成额度，只是白等一个冷却窗口。
+/// 所以两个条件冲突时，**按额度处置**是更安全的默认。
+///
+/// 英文那几条与 `stream_frame_fault` 里判 429 的键（`rate limit` / `too many`）
+/// 同源：同一个信封在这里被认成额度、到了流内却被认成内容拒答，会自相矛盾。
+fn quota_or_limit_hint(message: &str) -> bool {
+    const QUOTA_MARKERS: &[&str] = &[
+        // 中文
+        "额度", "配额", "余额", "积分不足", "次数已达", "已达上限", "超出限制",
+        // 英文
+        "quota", "rate limit", "too many requests", "insufficient",
+    ];
+    let lowered = message.to_lowercase();
+    QUOTA_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker.to_lowercase().as_str()))
+}
+
 /// `InferHub.ModelArts.<biz>.403` + 中文拒绝话术 = **模型拒绝回答**。
 ///
-/// 两个条件同时成立才算：
+/// 三个条件同时成立才算：
 ///   * 码必须落在 `InferHub.ModelArts.` 家族且以 `.403` 结尾 —— 该家族的末段
 ///     就是这次失败的性质（对照 `81114.429` 是限流、`001001020.406` 是不支持
 ///     图片）。只认 `.403` 不认整串，是因为中段（`81011`）是业务分组码，
 ///     换模型/换场景会变。
 ///   * 正文必须带拒绝话术 —— 光有 `.403` 也可能意味着「没有这个模型的权限」，
 ///     那种情况该维持 502（权限问题换账号有意义），不该冒充内容拒绝。
-fn is_model_refusal(code: &str, message: &str) -> bool {
+///   * 正文**不能**带额度/限流话术（见 [`quota_or_limit_hint`]）。这一条是
+///     2026-11-09 补的：`.403` 家族里 `81114.403` 就是额度，它的话术同样以
+///     「抱歉」开头，前两条判据会把它判成内容拒答。
+///
+/// ── 为什么是 `pub`（2026-11-09）───────────────────────────────
+/// 同一条判据有两个来路：流内信封（本模块的 `stream_frame_fault`）与
+/// **真正的非 2xx 403**（`adapter::classify`）。后者原先把所有 403 一律当
+/// 「额度限额」，于是内容拒答会被当成限额去**罚账号**（冷却到窗口重置）——
+/// 账号其实健康，罚错了还占着一个冷却名额。两条来路必须共用同一份判据，
+/// 否则「同一个上游行为，走流内信封是一种处置、走状态码是另一种」。
+pub fn is_model_refusal(code: &str, message: &str) -> bool {
     const REFUSAL_MARKERS: &[&str] = &["抱歉", "无法提供", "无法协助", "无法帮助"];
     code.starts_with("InferHub.ModelArts.")
         && code.ends_with(".403")
         && REFUSAL_MARKERS.iter().any(|marker| message.contains(*marker))
+        && !quota_or_limit_hint(message)
+}
+
+/// 正文里是否带「模型拒绝回答」的话术（不看业务码）。
+///
+/// 供 `adapter::classify` / `chat::upstream_http_error` 在**只有状态码、没有
+/// 业务码**的路径上兜底：上游偶尔直接回 403 + 一段中文拒绝话术而不带
+/// `error_code`（首包门之外的那条路）。
+///
+/// ── 为什么必须**排除**额度话术（2026-11-09 修）───────────────────
+/// 光看拒绝话术会把额度耗尽的文案判成内容拒答 —— 上游那类文案同样以「抱歉」
+/// 开头（「抱歉，您的额度不足」「抱歉，当前套餐配额已用完」）。判错的代价极不
+/// 对称：
+///
+/// ```text
+/// 403 + 抱歉，额度不足
+///   → 误判 ContentBlocked（不罚账号、不记冷却）
+///   → 动作 0 换中性提示词同账号重发（白烧一次上游配额）
+///   → 第二次仍 403（额度真没了，换提示词没用）→ degraded 已 true，不再补救
+///   → class 仍是 ContentBlocked → 跳过 QuotaLimited 记账 → 直接顺延换号
+///   → 该账号从未进冷却，下次请求继续被选中，无限撞同一面额度墙
+/// ```
+///
+/// 最后两行正是 §10.15 修掉的那个「不记冷却 → 28 秒内连打 8 次」的同一个症状，
+/// 只是换了个入口。所以这里要求**两个条件同时成立**：有拒绝话术，且**没有**
+/// 任何额度/限流话术。排除优先于命中 —— 一句里同时出现两种话术时，按额度处置
+/// 是更安全的默认（罚账号只是白等一个窗口，漏罚会无限重撞）。
+pub fn looks_like_refusal(message: &str) -> bool {
+    const REFUSAL_MARKERS: &[&str] = &["抱歉", "无法提供", "无法协助", "无法帮助"];
+    REFUSAL_MARKERS.iter().any(|marker| message.contains(*marker))
+        && !quota_or_limit_hint(message)
 }
 
 /// 把流内故障转成编排层能用的错误：**带上分类后的状态码**，好让上游循环按
@@ -271,11 +347,22 @@ fn is_model_refusal(code: &str, message: &str) -> bool {
 /// 按 `code` 分支的客户端（不少 SDK 拿 `insufficient_quota` 决定要不要停手）
 /// 会读不到信号。`type` 保持本仓统一映射（`errors.rs` 照抄 Node 版那条），
 /// 不为一家破例 —— 那会让所有家的错误形状各说一套。
+/// ── 400 也要带码（2026-11-09）──────────────────────────────────
+/// 上面那段说的是「给客户端」的码，但对**编排层**另有一条更硬的要求：网关
+/// 有状态路径（`conversation`）只能拿到一个 `GatewayError`，它靠 `code`
+/// 重新推分类（`plugin_host/rpc.rs::classify_conversation_error`）。若 400 不带
+/// 码，那次「模型拒答」在网关侧只能落成 `Fatal` ——「换中性提示词重试」的
+/// 补救（`provider_loop` 动作 0）一个字节都跑不到，于是 `fujiang` 模式每次都
+/// 确定性撞同一堵墙。`content_blocked` 是网关与严格边界共用的机器码
+/// （`strict_error_codes` 的内容策略分组里有它），不是本家自造。
 pub fn fault_to_error(fault: &StreamFault) -> GatewayError {
     let error = GatewayError::with_status(i32::from(fault.status), fault.message.clone());
     match fault.status {
         403 => error.with_code("insufficient_quota"),
         429 => error.with_code("rate_limit_exceeded"),
+        // 400 在本模块只有一条来源：`is_model_refusal` 命中的模型拒答（见
+        // `stream_frame_fault` 的状态映射）。所以这里可以无条件贴内容拦截码。
+        400 => error.with_code("content_blocked"),
         _ => error,
     }
 }

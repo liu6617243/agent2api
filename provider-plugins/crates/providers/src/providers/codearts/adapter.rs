@@ -34,6 +34,7 @@ use crate::proxy_util::{resolve_account_proxy, ProxyResolution};
 
 use super::chat;
 use super::credentials::Credential;
+use super::stream_fault;
 use super::models;
 use super::session;
 use super::{accounts, authorization, balance, credits, login, onboarding, refresh, welfare};
@@ -532,7 +533,21 @@ impl Provider for CodeArtsProvider {
     ///
     /// **注意**：CodeArts 的业务失败常常不体现在状态码上（额度耗尽是 HTTP 200
     /// SSE 里的信封），那部分由首包门 + `stream_fault` 负责；这里只管真的是
-    /// 状态码的错。三条口径与参考实现一致：403 = 额度、429 = 限流、其余透传。
+    /// 状态码的错。
+    ///
+    /// ── 403 不能一律当额度（2026-11-09 修）──────────────────────
+    /// 原来这里 `403 => QuotaLimited`，与参考实现「403 = 额度」逐字对齐。但
+    /// CodeArts 的 403 有**两种**含义：
+    ///   * `InferHub.ModelArts.81114.403` 之类 —— 额度 / 权限，罚账号换号有意义；
+    ///   * `InferHub.ModelArts.81011.403` + 中文拒绝话术 —— **模型自己拒绝回答**
+    ///     （「抱歉，我无法提供关于您提问内容的建议…」）。账号完全健康，罚它
+    ///     等于把一个好账号按进冷却，还占掉一次换号额度。
+    ///
+    /// 后者的正确处置是 `ContentBlocked`：不罚账号，换中性提示词同账号重试一次
+    /// （见网关 `provider_loop` 的「动作 0」与 `prompt::DEGRADED_PROMPT`）。
+    /// 判据与流内信封那条**共用同一个函数**（`stream_fault::is_model_refusal` /
+    /// `looks_like_refusal`），避免「同一个上游行为，走流内是一种处置、走状态码
+    /// 是另一种」。
     fn classify(&self, status: u16, error_body: &Value) -> proto::ErrorClass {
         let raw = error_body
             .get("message")
@@ -553,12 +568,48 @@ impl Provider for CodeArtsProvider {
         } else {
             format!("上游返回 {status}{}", raw_part(raw))
         };
+        // 业务码可能挂在 `error_code`（流内信封形态）或已拼进 message 的
+        // `上游报告 <code>：…` 前缀里 —— 两处都取一下。
+        let code = error_body
+            .get("error_code")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        // 网关回灌的调用带着插件自己上次写的机器码（见下面 `refusal` 的说明）
+        let provider_code = error_body
+            .get("providerCode")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let refusal = stream_fault::is_model_refusal(&code, &message)
+            || (status == 403 && stream_fault::looks_like_refusal(&message))
+            // 网关回灌的那条请求体（`forward_conversation` 的 `Done(Err)` 分支）
+            // 带的是 `providerCode`：那是插件自己上次写进 `code` 的串。它已经
+            // 是**归一后的机器码**，比文案可靠 —— 认它，等于让「插件判定 →
+            // 网关 → 插件重新分类」这条往返不会把结论丢掉。
+            || is_content_block_code(&provider_code);
         match status {
+            // 内容拒答优先于额度：同一个 403，性质完全不同（见函数文档）
+            403 if refusal => proto::ErrorClass::ContentBlocked {
+                status: 400,
+                message: format!("{message}{}", crate::content_block::CONTENT_BLOCK_HINT),
+                upstream_code: None,
+            },
             403 => proto::ErrorClass::QuotaLimited {
                 reset_at: None,
                 message,
                 upstream_code: None,
                 status,
+            },
+            // 400：本家只在这两种情况下给 400 —— 内容拒答（`content_blocked`），
+            // 或插件自己拼的 400（参数/前置条件类）。带内容拦截码的走
+            // `ContentBlocked`，其余维持 Fatal（不罚账号、不重试）。
+            400 if refusal => proto::ErrorClass::ContentBlocked {
+                status: 400,
+                message: format!("{message}{}", crate::content_block::CONTENT_BLOCK_HINT),
+                upstream_code: None,
             },
             429 => proto::ErrorClass::QuotaLimited {
                 reset_at: None,
@@ -924,6 +975,38 @@ fn raw_part(raw: &str) -> String {
     } else {
         format!(": {}", raw.trim())
     }
+}
+
+/// 网关与本插件共用的「内容拦截」机器码集合。
+///
+/// ── 为什么要在插件侧也有一份 ────────────────────────────────
+/// `classify()` 的入参有两个来路：
+///   1. 插件内部拼的诊断体（只有 `message` / `error_code`）；
+///   2. **网关回灌**的归一化细节（`plugin_host/rpc.rs` 的 `forward_conversation`，
+///      它带 `providerCode` = 上次这个插件写进 `code` 的串）。
+/// 第 2 条要能被重新认出来，否则「插件判定 → 网关 → 插件再判一次」这条往返
+/// 会把结论丢掉：网关已经把错误标成内容拦截了，插件却回一句「我不认识」。
+///
+/// 表的内容与网关 `plugin_host::rpc::is_content_block_code`、
+/// `strict_error_codes::known` 的内容策略分组逐字一致 —— 三处必须是同一批
+/// 机器码，否则三处会各认一部分。
+fn is_content_block_code(code: &str) -> bool {
+    matches!(
+        code.trim(),
+        "content_filter"
+            | "content_blocked"
+            | "content_policy_violation"
+            | "content_policy_rejected"
+            | "bio_policy"
+            | "cyber_policy"
+            | "refusal"
+            | "safety"
+            | "prohibited_content"
+            | "blocklist"
+            | "spii"
+            | "image_safety"
+            | "invalid_prompt"
+    )
 }
 
 /// `welfare::Outcome` → `CheckinReport`。
