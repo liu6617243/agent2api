@@ -114,6 +114,13 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   // CodeArts 的**SSO 票根**（`SSOTGC`）草稿：会话 cookie 的「种子」。
   // 空 = 不修改（值不回显，后端只给 `hasSsoTgc` 布尔），清除走显式按钮。
   // 只有 CodeArts 有这一项，别家恒为空串、那一段也不渲染。
+  //
+  // 2026-11-09：CodeArts 的「网页会话 cookie」输入框**已删除**。理由见
+  // `credits.rs:fetch_renewing` —— 那条 cookie 是插件拿票根现场铸出来的产物，
+  // 铸完自动写回账号（`portal_session::persist`），用户没有需要填它的理由。
+  // 走「系统浏览器」登录、票根也没抓到时确实会退化成只有聚合余额，但那种情况
+  // 的正确出路是补一张票根（下面那一栏），不是手贴一条几小时就死的 cookie ——
+  // 留着输入框只会让用户以为这是第二样必须交的东西（实测已产生这样误解）。
   const [tgcDraft, setTgcDraft] = React.useState('')
   // ZCode 的「使用哪个套餐」草稿（非 ZCode 账号恒为空串，那一段也不渲染）
   const [planChannel, setPlanChannel] = React.useState(() => zcodePlanOf(account))
@@ -205,29 +212,31 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   const target: AccountRecord = account
   const peers = peersOf(target, allAccounts())
   const isCatpaw = providerOf(target) === 'catpaw'
-  // 认「网页会话 cookie」的家（Qoder 两家 + CodeArts）：设置里比别家多一行
-  // 「网页会话 cookie」（判据与后端 `account_store::supports_session_cookie` 同一口径）
+  // 认「网页会话 cookie」的家：现在只剩 **Qoder 两家**。
+  //
+  // ⚠️ CodeArts 曾在这份名单里（`supportsSessionCookie` 至今仍返回 true），但它的
+  // 输入框 2026-11-09 已删除 —— 那条 cookie 由插件拿 SSO 票根现场铸出并自动写回
+  // 账号，用户没有填它的理由。**`supportsSessionCookie` 别跟着改**：它是「后端接不
+  // 接受这个字段」的能力位（与 `account_store::supports_session_cookie` 同口径），
+  // 插件写回 cookie 仍然走那个字段；这里只决定「要不要给用户一个输入框」。
   const supportsCookie = supportsSessionCookie(target)
-  // 两家的 cookie 来源不同（站点、要抠的键都不同），所以占位与说明分开写 ——
-  // 共用一句「复制那一行」会让 CodeArts 用户去 qoder.com.cn 里找，找得到才怪。
   const isCodearts = providerOf(target) === 'codearts'
-  const cookiePlaceholder = isCodearts
-    ? t('整条 Cookie 串（含 devclouddevuibjtcftk），可多行')
-    : t('qoder_session_cookie=…（整条 Cookie 串，可多行）')
-  const cookieDescription = isCodearts
-    ? t('用于读取每份积分的到期时间（「有效期」列）。浏览器登录 codearts.huaweicloud.com 后按 F12 → Application → Cookies 复制整条 Cookie 串（其中 devclouddevuibjtcftk 那一项会自动用作 csrf 头，不必单独贴）。原值不会回显，填好后点「保存更改」生效。')
-    : t('用于读取每批积分的到期时间（「有效期」列）。浏览器登录后按 F12 → Application → Cookies 复制 qoder_session_cookie 那一行，整条 Cookie 串或多行粘贴都行。原值不会回显，填好后点「保存更改」生效。')
+  const cookiePlaceholder = t('qoder_session_cookie=…（整条 Cookie 串，可多行）')
+  const cookieDescription = t('用于读取每批积分的到期时间（「有效期」列）。浏览器登录后按 F12 → Application → Cookies 复制 qoder_session_cookie 那一行，整条 Cookie 串或多行粘贴都行。原值不会回显，填好后点「保存更改」生效。')
   // ── CodeArts 的 SSO 票根（`SSOTGC`）────────────────────────
-  // 这一段是「换电脑也能用」的关键：上面那条会话 cookie 是**会话级**的（门户
-  // 签发时没有 Max-Age/Expires，浏览器一退就没了），票根才是长期票 —— 插件拿它
-  // 走一遍 `/authui/login?service=…` 就能现场重铸会话（`codearts/portal_session.rs`）。
+  // 这一段是「换电脑也能用」的关键：门户那条会话 cookie 是**会话级**的（签发时
+  // 没有 Max-Age/Expires，浏览器一退就没了），票根才是长期票 —— 插件拿它走一遍
+  // `/authui/login?service=…` 就能现场重铸会话（`codearts/portal_session.rs`）。
+  //
+  // 2026-11-09 起这是 CodeArts 唯一需要用户经手的字段：会话 cookie 的输入框已删除
+  // （理由见上面 `supportsCookie` 那段注释）。
   //
   // 文案把「从哪个界面、哪个域、哪个键拿」写死：换机器时用户手上只有浏览器，
   // 一句「复制票根」等于没说。三处都写了（Application 表格 / Request Headers /
   // Reqable 抓包），因为三种浏览器与三种取证习惯都有人用。
   // ── 文案的三条硬约束（改文案时不要破）──────────────────────
   //   ① 必须写清「哪个域」：`auth.huaweicloud.com`，**不是** `codearts.huaweicloud.com`。
-  //      上面那条会话 cookie 在门户域，票根在统一身份域 —— 两个域两套 cookie，
+  //      票根在统一身份域，门户那条会话 cookie 在 codearts 域 —— 两个域两套 cookie，
   //      在门户域里翻一辈子也翻不到 `SSOTGC`（这是用户 2026-11-09 实际卡住的地方）。
   //   ② 必须写清「长什么样」：`TGTX--…-sso`，约 100 字符。用户据此一眼判断自己
   //      复制的是票根还是别的东西。
@@ -239,7 +248,7 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   //    `src-tauri/src/codearts_login.rs`）。不写明这点的话，用户看到「已配置」
   //    会以为是上次手工贴的，或者反过来以为自己漏了步骤而重复去浏览器里抠。
   const tgcPlaceholder = t('TGTX--…-sso（只粘 SSOTGC 这一项的值）')
-  const tgcDescription = t('华为云统一身份的长期票根，作用域 auth.huaweicloud.com —— 注意它和上面那条网页会话 cookie 不在同一个域，因此从 codearts.huaweicloud.com 复制的整条 cookie 串里没有它。会话 cookie 是它现场铸出来的短期产物（浏览器一重启就丢），票根不会 —— 换电脑、重装之后有这一项，插件就能自己把会话续回来，不必每次开机都回浏览器里抠。用「内嵌窗口」网页登录时这一项会自动配好；只有走「系统浏览器」登录、或那次登录上游没下发票根时才需要手工补。取法（三处任选其一，都在 auth.huaweicloud.com 上）：① 浏览器登录 codearts.huaweicloud.com 后按 F12 → Application → Cookies → 展开 https://auth.huaweicloud.com → 复制 SSOTGC 那一行的 Value（整行带 Path / Domain 一起粘也行，网关会自己抠出值）；② 在 Network 里点任意一条 auth.huaweicloud.com 的请求 → Request Headers → 从 Cookie 里复制 SSOTGC=… 那一段；③ Reqable 抓包里筛 auth.huaweicloud.com，同样看 Cookie 请求头。值形如 TGTX--…-sso（约 100 字符）；粘别的会被拒并提示。原值不会回显。')
+  const tgcDescription = t('华为云统一身份的长期票根，作用域 auth.huaweicloud.com —— CodeArts 账号里只有这一项需要你操心：逐份积分、到期时间都靠它。插件拿它走一遍 SSO 就现场铸出一条网页会话 cookie（门户签发的短期产物，浏览器一关就死），铸完自动写回账号，不需要你手贴。所以「会话 cookie」在这个面板里没有输入框：它是票根浇出来的苗，不是第二样要交的东西。换电脑、重装之后有这一项就够，不必回浏览器里抠。用「内嵌窗口」网页登录时这一项会自动配好；只有走「系统浏览器」登录、或那次登录上游没下发票根时才需要手工补。取法（三处任选其一，都在 auth.huaweicloud.com 上，别去 codearts.huaweicloud.com 找，那个域里没有它）：① 浏览器登录 codearts.huaweicloud.com 后按 F12 → Application → Cookies → 展开 https://auth.huaweicloud.com → 复制 SSOTGC 那一行的 Value（整行带 Path / Domain 一起粘也行，网关会自己抠出值）；② 在 Network 里点任意一条 auth.huaweicloud.com 的请求 → Request Headers → 从 Cookie 里复制 SSOTGC=… 那一段；③ Reqable 抓包里筛 auth.huaweicloud.com，同样看 Cookie 请求头。值形如 TGTX--…-sso（约 100 字符）；粘别的会被拒并提示。原值不会回显。')
   // 自定义账号：凭证段（API Key / 无需鉴权）只对它渲染。判据用 provider 前缀 ——
   // 与后端 `custom_account_provider` 一致（提供商被删后残留的账号同样该能改凭证）
   const isCustomAccount = providerOf(target).startsWith('custom-')
@@ -597,12 +606,16 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
       // 输入框永远是空的；若把「空」解释成清除，用户每次保存设置都会把配好的凭证删掉）。
       // 清除走上面那个显式按钮。
       const balancePatch = isCatpaw && balanceToken.trim() ? { balanceToken: balanceToken.trim() } : {}
-      // 网页会话 cookie（Qoder / CodeArts）：与上面同一形制 —— 空值 = 不修改（原值
+      // 网页会话 cookie（只剩 Qoder 两家）：与上面同一形制 —— 空值 = 不修改（原值
       // 不回显，把「空」当清除会让每次保存设置都删掉配好的 cookie），清除走那个
       // 显式按钮。尾部只剩分号时也按「没填」处理：后端压平后是空串 = 清除，那会让
       // 这次保存变成一次意图外的撤销（`accountPatchConfirmed` 也会因此判「结果未确认」）。
+      //
+      // CodeArts 不在此列：那条 cookie 是插件拿票根铸出来的产物（见上面的注释），
+      // 界面上没有输入框，`cookieDraft` 恒为空 —— 这里仍显式排除它，避免以后有人
+      // 「顺手」把字段加回来又忘了这套语义。
       const cookieValue = cookieDraftValue(cookieDraft)
-      const cookiePatch = supportsCookie && cookieValue ? { sessionCookie: cookieValue } : {}
+      const cookiePatch = supportsCookie && !isCodearts && cookieValue ? { sessionCookie: cookieValue } : {}
       // SSO 票根（CodeArts）：同一形制 —— 空 = 不修改，清除走那个显式按钮。
       // 只在 CodeArts 账号上提交（后端也按 provider 挡，见 `accounts.rs` 的
       // `ssoTgc` 分支）。
@@ -785,7 +798,7 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
                             value={name} onChange={event => setName(event.currentTarget.value)} />
                         </Field>
                         <div className='acct-dlg-readonly'><span>{t('账号 ID')}</span><code>{target.id}</code></div>
-                        {supportsCookie ? <Field className='acct-dlg-field acct-dlg-cookie-field'>
+                        {supportsCookie && !isCodearts ? <Field className='acct-dlg-field acct-dlg-cookie-field'>
                           <div className='acct-dlg-field-head'>
                             <FieldLabel htmlFor='account-session-cookie'>{t('网页会话 cookie')}</FieldLabel>
                             <span className='acct-dlg-cookie-actions'>
@@ -806,7 +819,7 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
                         </Field> : null}
                         {isCodearts ? <Field className='acct-dlg-field acct-dlg-cookie-field'>
                           <div className='acct-dlg-field-head'>
-                            <FieldLabel htmlFor='account-sso-tgc'>{t('SSO 票根（换电脑后靠它续会话）')}</FieldLabel>
+                            <FieldLabel htmlFor='account-sso-tgc'>{t('SSO 票根（有这一项就够）')}</FieldLabel>
                             <span className='acct-dlg-cookie-actions'>
                               <Badge shape='tag' variant={account.hasSsoTgc === true ? 'success' : 'secondary'}>
                                 {account.hasSsoTgc === true ? t('已配置') : t('未配置')}
