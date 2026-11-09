@@ -327,7 +327,9 @@ impl Provider for CodeArtsProvider {
             let permit = SESSION_GATE
                 .get_or_init(|| session::SessionGate::new(session::DEFAULT_SESSION_LIMIT))
                 .acquire(models::DEFAULT_BASE_URL, &gate_identity, gate_override)
-                .map_err(GatewayError::into_message)?;
+                // 409（本账号并发已满）要原样过线：网关看到它才会换下一个账号，
+                // 抹成 502 就变成「同一账号反复撞自己的并发墙」。
+                .map_err(GatewayError::into_control_message)?;
 
             // ④ 占一个上游会话槽（心跳 busy + 后台续期）
             let mut options = session::SessionOptions::new(
@@ -340,7 +342,7 @@ impl Provider for CodeArtsProvider {
                 Ok(session) => session,
                 Err(error) => {
                     drop(permit);
-                    return Err(error.message);
+                    return Err(error.into_control_message());
                 }
             };
             let session_id = session.id().to_string();
@@ -383,7 +385,7 @@ impl Provider for CodeArtsProvider {
                     Err(error) => {
                         session.stop().await;
                         drop(permit);
-                        return Err(error.message);
+                        return Err(error.into_control_message());
                     }
                 }
             };
@@ -423,7 +425,11 @@ impl Provider for CodeArtsProvider {
                 drop(permit);
                 let error =
                     chat::upstream_http_error(status, &error_body, &credential, truncated, &upstream_model);
-                return Err(error.message);
+                // ⚠️ 必须 `into_control_message()` 而不是 `.message`：非 2xx 里
+                // 403 / 429 是「额度 / 限流」，编排层要靠状态码记冷却 + 换号。
+                // 只传文案时 SDK 会把它包成 INTERNAL，网关兜底成 502 Fatal，
+                // 于是**同一个已限流的账号被反复选中**（2026-11-09 实测：28 秒内 8 次）。
+                return Err(error.into_control_message());
             }
 
             // ⑦ 首包门：一个字节都没下发之前就决定"交出去"还是"换账号"
@@ -436,7 +442,10 @@ impl Provider for CodeArtsProvider {
                     );
                     session.stop().await;
                     drop(permit);
-                    return Err(error.message);
+                    // 同上：首包门撞额度/限流信封时状态码是 403/429，
+                    // 丢了就等于把「换账号」的机会扔掉（这条是 14:52 那批
+                    // 连续 502 的直接成因 —— 信封是 `InferHub.ModelArts.81114.429`）。
+                    return Err(error.into_control_message());
                 }
             };
             // ⑦.5 体积墙也走在**流里**：HTTP 200 + 一帧 `InferHub.001001005.400`
@@ -468,7 +477,10 @@ impl Provider for CodeArtsProvider {
                     wire_bytes,
                 );
                 let completion = chat::aggregate_sse(&all, &upstream_model)
-                    .map_err(GatewayError::into_message)?;
+                    // 非流式路径同样要走 control message：聚合时挖出的
+                    // `insufficient quota` / 限流信封带着 403/429，
+                    // `into_message` 会把它抹成 502（与流式那两处同一理由）。
+                    .map_err(GatewayError::into_control_message)?;
                 let payload = serde_json::to_string(&completion).map_err(|error| {
                     format!("CodeArts 聚合结果序列化失败：{error}")
                 })?;
@@ -528,7 +540,19 @@ impl Provider for CodeArtsProvider {
             .or_else(|| error_body.get("error"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        let message = format!("上游返回 {status}{}", raw_part(raw));
+        // 插件自己已经拼好的文案（`上游报告 …` / `CodeArts 上游返回 HTTP …` /
+        // `模型 X 不支持图片输入…`）原样用：再加一层「上游返回 429:」会得到双前缀
+        // （2026-11-09 日志里那句 `上游返回 429: 上游报告 …`）。
+        // 只有上游原始诊断体送进来时才补状态码。
+        let already_shaped = raw.starts_with("上游")
+            || raw.starts_with("CodeArts")
+            || raw.starts_with("模型 ")
+            || raw.starts_with("当前模型");
+        let message = if already_shaped {
+            raw.trim().to_string()
+        } else {
+            format!("上游返回 {status}{}", raw_part(raw))
+        };
         match status {
             403 => proto::ErrorClass::QuotaLimited {
                 reset_at: None,

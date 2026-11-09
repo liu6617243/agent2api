@@ -264,12 +264,28 @@ async fn http_error(status: u16, response: reqwest::Response) -> GatewayError {
 
 fn frame_error(code: i64, message: &str) -> GatewayError {
     let kind = super::errors::stream_error_kind(code, message);
-    GatewayError::with_status(
-        i32::from(status_for(kind)),
-        format!("Trae 上游错误：code={code} msg={message}"),
-    )
-    .with_code(PROVIDER_ID)
-    .upstream_code(code)
+    // 上游的 `event: error` 经常只给码不给话（2026-11-09 实测 `code=1005 msg=`）。
+    // 拼出 `msg=` 尾巴会让人以为消息被截断了，按码补一句人能读的说明。
+    let detail = if !message.trim().is_empty() {
+        message.trim().to_string()
+    } else {
+        match kind {
+            ErrorKind::PlanLimit => "计划额度或模型配额不足".to_string(),
+            ErrorKind::SoftRate => "上游限流".to_string(),
+            ErrorKind::SessionDead => "登录态失效，需要重新登录".to_string(),
+            ErrorKind::InputTooLarge => "请求体过大".to_string(),
+            ErrorKind::ModelUnavailable | ErrorKind::NotFound => "该通道没有这个模型".to_string(),
+            _ => String::new(),
+        }
+    };
+    let text = if detail.is_empty() {
+        format!("Trae 上游错误：code={code}")
+    } else {
+        format!("Trae 上游错误：code={code} msg={detail}")
+    };
+    GatewayError::with_status(i32::from(status_for(kind)), text)
+        .with_code(PROVIDER_ID)
+        .upstream_code(code)
 }
 
 async fn final_error(error: GatewayError, limit: &Limit<'_>) -> GatewayError {

@@ -230,10 +230,32 @@ pub fn stream_frame_fault(payload: &str) -> Option<StreamFault> {
         403
     } else if code.contains("429") || lowered.contains("rate limit") || lowered.contains("too many") {
         429
+    } else if is_model_refusal(&code, &message) {
+        // 模型自己拒绝回答（`InferHub.ModelArts.81011.403`，正文是「抱歉，我无法
+        // 提供关于您提问内容的建议…」）。这是**内容层面**的结论，不是网关故障：
+        // 报 502 会让用户去查网关、也让编排层去换账号（换谁都会拒，白烧一份额度）。
+        // 400 才是诚实的口径 —— 请求本身没毛病，是这次内容被模型拒了。
+        400
     } else {
         502
     };
     Some(StreamFault { code, message, status })
+}
+
+/// `InferHub.ModelArts.<biz>.403` + 中文拒绝话术 = **模型拒绝回答**。
+///
+/// 两个条件同时成立才算：
+///   * 码必须落在 `InferHub.ModelArts.` 家族且以 `.403` 结尾 —— 该家族的末段
+///     就是这次失败的性质（对照 `81114.429` 是限流、`001001020.406` 是不支持
+///     图片）。只认 `.403` 不认整串，是因为中段（`81011`）是业务分组码，
+///     换模型/换场景会变。
+///   * 正文必须带拒绝话术 —— 光有 `.403` 也可能意味着「没有这个模型的权限」，
+///     那种情况该维持 502（权限问题换账号有意义），不该冒充内容拒绝。
+fn is_model_refusal(code: &str, message: &str) -> bool {
+    const REFUSAL_MARKERS: &[&str] = &["抱歉", "无法提供", "无法协助", "无法帮助"];
+    code.starts_with("InferHub.ModelArts.")
+        && code.ends_with(".403")
+        && REFUSAL_MARKERS.iter().any(|marker| message.contains(*marker))
 }
 
 /// 把流内故障转成编排层能用的错误：**带上分类后的状态码**，好让上游循环按

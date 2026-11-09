@@ -165,7 +165,15 @@ impl Provider for TraeProvider {
             .filter(|text| !text.is_empty())
             .unwrap_or("上游错误");
         let code = error_body.get("code").and_then(Value::as_i64);
-        let message = format!("上游返回 {status}: {detail}");
+        // 插件自己已经拼好的文案（`Trae 上游错误：…` / `Trae 上游返回 429: …`）原样用：
+        // 再加一层「上游返回 429: 」会得到双前缀（2026-11-09 日志：
+        // `上游返回 429: Trae 上游错误：code=1005 …`）。
+        // 只有上游原始诊断体（不带本家前缀）才补状态码。
+        let message = if detail.starts_with("Trae") {
+            detail.to_string()
+        } else {
+            format!("上游返回 {status}: {detail}")
+        };
         // 判据吃的是**整份错误体**而不是那句文案：参考实现的分类靠在 body 里
         // 找 `"code":1005` / `"code":4008` 这类片段，只传文案就会漏掉这套判据。
         match classify(status, &error_body.to_string()) {
