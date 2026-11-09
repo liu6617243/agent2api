@@ -646,6 +646,29 @@ impl ProviderAdapter for RpcAdapter {
     fn classify_conversation_error(&self, error: &GatewayError) -> UpstreamErrorClass {
         // 新增 scoped runtime 已在异步错误边界完成正式分类；不能重新按 HTTP 429 猜配额。
         if strict::applies(self.id) { return strict::cached_class(self.id, error); }
+        // ── 插件已明确声明「这是内容策略拦截」（2026-11-09）───────────
+        // 有状态路径（`conversation` 流式 RPC）的失败只能带一个 `GatewayError`
+        // 回来，分类信息全靠这里重新推。原来这里只认 `is_quota_limit()`，其余
+        // 一律 Fatal —— 于是 CodeArts 的「模型拒答」在网关侧永远是 Fatal，
+        // 编排层的「动作 0（换中性提示词重试）」一个字节都跑不到，`fujiang`
+        // 模式下每一次请求都确定性撞同一堵墙。
+        //
+        // 判据读 `error.code`：插件在拒答时把分类写进 `code`（见
+        // `plugin_host/errors.rs::control_error`，它把 `provider_http:` 信封里的
+        // `code` 原样搬到 `GatewayError.code`）。只认这张有限表，不做文案猜测
+        // —— 文案是给人看的，随时会变。
+        if let Some(code) = error.code.as_deref() {
+            if is_content_block_code(code) {
+                return UpstreamErrorClass::ContentBlocked {
+                    // 400 而不是 403：403 在客户端语义里是「权限」，会诱导 SDK
+                    // 停止重试；内容拦截的诚实口径是「这份内容被拒了」（见
+                    // `codearts::stream_fault` 里同一处取舍的论证）。
+                    status: 400,
+                    message: error.message.clone(),
+                    upstream_code: error.upstream_code,
+                };
+            }
+        }
         // 此钩子同步，不能再发分类 RPC；旧提供商保留既有 429/6004 的记账语义。
         if error.is_quota_limit() {
             let reset_at = crate::server::errors::parse_quota_reset_at(&error.message);
@@ -1912,6 +1935,41 @@ fn conversation_error(status: u16, class: UpstreamErrorClass, body: &Value) -> G
     }
 }
 
+/// 「内容策略拦截」在插件错误码里的有限集合。
+///
+/// ── 为什么需要这张表 ────────────────────────────────────────
+/// 有状态路径（`conversation` 流式 RPC）的失败只带一个 `GatewayError` 回来：
+/// 插件在错误信封里写的 `code` 被 `errors::control_error` 原样搬进
+/// `GatewayError.code`，但分类动作要在这里重新推。没有这张表，插件就算把
+/// 「这是内容拦截」写进 `code`，网关也只会把它当 `Fatal` 透传 ——
+/// 「换中性提示词重试」的补救永远不触发。
+///
+/// ── 为什么只认这张有限表、不做文案猜测 ───────────────────────
+/// 文案是给人看的、随时会变（上游改一个标点就失配）；而这张表里的每个值都是
+/// **机器码**，由插件自己按上游语义映射好再发上来。宁可漏认（退化成 Fatal，
+/// 与改造前行为一致），也不按文案猜（猜错会把限额当内容拦截，白烧一次重试）。
+///
+/// 表里的取值与 `strict_error_codes::known` 的内容策略分组保持一致 ——
+/// 两处共用同一批机器码，避免「严格边界认、这条路径不认」的分叉。
+fn is_content_block_code(code: &str) -> bool {
+    matches!(
+        code,
+        "content_filter"
+            | "content_blocked"
+            | "content_policy_violation"
+            | "content_policy_rejected"
+            | "bio_policy"
+            | "cyber_policy"
+            | "refusal"
+            | "safety"
+            | "prohibited_content"
+            | "blocklist"
+            | "spii"
+            | "image_safety"
+            | "invalid_prompt"
+    )
+}
+
 /// 错误体没有可读文案时的兜底（与内置家的 `上游返回 {status}: …` 同形态）。
 fn describe_body(body: &Value) -> String {
     match body {
@@ -1961,4 +2019,60 @@ fn headers_json(headers: &HeaderMap) -> Value {
         }
     }
     Value::Object(map)
+}
+
+#[cfg(test)]
+mod content_block_code_tests {
+    use super::is_content_block_code;
+
+    /// 表里的每个值都必须认。
+    ///
+    /// ── 这条测试守的是什么 ──────────────────────────────────────
+    /// 这张表是**插件与网关之间的契约**：插件在错误信封的 `code` 里写这些机器码
+    /// （`codearts::stream_fault::fault_to_error` 的 400 分支写 `content_blocked`），
+    /// 网关靠它把「有状态路径的失败」认成内容拦截，才会走「换中性提示词重试」。
+    /// 任何一边单独改表，这条补救链就静默失效 —— 而失效的症状是「fujiang 模式
+    /// 每次请求都被拒」，看起来像上游的问题，不像网关的 bug。
+    #[test]
+    fn known_content_block_codes_are_recognized() {
+        for code in [
+            "content_filter",
+            "content_blocked",
+            "content_policy_violation",
+            "content_policy_rejected",
+            "bio_policy",
+            "cyber_policy",
+            "refusal",
+            "safety",
+            "prohibited_content",
+            "blocklist",
+            "spii",
+            "image_safety",
+            "invalid_prompt",
+        ] {
+            assert!(is_content_block_code(code), "{code} 应当被认成内容拦截");
+        }
+    }
+
+    /// 额度 / 限流 / 通用失败**不能**被误认成内容拦截。
+    ///
+    /// 误认的代价不对称：内容拦截会走「同账号再发一次」，于是一封额度错误会被
+    /// 白重试一次（多烧一份上游配额），而且这次重试不会触发冷却 —— 账号会在
+    /// 下一次请求里继续被选中，反复撞同一堵墙。
+    #[test]
+    fn quota_and_generic_codes_are_not_content_blocks() {
+        for code in [
+            "insufficient_quota",
+            "rate_limit_exceeded",
+            "quota_exceeded",
+            "resource_exhausted",
+            "unauthorized",
+            "account_proxy_unavailable",
+            // 大小写敏感：表里全是小写机器码，上游的 `Content_Filter` 不认
+            "Content_Filter",
+            "",
+        ] {
+            assert!(!is_content_block_code(code), "{code} 不该被认成内容拦截");
+        }
+    }
 }

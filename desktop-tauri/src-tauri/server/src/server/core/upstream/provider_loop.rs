@@ -860,7 +860,10 @@ async fn attempt_queue(
                 ctx,
                 provider_id,
                 adapter,
-                target,
+                // 克隆一份：下面的「动作 0」补救要**同一个账号**再发一次，
+                // 而 `attempt_stateful` 按值消费 `target`。几个 String + 一份
+                // 账号 JSON，没有独占资源（见 `RouteTarget` 的 derive 说明）。
+                target.clone(),
                 slot,
                 connections,
                 degraded,
@@ -878,7 +881,7 @@ async fn attempt_queue(
                     }
                     return Ok(crate::server::core::plugin_host::hold_adapter(outcome, adapter_handle));
                 },
-                Err(error) => {
+                Err(mut error) => {
                     // 手动终止优先（与无状态 / 自定义两条路径同一判定与理由）：
                     // 会话式这一轮已经结束，但用户要的是终止 —— 不把它当成
                     // 普通失败去顺延下一个账号（那会把终止拖成另一轮转发）
@@ -904,11 +907,127 @@ async fn attempt_queue(
                     // 整份 `class` 交给 `mark_conversation_limited` 而不是在这里
                     // 拆散取值 —— 拆散后「漏带一个字段」编译期与运行期都不报错
                     // （本分支此前就把 `reset_at` 写成死 `None`，见那个函数的说明）。
-                    let class = adapter.classify_conversation_error(&error);
+                    //
+                    // 两个 `mut` 是为下面的动作 0 准备的：补救失败时要用**补救后**
+                    // 的错误与分类接着走记账/顺延，而不是拿补救前那份。
+                    let mut class = adapter.classify_conversation_error(&error);
                     // Scoped runtime 的原生 loader 已拥有单次 token 恢复；宿主不再消费
                     // refresh，也不把 Fatal/权限/WAF/取消/超时改成账号顺延。
                     if strict_runtime && !matches!(&class, UpstreamErrorClass::QuotaLimited { .. }) {
                         return Err(error);
+                    }
+                    // ── 动作 0（会话式版）：内容拦截 → 换中性提示词，同账号再发一次 ──
+                    //
+                    // ── 为什么这一段必须存在 ────────────────────────────────
+                    // 无状态路径在同一个函数里早就有动作 0（见 `failure` 分支那一段），
+                    // 但那条路走的是适配器的 `send_with_retry`，能自己换 body 重发。
+                    // 会话式路径（`conversation` 一条 RPC = 一个会话轮次）**没有**
+                    // 这一层：插件从头到尾只收到一份 body。于是分类修好之后，坏掉的
+                    // 是哪一环都不再是分类 —— 而是**补救动作压根没实现**：
+                    // CodeArts 的模型拒答在这里被判成 `ContentBlocked` 之后，直接
+                    // 落进下面的顺延/透传，`fujiang` 模式每一次请求都确定性撞同一堵墙。
+                    // 本轮不实现它，前面所有的分类工作都是空转。
+                    //
+                    // ── 与无状态版逐条对齐的条件 ────────────────────────────
+                    //   * `!degraded`：一次请求只补救一次；
+                    //   * `!ctx.preserve_system_prompt`：用户明确要求原样保留 system
+                    //     时不擅自换掉它；
+                    //   * `attempt_prompt.mode.degradable()`：模式本身允许降级
+                    //     （`custom` 的 system 已由网关接管，再撞拦截多半是用户内容
+                    //     本身触发审核，换提示词解决不了）；
+                    //   * `!named_switch`：这一轮已经因为账号级策略被点名换号
+                    //     （挂起/冷却/指定错误码直接换号）时不再原地重试 ——
+                    //     那条策略比内容补救优先，否则会把一个已判定不可用的账号
+                    //     再打一次。
+                    // 不同的只有一处：会话式路径没有 `failure.policy`（那份策略
+                    // 由无状态发送链产出），能借用的只有「指定错误码直接换号」
+                    // 这一条 —— `no_retry` 名单里的码（如 402）语义是「别对同一个
+                    // 账号再发」，内容补救也必须让位。
+                    let named_switch = direct_switch_status(i64::from(error.status_code));
+                    let attempt_prompt = ctx.prompt.for_provider(provider_id);
+                    if matches!(&class, UpstreamErrorClass::ContentBlocked { .. })
+                        && !ctx.preserve_system_prompt
+                        && !named_switch
+                        && !degraded
+                        && attempt_prompt.mode.degradable()
+                    {
+                        degraded = true;
+                        crate::server::core::degrade::trigger();
+                        let until_text = crate::server::core::degrade::until_text();
+                        let reason = format!(
+                            "内容策略拦截（疑似 system 指纹误报），换中性提示词重试一次；\
+                             降级持续到 {until_text}（届时恢复「{}/{}」）",
+                            attempt_prompt.mode.label(),
+                            provider_id,
+                        );
+                        // 与无状态版同一落点：这是**同一轮内**的重试（同一个账号、
+                        // 换的是 body 不是账号），所以这里**不**消耗换号额度。
+                        //
+                        // ⚠️ 明细的起头**不在这里** —— `attempt_stateful` 内部自己会
+                        // `note_attempt` + `note_attempt_started`。在这里再开一次会
+                        // 得到「一条补救前的失败明细 + 两条重试明细」，而
+                        // attempts 只 +2：明细条数就会大于 attempts（前端渲染出
+                        // 一条无状态码、无错误的悬空项）。
+                        //
+                        // 所以只记一条重试原因（落在刚才失败的那条明细上），
+                        // 剩下的事交给 `attempt_stateful` —— 它的错误出口会把
+                        // 第二条明细定稿，两条明细 / 两次 attempts 一一对应。
+                        ctx.telemetry.note_attempt_retry(
+                            &reason,
+                            Some(i64::from(error.status_code)),
+                            0,
+                        );
+                        logging::log("[Upstream]", &format!("⚠️ {reason}"));
+                        match attempt_stateful(
+                            service,
+                            ctx,
+                            provider_id,
+                            adapter,
+                            target.clone(),
+                            slot,
+                            connections,
+                            degraded,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => {
+                                if let Some(account_id) = stateful_account_id.as_deref() {
+                                    service.route.sticky_bind(
+                                        &conv_key, &model, &attempt_key, sticky_source, logging::now_ms(),
+                                        ctx.routing.settings.sticky.ttl_ms().unwrap_or(0), sticky_generation,
+                                    );
+                                    service.route.backoff_clear(account_id);
+                                    service.route.sink_clear(account_id);
+                                }
+                                return Ok(crate::server::core::plugin_host::hold_adapter(outcome, adapter_handle));
+                            }
+                            // 补救也失败：**用这次的错误**继续走下面的记账与顺延
+                            // （它的文案最贴近真实原因）。与无状态版同一处置 ——
+                            // 动作 0 用掉之后 `degraded` 已是 true，那边也是落回
+                            // 「限额记账 → 换号顺延」这条公共出口，而不是提前
+                            // `return`：提前返回会把「换号」这条唯一还能改变变量
+                            // 的路也一起掐掉（下一个账号未必在同一家、同一个出口）。
+                            Err(retry_error) => {
+                                if ctx.telemetry.is_cancelled() {
+                                    ctx.telemetry.finish_last_attempt(
+                                        Some(cancellation::MANUAL_TERMINATED_STATUS),
+                                        Some(cancellation::MANUAL_TERMINATED),
+                                    );
+                                    return Err(cancellation::cancelled_error());
+                                }
+                                logging::console_line(
+                                    "[Upstream]",
+                                    &format!(
+                                        "⚠️ 内容拦截补救（中性提示词）后仍失败：{}",
+                                        retry_error.message
+                                    ),
+                                );
+                                // 分类要对**补救后**的错误重算：第二次可能换了一种
+                                // 失败（例如中性提示词过了审核、却撞上额度）。
+                                class = adapter.classify_conversation_error(&retry_error);
+                                error = retry_error;
+                            }
+                        }
                     }
                     if let (UpstreamErrorClass::QuotaLimited { .. }, Some(account_id)) =
                         (&class, &stateful_account_id)
@@ -2520,9 +2639,10 @@ async fn attempt_stateful(
     // ── 内容处理：凭证已就绪、这一家**即将发送**，此刻才决定发送体 ────────
     // 与无状态路径同一时机与同一判据：选路失败（503/401）的请求走不到这里，
     // 不会产生一次「已转发的处理」；未勾选的家拿到的是客户端原始请求体。
-    // `degraded` 由调用方（账号循环）给出：本路径**没有**就地补救（有状态
-    // provider 一次转发就是一个会话轮次，没有「换提示词重发」这一步），
-    // 但降级期内（状态机已生效）首发的提示词也要跟着换。
+    // `degraded` 由调用方（账号循环）给出：本函数**自身**没有就地补救，但
+    // 调用方在 `Err` 分支里有「动作 0」（内容拦截 → 换中性提示词、同账号再发
+    // 一次），它会带着 `degraded = true` 再调一次本函数 —— 于是降级期内首发
+    // 的提示词也跟着换（这条路径没有自己的重发循环，补救必须在外层做）。
     let send = send_body(ctx, provider_id, target.account.as_ref(), degraded).await;
     // 内置家透传出口的内部字段剥离：与无状态路径同一理由（见那里的说明）
     let stripped = strip_internal_fields(&send.body);
