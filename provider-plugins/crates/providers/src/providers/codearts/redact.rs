@@ -40,6 +40,9 @@ fn secrets_of(credential: &Credential) -> Vec<String> {
         // 全部账单接口。portal 回的是门户 HTML（可能带回显的请求头），漏盖一次
         // 就等于把账号交给所有能看到日志的人。
         credential.session_cookie.clone(),
+        // SSO 票根：比 cookie 更长寿（cookie 重启就丢，票根不死就一直有效）。
+        // 它出现在 SSO 域的错误页 / 重定向里同样会被回显 —— 同一等级，必须盖。
+        credential.sso_tgc.clone(),
     ];
     if let Some(context) = credential.oauth_context.as_ref() {
         secrets.push(context.pkce_pair.code_verifier.clone());

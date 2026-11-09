@@ -684,7 +684,7 @@ pub async fn refresh_usage(ctx: &PluginCtx, account_id: &str, now_ms: i64) -> Va
         super::models::DEFAULT_BASE_URL, &credential, chat::DEFAULT_LANGUAGE, chat::DEFAULT_PLUGIN_VERSION,
     ).await else { return Value::Null };
     let proxy = super::adapter::record_proxy(ctx, account_id).await.ok().flatten();
-    let web = super::credits::fetch(&credential, proxy.as_ref()).await;
+    let web = super::credits::fetch_renewing(ctx, account_id, &credential, proxy.as_ref()).await;
     let _ = now_ms;
     balance::usage_document_with(Some(&statistics), web.as_ref())
 }

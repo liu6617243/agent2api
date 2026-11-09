@@ -60,6 +60,7 @@ pub(crate) mod login;
 pub(crate) mod models;
 pub(crate) mod oauth;
 pub(crate) mod onboarding;
+pub(crate) mod portal_session;
 pub(crate) mod redact;
 pub(crate) mod refresh;
 pub(crate) mod response_stream;

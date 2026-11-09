@@ -34,6 +34,32 @@ pub const MAX_COOKIE_LENGTH: usize = 8192;
 /// 少一层翻译。⚠️ 这是**落盘契约**：改名会让存量账号的 cookie 读不到。
 pub const SESSION_COOKIE_FIELD: &str = "sessionCookie";
 
+/// 华为云 SSO 票根（`SSOTGC`）的落盘键。
+///
+/// ── 它是干什么的 ────────────────────────────────────────────
+/// 网页会话 cookie 那两条（`devclouddevuibjJ_SESSION_ID` + `devclouddevuibjtcftk`）
+/// 都是**会话级**的，浏览器一重启就没了，且两者严格配对、不能分开复用。而
+/// `SSOTGC`（Ticket-Granting Cookie，落在 `auth.huaweicloud.com` 的
+/// `Path=/authui/`）是**长期**票据 —— 浏览器重启后能自动登录回去靠的就是它。
+///
+/// 存它就能在 cookie 失效时静默重铸一条（见 [`super::portal_session`]），
+/// 不必每次重启都手工去浏览器复制。⚠️ 这是**落盘契约**：改名会让存量账号的
+/// 票根读不到（症状是「配了票根却还是一次性」）。
+pub const SSO_TGC_FIELD: &str = "ssoTgc";
+
+/// 会话 cookie 的键名（门户下发会话时用的就是这个名字）。
+pub const SESSION_COOKIE_KEY: &str = "devclouddevuibjJ_SESSION_ID";
+
+/// CSRF 令牌的键名（POST 的 `cftk` 头取的就是同一条 cookie 里这一项的值）。
+pub const CFTK_COOKIE: &str = "devclouddevuibjtcftk";
+
+/// SSO 票根的长度上限（字符）。
+///
+/// 实测票根 100 字符上下（`TGTX--F1840439038-8498999-<64 hex>-sso`）；给 4 KiB
+/// 余量是为了容忍上游换编码/加前缀，但仍在「不可能是一条 cookie 串」的量级上
+/// —— 用户把整段 Cookie 串贴进票根框时要能拦住，否则会把只该有一项的字段塞满。
+pub const MAX_TGC_LENGTH: usize = 4096;
+
 /// P-256 私钥 JWK（`d` 是标量的 base64url，32 字节定长）。
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Jwk {
@@ -107,10 +133,21 @@ pub struct Credential {
     /// 时刻，AK/SK 那条签名链打不进 portal BFF（实测 404）。
     ///
     /// 它不是登录换来的、也没有任何接口能换出来 —— 只能由用户从浏览器复制。
-    /// 缺省就整条通道不查（见 `credits::fetch` 的第一道判据），账号页只剩聚合
+    /// 缺省就整条通道不查（见 `credits::fetch_renewing` 的第一道判据），账号页只剩聚合
     /// 余额，与本次改动之前的行为一致。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_cookie: String,
+    /// **华为云 SSO 票根**（`SSOTGC`，可选）：网页会话 cookie 的「种子」。
+    ///
+    /// 上面那条 cookie 是会话级的（门户的 `Set-Cookie` 没有 `Max-Age` / `Expires`），
+    /// 浏览器一重启就丢；而这条是长期票据，浏览器重启后自动登录回去靠的就是它。
+    /// 有它就等于把「每次重启手工复制 cookie」换成「贴一次票根，之后自动重铸」
+    /// （见 [`super::portal_session::renew`]）。
+    ///
+    /// 缺省时行为与只有 `session_cookie` 时完全一样：cookie 过期就静默降级成
+    /// 聚合值，等用户重贴。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sso_tgc: String,
 }
 
 impl Credential {
@@ -232,6 +269,10 @@ impl Credential {
         // —— 早期/别的入口可能已经把多行串落了库，只在写入处压平的话那些记录
         // 要重新添加一次才能恢复。
         credential.session_cookie = session_cookie_of(body);
+        // SSO 票根：只认一个键名（本家专有，Qoder 没有对应物）。读取侧同样过一遍
+        // 「抽值」—— 用户常常整段粘 `SSOTGC=TGTX--…; Path=/authui/`（F12 的
+        // Table 视图给的就是这种形状），那不是一条能直接拼进 Cookie 头的值。
+        credential.sso_tgc = sso_tgc_of(body);
         if !credential.valid() {
             return Err("CodeArts 凭据缺少 access_key_id 或 secret_access_key".to_string());
         }
@@ -276,6 +317,12 @@ impl Credential {
                 Value::String(self.session_cookie.clone()),
             );
         }
+        // SSO 票根同理：serde 给的是 `sso_tgc`，而落盘键、后端 PATCH 入口、前端
+        // 输入框都按 `ssoTgc` 找。**空值不写**（与上面那条同一纪律：用户重新贴一份
+        // 只有 AK/SK 的凭据时不该把票根洗掉）。
+        if !self.sso_tgc.trim().is_empty() {
+            record.insert(SSO_TGC_FIELD.to_string(), Value::String(self.sso_tgc.clone()));
+        }
         Value::Object(record)
     }
 
@@ -301,6 +348,78 @@ fn text_of(value: &Value, keys: &[&str]) -> String {
 /// 名字带 `_of` 是为了不和 `Credential::session_cookie` 那个同名字段混淆。
 pub fn session_cookie_of(payload: &Value) -> String {
     normalize_cookie(&text_of(payload, &[SESSION_COOKIE_FIELD, "session_cookie", "webCookie"]))
+}
+
+/// 从 payload 里取 SSO 票根并抽成**纯值**。
+///
+/// ── 为什么不能像 cookie 那样只 `trim` ────────────────────────
+/// 票根只有一个键、一个值，而用户会从三种地方拿：
+///   · DevTools 的 **Request Headers → Cookie**：`SSOTGC=TGTX--…-sso`（可能与其他
+///     键混在同一行）→ 要按 `;` 切开挑出 `SSOTGC`；
+///   · DevTools 的 **Application → Cookies** 表格里那一格：纯值 `TGTX--…-sso`；
+///   · 「Copy as cURL」：整段 `Cookie:` 多行 → 先压平再挑。
+///
+/// 三种都只在「输入里出现过 `SSOTGC=`」时才走抽取；否则整段当纯值看（第二种）。
+/// 抽不出来（有 `SSOTGC=` 但值为空）返回空串 —— 让上层判成「没配票根」，
+/// 而不是把一段带属性尾巴（`; Path=/authui/`）的垃圾拼进 Cookie 头。
+///
+/// ⚠️ **不是票根形状的结果一律返回空串**（见 [`looks_like_tgc`]）：早先这里是
+/// 「没看到 `SSOTGC=` 就当纯值用」，于是把整条 `devclouddevuibjJ_SESSION_ID=…;
+/// devclouddevuibjtcftk=…` 存成了票根 —— 那串永远换不到会话，而界面显示
+/// 「已配置」。这类**认不出**必须显形（空串 → 上层拒绝 / 判未配置），
+/// 不能静默落盘。
+pub fn sso_tgc_of(payload: &Value) -> String {
+    let raw = text_of(payload, &[SSO_TGC_FIELD, "sso_tgc", "SSOTGC", "tgc"]);
+    normalize_tgc(&raw)
+}
+
+/// 票根文本 → 纯值（见 [`sso_tgc_of`] 的说明）。
+///
+/// 返回空串 = **认不出是票根**（不是「清除」：清除走 `null` / 空输入那条路）。
+pub fn normalize_tgc(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    // 多行粘贴（Copy as cURL）先压平；压平只按 `;` 与空格拼，不会破坏值本身。
+    let flat = normalize_cookie(raw);
+    // ① 输入里明确出现过 `SSOTGC=` → 取它后面那一段（到 `;` 或空白为止）。
+    //    这条覆盖「整段请求头 / 整段 cookie 串」，是最常见的粘贴形态。
+    let candidate = if let Some(index) = flat.find("SSOTGC=") {
+        let tail = &flat[index + "SSOTGC=".len()..];
+        tail.split(|character: char| character == ';' || character.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .trim()
+    } else {
+        // ② 没有键名 → 当纯值看，只切掉可能粘进来的属性尾巴（`TGTX--…-sso; Path=/authui/`）。
+        flat.split(|character: char| character == ';' || character.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .trim()
+    };
+    // ③ **形状判据**：认不出就返回空串，绝不把别家的 cookie 存成票根。
+    if !looks_like_tgc(candidate) {
+        return String::new();
+    }
+    candidate.chars().take(MAX_TGC_LENGTH).collect()
+}
+
+/// 这一段文本**像不像**一条 `SSOTGC` 票根。
+///
+/// ── 为什么必须有这条判据（2026-11-09 踩过）──────────────────
+/// 用户从 `codearts.huaweicloud.com` 复制**整条 cookie 串**贴进票根框（那正是
+/// 早先提示语鼓励的形态！），而那条串里**根本没有 `SSOTGC`** —— 票根在
+/// `auth.huaweicloud.com` 域、`Path=/authui/`，是两个不同的域。旧逻辑会把
+/// 第一个 `k=v` 对（`devclouddevuibjJ_SESSION_ID=…`）当成票根落盘：
+/// 界面显示「已配置」，插件拿它换票永远失败，而日志里只有一句「换不到会话」。
+///
+/// 判据取**上游的实际形状**：以 `TGTX--` 开头、以 `-sso` 结尾（实测
+/// `TGTX--F1840439038-8498999-<64 hex>-sso`，约 100 字符）。放宽成只认
+/// `TGTX` 前缀也够 —— 尾部再加一条长度下限，避免把 `TGTX` 本身当票根。
+pub fn looks_like_tgc(value: &str) -> bool {
+    let value = value.trim();
+    value.len() >= 16 && value.starts_with("TGTX") && value.ends_with("-sso")
 }
 
 /// 把一段原始 cookie 文本压成**单行**（`a=1; b=2`）。

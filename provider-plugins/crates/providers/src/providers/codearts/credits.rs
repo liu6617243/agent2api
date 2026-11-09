@@ -70,7 +70,11 @@ const OPS_OVERVIEW_PATH: &str = "/portal/promptcenter/v1/ops/credit/overview";
 const OPS_CAMPAIGN_PATH: &str = "/portal/promptcenter/v1/ops/credit/campaign";
 
 /// `cftk` 头的来源键（同一条 cookie 串里）。
-const CFTK_COOKIE: &str = "devclouddevuibjtcftk";
+///
+/// 与 [`super::credentials::CFTK_COOKIE`] 同一个字面量 —— 那一处是「建会话时写」
+/// 与「从粘贴值里抽」，这一处是「读出来当请求头」，三处必须是同一个 key，
+/// 所以只留一份常量。
+const CFTK_COOKIE: &str = super::credentials::CFTK_COOKIE;
 
 /// 最多拉多少个活动的逐笔明细。上游的活动数是个位数（实测 4 个），
 /// 这个上限只是防止某个账号被发了上百个活动时把一次余额查询拖成串行长龙。
@@ -253,23 +257,53 @@ async fn portal(
 // 解析
 // ─────────────────────────────────────────────────────────────
 
-/// 读全部逐批明细。**没有 cookie 直接返回 `None`**（不发任何请求）。
+/// 读全部逐批明细（**唯一的对外入口**）。
+///
+/// ── 为什么只剩这一个入口 ────────────────────────────────────
+/// 早先这里是一个「纯函数」`fetch(&credential, proxy)`：只吃凭据、不碰账号存储，
+/// 好处是任何调用点都能用。但它拿不到 `account_id`，于是没法把「用票根重铸出来的
+/// 新 cookie」写回账号 —— 每个进程启动后都要重铸一次，等于白花一次 SSO 往返。
+///
+/// 现在统一成这个形态：**手工 cookie 能用就用，不能用才动票根**。没有 cookie 且
+/// 没有票根时它立刻返回 `None`（一次请求都不发），与从前完全一样。
 ///
 /// 失败一律静默降级：cookie 过期时这条通道会一直不可用，不该每轮余额查询都报错
 /// （用户没重贴之前没有任何动作可做）。与 Qoder 的 `web_credit_packs` 同一取向。
-pub async fn fetch(credential: &Credential, proxy: Option<&ResolvedProxy>) -> Option<WebCredits> {
+pub async fn fetch_renewing(
+    ctx: &agent2api_provider_sdk::PluginCtx,
+    account_id: &str,
+    credential: &Credential,
+    proxy: Option<&ResolvedProxy>,
+) -> Option<WebCredits> {
     // 读取侧也过一遍归一：早期版本可能已经把多行串落了库（见 `normalize_cookie`）。
     let cookie = credentials::normalize_cookie(&credential.session_cookie);
-    if cookie.is_empty() {
-        return None;
+    if !cookie.is_empty() {
+        if let Some(credits) = read(&cookie, proxy).await {
+            return Some(credits);
+        }
     }
+    // ── 手工 cookie 失效（或压根没贴）→ 看能不能用票根重铸 ────────
+    // 没配票根时 `renew` 立刻返回 `None`，不花一次往返。
+    let fresh = super::portal_session::renew(ctx, account_id, credential, proxy).await?;
+    crate::logging::verbose(
+        "[CodeArts]",
+        "网页会话 cookie 已由 SSO 票根重建，用新会话重读逐批明细",
+    );
+    read(&fresh, proxy).await
+}
+
+/// 用一条既有 cookie 串读全部明细（读不出东西返回 `None`）。
+///
+/// 四个端点的顺序与失败语义见模块头：任一端点失败只让「明细少几行」，
+/// 全部为空才算这条通道不可用。
+async fn read(cookie: &str, proxy: Option<&ResolvedProxy>) -> Option<WebCredits> {
     // `cftk` 就在同一条 cookie 里 —— 用户不必为同一件事贴两次。
-    let cftk = credentials::cookie_value(&cookie, CFTK_COOKIE).map(str::to_string);
+    let cftk = credentials::cookie_value(cookie, CFTK_COOKIE).map(str::to_string);
 
     let mut credits = WebCredits::default();
 
     // ① 汇总：给 available 兜底 + expiring_credit_amount 留档
-    if let Some(payload) = portal("GET", &cookie, None, OVERVIEW_PATH, None, proxy).await {
+    if let Some(payload) = portal("GET", cookie, None, OVERVIEW_PATH, None, proxy).await {
         read_overview(&payload, &mut credits);
     }
 
@@ -282,7 +316,7 @@ pub async fn fetch(credential: &Credential, proxy: Option<&ResolvedProxy>) -> Op
             "pageNum": 1,
             "pageSize": PAGE_SIZE,
         });
-        if let Some(payload) = portal("POST", &cookie, Some(token), CREDIT_PAGE_PATH, Some(&body), proxy).await {
+        if let Some(payload) = portal("POST", cookie, Some(token), CREDIT_PAGE_PATH, Some(&body), proxy).await {
             for batch in read_credit_page(&payload) {
                 credits.rows.push(row_of(&batch));
             }
@@ -296,10 +330,10 @@ pub async fn fetch(credential: &Credential, proxy: Option<&ResolvedProxy>) -> Op
     }
 
     // ③ 活动福利：先拿活动清单，再逐个拉逐笔
-    if let Some(payload) = portal("GET", &cookie, None, OPS_OVERVIEW_PATH, None, proxy).await {
+    if let Some(payload) = portal("GET", cookie, None, OPS_OVERVIEW_PATH, None, proxy).await {
         for campaign_id in campaign_ids(&payload) {
             let path = format!("{OPS_CAMPAIGN_PATH}/{campaign_id}?pageNum=1&pageSize={PAGE_SIZE}");
-            let Some(payload) = portal("GET", &cookie, None, &path, None, proxy).await else {
+            let Some(payload) = portal("GET", cookie, None, &path, None, proxy).await else {
                 continue;
             };
             for batch in read_campaign(&payload) {

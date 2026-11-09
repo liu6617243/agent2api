@@ -887,7 +887,7 @@ async fn query_usage(ctx: &PluginCtx, account_id: &str) -> Result<Value, Gateway
     let statistics = balance::fetch_statistics(
         models::DEFAULT_BASE_URL, &credential, chat::DEFAULT_LANGUAGE, chat::DEFAULT_PLUGIN_VERSION,
     );
-    let web = credits::fetch(&credential, proxy.as_ref());
+    let web = credits::fetch_renewing(ctx, account_id, &credential, proxy.as_ref());
     let (statistics, web) = tokio::join!(statistics, web);
     let statistics = statistics?;
     Ok(balance::usage_document_with(Some(&statistics), web.as_ref()))

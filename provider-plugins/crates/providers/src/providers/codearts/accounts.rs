@@ -92,6 +92,7 @@ impl AccountDraft {
             refresh_token,
             oauth_context,
             session_cookie,
+            sso_tgc,
         } = self.credential;
         if access_key_id.trim().is_empty() || secret_access_key.trim().is_empty() {
             return Err("CodeArts 凭据缺少 access_key_id 或 secret_access_key".to_string());
@@ -122,6 +123,9 @@ impl AccountDraft {
         // 同样成立。用户重新粘贴一份只有 AK/SK 的凭据时，不该把上次贴的 cookie
         // 洗掉（那会让有效期列悄悄退回「—」，而记录里看起来什么都没变）。
         insert_text(&mut secret, super::credentials::SESSION_COOKIE_FIELD, &session_cookie);
+        // SSO 票根：同样「只在非空时写」—— 贴一份只有 AK/SK 的凭据不该把票根洗掉。
+        // 它是会话 cookie 的种子（见 `portal_session`），存了之后重启不必再手工复制。
+        insert_text(&mut secret, super::credentials::SSO_TGC_FIELD, &sso_tgc);
         // ── 通用键名（与网关 `to_record_value` 逐字同口径）──────────
         // 网关的账号投影与「这个账号能不能用」的判定读的是这些通用键；
         // 插件家的公开视图由插件自己给，但**选路与启用判定**仍在网关侧读
@@ -223,6 +227,14 @@ pub(super) fn account_view(secret: &Value) -> Value {
     public.insert(
         "hasSessionCookie".to_string(),
         Value::Bool(credential.as_ref().is_some_and(|value| !value.session_cookie.trim().is_empty())),
+    );
+    // SSO 票根同样只给布尔。它与上面那条是两个东西：cookie 是门户当场签发、浏览器
+    // 一重启就丢的短期票据；票根是统一身份那张长期票，插件拿它现场重铸会话
+    // （见 `portal_session`）。界面据此显示「已配置 / 未配置」与那颗清除按钮 ——
+    // 拿到票根等于拿到长期登录态，所以值本身绝不下发。
+    public.insert(
+        "hasSsoTgc".to_string(),
+        Value::Bool(credential.as_ref().is_some_and(|value| !value.sso_tgc.trim().is_empty())),
     );
     public.insert(
         "refreshTokenExpiresAt".to_string(),
