@@ -1,27 +1,14 @@
 //! msToken：官方客户端每个请求的 URL 参数都带（Cookie 里另有一颗）。
 //!
-//! ── 为什么只做 msToken、不做 a_bogus（2026-11-08 的实测决策）──
-//! 抓包证实官方请求带 `msToken` 与 `a_bogus` 两个签名件，但两者的可补性
-//! 完全不同：
+//! ── 关于 a_bogus（2026-11-11 结论已更新）───────────────
+//! 抓包证实官方 `/alice/ug/*` 每条请求都带 `a_bogus`（解码 145 字节 / 196
+//! 字符），而插件此前一条都没带。曾以为「照抖音版结构自己签一个」就能补上，
+//! 实现完（见 [`super::abogus`]）拿真机签名反推验证后**否掉了**：豆包这一档
+//! 与 `douyin_abogus_python` 系列不同构，三处标志位一个都对不上。所以
+//! `a_bogus` 目前不产出（总闸关闭），签到的修正靠另外三条已对齐的事实：
+//! `aid=582478`、26 个查询参数按官方顺序、签到前先发 `landing/report`。
 //!
-//! · `msToken` 是**服务端下发、前端回放**的轮换令牌：每次响应都经
-//!   `x-ms-token` 响应头发给客户端（本插件不带 msToken 的响应里也有这个
-//!   头），官方 JS 接住后放进下一个请求的 URL 参数。因此插件只要
-//!   「接住响应头 → 带回下一个请求」就是在走官方同一条轮换链路。
-//!
-//! · `a_bogus` 是纯前端计算签名，但豆包的变体与公开逆向实现**对不上**：
-//!   官方解码后 196 字符（含 `==` 补位，146 码位）；douyin 公开旧版实现
-//!   （xiaolifeidao-fly/douyin_abogus_python，44 字节结构 + 浏览器信息）
-//!   输出约 164~170 字符；mafqla/douyin-api 文档里的 douyin 新版是 192
-//!   字符。三个数字互不相等 —— 豆包用的既不是旧版也不是新版 douyin 结构。
-//!   塞一个结构错误的签名比不带更危险（服务端可直接判「签名无效」），而
-//!   2026-11-08 的实数据表明插件不带 a_bogus 的请求全部成功（同日官方
-//!   客户端签到成功、Agent2API 批量签到 10/10 成功），即这些端点目前
-//!   **不硬校验** a_bogus。结论：不签，留此记录；若上游将来开始拒签，
-//!   参考实现在 `.workbuddy/tmp/abogus/abogus.py`，先抓豆包自己的样本
-//!   反推结构再移植，不要拿 douyin 版本硬凑。
-//!
-//! ── 为什么「没有就不带」，而不是自己造一颗 ────────────────────
+//! ── 为什么 msToken「没有就不带」，而不是自己造一颗 ────────────
 //! msToken 是服务端加密下发的载荷，不是普通随机串。自造一颗 168 位
 //! base64 塞进 query，服务端要么解不开直接判异常、要么（更糟）把它记成
 //! 「这个会话的令牌是坏的」—— 那正是本改造要消除的东西。而「不带」是
@@ -47,7 +34,6 @@ fn tokens() -> &'static Mutex<HashMap<String, (String, Instant)>> {
     static TOKENS: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
     TOKENS.get_or_init(Mutex::default)
 }
-
 /// 上游响应头 `x-ms-token` 下发的新值落盘（`api::json_response` 调用）。
 ///
 /// `session` 传空表示「响应带了新令牌但取不到会话键」（官方这批响应的
@@ -83,6 +69,95 @@ pub fn ms_token(session: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ── web_tab_id ───────────────────────────────────────────────
+
+/// `web_tab_id`：官方每开一个 webview 生成一颗 UUID，并在**该 webview 的所有
+/// 请求**上复用。抓包里同一个 `conn` 内的 `landing/report` / `landing/get` /
+/// `landing/checkin` 用的是同一颗。
+///
+/// 这里按会话（`sessionid`）缓存：同一账号同一时刻只应有一颗 tab id，反复换
+/// 等于自报「这个账号同时开了十几个窗口」。缺失时按 UUIDv4 形态现场生成 ——
+/// 它不是服务端下发的载荷（不像 msToken），自己生成是安全的。
+pub fn web_tab_id(credentials: &serde_json::Value) -> Option<String> {
+    let session = super::accounts::cookie_header(credentials)
+        .ok()
+        .map(|header| super::accounts::session_of_header(&header))
+        .unwrap_or_default();
+    let key = session.trim().to_string();
+    type Tabs = Mutex<HashMap<String, (String, Instant)>>;
+    static TABS: OnceLock<Tabs> = OnceLock::new();
+    /// tab id 跟随 webview 生命周期，给足一天；过期即换一颗新的。
+    const TAB_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+    let tabs = TABS.get_or_init(Mutex::default);
+    let mut guard = tabs.lock().ok()?;
+    if let Some((id, at)) = guard.get(&key) {
+        if at.elapsed() < TAB_TTL {
+            return Some(id.clone());
+        }
+    }
+    let id = uuid_v4();
+    if guard.len() >= 256 {
+        guard.clear();
+    }
+    guard.insert(key, (id.clone(), Instant::now()));
+    Some(id)
+}
+
+/// UUIDv4 形态的随机串（`8-4-4-4-12`，第三段首字符固定 `4`，第四段首字符
+/// 取 `8|9|a|b`）—— 与 Chromium 的 `crypto.randomUUID()` 输出同形态。
+fn uuid_v4() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // 熵不可用时退回时间派生，绝不能因此让签到失败。
+        let now = crate::http::now_ms() as u128;
+        bytes.copy_from_slice(&now.to_le_bytes()[..16]);
+    }
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+// ── aid ─────────────────────────────────────────────────────
+
+/// 签到类请求该用的 `aid`。
+///
+/// 默认豆包桌面端 `582478`（抓包里 `landing/checkin` 6/6 全是它，见
+/// [`super::abogus`] 模块头的时间线）。只有当账号快照**明确**声明自己是
+/// 豆包工作端（`clientKind == "work"`）时才用 `1044603` —— 这种情况下用户
+/// 真的在豆包工作客户端里签，用工作端 aid 才是对的。
+pub fn checkin_aid(credentials: &serde_json::Value) -> u64 {
+    match credentials["clientKind"]
+        .as_str()
+        .map(str::trim)
+        .unwrap_or_default()
+    {
+        "work" => 1_044_603,
+        _ => 582_478,
+    }
+}
+
+// ── a_bogus ─────────────────────────────────────────────────
+
+/// 给一条**已拼好的 query 串**（不含 `a_bogus`）出签名。
+///
+/// 目前固定返回 `None` —— [`super::abogus::A_BOGUS_ENABLED`] 默认关闭，
+/// 因为豆包这一档的签名结构与公开的抖音版**不同构**（反推证据见
+/// [`super::abogus`] 模块头）。留着这个入口是为了将来换掉实现时上层不用动。
+///
+/// 读接口（`/chat/completion` 等）本来也不签 —— 抓包里它们在 `/samantha/*`
+/// 下不带 `a_bogus`，且插件这条链路一直是通的，不该在这里冒险动它。
+pub fn a_bogus(query: &str, user_agent: &str, method: &str) -> Option<String> {
+    super::abogus::sign(query, user_agent, method)
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 //! Adapted under MIT; the complete notice is in licenses/EchoBird-MIT.txt.
 //! 登录态为 Cookie；无凭证续期接口，失效后必须重新登录。
 
+mod abogus;
 mod accounts;
 mod api;
 mod catalog;

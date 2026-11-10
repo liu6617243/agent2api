@@ -21,6 +21,29 @@ const V3_GROUP: &str = "pc_incentive_task_mvp_v3";
 /// 回执 `data.checked_in / reward_status / continuous_days` 就是权威结果。
 const CHECKIN_PATH: &str = "/alice/ug/campaign/landing/checkin";
 
+/// 签到前的用户操作上报接口。
+///
+/// ── 为什么这一条不能省（2026-11-11 按 Reqable 原始报文定案）──
+/// 客户端**每一次**签到都是两条请求，间隔约 20ms：
+///
+/// | # | 时刻（11-10） | 路径 | body |
+/// |---|--------------|------|------|
+/// | 1 | 12:40:19.150 | `landing/report` | `{"event_type":"user_operate","biz_event_name":"check_in"}` |
+/// | 2 | 12:40:19.171 | `landing/checkin` | `{"scene":"pc_incentive_task_mvp_v3"}` |
+///
+/// 6 次抓包（11-05 ~ 11-10）无一例外，「report → checkin」永远成对出现。
+/// 插件此前只发第 2 条，等于「没有点击动作，直接来领奖」—— 服务端的处置正是
+/// `710010702 系统错误`（不告诉你是风控，也不告诉你哪条不对），并把该 uid
+/// 当天的签到口封掉，于是**同一天随后用官方客户端也签不上**。这就是用户
+/// 反复说的「用 agent2api 签豆包就废了」，也是 §10.19 把它判成「上游写接口
+/// 故障」时被误导的那条线索。
+const REPORT_PATH: &str = "/alice/ug/campaign/landing/report";
+
+/// 签到前的操作上报体，逐字照抄抓包（字段名、顺序、取值都不改）。
+fn report_body() -> Value {
+    json!({"event_type": "user_operate", "biz_event_name": "check_in"})
+}
+
 /// 任务奖励领取接口。只用于**非签到**任务；签到走 [`CHECKIN_PATH`]。
 ///
 /// 历史坑：daily_signin 打这个接口永远只回
@@ -41,38 +64,61 @@ const CLAIM_RETRY_MS: i64 = 10 * 60_000;
 
 /// 上游写接口整体报「系统错误」时的自动复核间隔。
 ///
-/// 比 [`CLAIM_RETRY_MS`] 拉宽一倍：网关对每个账号每天只给 3 次自动重试
-/// （`auto_checkin::retry` 的 `retryLimit` 缺省 3、`retryGapMinutes` 缺省 10），
-/// 而「写接口整体不可用」这种故障通常以「几十分钟到几小时」计。10 分钟一档只覆盖
-/// 半小时；20 分钟一档能覆盖一小时，且当天手动签到、启动补签仍会各自再打一次。
-const SYSTEM_ERROR_RETRY_MS: i64 = 20 * 60_000;
+/// ── 为什么是「明天早上」而不是「20 分钟后」───────────────────
+/// 这一档的真实含义是「uid 当日签到口被封」（见 [`upstream_system_error`]），
+/// 豆包按**自然日**解锁，当天再重试多少次都是同一条 710010702。网关对每个
+/// 账号每天只给 3 次自动重试（`auto_checkin::retry` 的 `retryLimit` 缺省 3），
+/// 20 分钟一档会把 3 次全浪费在同一个被封的日子里 —— 所以直接指到下一天
+/// 早上（豆包签到刷新在 0 点后，9 点这个时刻远离边界，任何时区误解都不至于
+/// 跨日失败）。
+fn next_day_retry_at(now_ms: i64) -> i64 {
+    /// 北京时间相对 UTC 的偏移。豆包按 UTC+8 的自然日结算，固定写死 ——
+    /// 用本机时区会在改了系统时区的机器上算错日子。
+    const CST_OFFSET_MS: i64 = 8 * 3600 * 1000;
+    const DAY_MS: i64 = 24 * 3600 * 1000;
+    /// 次日 09:00（北京时间）。
+    const MORNING_MS: i64 = 9 * 3600 * 1000;
+
+    let local = now_ms + CST_OFFSET_MS;
+    let next_day_start = (local / DAY_MS + 1) * DAY_MS;
+    next_day_start + MORNING_MS - CST_OFFSET_MS
+}
 
 /// 上游「系统错误」的业务码：`710010702`（`msg=系统错误 / message=system error`）
 /// 与 `625002002`（`系统内部异常`）。
 ///
-/// ── 为什么单认这一档（2026-11-10 实测）─────────────────────────
-/// `landing/checkin` 对**任何通过鉴权的入参**都回 `710010702`：真实 scene、
-/// 瞎编的 `scene`（`__no_such_campaign__`）、空 body、换 `aid`（1044603 /
-/// 582478 / 497858）、只换活动组名 —— 全是同一条 710010702。而同一套
-/// cookie/query 打 `v3/detail`（同一活动组）、`landing/get`（`main_page_info`
-/// 此刻仍写着「今日签到领 200 额度」）、`quota/records`、`launch`、
-/// `item/reward/claim/` **全部正常返回** —— 说明是**这条写接口自身**在上游侧
-/// 不可用，不是请求构造问题。
+/// ── 这一档到底是什么（2026-11-11 结论已更正）───────────────
+/// 旧注释把它判成「上游写接口自身不可用」，理由是「随便换 scene / aid / 空 body
+/// 都回同一条 710010702，而同期读接口全部正常」，还引了「官方 SDK 直调也炸」的
+/// logId 作决定性证据。**那条推理是错的**，两处：
 ///
-/// 鉴权仍然先行：去掉 cookie 时同一接口回 `710012001 登录已过期`（不是
-/// 710010702），所以这一档是「过了鉴权、死在业务处理里」的 5xx 语义，
-/// 不是「你没登录」也不是「你没资格」。走 `item/reward/claim/` 领
-/// `daily_signin` 仍只回 `biz_error code 3 领取结果确认中` 且状态永不落地
-/// （见 [`CLAIM_PATH`] 的注），所以也没有旁路可绕。
+/// 1. 「怎么改入参都是 710010702」恰恰是**风控软拒绝**的形状 —— 它不看你的
+///    body 长什么样，看的是「这条请求的来路像不像客户端的签到」。真正的 5xx
+///    会随入参抖动，而风控是一刀切。
+/// 2. 那条「官方 SDK 直调也炸」的 logId 发生在插件失败之后 3~4 分钟，而风控
+///    是**按 uid 当天封口**的（插件那一次裸请求已经把 uid 锁了）。所以官方
+///    那一次失败是**后果**，不是原因。
 ///
-/// 决定性证据：用官方 SDK（页面内 `incentiveTaskUgCampaignApiService.DailyCheckIn`，
-/// 带官方 `a_bogus` + 真 `msToken`）在同一浏览器里直调，回执拿到的是**一模一样**的
-/// 710010702（`logId 2026111014254054FE84F66D4B67EF94DB`）。也就是说官方自己此刻
-/// 也签不上 —— 补 `a_bogus` 不可能解决这一档。
+/// 决定性反证来自真机台账（`checkin_records`）与 Reqable 抓包的逐日对齐：
 ///
-/// 这一档是**上游写接口的瞬时故障**（语义等同 5xx），不是「账号不可签」也不是
-/// 「插件请求不对」，所以不能按 `Fatal` 落成一条 `failed`（那正是「用 agent2api
-/// 签豆包就废了」的观感来源）。改为回查 + 挂 `retryAt`，等上游恢复后自动补领。
+/// | 日期 | 插件 POST checkin | 客户端签到 | 结果 |
+/// |------|------------------|-----------|------|
+/// | 11-05 | 09:36:10 failed | 09:37:04 | 客户端 54 秒后同为 710010702 |
+/// | 11-06 | **未 POST** | 11:58:09 | 客户端成功，+200 |
+/// | 11-08 | 15:39:31 already（未 POST） | 14:35:30 | 客户端成功，+200 |
+/// | 11-09 | **未 POST** | 09:44:45 | 客户端成功，+400 |
+/// | 11-10 | 12:36:34 failed | 12:40:19 | 客户端 3 分 46 秒后同为 710010702 |
+///
+/// **插件 POST 过的日子客户端全挂，没 POST 的日子客户端全过。**
+///
+/// 所以本函数保留，但语义从「等上游恢复」改成「今天这个 uid 已经被锁了」：
+/// 仍然回查（幂等，万一真签上了就别报错）、仍然挂 `retryAt`（明日自动补），
+/// 但不再宣称「官方客户端此刻同样签不上」—— 那是我们造成的。
+///
+/// 真正的修法是让请求本身跟客户端一致：`aid=582478`、26 个查询参数按官方
+/// 顺序、签到前先发 [`REPORT_PATH`]、以及 `/alice/ug/*` 上带 `a_bogus`
+/// （见 `abogus` 模块头）。这些已在 `api::endpoint` 与 `checkin_with_retry`
+/// 里落地；本分支从此只作为兜底。
 fn upstream_system_error(error: &GatewayError) -> bool {
     matches!(error.upstream_code, Some(710010702 | 625002002))
 }
@@ -336,6 +382,19 @@ pub async fn checkin_with_retry(
     // 回 biz_error code 3「领取结果确认中，请稍后重试」，状态永不落地——这正是
     // 「签到总是有问题」的根因。真正的签到是 landing/checkin，body 只带 scene
     // （= campaign_group_code），同步返回权威字段 checked_in。
+    //
+    // ── 顺序照抄客户端：先 report 再 checkin ────────────────────
+    // 见 [`REPORT_PATH`]。这一条**失败不影响签到**：它只是埋点/行为上报，
+    // 客户端自己也是 fire-and-forget（抓包里下一跳 20ms 就到，不等回执）。
+    // 但如果连它都发不出去（网络/代理挂了），那么 checkin 也一定发不出去，
+    // 交给后面的 checkin 报错即可，不在这里额外判死。
+    match api::post(&client, &credentials, REPORT_PATH, &report_body()).await {
+        Ok(_) => {}
+        Err(error) => crate::logging::verbose(
+            "[DoubaoWork]",
+            &format!("签到前置上报 landing/report 失败（不影响签到本身）：{error}"),
+        ),
+    }
     let response = match api::post(
         &client,
         &credentials,
@@ -346,14 +405,16 @@ pub async fn checkin_with_retry(
     {
         Ok(response) => response,
         Err(error) if upstream_system_error(&error) => {
-            // 上游写接口当前报「系统错误」（见 [`upstream_system_error`]）：这一档
-            // 连官方客户端都签不上，判 failed 只会让用户以为插件坏了。先回查一次
-            // —— 上游偶尔在「已落库但响应组装失败」时也回这个码，真签上了就别报错；
-            // 没签上就报中性 Inactive + retryAt，等上游恢复后由网关自动补领。
+            // 710010702 / 625002002：按 [`upstream_system_error`] 的更正结论，
+            // 这**不是**上游故障，而是「这个 uid 今天的签到口已经被封了」——
+            // 裸 POST 一次 `landing/checkin` 就会造成这个结果。先回查一次：
+            // 万一上游「已落库但响应组装失败」，真签上了就别报错；没签上就报
+            // 中性 Inactive + retryAt，`retryAt` 直接给到**明天**（当天重试必然
+            // 还是同一档，白耗网关的 3 次自动复核额度）。
             crate::logging::verbose(
                 "[DoubaoWork]",
                 &format!(
-                    "签到写接口报上游系统错误（code={:?}），已转回查 + 自动复核：{}",
+                    "签到返回上游系统错误（code={:?}）—— 按台账判据这是 uid 当日风控封口，而不是上游故障：{}",
                     error.upstream_code, error.message
                 ),
             );
@@ -371,9 +432,9 @@ pub async fn checkin_with_retry(
                 _ => CheckinResult {
                     report: report(
                         proto::CheckinOutcome::Inactive,
-                        "豆包上游签到接口暂时报「系统错误」（官方客户端此刻同样签不上），已排自动复核，恢复后会自动补领",
+                        "豆包返回「系统错误」：该账号今日签到已被风控封口（豆包按天锁定，当天任何客户端都签不上），明天自动补签",
                     ),
-                    retry_at: Some(crate::http::now_ms() + SYSTEM_ERROR_RETRY_MS),
+                    retry_at: Some(next_day_retry_at(crate::http::now_ms())),
                     details: None,
                 },
             });
