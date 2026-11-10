@@ -39,6 +39,44 @@ const CLAIM_SETTLE_WAIT_MS: u64 = 8_000;
 /// 签到。上游按天幂等，重跑不会重复发奖。
 const CLAIM_RETRY_MS: i64 = 10 * 60_000;
 
+/// 上游写接口整体报「系统错误」时的自动复核间隔。
+///
+/// 比 [`CLAIM_RETRY_MS`] 拉宽一倍：网关对每个账号每天只给 3 次自动重试
+/// （`auto_checkin::retry` 的 `retryLimit` 缺省 3、`retryGapMinutes` 缺省 10），
+/// 而「写接口整体不可用」这种故障通常以「几十分钟到几小时」计。10 分钟一档只覆盖
+/// 半小时；20 分钟一档能覆盖一小时，且当天手动签到、启动补签仍会各自再打一次。
+const SYSTEM_ERROR_RETRY_MS: i64 = 20 * 60_000;
+
+/// 上游「系统错误」的业务码：`710010702`（`msg=系统错误 / message=system error`）
+/// 与 `625002002`（`系统内部异常`）。
+///
+/// ── 为什么单认这一档（2026-11-10 实测）─────────────────────────
+/// `landing/checkin` 对**任何通过鉴权的入参**都回 `710010702`：真实 scene、
+/// 瞎编的 `scene`（`__no_such_campaign__`）、空 body、换 `aid`（1044603 /
+/// 582478 / 497858）、只换活动组名 —— 全是同一条 710010702。而同一套
+/// cookie/query 打 `v3/detail`（同一活动组）、`landing/get`（`main_page_info`
+/// 此刻仍写着「今日签到领 200 额度」）、`quota/records`、`launch`、
+/// `item/reward/claim/` **全部正常返回** —— 说明是**这条写接口自身**在上游侧
+/// 不可用，不是请求构造问题。
+///
+/// 鉴权仍然先行：去掉 cookie 时同一接口回 `710012001 登录已过期`（不是
+/// 710010702），所以这一档是「过了鉴权、死在业务处理里」的 5xx 语义，
+/// 不是「你没登录」也不是「你没资格」。走 `item/reward/claim/` 领
+/// `daily_signin` 仍只回 `biz_error code 3 领取结果确认中` 且状态永不落地
+/// （见 [`CLAIM_PATH`] 的注），所以也没有旁路可绕。
+///
+/// 决定性证据：用官方 SDK（页面内 `incentiveTaskUgCampaignApiService.DailyCheckIn`，
+/// 带官方 `a_bogus` + 真 `msToken`）在同一浏览器里直调，回执拿到的是**一模一样**的
+/// 710010702（`logId 2026111014254054FE84F66D4B67EF94DB`）。也就是说官方自己此刻
+/// 也签不上 —— 补 `a_bogus` 不可能解决这一档。
+///
+/// 这一档是**上游写接口的瞬时故障**（语义等同 5xx），不是「账号不可签」也不是
+/// 「插件请求不对」，所以不能按 `Fatal` 落成一条 `failed`（那正是「用 agent2api
+/// 签豆包就废了」的观感来源）。改为回查 + 挂 `retryAt`，等上游恢复后自动补领。
+fn upstream_system_error(error: &GatewayError) -> bool {
+    matches!(error.upstream_code, Some(710010702 | 625002002))
+}
+
 fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value[key]
         .as_str()
@@ -298,13 +336,50 @@ pub async fn checkin_with_retry(
     // 回 biz_error code 3「领取结果确认中，请稍后重试」，状态永不落地——这正是
     // 「签到总是有问题」的根因。真正的签到是 landing/checkin，body 只带 scene
     // （= campaign_group_code），同步返回权威字段 checked_in。
-    let response = api::post(
+    let response = match api::post(
         &client,
         &credentials,
         CHECKIN_PATH,
         &json!({"scene": task.group}),
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(error) if upstream_system_error(&error) => {
+            // 上游写接口当前报「系统错误」（见 [`upstream_system_error`]）：这一档
+            // 连官方客户端都签不上，判 failed 只会让用户以为插件坏了。先回查一次
+            // —— 上游偶尔在「已落库但响应组装失败」时也回这个码，真签上了就别报错；
+            // 没签上就报中性 Inactive + retryAt，等上游恢复后由网关自动补领。
+            crate::logging::verbose(
+                "[DoubaoWork]",
+                &format!(
+                    "签到写接口报上游系统错误（code={:?}），已转回查 + 自动复核：{}",
+                    error.upstream_code, error.message
+                ),
+            );
+            return Ok(match refetch(&client, &credentials, &task.key, &task.group).await {
+                Ok(Some((true, streak))) => CheckinResult {
+                    report: proto::CheckinReport {
+                        outcome: proto::CheckinOutcome::Claimed,
+                        credit: task.points.map(|points| format!("{points} 额度")),
+                        streak: streak.or(task.streak),
+                        message: Some("豆包工作签到成功".into()),
+                    },
+                    retry_at: None,
+                    details: None,
+                },
+                _ => CheckinResult {
+                    report: report(
+                        proto::CheckinOutcome::Inactive,
+                        "豆包上游签到接口暂时报「系统错误」（官方客户端此刻同样签不上），已排自动复核，恢复后会自动补领",
+                    ),
+                    retry_at: Some(crate::http::now_ms() + SYSTEM_ERROR_RETRY_MS),
+                    details: None,
+                },
+            });
+        }
+        Err(error) => return Err(error),
+    };
     let data = response
         .get("data")
         .and_then(Value::as_object)
