@@ -164,7 +164,7 @@ pub fn headers(credentials: &Value) -> Result<Vec<(String, String)>, GatewayErro
 
 /// 按路径微调请求头 —— 目前只有一条差异，但它出现在**所有** `/alice/ug/*` 上。
 ///
-/// ── 差异是什么（2026-11-11 逐条比对 Reqable 原始报文）──────────
+/// ── 差异是什么（2026-11-10 逐条比对 Reqable 原始报文）──────────
 /// 客户端对这些 `landing/*` 请求**不带 `Origin`**，`Referer` 是站点根
 /// `https://www.doubao.com/`；而插件此前一律发 `Origin: https://www.doubao.com`
 /// + `Referer: https://www.doubao.com/chat/`。这不是风格问题：
@@ -223,7 +223,7 @@ const CHROMIUM_VERSION: &str = "147.0.7727.149";
 /// 拦下 —— 生图走的就是同一个 `/chat/completion`，没有例外。所以两边共用本
 /// 函数，编码按 [`encode`] 的 RFC3986 未保留字符集自己来。
 ///
-/// ── 参数顺序照抄客户端（2026-11-11 按 Reqable 原始报文逐字段对齐）──
+/// ── 参数顺序照抄客户端（2026-11-10 按 Reqable 原始报文逐字段对齐）──
 /// 官方顺序：`version_code, language, device_platform, doubao_device_platform,
 /// aid, real_aid, pkg_type, device_id, pc_version, doubao_pc_version, web_id,
 /// tea_uuid, region, sys_region, samantha_web, web_platform,
