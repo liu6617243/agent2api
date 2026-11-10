@@ -55,12 +55,15 @@
 pub const A_BOGUS_ENABLED: bool = false;
 
 /// 自定义字母表（与官方 JS 的 `__str` 一致，`s4` 是 `a_bogus` 用的那张）。
-const ALPHABET: &[u8; 65] =
-    b"Dkdpgh2ZmsQB80/MfvV36XI1R45-WUAlEixNLwoqYTOPuzKFjJnry79HbGcaStCe=";
+///
+/// 两张表**长度不同**：`s4` 是 65 字符（末位带 `=` 补位符），`s3` 是 64 字符
+/// （**不带** `=` —— 官方 s3 链路自己补位，表里没这个字符）。所以下面都声明成
+/// 切片而不是 `&[u8; 65]`，否则 `s3` 那张会因长度不匹配编不过（E0308）。
+/// 码位值域都是 `0..=63`，两张表都覆盖得到；补位用的字面 `'='` 不查表。
+const ALPHABET: &[u8] = b"Dkdpgh2ZmsQB80/MfvV36XI1R45-WUAlEixNLwoqYTOPuzKFjJnry79HbGcaStCe=";
 
-/// `s3`：UA 摘要那条链路用的字母表。
-const ALPHABET_S3: &[u8; 65] =
-    b"ckdp1h4ZKsUB80/Mfvw36XIgR25+WQAlEi7NLboqYTOPuzmFjJnryx9HVGDaStCe";
+/// `s3`：UA 摘要那条链路用的字母表（64 字符，无补位符）。
+const ALPHABET_S3: &[u8] = b"ckdp1h4ZKsUB80/Mfvw36XIgR25+WQAlEi7NLboqYTOPuzmFjJnryx9HVGDaStCe";
 
 /// 官方拼在摘要尾巴上的固定串。
 const END_STRING: &str = "cus";
@@ -193,8 +196,9 @@ fn rc4(key: &[u8], plaintext: &[u8]) -> Vec<u8> {
 
 /// 官方 `generate_result` 的等价物：3 字节 → 4 码位，末组按长度截。
 ///
-/// `alphabet` 传 [`ALPHABET`]（`s4`）或 [`ALPHABET_S3`]（`s3`）。
-fn b64(data: &[u8], alphabet: &[u8; 65]) -> String {
+/// `alphabet` 传 [`ALPHABET`]（`s4`，65 字符）或 [`ALPHABET_S3`]（`s3`，64 字符）。
+/// 两者长度不同，所以取切片入参 —— 补位 `=` 是字面量，不走表。
+fn b64(data: &[u8], alphabet: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4 + 3);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
