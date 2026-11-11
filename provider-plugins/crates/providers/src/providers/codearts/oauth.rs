@@ -674,8 +674,8 @@ pub(crate) fn parse_ticket_credential(text: &str) -> Result<Credential, GatewayE
         // （ticket 只给 AK/SK + security token）。贴要么走「添加账号」表单，要么走
         // 账号设置弹窗的 PATCH —— 两条都在网关侧，与这里无关。
         session_cookie: String::new(),
-        // SSO 票根同理：它是用户在浏览器里登录华为云之后才有的长期票据，
-        // 登录链路（ticket / OAuth）都不产它。
+        // SSO 票根同理：它是用户在浏览器里登录华为云之后才有的东西（会话级 + 滑动过期，
+        // 不是长期票据 —— 见清单 §10.21），登录链路（ticket / OAuth）都不产它。
         sso_tgc: String::new(),
     };
     if !credential.valid() || credential.security_token.trim().is_empty() {

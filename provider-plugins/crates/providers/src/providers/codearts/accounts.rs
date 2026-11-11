@@ -229,9 +229,12 @@ pub(super) fn account_view(secret: &Value) -> Value {
         Value::Bool(credential.as_ref().is_some_and(|value| !value.session_cookie.trim().is_empty())),
     );
     // SSO 票根同样只给布尔。它与上面那条是两个东西：cookie 是门户当场签发、浏览器
-    // 一重启就丢的短期票据；票根是统一身份那张长期票，插件拿它现场重铸会话
-    // （见 `portal_session`）。界面据此显示「已配置 / 未配置」与那颗清除按钮 ——
-    // 拿到票根等于拿到长期登录态，所以值本身绝不下发。
+    // 一重启就丢的短期票据；票根能现场把它铸出来，插件拿它重铸会话（见
+    // `portal_session`）。界面据此显示「已配置 / 未配置」与那颗清除按钮。
+    //
+    // ⚠️ 票根**不是长期票据**（2026-11-11 实测纠正，见清单 §10.21）：它同样是会话级
+    // + 滑动过期，插件靠 `touch` 滚动续它。**值本身绝不下发** —— 拿到它等于拿到
+    // 一枚能反复换出新会话的种子。
     public.insert(
         "hasSsoTgc".to_string(),
         Value::Bool(credential.as_ref().is_some_and(|value| !value.sso_tgc.trim().is_empty())),
