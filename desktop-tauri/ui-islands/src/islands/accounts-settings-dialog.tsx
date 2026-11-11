@@ -225,8 +225,15 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   const cookieDescription = t('用于读取每批积分的到期时间（「有效期」列）。浏览器登录后按 F12 → Application → Cookies 复制 qoder_session_cookie 那一行，整条 Cookie 串或多行粘贴都行。原值不会回显，填好后点「保存更改」生效。')
   // ── CodeArts 的 SSO 票根（`SSOTGC`）────────────────────────
   // 这一段是「换电脑也能用」的关键：门户那条会话 cookie 是**会话级**的（签发时
-  // 没有 Max-Age/Expires，浏览器一退就没了），票根才是长期票 —— 插件拿它走一遍
-  // `/authui/login?service=…` 就能现场重铸会话（`codearts/portal_session.rs`）。
+  // 没有 Max-Age/Expires，浏览器一退就没了），票根能现场把它铸出来 —— 插件拿它走
+  // 一遍 `/authui/login?service=…` 就能重铸会话（`codearts/portal_session.rs`）。
+  //
+  // ⚠️ **票根不是长期票**（2026-11-11 实测推翻了这个说法，见清单 §10.21）：上游给它
+  // 的 Set-Cookie 同样没有 Max-Age/Expires，能跨重启只因「每次使用即续期」的滑动
+  // 过期。所以文案必须写清两件事，少一句就是又要误导用户一次：
+  //   ① 插件在 cookie 有效期间也会**滚动续期**（`credits::touch`，10 分钟节流）；
+  //   ② 网关整段关掉超过账号的会话超时窗口，票根会失效 —— 那时要**重新登录一次**，
+  //      且界面上打 ⚠ 明说（`WebCreditsState::Expired` → `warnings`），不再静默。
   //
   // 2026-11-09 起这是 CodeArts 唯一需要用户经手的字段：会话 cookie 的输入框已删除
   // （理由见上面 `supportsCookie` 那段注释）。
@@ -248,7 +255,7 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   //    `src-tauri/src/codearts_login.rs`）。不写明这点的话，用户看到「已配置」
   //    会以为是上次手工贴的，或者反过来以为自己漏了步骤而重复去浏览器里抠。
   const tgcPlaceholder = t('TGTX--…-sso（只粘 SSOTGC 这一项的值）')
-  const tgcDescription = t('华为云统一身份的长期票根，作用域 auth.huaweicloud.com —— CodeArts 账号里只有这一项需要你操心：逐份积分、到期时间都靠它。插件拿它走一遍 SSO 就现场铸出一条网页会话 cookie（门户签发的短期产物，浏览器一关就死），铸完自动写回账号，不需要你手贴。所以「会话 cookie」在这个面板里没有输入框：它是票根浇出来的苗，不是第二样要交的东西。换电脑、重装之后有这一项就够，不必回浏览器里抠。用「内嵌窗口」网页登录时这一项会自动配好；只有走「系统浏览器」登录、或那次登录上游没下发票根时才需要手工补。取法（三处任选其一，都在 auth.huaweicloud.com 上，别去 codearts.huaweicloud.com 找，那个域里没有它）：① 浏览器登录 codearts.huaweicloud.com 后按 F12 → Application → Cookies → 展开 https://auth.huaweicloud.com → 复制 SSOTGC 那一行的 Value（整行带 Path / Domain 一起粘也行，网关会自己抠出值）；② 在 Network 里点任意一条 auth.huaweicloud.com 的请求 → Request Headers → 从 Cookie 里复制 SSOTGC=… 那一段；③ Reqable 抓包里筛 auth.huaweicloud.com，同样看 Cookie 请求头。值形如 TGTX--…-sso（约 100 字符）；粘别的会被拒并提示。原值不会回显。')
+  const tgcDescription = t('华为云统一身份的 SSO 票根，作用域 auth.huaweicloud.com —— CodeArts 账号里只有这一项需要你操心：逐份积分与到期时间都靠它。插件拿它走一遍 SSO 就现场铸出一条网页会话 cookie（门户签发的会话级产物，浏览器一关就死），铸完自动写回账号，不需要你手贴。所以「会话 cookie」在这个面板里没有输入框：它是票根浇出来的苗，不是第二样要交的东西。注意：它不是长期票据 —— 上游给它的 Set-Cookie 同样没有 Max-Age / Expires，只是「每次使用即续期」才显得耐用。插件在 cookie 有效期间也会滚动续期（每次读到余额就顺手拿票根换一次，10 分钟最多一次），所以只要网关在跑、余额在查，它就一直接着；网关整段关掉超过账号的会话超时（默认闲置 1 小时、上限 24 小时）就会失效，那时需要重新登录一次，界面会打 ⚠ 说明原因，不再无声消失。换电脑、重装之后贴一次这一项就够，不必回浏览器里抠。用「内嵌窗口」网页登录时这一项会自动配好；只有走「系统浏览器」登录、或那次登录上游没下发票根时才需要手工补。取法（三处任选其一，都在 auth.huaweicloud.com 上，别去 codearts.huaweicloud.com 找，那个域里没有它）：① 浏览器登录 codearts.huaweicloud.com 后按 F12 → Application → Cookies → 展开 https://auth.huaweicloud.com → 复制 SSOTGC 那一行的 Value（整行带 Path / Domain 一起粘也行，网关会自己抠出值）；② 在 Network 里点任意一条 auth.huaweicloud.com 的请求 → Request Headers → 从 Cookie 里复制 SSOTGC=… 那一段；③ Reqable 抓包里筛 auth.huaweicloud.com，同样看 Cookie 请求头。值形如 TGTX--…-sso（约 100 字符）；粘别的会被拒并提示。原值不会回显。')
   // 自定义账号：凭证段（API Key / 无需鉴权）只对它渲染。判据用 provider 前缀 ——
   // 与后端 `custom_account_provider` 一致（提供商被删后残留的账号同样该能改凭证）
   const isCustomAccount = providerOf(target).startsWith('custom-')
@@ -819,7 +826,7 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
                         </Field> : null}
                         {isCodearts ? <Field className='acct-dlg-field acct-dlg-cookie-field'>
                           <div className='acct-dlg-field-head'>
-                            <FieldLabel htmlFor='account-sso-tgc'>{t('SSO 票根（有这一项就够）')}</FieldLabel>
+                            <FieldLabel htmlFor='account-sso-tgc'>{t('SSO 票根（贴一次，插件自动续期）')}</FieldLabel>
                             <span className='acct-dlg-cookie-actions'>
                               <Badge shape='tag' variant={account.hasSsoTgc === true ? 'success' : 'secondary'}>
                                 {account.hasSsoTgc === true ? t('已配置') : t('未配置')}

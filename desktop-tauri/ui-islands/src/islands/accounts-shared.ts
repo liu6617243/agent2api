@@ -207,9 +207,12 @@ export type AccountRecord = {
    * `plugin_public::credential_fields` 派生）。
    *
    * 它与 `hasSessionCookie` 是两个东西：会话 cookie 是门户当场签发、浏览器一重启
-   * 就丢的短期票据；票根是统一身份那张长期票，插件拿它现场重铸会话
-   * （`codearts/portal_session.rs`）。所以「换电脑只要贴一次票根」。
-   * **值本身绝不透出** —— 拿到它等于拿到长期登录态。
+   * 就丢的短期票据；票根能现场换出会话（`codearts/portal_session.rs`）。
+   *
+   * ⚠️ 票根**不是**长期票据（2026-11-11 实测定案，见清单 §10.21）：它同样是会话级，
+   * 跨重启只靠「每次使用即续期」，插件 `credits::touch` 在 cookie 有效期间滚动推它。
+   * 所以「换电脑只贴一次」成立，「贴一次之后永远不用管」不成立。
+   * **值本身绝不透出** —— 拿到它等于拿到完整门户会话能力。
    */
   hasSsoTgc?: boolean
   /**

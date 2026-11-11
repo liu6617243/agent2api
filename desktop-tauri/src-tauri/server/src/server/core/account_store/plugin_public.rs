@@ -63,9 +63,13 @@ pub(super) fn credential_fields(record: &StoredAccount, public: &mut Map<String,
     // **SSO 票根**（`ssoTgc`）：CodeArts 独有 —— 会话 cookie 的「种子」。
     //
     // 会话 cookie 是会话级的（门户的 Set-Cookie 没有 Max-Age/Expires），浏览器一
-    // 重启就丢，且它与 cftk 严格配对、不能分开复用。`SSOTGC` 是长期票据（浏览器
-    // 重启后能自动登录回去靠的就是它），插件拿它现场重铸 cookie
-    // （见插件侧 `codearts/portal_session.rs`）。
+    // 重启就丢，且它与 cftk 严格配对、不能分开复用。票根能现场把它铸出来，插件拿它
+    // 重铸会话（见插件侧 `codearts/portal_session.rs`）。
+    //
+    // ⚠️ 票根**不是长期票据**（2026-11-11 实测纠正，见修改清单 §10.21）：上游给它的
+    // Set-Cookie 同样没有 Max-Age/Expires，跨重启只靠「每次使用即续期」。插件的
+    // `credits::touch` 在 cookie 有效期间滚动推它；网关整段停超过账号会话超时窗口时
+    // 票根照样会死，届时界面上以 `warnings` 明说「需重新登录一次」。
     //
     // 值同样绝不下发，只给这个布尔 —— 界面据此显示「已配置 / 未配置」与清除按钮。
     if record.provider() == super::codearts_accounts::CODEARTS_PROVIDER_ID {
@@ -127,8 +131,9 @@ pub(super) fn is_private_field(key: &str) -> bool {
         // 网页会话 cookie（Qoder 系 / CodeArts）：能读网页 BFF 的完整会话，与令牌
         // 同级，绝不下发（界面只要 `hasSessionCookie` 这个布尔，见 `credential_fields`）
         | "sessionCookie" | "session_cookie" | "webCookie"
-        // SSO 票根（CodeArts）：比会话 cookie 更长寿 —— 拿到它就能反复铸出新会话，
-        // 等价于「长期登录态」。同样绝不下发（界面只要 `hasSsoTgc`）。
+        // SSO 票根（CodeArts）：能换出新会话的「种子」—— 拿到它就能反复铸出会话，
+        // 所以与令牌同级，绝不下发（界面只要 `hasSsoTgc`）。**但别以为它更长寿**：
+        // 它与会话 cookie 同一等级（会话级 + 滑动过期，见 §10.21），只是可反复使用。
         | "ssoTgc" | "sso_tgc" | "SSOTGC"
     )
 }
