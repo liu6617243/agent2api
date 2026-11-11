@@ -40,15 +40,29 @@ pub const SESSION_COOKIE_FIELD: &str = "sessionCookie";
 /// 网页会话 cookie 那两条（`devclouddevuibjJ_SESSION_ID` + `devclouddevuibjtcftk`）
 /// 都是**会话级**的，浏览器一重启就没了，且两者严格配对、不能分开复用。而
 /// `SSOTGC`（Ticket-Granting Cookie，落在 `auth.huaweicloud.com` 的
-/// `Path=/authui/`）是**长期**票据 —— 浏览器重启后能自动登录回去靠的就是它。
+/// `Path=/authui/`）是它们的**种子** —— 拿它能现场重放整条 SSO 链铸出新会话。
+///
+/// ⚠️ **它不是「长期票据」**（这一点 2026-11-11 用实测纠正过）：
+/// `Set-Cookie` 里既没有 `Max-Age` 也没有 `Expires`，按 RFC 6265 属会话级；
+/// 服务端另有账号级「会话超时策略」（IAM → 安全设置 → 登录验证策略，默认闲置
+/// 1 小时、上限 24 小时）。它之所以在浏览器里显得很耐用，是因为**每次使用都会
+/// 被换成一枚新的**（滑动过期）—— 所以「一直用着」才是它活着的原因。
 ///
 /// 存它就能在 cookie 失效时静默重铸一条（见 [`super::portal_session`]），
-/// 不必每次重启都手工去浏览器复制。⚠️ 这是**落盘契约**：改名会让存量账号的
+/// 并且每次重铸都把上游回的新票根写回来（见同模块的 `persist`）——
+/// 这两件事合起来才是真正的「保活」。⚠️ 这是**落盘契约**：改名会让存量账号的
 /// 票根读不到（症状是「配了票根却还是一次性」）。
 pub const SSO_TGC_FIELD: &str = "ssoTgc";
 
-/// 会话 cookie 的键名（门户下发会话时用的就是这个名字）。
+/// 会话 cookie 的键名（门户下发会话时用的就是这个名）。
 pub const SESSION_COOKIE_KEY: &str = "devclouddevuibjJ_SESSION_ID";
+
+/// 票根在 Cookie 头里的**键名**（与落盘键 `ssoTgc` 不是一个东西）。
+///
+/// ⚠️ 这两个名字必须分清：`SSOTGC` 是**上游的 cookie 名**（出现在 `Cookie:` /
+/// `Set-Cookie:` 里），`ssoTgc` 是**我们落盘的字段名**。混用会让「从响应里捡
+/// 新票根」这一步永远捡不到 —— 2026-11-11 那次就是这么看着代码没问题的。
+pub const SSO_TGC_COOKIE: &str = "SSOTGC";
 
 /// CSRF 令牌的键名（POST 的 `cftk` 头取的就是同一条 cookie 里这一项的值）。
 pub const CFTK_COOKIE: &str = "devclouddevuibjtcftk";
@@ -133,17 +147,23 @@ pub struct Credential {
     /// 时刻，AK/SK 那条签名链打不进 portal BFF（实测 404）。
     ///
     /// 它不是登录换来的、也没有任何接口能换出来 —— 只能由用户从浏览器复制。
-    /// 缺省就整条通道不查（见 `credits::fetch_renewing` 的第一道判据），账号页只剩聚合
+    /// 缺省就整条通道不查（见 `credits::fetch_renewing_with_state` 的第一道判据），账号页只剩聚合
     /// 余额，与本次改动之前的行为一致。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_cookie: String,
     /// **华为云 SSO 票根**（`SSOTGC`，可选）：网页会话 cookie 的「种子」。
     ///
     /// 上面那条 cookie 是会话级的（门户的 `Set-Cookie` 没有 `Max-Age` / `Expires`），
-    /// 浏览器一重启就丢；而这条是长期票据，浏览器重启后自动登录回去靠的就是它。
-    /// 有它就等于把「每次重启手工复制 cookie」换成「贴一次票根，之后自动重铸」
-    /// （见 [`super::portal_session::renew`]）。
+    /// 浏览器一重启就丢。这条票根**比它长，但也不是长期的** —— 它的
+    /// `Set-Cookie` 同样没有 `Max-Age` / `Expires`（按 RFC 6265 是会话级 cookie），
+    /// 服务端再叠一道账号级「会话超时策略」（默认闲置 1 小时、上限 24 小时）。
     ///
+    /// ⚠️ 2026-11-11 实测推翻过旧说法「票根是长期票据」：11-10 12:33 登录捡到的票根
+    /// 在 11-11 13:15 就被服务端清掉了。**它靠「一直被用」活着**：每次换票成功，
+    /// 上游都回一枚新的（滑动过期），所以要把它一起写回去（见
+    /// [`super::portal_session::persist`]），否则最多活过一个窗口。
+    ///
+    /// 有它就等于把「每次重启手工复制 cookie」换成「贴一次票根，之后自动重铸」。
     /// 缺省时行为与只有 `session_cookie` 时完全一样：cookie 过期就静默降级成
     /// 聚合值，等用户重贴。
     #[serde(default, skip_serializing_if = "String::is_empty")]

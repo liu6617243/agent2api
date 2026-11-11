@@ -300,6 +300,35 @@ pub fn usage_document(statistics: Option<&Statistics>) -> Value {
 /// 翻倍照旧 —— 所以分项取「除汇总行外所有带剩余积分的行」。认不出包含关系
 /// （数值对不上 / 分项缺席）时不剔除：宁可照旧全加，也不凭猜丢掉一笔真实的钱。
 pub fn usage_document_with(statistics: Option<&Statistics>, web: Option<&credits::WebCredits>) -> Value {
+    usage_document_full(statistics, web, credits::WebCreditsState::Ok)
+}
+
+/// 同 [`usage_document_with`]，另外把「逐批明细为什么缺席」写成一条 `warnings`。
+///
+/// ── 为什么这条说明必须存在（2026-11-11）─────────────────────
+/// 「有效期」列唯一的数据来源是网页逐批明细（见 [`usage_document_with`] 的头注）。
+/// 那个通道失败是**静默降级**：`credits[]` 退回聚合行、到期时刻整列空着，而余额
+/// 数字照常显示 —— 用户在界面上看到的只是「有效期今天没了」，无从判断原因。
+/// 把原因写进 `warnings`（前端 `usageWarningsOf` 已有的渲染通道），账号行就会
+/// 带一个 ⚠ 与那句说明，直接告诉用户「去重新登录一次」还是「稍后重试」。
+///
+/// `Ok` 时**什么都不写**：这是正常态，不该在界面上加噪音。
+pub fn usage_document_full(
+    statistics: Option<&Statistics>,
+    web: Option<&credits::WebCredits>,
+    state: credits::WebCreditsState,
+) -> Value {
+    let mut document = usage_document_inner(statistics, web);
+    let note = state.note();
+    if !note.is_empty() {
+        if let Some(object) = document.as_object_mut() {
+            object.insert("warnings".to_string(), json!([note]));
+        }
+    }
+    document
+}
+
+fn usage_document_inner(statistics: Option<&Statistics>, web: Option<&credits::WebCredits>) -> Value {
     let mut wallets = Vec::new();
     let mut credit_left: Option<f64> = None;
     let mut meter_rows: Vec<Value> = Vec::new();

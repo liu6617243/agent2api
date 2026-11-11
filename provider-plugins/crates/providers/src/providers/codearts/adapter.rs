@@ -962,10 +962,12 @@ async fn query_usage(ctx: &PluginCtx, account_id: &str) -> Result<Value, Gateway
     let statistics = balance::fetch_statistics(
         models::DEFAULT_BASE_URL, &credential, chat::DEFAULT_LANGUAGE, chat::DEFAULT_PLUGIN_VERSION,
     );
-    let web = credits::fetch_renewing(ctx, account_id, &credential, proxy.as_ref());
-    let (statistics, web) = tokio::join!(statistics, web);
+    let web = credits::fetch_renewing_with_state(ctx, account_id, &credential, proxy.as_ref());
+    let (statistics, (web, state)) = tokio::join!(statistics, web);
     let statistics = statistics?;
-    Ok(balance::usage_document_with(Some(&statistics), web.as_ref()))
+    // 带状态的那一版：明细缺席时把原因写进 `warnings`，账号行会带一句
+    // 「去重新登录一次」而不是只留一个空的有效期列（见 `usage_document_full`）。
+    Ok(balance::usage_document_full(Some(&statistics), web.as_ref(), state))
 }
 
 /// 把上游原文拼成统一文案的一截（空则不拼）。
