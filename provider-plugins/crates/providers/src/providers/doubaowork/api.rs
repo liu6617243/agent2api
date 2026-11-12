@@ -140,11 +140,9 @@ pub fn headers(credentials: &Value) -> Result<Vec<(String, String)>, GatewayErro
             header::ACCEPT.as_str().into(),
             "application/json, text/plain, */*".into(),
         ),
-        // 抓包（2026-11-08）里官方请求带的全套浏览器指纹头：UA 已补
-        // Samantha 后缀，这几个头一并补齐 —— 它们是服务端侧「这是真浏览器」
-        // 的旁证，缺了就是另一种「从没见过的客户端」。注意官方 `sec-fetch-site`
-        // 是 cross-site（客户端 webview 的跨源形态），别照抄成 same-origin 的
-        // 「标准浏览器」想当然值。
+        // 真实客户端（2026-11-12 CDP 抓包）在 `landing/*` 上带的浏览器指纹头：
+        // `sec-ch-ua` / `sec-ch-ua-mobile` / `sec-ch-ua-platform` / `Agw-Js-Conv`。
+        // 值是抓包原文，`chrome_major` 跟着 UA 走。
         (
             "sec-ch-ua".into(),
             format!("\"Chromium\";v=\"{chrome_major}\", \"Not.A/Brand\";v=\"8\""),
@@ -156,30 +154,24 @@ pub fn headers(credentials: &Value) -> Result<Vec<(String, String)>, GatewayErro
         ("sec-fetch-dest".into(), "empty".into()),
         ("accept-language".into(), "zh-CN,zh;q=0.9".into()),
         ("Agw-Js-Conv".into(), "str".into()),
-        // Chromium 自己会带的请求优先级头，抓包 979 条里 831 条都有。
-        // 少了它不致命，但「一堆浏览器头齐全、就缺 priority」是另一种怪。
         ("priority".into(), "u=1, i".into()),
     ])
 }
 
 /// 按路径微调请求头 —— 目前只有一条差异，但它出现在**所有** `/alice/ug/*` 上。
 ///
-/// ── 差异是什么（2026-11-10 逐条比对 Reqable 原始报文）──────────
-/// 客户端对这些 `landing/*` 请求**不带 `Origin`**，`Referer` 是站点根
-/// `https://www.doubao.com/`；而插件此前一律发 `Origin: https://www.doubao.com`
-/// + `Referer: https://www.doubao.com/chat/`。这不是风格问题：
+/// ── 差异是什么（2026-11-12 CDP 抓真机客户端全量报文）────────────
+/// 客户端这些 `landing/*` 请求**不带 `Origin`**，`Referer` 是**任务中心页**
+/// `https://www.doubao.com/pc/agent-explore?scroll_to=tasks` —— 不是站点根。
 ///
-/// | 路径 | 客户端 Origin | 客户端 Referer |
-/// |------|--------------|---------------|
-/// | `landing/report` ×9  | 无 | `https://www.doubao.com/` |
-/// | `landing/checkin` ×5 | 无 | `https://www.doubao.com/` |
-/// | `landing/get` ×3     | 无 | `https://www.doubao.com/` |
-/// | `v3/detail/`         | 有（4/7） | `https://www.doubao.com/` |
+/// 上一版（11-10 据 Reqable）把 Referer 写成站点根 `/`，理由是「同源请求」。
+/// 那只对了一半：同源确实不带 `Origin`（这条已采纳并保留），但 Referer 是
+/// 发起文档的真实地址 —— 客户端是从任务中心页发的，所以带的是那一页的 URL。
+/// 插件凭空发起时没有「当前文档」，用任务中心页最贴合：签到任务就长在那里。
 ///
 /// 带 `Origin` = 「这是一个跨源 fetch，我声明来自哪里」；不带 = 「同源请求」。
-/// 客户端签到是从站点根页面的同源文档里发的，所以两个头都不该有 /
-/// 只该有根 Referer。插件那两个头等于在风控侧自报「我是从 `/chat/` 页面
-/// 跨源打过来的第三方」—— 与它实际的身份（冒充客户端）矛盾。
+/// 插件此前两个头都带（`Origin` + `/chat/` Referer），等于在风控侧自报
+/// 「我是从 `/chat/` 页面跨源打过来的第三方」—— 与它实际的身份矛盾。
 ///
 /// ⚠️ 只对 `/alice/ug/*` 生效。`/chat/completion` 那条转发链路一直是通的，
 /// 不动它；`/passport/*`（账号识别）抓包里确实带 `Origin`，也不动。
@@ -189,30 +181,97 @@ pub fn headers_for(credentials: &Value, path: &str) -> Result<Vec<(String, Strin
         list.retain(|(key, _)| !key.eq_ignore_ascii_case("origin"));
         for (key, value) in list.iter_mut() {
             if key.eq_ignore_ascii_case("referer") {
-                *value = format!("{BASE_URL}/");
+                *value = format!("{BASE_URL}/pc/agent-explore?scroll_to=tasks");
             }
         }
     }
     Ok(list)
 }
 
-// ── aid：官方是 582478，不是 1044603 ─────────────────────────
-// 官方客户端（豆包 PC 2.32.6 / Chromium 147）在 `landing/*` 系列上的 `aid` 是
-// **582478**。取值与判定都收敛在 `super::sign::checkin_aid`（那里会按账号是否
-// 明确声明自己是豆包工作端来覆盖）。这里只留「为什么」，不留第二份数字 ——
-// 两处各存一份，迟早会漂。
+// ── aid：真实客户端是 497858，不是 582478 ───────────────────
+// 2026-11-12 用 CDP 直连真机客户端（`--remote-debugging-port=9342`）抓
+// 任务中心签到，`landing/checkin` 的 `aid` / `real_aid` 是 **497858**。
 //
-// `1044603` 是**豆包工作**的 app id，`582478` 是**豆包桌面端**的。本插件实际
-// 驱动的账号是普通豆包账号，用户在客户端里点签到走的是 582478 —— 抓包
-// （2026-11-05 ~ 11-10 共 6 次）里 `landing/checkin` 的 `aid` / `real_aid`
-// 无一例外都是 582478。拿 1044603 去打同一条写接口，在风控侧就是「一个从没
-// 出现过的工作端在替这个 uid 签到」。
+// 早先记的 582478 来自**网页聊天页**的 onboarding 签到（那是另一条入口，
+// 前端在 `doubao.com` 文档里自己发的 fetch），不是客户端任务中心。两者不
+// 通用：拿 582478 打任务中心的 checkin，服务端按「aid 与活动组不匹配」处置。
+//
+// 取值收敛在 `super::sign::checkin_aid`，这里只留「为什么」。
 //
 // ⚠️ 这与「读接口」无关：`/chat/completion` 等转发接口一直工作正常，不要
 // 为了这条签到改动它们。
 
-/// 官方客户端（2.32.6）的 Chromium 内核版本，抓包里每个请求都带。
-const CHROMIUM_VERSION: &str = "147.0.7727.149";
+/// 真实客户端的查询串参数，**按线上顺序**返回（不含 `a_bogus`，它由签名层补）。
+///
+/// ── 为什么抽成独立函数 ──────────────────────────────────────
+/// 同一份参数现在有两个消费者：
+/// · [`endpoint`] —— 插件自己的 reqwest 通道（能签名就签，签不上就只能不发）；
+/// · `super::webview` —— 交给 Chromium 渲染进程发（网络栈自动补 `a_bogus`）。
+/// 两边一旦各写一遍，字段就会漂移 —— 2026-11-10 那版正是这么错的（11 处偏差，
+/// 见 [`endpoint`] 的差异清单）。参数只有一个定义处，改一处两边同时生效。
+///
+/// 返回 `Vec<(String, String)>` 而非 `&'static str` 键：`web_id` / `tea_uuid`
+/// 这类是运行时取的，键虽然静态但值不是，统一成 owned 少一层转换。
+pub fn query_pairs(credentials: &Value) -> Result<Vec<(String, String)>, GatewayError> {
+    let client_version = credentials["clientVersion"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_CLIENT_VERSION);
+    let aid = super::sign::checkin_aid(credentials);
+    let mut query: Vec<(String, String)> = vec![
+        ("version_code".into(), "20800".into()),
+        ("language".into(), "zh".into()),
+        ("device_platform".into(), "web".into()),
+        ("doubao_device_platform".into(), "web".into()),
+        ("aid".into(), aid.to_string()),
+        ("real_aid".into(), aid.to_string()),
+        ("pkg_type".into(), "release_version".into()),
+        // 客户端**一定**带 `device_id` 这个键，但值是空串。这里保留占位而不是
+        // 整条省略：少一个键与「键在但空」在服务端日志里是两种形状。
+        ("device_id".into(), String::new()),
+    ];
+    query.push(("pc_version".into(), client_version.to_string()));
+    query.push((
+        "doubao_pc_version".into(),
+        super::sign::doubao_pc_version(credentials).to_string(),
+    ));
+    // `web_id`：客户端由 `POST /alice/user/launch/core` 的响应下发
+    // （`data.web_id`），之后每个请求都带。账号 Cookie 里没有这个键，所以
+    // 只能缓存服务端下发的那一颗（`sign::store_web_id` / `sign::web_id`）。
+    if let Some(value) = super::sign::web_id(credentials) {
+        query.push(("web_id".into(), value));
+    }
+    // `tea_uuid`：埋点 SDK 的设备标识 = 本机 device_id。客户端**不把设备号
+    // 放进 `device_id`，而是放进这里** —— 与上一版正好相反。
+    if let Some(device) = super::client::device_id() {
+        query.push(("tea_uuid".into(), device));
+    }
+    query.extend([
+        ("region".into(), String::new()),
+        ("sys_region".into(), String::new()),
+        ("samantha_web".into(), "1".into()),
+        ("web_platform".into(), "desktop".into()),
+        ("use-olympus-account".into(), "1".into()),
+    ]);
+    // `web_tab_id`：客户端每次新开 webview 生成一颗 UUID，官方每个请求都带。
+    // 同一会话复用同一颗（只在新开会话时换），否则「同一账号同一时刻多个
+    // 不同 tab」本身就是异常信号。
+    //
+    // ⚠️ 只出现**一次**。2026-11-12 之前的版本在这里和 `runtime` 之后各推了
+    // 一次，导致线上 query 出现重复键（真实客户端只有一颗）—— 重复键在
+    // percent-encode 之后的签名字符串里是两颗不同的值，签名必然对不上。
+    if let Some(tab) = super::sign::web_tab_id(credentials) {
+        query.push(("web_tab_id".into(), tab));
+    }
+    // ⚠️ 顺序：`runtime_version` 在 `runtime` **之前**（真实客户端如此）。
+    query.push((
+        "runtime_version".into(),
+        super::sign::doubao_pc_version(credentials).to_string(),
+    ));
+    query.push(("runtime".into(), "web".into()));
+    Ok(query)
+}
 
 /// 组装一次上游请求的完整地址（含查询串）。
 ///
@@ -223,93 +282,31 @@ const CHROMIUM_VERSION: &str = "147.0.7727.149";
 /// 拦下 —— 生图走的就是同一个 `/chat/completion`，没有例外。所以两边共用本
 /// 函数，编码按 [`encode`] 的 RFC3986 未保留字符集自己来。
 ///
-/// ── 参数顺序照抄客户端（2026-11-10 按 Reqable 原始报文逐字段对齐）──
-/// 官方顺序：`version_code, language, device_platform, doubao_device_platform,
-/// aid, real_aid, pkg_type, device_id, pc_version, doubao_pc_version, web_id,
+/// ── 参数顺序照抄真实客户端（2026-11-12 CDP 抓包逐字段对齐）──
+/// 真实顺序（22 个）：
+/// `version_code, language, device_platform, doubao_device_platform, aid,
+/// real_aid, pkg_type, device_id, pc_version, doubao_pc_version, web_id,
 /// tea_uuid, region, sys_region, samantha_web, web_platform,
-/// use-olympus-account, runtime, runtime_version, client_platform,
-/// chromium_version, channel, fp, web_tab_id, msToken, a_bogus`。
+/// use-olympus-account, web_tab_id, runtime_version, runtime, msToken,
+/// a_bogus`。
+///
+/// 与 11-10 那版（据 Reqable 报文对齐）的差异 —— 那版错了 11 处，逐条：
+/// · `aid`/`real_aid`：582478 → **497858**（入口不同，见上方 aid 段）；
+/// · `doubao_device_platform`：desktop → **web**；
+/// · `device_id`：有值 → **空串占位**（客户端确实带这个键但值为空）；
+/// · `pc_version`：2.33.5 → **2.32.6**；`doubao_pc_version`：跟 pc_version
+///   同值 → **5.74.71**（它俩不是同一个数，是两个独立字段）；
+/// · `runtime_version`：3.42.0 → **5.74.71**；
+/// · `region`/`sys_region`：CN → **空串**；
+/// · `web_tab_id` 位置：在 `use-olympus-account` 之后、`runtime*` 之前；
+/// · `runtime` 顺序：在 `runtime_version` **之后**；
+/// · **删掉**客户端根本没有的 4 个：`client_platform`、`chromium_version`、
+///   `channel`、`fp`。
+///
 /// 签名（`a_bogus`）对 query 串是**顺序敏感**的，顺序错了签名就废，所以这里
 /// 不能随手插字段。
 pub fn endpoint(credentials: &Value, path: &str) -> Result<String, GatewayError> {
-    let client_version = credentials["clientVersion"]
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_CLIENT_VERSION);
-    let aid = super::sign::checkin_aid(credentials);
-    let mut query: Vec<(&str, String)> = vec![
-        ("version_code", "20800".into()),
-        ("language", "zh".into()),
-        ("device_platform", "web".into()),
-        ("doubao_device_platform", "desktop".into()),
-        ("aid", aid.to_string()),
-        ("real_aid", aid.to_string()),
-        ("pkg_type", "release_version".into()),
-    ];
-    // 设备号：先用账号自己的（网页登录态里可能带 `device_id` Cookie），没有
-    // 就兜底读本机豆包工作客户端的，再读不到回退豆包客户端的（`client` 模块
-    // 头的 2026-11-08 注：两者共用风控设备库）—— 风控认的是「这个账号在这台
-    // 受信设备上」，不读客户端的设备号，转发一定会被人机验证拦下。
-    let device = credentials["deviceId"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(super::client::device_id);
-    if let Some(device) = device.as_deref() {
-        query.push(("device_id", device.into()));
-    }
-    query.push(("pc_version", client_version.to_string()));
-    query.push(("doubao_pc_version", client_version.to_string()));
-    if let Some(value) = credentials["webId"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-    {
-        query.push(("web_id", value.into()));
-    }
-    if let Some(device) = device.as_deref() {
-        // 抓包里官方请求还带 `tea_uuid=<device_id>`（埋点 SDK 的设备标识），
-        // 与 device_id 同值 —— 一并带上，凑齐官方的设备三元组。
-        query.push(("tea_uuid", device.into()));
-    }
-    query.extend([
-        ("region", "CN".into()),
-        ("sys_region", "CN".into()),
-        ("samantha_web", "1".into()),
-        ("web_platform", "desktop".into()),
-        ("use-olympus-account", "1".into()),
-        ("runtime", "web".into()),
-        // ⚠️ 客户端 2.32.6 抓包里是 3.42.0，不是 3.42.2。
-        ("runtime_version", "3.42.0".into()),
-        ("client_platform", "pc_client".into()),
-    ]);
-    // `chromium_version` / `channel` 是客户端 webview 自报的内核与渠道，
-    // 抓包里每个请求都在。这两个值和 UA 的 Chrome 主版本是一套东西，缺了
-    // 就是「浏览器没报内核」的怪客户端。
-    let chromium = credentials["chromiumVersion"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .unwrap_or(CHROMIUM_VERSION);
-    query.push(("chromium_version", chromium.into()));
-    let channel = credentials["channel"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .unwrap_or("win");
-    query.push(("channel", channel.into()));
-    if let Some(device) = device.as_deref() {
-        query.push(("fp", format!("verify_{device}")));
-    } else if let Some(fingerprint) = credentials["fingerprint"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-    {
-        query.push(("fp", fingerprint.into()));
-    }
-    // `web_tab_id`：客户端每次新开 webview 生成一颗 UUID，官方每个请求都带。
-    // 同一会话复用同一颗（只在新开会话时换），否则「同一账号同一时刻多个
-    // 不同 tab」本身就是异常信号。
-    if let Some(tab) = super::sign::web_tab_id(credentials) {
-        query.push(("web_tab_id", tab));
-    }
+    let mut query = query_pairs(credentials)?;
     // msToken：官方每个请求的 URL 参数都带（响应经 `x-ms-token` 轮换，见
     // `sign` 模块头）。放 query 末尾，与官方参数顺序一致。
     //
@@ -325,22 +322,15 @@ pub fn endpoint(credentials: &Value, path: &str) -> Result<String, GatewayError>
         .map(|header| super::accounts::session_of_header(&header))
         .unwrap_or_default();
     if let Some(token) = super::sign::ms_token(&session) {
-        query.push(("msToken", token));
+        query.push(("msToken".into(), token));
     }
 
     // ── 先编码再签名 ────────────────────────────────────────────
     // `a_bogus` 的签名对象是**线上那一串字节**（即已 percent-encode 的
     // query），不是解码后的语义值 —— 服务端是从收到的原始 URL 上重算的。
-    // 顺序同理：签名对参数顺序敏感，所以这里的 `query` 顺序就是签名的输入，
-    // 中途插字段会让签名废掉（见上方目录式的顺序注释）。
-    let encoded = |pairs: &[(&str, String)]| {
-        pairs
-            .iter()
-            .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
-            .collect::<Vec<_>>()
-            .join("&")
-    };
-    let mut wire = encoded(&query);
+    // 顺序同理：签名对参数顺序敏感，所以 `query` 的顺序就是签名的输入，
+    // 中途插字段会让签名废掉（见 [`query_pairs`] 的顺序注释）。
+    let mut wire = pairs_to_wire(&query);
 
     // ── 签名范围：只签 `/alice/ug/*` ─────────────────────────────
     // 抓包（2026-11-05 ~ 11-10，6 次）证实客户端在 `landing/report`、
@@ -355,6 +345,19 @@ pub fn endpoint(credentials: &Value, path: &str) -> Result<String, GatewayError>
         }
     }
     Ok(format!("{BASE_URL}{path}?{wire}"))
+}
+
+/// 把参数对拼成线上 query 串（percent-encode 后按顺序用 `&` 连接）。
+///
+/// 抽出来是因为它同时是**签名的输入**与**线上字节**：`webview` 通道也要拼出
+/// 一模一样的一串（差别只在最后不追加 `a_bogus`，由浏览器网络栈补）。两处
+/// 拼法一旦不一致，签名对象就变了。
+pub fn pairs_to_wire(pairs: &[(String, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 pub fn request(
@@ -537,6 +540,17 @@ pub async fn json_response(
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
         GatewayError::with_status(502, "豆包工作未返回有效 JSON，请检查登录态或稍后重试")
     })?;
+    // `web_id` 由 `launch/core` 的响应下发（`data.web_id`），客户端拿到后回填
+    // 到之后所有请求的 query 上（见 `sign::store_web_id`）。这里接住存起来，
+    // 与 `x-ms-token` 同一条「只回放服务端下发值」的路子。
+    if let Some(web_id) = value
+        .pointer("/data/web_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|web_id| !web_id.is_empty())
+    {
+        super::sign::store_web_id("", web_id);
+    }
     if !(200..300).contains(&status)
         || number(&value["code"]).is_some_and(|code| code != 0 && !(ug && code == 200))
     {

@@ -1,12 +1,28 @@
 //! msToken：官方客户端每个请求的 URL 参数都带（Cookie 里另有一颗）。
 //!
-//! ── 关于 a_bogus（2026-11-10 结论已更新）───────────────
-//! 抓包证实官方 `/alice/ug/*` 每条请求都带 `a_bogus`（解码 145 字节 / 196
-//! 字符），而插件此前一条都没带。曾以为「照抖音版结构自己签一个」就能补上，
-//! 实现完（见 [`super::abogus`]）拿真机签名反推验证后**否掉了**：豆包这一档
-//! 与 `douyin_abogus_python` 系列不同构，三处标志位一个都对不上。所以
-//! `a_bogus` 目前不产出（总闸关闭），签到的修正靠另外三条已对齐的事实：
-//! `aid=582478`、26 个查询参数按官方顺序、签到前先发 `landing/report`。
+//! ── 关于 a_bogus（2026-11-12 结论：不可伪造，只能绕）───────────
+//! 抓包证实官方 `/alice/ug/*` 每条请求都带 `a_bogus`（`landing/checkin` 上是
+//! 184 字符 / 解码 136 字节的纯二进制）。曾以为「照抖音版结构自己签一个」就能
+//! 补上，实现完（见 [`super::abogus`]）拿真机签名反推验证后**否掉了**：豆包
+//! 这一档与 `douyin_abogus_python` 系列不同构，三处标志位一个都对不上。
+//!
+//! 2026-11-12 又在真实客户端页面内直接探测其签名 SDK，把「能不能由 web 侧
+//! 复现」也一并否掉：
+//!
+//! | 调用 | 返回 |
+//! |------|------|
+//! | `byted_acrawler.frontierSign({url,method,body})` | `{"X-Bogus":"RDgZdDWD1vSJNQ0Y"}` |
+//! | 同上 + `signType:'a_bogus'` | 仍 `{"X-Bogus":…}` |
+//! | `window.bdms.frontierSign` | 仍 `{"X-Bogus":…}` |
+//!
+//! 也就是说 `webmssdk.es5.js` / `sdk-glue.js` 这两份 web 侧 SDK **只能产出
+//! 16 字符的 `X-Bogus`**；`landing/checkin` 上那颗 184 字符 `a_bogus` 是客户端
+//! **native mssdk** 出的（客户端日志里的 `other.mssdk_native`）。
+//!
+//! 所以 `a_bogus` 的正确处理是**不发这颗请求**，而不是伪造它 —— 见
+//! [`super::rewards::checkin_with_retry`]：签到改为只读 `v3/detail`，未签就
+//! 引导用户去客户端点。伪造/裸奔的写请求每发一次就把该 uid 当天封死一次
+//! （连官方客户端一起废），这是 11-05 以来所有「豆包签到废了」的来源。
 //!
 //! ── 为什么 msToken「没有就不带」，而不是自己造一颗 ────────────
 //! msToken 是服务端加密下发的载荷，不是普通随机串。自造一颗 168 位
@@ -131,10 +147,16 @@ fn uuid_v4() -> String {
 
 /// 签到类请求该用的 `aid`。
 ///
-/// 默认豆包桌面端 `582478`（抓包里 `landing/checkin` 6/6 全是它，见
-/// [`super::abogus`] 模块头的时间线）。只有当账号快照**明确**声明自己是
-/// 豆包工作端（`clientKind == "work"`）时才用 `1044603` —— 这种情况下用户
-/// 真的在豆包工作客户端里签，用工作端 aid 才是对的。
+/// 2026-11-12 用 CDP 直连真机客户端（`--remote-debugging-port=9342`）抓任务
+/// 中心的 `landing/checkin`，`aid` / `real_aid` 是 **497858**。
+///
+/// 早先记的 `582478` 是错的：那次样本来自**网页聊天页**（`doubao.com` 文档
+/// 里前端自己发的 fetch，用于 onboarding 引导签到），与客户端任务中心
+/// 不是同一条入口。`landing/report` / `landing/get` / `v3/detail` 在任务中心
+/// 语境下同样都是 `497858`。
+///
+/// `1044603` 是**豆包工作**的 app id，只有当账号快照**明确**声明自己是豆包
+/// 工作端（`clientKind == "work"`）且用户真在工作端里签时才用。
 pub fn checkin_aid(credentials: &serde_json::Value) -> u64 {
     match credentials["clientKind"]
         .as_str()
@@ -142,8 +164,96 @@ pub fn checkin_aid(credentials: &serde_json::Value) -> u64 {
         .unwrap_or_default()
     {
         "work" => 1_044_603,
-        _ => 582_478,
+        _ => 497_858,
     }
+}
+
+// ── doubao_pc_version ────────────────────────────────────────
+
+/// 谁是「豆包客户端版本 5.x」那一个数。
+///
+/// 上一版把 `pc_version` 和 `doubao_pc_version` 写成同一个值（都是
+/// `clientVersion`），真实客户端不是：抓包里
+/// `pc_version=2.32.6`（壳版本）、`doubao_pc_version=5.74.71`（业务包版本），
+/// 而且 `runtime_version` 也跟着 `doubao_pc_version`（= 5.74.71）。
+///
+/// 三个数各是一套：
+/// · `pc_version`       = 客户端壳版本 → `credentials.clientVersion`，缺省 2.32.6；
+/// · `doubao_pc_version` = 业务包版本 → `credentials.doubaoPcVersion`，缺省 5.74.71；
+/// · `runtime_version`   = 与业务包版本同值（真实抓包如此）。
+///
+/// 分开取值是因为它们在客户端是两份独立配置，硬绑成一个数会在壳/包版本
+/// 不同步的机器上露出马脚。
+pub fn doubao_pc_version(credentials: &serde_json::Value) -> &str {
+    credentials["doubaoPcVersion"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_DOUBAO_PC_VERSION)
+}
+
+/// 真实客户端（2.32.6 壳 / 5.74.71 业务包）的业务包版本，抓包里每个请求都带。
+pub const DEFAULT_DOUBAO_PC_VERSION: &str = "5.74.71";
+
+// ── web_id ──────────────────────────────────────────────────
+
+/// `web_id`：客户端每个请求都带，但**账号 Cookie 里没有这个键**。
+///
+/// 来源是 `POST /alice/user/launch/core` 的响应 `data.web_id`
+/// （2026-11-12 抓包：`{"...","ttwid":"...","web_id":"7699132147475203619"}`）。
+/// 客户端拿到后回填到之后所有请求的 query 上。
+///
+/// 所以这里跟 `msToken` 同一个套路：**只回放服务端真下发过的值**，拿不到就
+/// 整条不带（`api::endpoint` 那边是 `if let Some`）。自造一颗会被当成
+/// 「这个 uid 换了一台设备」—— 比不带更糟。
+///
+/// 缓存按会话（`sessionid`）隔离，与 `msToken` 同口径：多账号共用一颗等于
+/// 自报「这些账号是同一台机器」。
+pub fn store_web_id(session: &str, web_id: &str) {
+    let web_id = web_id.trim();
+    if web_id.is_empty() {
+        return;
+    }
+    let key = session.trim().to_string();
+    if let Ok(mut ids) = web_ids().lock() {
+        if ids.len() >= 64 {
+            ids.clear();
+        }
+        ids.insert(key, (web_id.to_string(), Instant::now()));
+    }
+}
+
+fn web_ids() -> &'static Mutex<HashMap<String, (String, Instant)>> {
+    static IDS: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
+    IDS.get_or_init(Mutex::default)
+}
+
+/// 当前会话可用的 `web_id`（服务端下发过且未过期）。
+///
+/// 读取顺序：会话份 → 全局份。**没有就返回 `None`，不自造**。
+pub fn web_id(credentials: &serde_json::Value) -> Option<String> {
+    // 快照里显式存过就用它（用户重导入时可能已经把 webId 存进来了）。
+    if let Some(value) = credentials["webId"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(value.to_string());
+    }
+    let session = super::accounts::cookie_header(credentials)
+        .ok()
+        .map(|header| super::accounts::session_of_header(&header))
+        .unwrap_or_default();
+    let session = session.trim();
+    let ids = web_ids().lock().ok()?;
+    for key in [session, ""] {
+        if let Some((value, at)) = ids.get(key) {
+            if at.elapsed() < TOKEN_TTL {
+                return Some(value.clone());
+            }
+        }
+    }
+    None
 }
 
 // ── a_bogus ─────────────────────────────────────────────────

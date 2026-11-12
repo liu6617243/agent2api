@@ -15,36 +15,43 @@ use crate::errors::GatewayError;
 
 const V3_GROUP: &str = "pc_incentive_task_mvp_v3";
 
-/// 签到接口。抓包（Reqable，豆包客户端 2.32.6 / doubao_pc_version 5.73.60）
-/// 证实客户端点「签到」**只**调这一个接口：
-/// `POST /alice/ug/campaign/landing/checkin` body `{"scene":"<活动组>"}`，
-/// 回执 `data.checked_in / reward_status / continuous_days` 就是权威结果。
-const CHECKIN_PATH: &str = "/alice/ug/campaign/landing/checkin";
 
-/// 签到前的用户操作上报接口。
+/// 为什么插件**自己（reqwest）发不出**这条写接口（2026-11-12 定案，推翻
+/// §10.20 的「对齐参数即可」）。
 ///
-/// ── 为什么这一条不能省（2026-11-10 按 Reqable 原始报文定案）──
-/// 客户端**每一次**签到都是两条请求，间隔约 20ms：
+/// 真实客户端的 `landing/checkin` 上带 `a_bogus`：184 字符、解码 136 字节的
+/// 纯二进制。2026-11-12 逐层探测，把「谁能生成它」问清楚了：
 ///
-/// | # | 时刻（11-10） | 路径 | body |
-/// |---|--------------|------|------|
-/// | 1 | 12:40:19.150 | `landing/report` | `{"event_type":"user_operate","biz_event_name":"check_in"}` |
-/// | 2 | 12:40:19.171 | `landing/checkin` | `{"scene":"pc_incentive_task_mvp_v3"}` |
+/// | 环境 | 能否产出 a_bogus | 证据 |
+/// |------|-----------------|------|
+/// | 纯 Rust（插件进程） | **不能** | 自研 `abogus.rs` 与豆包不同构，反推零命中 |
+/// | 页面 JS 显式调用 | **不能** | `frontierSign` 只回 16 字符 `X-Bogus` |
+/// | **任意 Chromium 渲染进程的 fetch** | **能** | 拦截器自动补 `msToken` + `a_bogus` |
+/// | 豆包客户端 webview | **能** | 同上（它也是 Chromium） |
 ///
-/// 6 次抓包（11-05 ~ 11-10）无一例外，「report → checkin」永远成对出现。
-/// 插件此前只发第 2 条，等于「没有点击动作，直接来领奖」—— 服务端的处置正是
-/// `710010702 系统错误`（不告诉你是风控，也不告诉你哪条不对），并把该 uid
-/// 当天的签到口封掉，于是**同一天随后用官方客户端也签不上**。这就是用户
-/// 反复说的「用 agent2api 签豆包就废了」，也是 §10.19 把它判成「上游写接口
-/// 故障」时被误导的那条线索。
-const REPORT_PATH: &str = "/alice/ug/campaign/landing/report";
+/// 关键差别在最后两行：`a_bogus` 不是在 JS 里算的，而是**渲染进程把请求交给
+/// native 网络栈时补上的**（`Network.requestWillBeSent` 抓到的 wire URL 里
+/// 已经带好了，但 152 个脚本源码里 `a_bogus` 出现 0 次）。所以：
+///
+/// · 插件用 reqwest 自己发 → 永远没有签名 → 必被 710010702，且**把该 uid
+///   当天的签到口封死，连官方客户端一起废**（用户 2026-11-12 原话：
+///   「风控惩罚会导致客户端也无法签到」）；
+/// · 走任意 Chromium 渲染进程发 → 签名由网络栈自动补 → 这才是唯一能通的通道。
+///
+/// ⚠️ 2026-11-12 追加实测（推翻此前「必须用豆包客户端」的判断）：**普通 Chrome
+/// 与 --headless=new Chrome 都能补出完整签名**，`v3/detail` 回 `code:0`。
+/// 所以插件不需要用户先开豆包客户端，自己起一个 headless 就行 ——
+/// 见 [`super::webview`]，它自带「先借已有调试端口、再自己拉起」两条路。
+///
+/// [`CheckinOutcome::Captcha`]（「需人工」）留给两种情形，都不发写请求：
+/// 自动签到路径（本就不该替用户写），以及浏览器通道不可用（这台机器上一个
+/// Chromium 都没有、或被 30 秒超时挡住）。
+///
+/// 这个常量只是文档锚点（正文在上），没有运行时用途。
+#[allow(dead_code)]
+const CHECKIN_BLOCKED: () = ();
 
-/// 签到前的操作上报体，逐字照抄抓包（字段名、顺序、取值都不改）。
-fn report_body() -> Value {
-    json!({"event_type": "user_operate", "biz_event_name": "check_in"})
-}
-
-/// 任务奖励领取接口。只用于**非签到**任务；签到走 [`CHECKIN_PATH`]。
+/// 任务奖励领取接口。只用于**非签到**任务；签到走 [`super::webview`]。
 ///
 /// 历史坑：daily_signin 打这个接口永远只回
 /// `biz_error{code:3,message:"领取结果确认中，请稍后重试"}, task_status:0`，
@@ -52,76 +59,7 @@ fn report_body() -> Value {
 /// 这就是「豆包签到总是有问题」的真正原因。
 const CLAIM_PATH: &str = "/alice/ug/campaign/item/reward/claim/";
 
-/// 领奖回执为「已受理但未出结果」时，等一拍再回查的时长。
-///
-/// 豆包的奖励发放是**异步**的：老领奖接口先回执「领取结果确认中，请稍后
-/// 重试」，积分/任务状态随后才落地。触发完立刻回查大概率还是未完成。
-const CLAIM_SETTLE_WAIT_MS: u64 = 8_000;
 
-/// 「确实没确认到账」时的自动复核间隔：挂进 `retryAt`，由网关调度重跑本次
-/// 签到。上游按天幂等，重跑不会重复发奖。
-const CLAIM_RETRY_MS: i64 = 10 * 60_000;
-
-/// 上游写接口整体报「系统错误」时的自动复核间隔。
-///
-/// ── 为什么是「明天早上」而不是「20 分钟后」───────────────────
-/// 这一档的真实含义是「uid 当日签到口被封」（见 [`upstream_system_error`]），
-/// 豆包按**自然日**解锁，当天再重试多少次都是同一条 710010702。网关对每个
-/// 账号每天只给 3 次自动重试（`auto_checkin::retry` 的 `retryLimit` 缺省 3），
-/// 20 分钟一档会把 3 次全浪费在同一个被封的日子里 —— 所以直接指到下一天
-/// 早上（豆包签到刷新在 0 点后，9 点这个时刻远离边界，任何时区误解都不至于
-/// 跨日失败）。
-fn next_day_retry_at(now_ms: i64) -> i64 {
-    /// 北京时间相对 UTC 的偏移。豆包按 UTC+8 的自然日结算，固定写死 ——
-    /// 用本机时区会在改了系统时区的机器上算错日子。
-    const CST_OFFSET_MS: i64 = 8 * 3600 * 1000;
-    const DAY_MS: i64 = 24 * 3600 * 1000;
-    /// 次日 09:00（北京时间）。
-    const MORNING_MS: i64 = 9 * 3600 * 1000;
-
-    let local = now_ms + CST_OFFSET_MS;
-    let next_day_start = (local / DAY_MS + 1) * DAY_MS;
-    next_day_start + MORNING_MS - CST_OFFSET_MS
-}
-
-/// 上游「系统错误」的业务码：`710010702`（`msg=系统错误 / message=system error`）
-/// 与 `625002002`（`系统内部异常`）。
-///
-/// ── 这一档到底是什么（2026-11-10 结论已更正）───────────────
-/// 旧注释把它判成「上游写接口自身不可用」，理由是「随便换 scene / aid / 空 body
-/// 都回同一条 710010702，而同期读接口全部正常」，还引了「官方 SDK 直调也炸」的
-/// logId 作决定性证据。**那条推理是错的**，两处：
-///
-/// 1. 「怎么改入参都是 710010702」恰恰是**风控软拒绝**的形状 —— 它不看你的
-///    body 长什么样，看的是「这条请求的来路像不像客户端的签到」。真正的 5xx
-///    会随入参抖动，而风控是一刀切。
-/// 2. 那条「官方 SDK 直调也炸」的 logId 发生在插件失败之后 3~4 分钟，而风控
-///    是**按 uid 当天封口**的（插件那一次裸请求已经把 uid 锁了）。所以官方
-///    那一次失败是**后果**，不是原因。
-///
-/// 决定性反证来自真机台账（`checkin_records`）与 Reqable 抓包的逐日对齐：
-///
-/// | 日期 | 插件 POST checkin | 客户端签到 | 结果 |
-/// |------|------------------|-----------|------|
-/// | 11-05 | 09:36:10 failed | 09:37:04 | 客户端 54 秒后同为 710010702 |
-/// | 11-06 | **未 POST** | 11:58:09 | 客户端成功，+200 |
-/// | 11-08 | 15:39:31 already（未 POST） | 14:35:30 | 客户端成功，+200 |
-/// | 11-09 | **未 POST** | 09:44:45 | 客户端成功，+400 |
-/// | 11-10 | 12:36:34 failed | 12:40:19 | 客户端 3 分 46 秒后同为 710010702 |
-///
-/// **插件 POST 过的日子客户端全挂，没 POST 的日子客户端全过。**
-///
-/// 所以本函数保留，但语义从「等上游恢复」改成「今天这个 uid 已经被锁了」：
-/// 仍然回查（幂等，万一真签上了就别报错）、仍然挂 `retryAt`（明日自动补），
-/// 但不再宣称「官方客户端此刻同样签不上」—— 那是我们造成的。
-///
-/// 真正的修法是让请求本身跟客户端一致：`aid=582478`、26 个查询参数按官方
-/// 顺序、签到前先发 [`REPORT_PATH`]、以及 `/alice/ug/*` 上带 `a_bogus`
-/// （见 `abogus` 模块头）。这些已在 `api::endpoint` 与 `checkin_with_retry`
-/// 里落地；本分支从此只作为兜底。
-fn upstream_system_error(error: &GatewayError) -> bool {
-    matches!(error.upstream_code, Some(710010702 | 625002002))
-}
 
 fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value[key]
@@ -251,7 +189,7 @@ fn tasks(value: &Value, group: &str) -> Vec<Task> {
 ///
 /// 签到不再用这套判读：抓包证实 daily_signin 打领奖接口永远只回
 /// `biz_error{code:3,"领取结果确认中，请稍后重试"}`，任务状态不会自行落地。
-/// 签到现在走 [`CHECKIN_PATH`]，回执自带 `checked_in` 权威字段。
+/// 签到现在走 [`super::webview`]（浏览器通道），回执自带 `checked_in` 权威字段。
 ///
 /// 「上游说已经受理，但结果还没出」以前落在 `Err` 里被当成致命错误，于是整场
 /// 判失败、`retryAt` 也带不出去 —— 那是旧签到路径的成因，留此备查。
@@ -330,23 +268,59 @@ async fn refetch(
     }))
 }
 
+/// 预热回执（`v3/detail`）里那个每日签到任务是否已完成，以及连续天数。
+///
+/// ── 为什么不按名字匹配 ──────────────────────────────────────
+/// 2026-11-12 把真实回执打出来看：任务行的标识是 `campaign_code`
+/// （签到那条的值是 `daily_signin`），状态在 `daily_checkin.checked_in_today`；
+/// 行里**根本没有** `name` / `task_name` / `title` 字段。按名字找「签到」会
+/// 恒返回 `None`，白写一段永远走不到的分支。
+///
+/// 所以直接复用 [`tasks`] —— 它本来就按 `campaign_code` + `daily_checkin`
+/// 判定 `daily` / `checked`，与签到主流程用的是同一套解析，不会两处判据漂移。
+fn warmup_state(warmup: &Value) -> Option<(bool, Option<u32>)> {
+    tasks(warmup, V3_GROUP)
+        .into_iter()
+        .find(|task| task.daily)
+        .map(|task| (task.checked || task.state == 3, task.streak))
+}
+
 /// 每日签到。返回 SDK 的 [`CheckinResult`]：`report` 是协议化结果，
 /// `retry_at` 是「稍后自动复核」的时刻 —— 必须一路带到网关
-/// （`claim.retryAt` → `auto_checkin::retry`），否则「没确认到账」的那一场
-/// 只能等用户手点，这正是此前的症状。
+/// （`claim.retryAt` → `auto_checkin::retry`）。
 /// 与 `Provider::checkin` 的契约对齐：只要报告本身。
-/// `retry_at` 这类附加信息走 [`checkin_with_retry`]（由 `checkin_with_options` 转发），
-/// 否则「回查未确认」的那一场会丢掉自动复核时刻。
+/// `retry_at` 这类附加信息走 [`checkin_with_retry`]（由 `checkin_with_options` 转发）。
+///
+/// ⚠️ 这条旧入口没有 `manual` 信息，按**自动**处理 —— 于是它只会读、不会写。
+/// 见 [`checkin_with_retry`] 的 `manual` 说明。
 pub async fn checkin(
     ctx: &PluginCtx,
     account: &str,
 ) -> Result<proto::CheckinReport, GatewayError> {
-    Ok(checkin_with_retry(ctx, account).await?.report)
+    Ok(checkin_with_retry(ctx, account, false).await?.report)
 }
 
+/// 每日签到主流程。
+///
+/// ── `manual` 决定「读」还是「读+写」（2026-11-12 定案）──────────
+/// 豆包这个写接口的失败代价不对称：**一次不合规的 `landing/checkin` 会把该 uid
+/// 当天的签到口封死，连官方客户端一起废**（用户 2026-11-12 原话：「风控惩罚会
+/// 导致客户端也无法签到」），而成功只是 +200 额度。所以无人值守不该碰它：
+///
+/// | `manual` | 触发方 | 行为 |
+/// |----------|--------|------|
+/// | `false` | 网关定时任务 / 自动重试 | 只 POST `v3/detail` 判状态；未签则报 `Captcha` 等人点，**不发任何写请求** |
+/// | `true`  | 用户在界面上点「签到」 | 完整通道：headless Chromium 补签名 → `report` → `checkin` |
+///
+/// 自动路径报 `Captcha` 而不是 `Inactive`：网关的 `claim_pending()` 只对
+/// `inactive` / `ineligible` 排重试（见 `core/billing/checkin.rs`），报
+/// `Inactive` 等于让它隔一段时间再跑一遍；`Captcha` 不在那张表里，
+/// 排不进重试循环。这样即便链路哪天又坏，自动侧也只是多读几次详情 ——
+/// 读接口没有惩罚。
 pub async fn checkin_with_retry(
     ctx: &PluginCtx,
     account: &str,
+    manual: bool,
 ) -> Result<CheckinResult, GatewayError> {
     let _guard = claim_lock().lock().await;
     let (_, credentials, client) = api::account(ctx, account, false).await?;
@@ -378,133 +352,158 @@ pub async fn checkin_with_retry(
             "今日已领取豆包工作签到奖励",
         )));
     }
-    // 签到**不是**任务领奖：抓包证实 daily_signin 打 `item/reward/claim/` 只会
-    // 回 biz_error code 3「领取结果确认中，请稍后重试」，状态永不落地——这正是
-    // 「签到总是有问题」的根因。真正的签到是 landing/checkin，body 只带 scene
-    // （= campaign_group_code），同步返回权威字段 checked_in。
+    // ── 自动签到的终点：只读，到此为止 ──────────────────────────
+    // 上面那次 `detail` 已经拿到了权威状态（那一刻未签，否则上面就 `Done` 了）。
+    // 自动任务在这里收工，**不发任何写请求** —— 这是「不加重账号惩罚」的全部实现。
     //
-    // ── 顺序照抄客户端：先 report 再 checkin ────────────────────
-    // 见 [`REPORT_PATH`]。这一条**失败不影响签到**：它只是埋点/行为上报，
-    // 客户端自己也是 fire-and-forget（抓包里下一跳 20ms 就到，不等回执）。
-    // 但如果连它都发不出去（网络/代理挂了），那么 checkin 也一定发不出去，
-    // 交给后面的 checkin 报错即可，不在这里额外判死。
-    match api::post(&client, &credentials, REPORT_PATH, &report_body()).await {
-        Ok(_) => {}
-        Err(error) => crate::logging::verbose(
-            "[DoubaoWork]",
-            &format!("签到前置上报 landing/report 失败（不影响签到本身）：{error}"),
-        ),
+    // 报 `Captcha`（语义是「需人工」，见 `CheckinOutcome` 的变体说明），不是
+    // `Inactive`。两层原因：
+    // · 语义上就是「这一步要人来点」，不是「今天没活动」——报 `Inactive` 会让
+    //   界面显示成没什么可做；
+    // · 机制上网关的 `claim_pending()` 只把 `inactive` / `ineligible` 放进
+    //   重试名单（`core/billing/checkin.rs`），`captcha` 不在其中。
+    //   不想让这台机器在你没看着的时候反复跑，就得避开那两个字面量。
+    if !manual {
+        return Ok(CheckinResult::from(report(
+            proto::CheckinOutcome::Captcha,
+            "豆包签到需要你手动点一次：它的签到是写入型接口，一次不合规的请求就会让该账号当天被封（连官方客户端一起签不上），所以插件不做自动签到。",
+        )));
     }
-    let response = match api::post(
-        &client,
-        &credentials,
-        CHECKIN_PATH,
-        &json!({"scene": task.group}),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(error) if upstream_system_error(&error) => {
-            // 710010702 / 625002002：按 [`upstream_system_error`] 的更正结论，
-            // 这**不是**上游故障，而是「这个 uid 今天的签到口已经被封了」——
-            // 裸 POST 一次 `landing/checkin` 就会造成这个结果。先回查一次：
-            // 万一上游「已落库但响应组装失败」，真签上了就别报错；没签上就报
-            // 中性 Inactive + retryAt，`retryAt` 直接给到**明天**（当天重试必然
-            // 还是同一档，白耗网关的 3 次自动复核额度）。
-            crate::logging::verbose(
-                "[DoubaoWork]",
-                &format!(
-                    "签到返回上游系统错误（code={:?}）—— 按台账判据这是 uid 当日风控封口，而不是上游故障：{}",
-                    error.upstream_code, error.message
-                ),
-            );
-            return Ok(match refetch(&client, &credentials, &task.key, &task.group).await {
-                Ok(Some((true, streak))) => CheckinResult {
-                    report: proto::CheckinReport {
-                        outcome: proto::CheckinOutcome::Claimed,
-                        credit: task.points.map(|points| format!("{points} 额度")),
-                        streak: streak.or(task.streak),
-                        message: Some("豆包工作签到成功".into()),
-                    },
-                    retry_at: None,
-                    details: None,
+    // ── 通道一：Chromium 渲染栈（唯一能签上的路）─────────────────
+    // `a_bogus` 由 Chromium 网络栈在**渲染进程交出发送**那一刻补上，与「是不是
+    // 豆包客户端」无关。插件自己起 headless Chrome 就行，用户不用先开客户端。
+    // 见 [`super::webview`]。失败（没装浏览器/启动失败/超时）返回 `None`，
+    // 落到通道二。
+    let cookies = super::accounts::cookie_pairs(&credentials).unwrap_or_default();
+    let pairs = api::query_pairs(&credentials)?;
+    if let Some(attempt) = super::webview::checkin(&cookies, &pairs).await {
+        let warmup = &attempt.warmup;
+        // ── 先看预热回执：签到任务是否已完成 ──
+        // `detail` 里那条每日签到行带 `daily_checkin.checked_in_today`。这比
+        // 让写请求去撞 710010702 再猜要可靠：撞一次就是一次不合规写请求。
+        let before = warmup_state(warmup).unwrap_or((false, None));
+        if before.0 {
+            return Ok(CheckinResult {
+                report: proto::CheckinReport {
+                    outcome: proto::CheckinOutcome::Claimed,
+                    credit: task.points.map(|points| format!("{points} 额度")),
+                    streak: before.1.or(task.streak),
+                    message: Some("今日已领取豆包签到奖励".into()),
                 },
-                _ => CheckinResult {
-                    report: report(
-                        proto::CheckinOutcome::Inactive,
-                        "豆包返回「系统错误」：该账号今日签到已被风控封口（豆包按天锁定，当天任何客户端都签不上），明天自动补签",
-                    ),
-                    retry_at: Some(next_day_retry_at(crate::http::now_ms())),
-                    details: None,
-                },
+                retry_at: None,
+                details: None,
             });
         }
-        Err(error) => return Err(error),
-    };
-    let data = response
-        .get("data")
-        .and_then(Value::as_object)
-        .ok_or_else(|| GatewayError::with_status(502, "豆包工作未返回签到回执"))?;
-    // biz_error 在这里只作「上游暂时不受理」的信号；成功判据只有 checked_in。
-    if let Some(error) = data.get("biz_error").filter(|error| !error.is_null()) {
-        if !settled_later(error) {
-            return Err(api::error(200, error));
+        // ── 没有写回执 = 浏览器侧已判定「今天签过」，没发写请求 ──
+        // 两个判据（`webview::signed_in` 与 `warmup_state`）都读同一批字段，
+        // 但遍历口径略有差别（前者走整棵树，后者走 `tasks`/`campaigns`/
+        // `milestones`）。真出现「浏览器说签了、`tasks` 没认出来」的情形，
+        // 宁可报「已领取」也不要补发写请求 —— 少签一次只是少一次展示，
+        // 多写一次是把账号往封口里推。
+        let Some(response) = attempt.checkin.as_ref() else {
+            return Ok(CheckinResult::from(report(
+                proto::CheckinOutcome::Claimed,
+                "今日已领取豆包签到奖励",
+            )));
+        };
+        let data = response.get("data").and_then(Value::as_object);
+        let confirmed = data
+            .map(|data| {
+                // ⚠️ 用 `get` 而不是 `data["…"]`：`serde_json::Map` 没有实现
+                // `Index<&str>`（只有 `Value` 有），直接下标编译不过。
+                data.get("checked_in").and_then(Value::as_bool) == Some(true)
+                    || data.get("reward_status").and_then(api::number) == Some(3)
+                    || data.get("task_status").and_then(api::number) == Some(3)
+            })
+            .unwrap_or(false);
+        // 回执是上游原文；code 0 + checked_in 才算成。
+        if confirmed {
+            // `quota::number` 收 `Option<&Value>`，所以走 `pointer` 而不是取址下标。
+            let points = crate::quota::number(response.pointer("/data/reward_amount"))
+                .or(task.points);
+            return Ok(CheckinResult {
+                report: proto::CheckinReport {
+                    outcome: proto::CheckinOutcome::Claimed,
+                    credit: points.map(|points| format!("{points} 额度")),
+                    streak: api::number(&response["data"]["continuous_days"])
+                        .and_then(|days| u32::try_from(days).ok())
+                        .or(task.streak),
+                    message: Some("豆包签到成功".into()),
+                },
+                retry_at: None,
+                details: None,
+            });
         }
-        // 上游说「确认中」：等一拍再回查，多半就能看到状态翻转
-        tokio::time::sleep(std::time::Duration::from_millis(CLAIM_SETTLE_WAIT_MS)).await;
-    }
-    // checked_in 是幂等的：当天已签再打一次仍回 true（并置 idempotent），所以
-    // 重跑不会重复发奖，也不会误判失败。
-    let confirmed = data.get("checked_in").and_then(Value::as_bool) == Some(true)
-        || api::number(&response["data"]["reward_status"]) == Some(3)
-        || api::number(&response["data"]["task_status"]) == Some(3);
-    // 回查失败**不能**把整场判失败：签到请求已经发出去了，这里只是没读到权威
-    // 状态。报中性 Inactive + retryAt，等网关复核即可。
-    let after = if confirmed {
-        None
-    } else {
-        match refetch(&client, &credentials, &task.key, &task.group).await {
-            Ok(after) => after,
-            Err(_) => {
-                return Ok(CheckinResult {
-                    report: report(
-                        proto::CheckinOutcome::Inactive,
-                        "豆包工作签到已提交，回查未成功，稍后自动复核",
-                    ),
-                    retry_at: Some(crate::http::now_ms() + CLAIM_RETRY_MS),
-                    details: None,
-                });
-            }
+        // 通道通了但上游没认（典型是当日已封口）：回查一次，仍未签就报
+        // 「已封口，明天再来」，并把重试指到次日 —— 当天换任何通道都一样。
+        let after = refetch(&client, &credentials, &task.key, &task.group)
+            .await
+            .ok()
+            .flatten();
+        if after.as_ref().is_some_and(|(done, _)| *done) {
+            return Ok(CheckinResult {
+                report: proto::CheckinReport {
+                    outcome: proto::CheckinOutcome::Claimed,
+                    credit: task.points.map(|points| format!("{points} 额度")),
+                    streak: after.and_then(|(_, streak)| streak).or(task.streak),
+                    message: Some("豆包签到成功".into()),
+                },
+                retry_at: None,
+                details: None,
+            });
         }
-    };
-    let done = confirmed || after.as_ref().is_some_and(|(done, _)| *done);
-    if done {
-        let points = crate::quota::number(response.pointer("/data/reward_amount")).or(task.points);
-        return Ok(CheckinResult {
-            report: proto::CheckinReport {
-                outcome: proto::CheckinOutcome::Claimed,
-                credit: points.map(|points| format!("{points} 额度")),
-                streak: api::number(&response["data"]["continuous_days"])
-                    .and_then(|days| u32::try_from(days).ok())
-                    .or_else(|| after.and_then(|(_, streak)| streak))
-                    .or(task.streak),
-                message: Some("豆包工作签到成功".into()),
+        let blocked = response
+            .get("code")
+            .and_then(Value::as_i64)
+            .map(|code| code == 710010702 || code == 625002002)
+            .unwrap_or(false);
+        // ── 关键判据：预热（读接口）通不通 ──
+        // 预热是 `v3/detail`，纯读、签名同一条链路。它能回 `code:0` 就说明
+        // 「签名有效、Cookie 有效、通道成立」—— 那么随后的 `checkin` 报
+        // 710010702 只能是**服务端对写接口的独立处置**（当日封口/风控降权），
+        // 不是插件这边的参数或通道问题。这个区分决定了用户该等一天还是该改配置，
+        // 所以文案必须分开写。
+        let channel_ok = warmup.get("code").and_then(Value::as_i64) == Some(0);
+        // ⚠️ **不带** `retry_at`，且报 `Captcha` 而不是 `Inactive`。
+        // 两个都为了同一件事：不让网关**排进重试循环**。
+        // · 封口按自然日重置，当天再跑必然是同一档，重试纯属浪费；
+        // · 更要紧的是重试意味着「你没看着的时候机器又发了一次请求」—— 正是
+        //   2026-11-12 用户明确否掉的行为（骂的是自动签到，不分读还是写）。
+        // `Captcha`（需人工）不在 `claim_pending()` 的重试名单里（它只认
+        // `inactive` / `ineligible`），语义也正好对：这一步该由人来点。
+        return Ok(CheckinResult::from(report(
+            proto::CheckinOutcome::Captcha,
+            if blocked && channel_ok {
+                "豆包签到被服务端拒绝（710010702）：读接口正常、写接口被单独挡下，属该账号当日风控封口。签到口按自然日重置，明天你再点一次即可"
+            } else if blocked {
+                "豆包返回「系统错误」（710010702）：该账号当日签到口已被风控封口，明天再点一次即可"
+            } else {
+                "豆包签到已提交但未确认到账，稍后回账号看一下状态"
             },
-            retry_at: None,
-            details: None,
-        });
+        )));
     }
-
-    // 走到这里是「本次没确认到账」：接口没报错，只是状态还没翻转。不判失败
-    // （失败会让用户以为签到坏了），报中性 Inactive 挂 retryAt 让网关自动复核。
-    Ok(CheckinResult {
-        report: report(
-            proto::CheckinOutcome::Inactive,
-            "豆包工作签到未确认到账，稍后自动复核",
-        ),
-        retry_at: Some(crate::http::now_ms() + CLAIM_RETRY_MS),
-        details: None,
-    })
+    // ── 浏览器通道不可用：终止，不加任何后备写请求 ───────────────
+    // 走到这里说明预热/签到两步都没跑起来（没装 Chrome/Edge、启动失败、30 秒内
+    // 没拿到签名 SDK）。**完全不需要用户开豆包客户端** —— 插件会自己拉起
+    // headless 浏览器；仅当这台机器上一个 Chromium 系浏览器都没有时才会到这里。
+    //
+    // ⚠️ 这里**不放**任何「退回 reqwest 直发」的分支。那条路发出的
+    // `landing/checkin` 没有 `a_bogus`，一次就够把该 uid 当天封死，连官方客户端
+    // 一起废（见 [`CHECKIN_BLOCKED`]）。历史上 `directCheckin` 开关就是干这个的，
+    // 2026-11-12 按用户要求整个删掉：宁可签不上，也不能替用户按下那个按钮。
+    //
+    // 报 `Captcha` 且**不带** `retry_at`：这是需要人来处理的状态（装浏览器），
+    // 自动重试不会让它变好，带上只会空耗网关的重试额度。
+    //
+    // 文案分两档：机器上确实没有 Chromium 内核浏览器（用户能自己解决），
+    // 还是浏览器在但这条通道没跑通（需要我这边再看日志）。混成一句会让
+    // 用户白装一遍浏览器。
+    let message = if super::webview::chromium_available() {
+        "豆包签到没跑通：浏览器起得来，但这条通道没拿到签名回执。可以先在豆包客户端「任务中心」手点一次签到，同时把这次的时间点告诉我，我去看实际回执。"
+    } else {
+        "豆包签到需要 Chromium 内核浏览器（a_bogus 签名由它补）。这台机器上没找到 Chrome/Edge，请装一个再点一次签到；也可以在豆包客户端「任务中心」手点「立即签到」。"
+    };
+    Ok(CheckinResult::from(report(proto::CheckinOutcome::Captcha, message)))
 }
 
 fn report(outcome: proto::CheckinOutcome, message: &str) -> proto::CheckinReport {

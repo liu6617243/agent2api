@@ -169,6 +169,14 @@ fn pairs(value: &Value) -> Result<BTreeMap<String, String>, GatewayError> {
     Ok(result)
 }
 
+/// 账号 Cookie 的键值对形态，供**必须逐条注入**的通道使用（CDP
+/// `Network.setCookie` 不接受整串 header）。与 [`cookie_header`] 同一份解析
+/// 与同一套校验 —— 两条路对「什么是合法 Cookie」必须给出同一个答案，
+/// 否则 reqwest 通道能过、浏览器通道过不去，排查时会被误导。
+pub fn cookie_pairs(secret: &Value) -> Result<Vec<(String, String)>, GatewayError> {
+    Ok(pairs(secret)?.into_iter().collect())
+}
+
 pub fn cookie_header(secret: &Value) -> Result<String, GatewayError> {
     let cookies = pairs(secret)?;
     if let Some(header) = secret["cookieHeader"].as_str() {

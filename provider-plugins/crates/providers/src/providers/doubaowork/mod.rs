@@ -18,6 +18,7 @@ mod rewards;
 mod sign;
 mod stream;
 mod upload;
+mod webview;
 
 use agent2api_provider_protocol as proto;
 use agent2api_provider_sdk::{ConversationSink, PluginCtx, Provider, ProviderMeta, SendFuture};
@@ -212,16 +213,31 @@ impl Provider for DoubaoWorkProvider {
         })
     }
 
-    /// 透传 `retry_at`：默认实现是 `checkin().map(Into::into)`，会把
-    /// 「稍后自动复核」的时刻丢掉（见 `rewards::checkin_with_retry` 的说明）。
+    /// 透传 `retry_at`，并把 `manual` 一路带到 [`rewards`]。
+    ///
+    /// ── 为什么 `manual` 必须真的传下去（2026-11-12）──────────────
+    /// 豆包的签到写接口（`landing/checkin`）被风控盯得很紧：**一条不合规的写
+    /// 请求就会把这个 uid 当天的签到口封死，连官方客户端一起废**。链路越不确定，
+    /// 无人值守重试的代价就越高 —— 每次自动重试都是一次新的写请求。
+    ///
+    /// 所以这里的策略是「**自动签到只读、手动签到才写**」：
+    /// · `manual == false`（网关定时任务）→ 只调 `v3/detail` 判「今天签没签」，
+    ///   已完成就报 `Done`，未完成就报 `Captcha` 让人来，**绝不发写请求**
+    ///   （`Captcha` 不在网关的重试名单里，`Inactive` 在 —— 见
+    ///   `core/billing/checkin.rs` 的 `claim_pending`）；
+    /// · `manual == true`（用户在界面上点）→ 走完整通道（起 headless Chromium
+    ///   补签名 → report → checkin）。
+    ///
+    /// 这样即使链路哪天又坏，自动重试也只是多读几次详情，不会把账号一天天
+    /// 往更深的惩罚里推。
     fn checkin_with_options<'a>(
         &'a self,
         ctx: &'a PluginCtx,
         account: &'a str,
-        _manual: bool,
+        manual: bool,
     ) -> SendFuture<'a, agent2api_provider_sdk::CheckinResult> {
         Box::pin(async move {
-            rewards::checkin_with_retry(ctx, account)
+            rewards::checkin_with_retry(ctx, account, manual)
                 .await
                 .map_err(crate::errors::GatewayError::into_control_message)
         })
