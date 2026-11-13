@@ -33,6 +33,31 @@
 //! 这条链在命令行上可以完整重放（实测同一 TGC 连跑 6 次都成功），所以不必让用户
 //! 每次重启后手动去浏览器复制一遍。
 //!
+//! ── 「保活」到底靠什么（2026-11-13 定稿，两次返工的结论）──────
+//! 票根是滑动过期的，所以保活 = **在窗口内不断拿它换一次 ticket**。这里有两个
+//! 相互独立的动作，接线位置**必须**分开：
+//!
+//! | 入口 | 什么时候跑 | 走几跳 | 写什么 |
+//! |---|---|---|---|
+//! | [`keepalive`] → [`touch`] → [`roll`] | **每次余额查询**（60 秒心跳） | 1 | 只写票根 + 推进时刻 |
+//! | [`renew`] → [`rebuild`] → [`mint`] | cookie 读不出明细时 | 3 | cookie + 票根 + 推进时刻 |
+//!
+//! 两次返工都栽在**把 `touch` 接在 `renew`/cookie 成功那一侧**：
+//!   · §10.21（11-11）：只接在 `renew` 成功之后 —— cookie 一直有效时它一次都不跑；
+//!   · 第二次（11-12）：改挂在「cookie 读取成功」分支 —— 真实节奏下那条分支几乎
+//!     不成立（cookie 会话级、机器休眠、用户按需点余额），票根从签发起一次都没被推。
+//! 11-12 的实证：15:43 重建成功 → 23:02 票根被清，中间**零次 `touch`**、零条日志。
+//!
+//! 现在 `touch` 由 [`keepalive`] 无条件驱动（判据是账号里落盘的
+//! [`credentials::SSO_TGC_PUSHED_FIELD`]），与 cookie 死活彻底解耦。
+//!
+//! ── 但「推得勤」只是一半：窗口本身要够宽（2026-11-13 补）──────
+//! 上面那条只解决「网关在跑的时候不会闲置过期」。真实节奏是「白天零星用、
+//! 晚上关机」，每天离线 9~14 小时 —— 而那段时间本模块**一次都跑不到**。
+//! 所以还需要把服务端那个窗口拉长到能盖住关机时长：见
+//! [`super::session_window`]（它把账号的会话超时策略从实测的 60 分钟调到
+//! 官方上限 24 小时）。两件事合起来才是完整的「不死」：**窗口够长 + 一直在用**。
+//!
 //! ── 几个只有试过才知道的细节 ────────────────────────────────
 //!   1. **同一个 ticket 可以反复换 session**（`ST-8498043-…` 连用 6 次都 302），
 //!      所以真正的一次性凭据只有 TGC 本身。重放失败只可能是 TGC 死了。
@@ -104,25 +129,126 @@ pub struct Minted {
     pub tgc: Option<String>,
 }
 
+/// 换票链失败的三档 —— **必须分开**，因为它们的处置完全相反。
+///
+/// ── 为什么不能统一报「票根已失效」（2026-11-13 实测）───────────
+/// 早先任何一步失败都写成「SSO 票根已失效…请重新登录」。真实日志里这类 warn
+/// 有一半根本不是票根死了 —— 最硬的反证是 11-11 那两分钟：
+/// ```text
+///   11-11 14:46:12  warn  SSO 票根已失效（换票未拿到重定向…）
+///   11-11 14:48:34  info  网页会话 cookie 已用 SSO 票根自动重建   ← 同一枚票根，成功
+/// ```
+/// 同一枚票根两分钟后就能换票，说明 14:46 那次是**短暂失败**（开机后网络未就绪 /
+/// 上游限流），不是票根死亡。11-12 15:41→15:43 也是同一形状。把这些说成「去重新
+/// 登录」，既误导用户，又淹没了真正的失效信号 —— 十条一样的 warn 里再没有一条
+/// 能区分的。
+///
+/// 分档之后每档的处置：
+///   · [`Failed::Transient`] —— 短退避（2 分钟）后重试，**不**碰 `claim_warn`、
+///     **不**报「去重新登录」；
+///   · [`Failed::Rejected`] —— 票根真被上游拒了：长退避（10 分钟）+ 每小时一句 warn；
+///   · [`Failed::Shape`] —— 换到票了但后两跳形状不对（上游改版）：不劝用户重登，
+///     因为重登救不了改版。
+#[derive(Clone, Debug)]
+pub enum Failed {
+    /// 这次没成但**下次可能就成**：DNS / 连接 / 超时，或上游 5xx / 429 限流。
+    Transient(String),
+    /// 服务端明确回答「不给票」（200 登录页 / 清票指令）—— 这才是「已失效」。
+    ///
+    /// 载荷是**一句能直接看的证据**（如「HTTP 200，服务端当场清票
+    /// （Set-Cookie: SSOTGC=; Max-Age=0）」），不是裸状态码：这一条 warn 会落到
+    /// 用户面前，要能让人一眼看出「上游把票收了」而不是「某个数字不对」。
+    Rejected(String),
+    /// 票根收下了，但后两跳拿不到会话 / cftk（上游形状不符）。
+    Shape(String),
+}
+
+impl Failed {
+    /// 给人看的一句原因（日志 / `WebCreditsState` 的 `warnings` 共用）。
+    pub fn reason(&self) -> String {
+        match self {
+            Failed::Transient(detail) => format!("暂时性失败（{detail}）"),
+            Failed::Rejected(detail) => format!("服务端不给票（{detail}）：TGC 已被上游收回"),
+            Failed::Shape(detail) => format!("换到票但会话没铸成（{detail}）：上游形状可能变了"),
+        }
+    }
+
+    /// 是否**确实**需要用户去重新登录（只有这一档才算）。
+    pub fn dead(&self) -> bool {
+        matches!(self, Failed::Rejected(_))
+    }
+
+    /// 是不是「过一会儿自己会好」那一档（`credits` 据此给「稍后重试」的文案）。
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Failed::Transient(_))
+    }
+
+    /// 这一档的退避时长。
+    ///
+    /// 暂时性那档短：多半是刚开机、Wi-Fi 还没连上，两分钟后自然就好；压 10 分钟
+    /// 等于让一个刚恢复的网络白等八分钟。
+    fn backoff(&self) -> std::time::Duration {
+        match self {
+            Failed::Transient(_) => TRANSIENT_BACKOFF,
+            Failed::Rejected(_) | Failed::Shape(_) => FAIL_BACKOFF,
+        }
+    }
+}
+
+/// 把 [`Failed`] 压成一行可逆字符串 —— `flight::run` 的 `Err` 只收得动 `String`。
+///
+/// ⚠️ 为什么不用「解析中文文案」来还原档位：文案随时会改，改一个字档位就丢了，
+/// 而这种丢法是**静默**的（失败还是失败，只是变成「票根已失效」）。用固定标记做
+/// 前缀，文案怎么改都不影响分流。
+fn tag(failed: &Failed) -> String {
+    match failed {
+        Failed::Transient(detail) => format!("{FAILED_TRANSIENT}\u{1}{detail}"),
+        Failed::Rejected(detail) => format!("{FAILED_REJECTED}\u{1}{detail}"),
+        Failed::Shape(detail) => format!("{FAILED_SHAPE}\u{1}{detail}"),
+    }
+}
+
+/// [`tag`] 的逆：认不出标记就按 [`Failed::Shape`] 处理（不劝用户重登）。
+fn untag(tagged: &str) -> Failed {
+    if let Some(detail) = tagged.strip_prefix(FAILED_TRANSIENT) {
+        return Failed::Transient(detail.trim_start_matches('\u{1}').to_string());
+    }
+    if let Some(detail) = tagged.strip_prefix(FAILED_REJECTED) {
+        return Failed::Rejected(detail.trim_start_matches('\u{1}').to_string());
+    }
+    if let Some(detail) = tagged.strip_prefix(FAILED_SHAPE) {
+        return Failed::Shape(detail.trim_start_matches('\u{1}').to_string());
+    }
+    // 没有标记：未知失败，按「形状不符」处置 —— 那种情形重登救不了，
+    // 报「去重新登录」只会把人引到错的方向。
+    Failed::Shape(tagged.to_string())
+}
+
+const FAILED_TRANSIENT: &str = "transient";
+const FAILED_REJECTED: &str = "rejected";
+const FAILED_SHAPE: &str = "shape";
+
 /// 重放整条 SSO 链，产出一条能打 portal BFF 的 cookie 串（外加新票根）。
 ///
-/// 返回 `None` = 任何一步没成（TGC 失效 / 上游改版 / 网络失败）。**不返回错误**：
-/// 这条通道是可选增强，失败时余额查询照旧走聚合值那一路。
-pub async fn mint(tgc: &str, proxy: Option<&ResolvedProxy>) -> Option<Minted> {
+/// 失败时返回 [`Failed`]（分档见那里的说明），让调用方能分别处置。
+pub async fn mint(tgc: &str, proxy: Option<&ResolvedProxy>) -> Result<Minted, Failed> {
     let tgc = tgc.trim();
     if tgc.is_empty() {
-        return None;
+        return Err(Failed::Shape("账号里没有票根".to_string()));
     }
     let client = match strict_client(proxy) {
         Some(client) => client,
-        None => return None,
+        None => return Err(Failed::Shape("HTTP 客户端构造失败".to_string())),
     };
 
     // ── 第 1 跳：TGC → 302 + ticket，**并顺走这枚滚动票根** ────────
     let (ticket, renewed_tgc) = exchange(&client, tgc).await?;
 
     // ── 第 2 跳：ticket → 门户会话 ─────────────────────────────
-    let mut hop = url::Url::parse(PORTAL_PAGE).ok()?;
+    let mut hop = match url::Url::parse(PORTAL_PAGE) {
+        Ok(url) => url,
+        Err(error) => return Err(Failed::Shape(format!("门户页地址非法：{error}"))),
+    };
     hop.query_pairs_mut().append_pair("ticket", &ticket);
     let session = match client
         .get(hop)
@@ -137,14 +263,14 @@ pub async fn mint(tgc: &str, proxy: Option<&ResolvedProxy>) -> Option<Minted> {
             match found {
                 Some(session) => session,
                 None => {
-                    verbose("ticket 换会话失败：响应里没有 devclouddevuibjJ_SESSION_ID");
-                    return None;
+                    return Err(Failed::Shape(
+                        "响应里没有 devclouddevuibjJ_SESSION_ID".to_string(),
+                    ));
                 }
             }
         }
         Err(error) => {
-            verbose(&format!("ticket 换会话请求失败：{}", crate::http::describe_chain(&error)));
-            return None;
+            return Err(Failed::Transient(crate::http::describe_chain(&error)));
         }
     };
 
@@ -166,19 +292,19 @@ pub async fn mint(tgc: &str, proxy: Option<&ResolvedProxy>) -> Option<Minted> {
             match found {
                 Some(cftk) => cftk,
                 None => {
-                    verbose("门户页没有下发 cftk：换到的会话可能不是本人（上游改版？）");
-                    return None;
+                    return Err(Failed::Shape(
+                        "门户页没有下发 cftk（换到的会话可能不是本人）".to_string(),
+                    ));
                 }
             }
         }
         Err(error) => {
-            verbose(&format!("门户页请求失败：{}", crate::http::describe_chain(&error)));
-            return None;
+            return Err(Failed::Transient(crate::http::describe_chain(&error)));
         }
     };
 
     // 两个值必须同一次铸出来（见模块头），拼成单行 cookie 串。
-    Some(Minted {
+    Ok(Minted {
         cookie: format!(
             "{}={session}; {}={cftk}",
             credentials::SESSION_COOKIE_KEY,
@@ -201,10 +327,17 @@ pub async fn mint(tgc: &str, proxy: Option<&ResolvedProxy>) -> Option<Minted> {
 ///
 /// 返回值是 `(ticket, 新票根)`。新票根为 `None` 只说明这次响应没带 —— 不是失败。
 ///
-/// ⚠️ 成败判据只用「有没有 302 + `Location` 里有没有 `ticket`」：票根死了就是这么
-/// 表现出来的（上游回 200 登录页，或回一枚 `SSOTGC=; Max-Age=0` 的清票指令）。
-async fn exchange(client: &reqwest::Client, tgc: &str) -> Option<(String, Option<String>)> {
-    let mut login = url::Url::parse(&format!("{AUTH_ORIGIN}{LOGIN_PATH}")).ok()?;
+/// ⚠️ 成败判据只用「有没有 302 + `Location` 里有没有 `ticket`」，失败分两档：
+/// 请求发不出去 = [`Failed::Transient`]（不是票根的错），拿到了响应但没有 302/票 =
+/// [`Failed::Rejected`]（票根被服务端拒了，这才是真的死了）。
+async fn exchange(
+    client: &reqwest::Client,
+    tgc: &str,
+) -> Result<(String, Option<String>), Failed> {
+    let mut login = match url::Url::parse(&format!("{AUTH_ORIGIN}{LOGIN_PATH}")) {
+        Ok(url) => url,
+        Err(error) => return Err(Failed::Shape(format!("换票入口地址非法：{error}"))),
+    };
     login.query_pairs_mut().append_pair("service", PORTAL_PAGE);
     let response = match client
         .get(login)
@@ -218,10 +351,7 @@ async fn exchange(client: &reqwest::Client, tgc: &str) -> Option<(String, Option
         .await
     {
         Ok(response) => response,
-        Err(error) => {
-            verbose(&format!("SSO 换票请求失败：{}", crate::http::describe_chain(&error)));
-            return None;
-        }
+        Err(error) => return Err(Failed::Transient(crate::http::describe_chain(&error))),
     };
     let status = response.status().as_u16();
     let location = response
@@ -236,13 +366,25 @@ async fn exchange(client: &reqwest::Client, tgc: &str) -> Option<(String, Option
     let renewed = last_cookie(response.headers(), credentials::SSO_TGC_COOKIE)
         .filter(|value| credentials::looks_like_tgc(value));
     if !(300..400).contains(&status) || location.is_empty() {
-        verbose(&format!(
-            "SSO 换票未拿到重定向（HTTP {status}）：TGC 可能已失效，需要在浏览器里重新登录后重取"
-        ));
-        return None;
+        // ── 先排除「上游自己不舒服」那一类（2026-11-13 加）────────────
+        // 429 / 5xx 是上游限流或抖动，票根**没有任何问题** —— 一律当暂时性失败，
+        // 两分钟后重试。不分这一档的话，一次限流就会给用户留一句「请重新登录」，
+        // 而 11-11 14:46→14:48 的证据正说明：同一枚票根两分钟后就好。
+        if status == 429 || status >= 500 {
+            return Err(Failed::Transient(format!("上游返回 HTTP {status}")));
+        }
+        // 走到这里说明**请求通了**、服务端明确回答「不给票」—— 票根真被拒。
+        return Err(Failed::Rejected(status));
     }
-    let ticket = ticket_of(&location)?;
-    Some((ticket, renewed))
+    let ticket = match ticket_of(&location) {
+        Some(ticket) => ticket,
+        None => {
+            return Err(Failed::Shape(
+                "302 的 Location 里没有 ticket 参数".to_string(),
+            ));
+        }
+    };
+    Ok((ticket, renewed))
 }
 
 /// 单飞地「换票 + 换会话 + 落盘」。`renew` 走这条（cookie 已经死了，要新的一条）。
@@ -256,12 +398,14 @@ async fn exchange(client: &reqwest::Client, tgc: &str) -> Option<(String, Option
 ///
 /// 返回新 cookie（**不管落盘成没成**）：它已经能用了，本次请求不该因为写不回
 /// 数据库而作废 —— 与 `refresh.rs` 处理「续期成功但写回失败」同一取向。
+///
+/// 失败带 [`Failed`] 档位回来：`renew` 要按档位决定是「劝用户重登」还是「等两分钟」。
 async fn rebuild(
     ctx: &PluginCtx,
     account_id: &str,
     tgc: &str,
     proxy: Option<&ResolvedProxy>,
-) -> Result<String, String> {
+) -> Result<String, Failed> {
     let key = format!("codearts-portal:{account_id}");
     let tgc = tgc.trim().to_string();
     let account = account_id.to_string();
@@ -270,25 +414,28 @@ async fn rebuild(
     // ⚠️ 两处形态要求（`flight::run` 的签名所致，不是风格问题）：
     //   1. `async move` + 先把捕获值 clone 出来：闭包被 `run` 消费掉，它返回的
     //      future 不能再借闭包环境（`FnOnce() -> Fut` 不接受借用环境的 future）；
-    //   2. 闭包返回 `Result<_, String>`，而 `mint` 给的是 `Option` —— 必须显式
-    //      match 转成 `Err`，不能 `?`（类型不兼容，且 `panic=abort` 下不许 unwrap）。
-    crate::flight::run(&key, || async move {
+    //   2. 闭包返回 `Result<_, String>`：`flight` 只传得动 `String`，所以这里把
+    //      [`Failed`] 压成一句话出去，**档位由 `renew` 从这句话里认回来**？
+    //      —— 不，那太脆。于是这种「需要保档位」的场合改用 `String` 带上档位
+    //      前缀（见 `FAILED_NETWORK` / `FAILED_SHAPE` 两个标记）。
+    let outcome: Result<String, String> = crate::flight::run(&key, || async move {
         // ⚠️ **进锁后必须重读账号**（这是 `flight::run` 的约定，见该模块头注）：
         // 等锁的这段时间里，前一个跑完的请求可能已经落盘了一枚**更新**的票根。
         // 继续用调用方手里那枚旧票根去换票，会被服务端当成「上一代」而失败
         // （票根是滑动的：新的签发即意味着旧的该退了）。重读只是一次本地读，
         // 比一次 SSO 往返便宜得多。
         let newest = freshest_tgc(&ctx, &account, &tgc).await;
-        let Some(minted) = mint(&newest, proxy.as_ref()).await else {
-            return Err(TGC_DEAD.to_string());
-        };
-        if minted.cookie.is_empty() {
-            return Err(TGC_DEAD.to_string());
+        match mint(&newest, proxy.as_ref()).await {
+            Ok(minted) if !minted.cookie.is_empty() => {
+                persist(&ctx, &account, Some(&minted.cookie), minted.tgc.as_deref()).await;
+                Ok(minted.cookie)
+            }
+            Ok(_) => Err(tag(&Failed::Shape("铸出来的 cookie 是空的".to_string()))),
+            Err(failed) => Err(tag(&failed)),
         }
-        persist(&ctx, &account, &minted.cookie, minted.tgc.as_deref()).await;
-        Ok(minted.cookie)
     })
-    .await
+    .await;
+    outcome.map_err(|tagged| untag(&tagged))
 }
 
 /// 账号里**当前**存着的那枚票根；读不出来 / 是空的就退回调用方手里这枚。
@@ -317,52 +464,82 @@ async fn freshest_tgc(ctx: &PluginCtx, account_id: &str, fallback: &str) -> Stri
 /// 只写 cookie 是不够的（那是本次「有效期又没了」的根因）：票根本身有超时窗口，
 /// 不跟着往前推，最多活一个窗口就死，之后所有查询都静默降级。所以每次换票成功
 /// 都把上游下发的新票根一起写回（见 [`Minted`] 的说明）。
+///
+/// ── 返回 `Result` 而不是 `Option`（2026-11-13 改）─────────────
+/// 调用方（`credits::fetch_renewing_with_state`）要把「为什么没拿到会话」写进
+/// 账号页的 `warnings`，而那句话必须分档 —— 网络抖动与票根死亡要说完全不同的
+/// 话。早先这里只有 `Option`，两档被压成同一个「已过期」，用户被误导去重登。
 pub async fn renew(
     ctx: &PluginCtx,
     account_id: &str,
     credential: &Credential,
     proxy: Option<&ResolvedProxy>,
-) -> Option<String> {
+) -> Result<String, Failed> {
     let tgc = credential.sso_tgc.trim().to_string();
     if tgc.is_empty() {
-        return None;
+        // 没票根不是「票根死了」：这个账号本来就走「cookie 死了等用户重贴」那条路。
+        return Err(Failed::Shape("账号里没有 SSO 票根".to_string()));
     }
     match rebuild(ctx, account_id, &tgc, proxy).await {
         Ok(cookie) => {
+            clear_failed(account_id);
             crate::logging::log("[CodeArts]", "网页会话 cookie 已用 SSO 票根自动重建");
-            Some(cookie)
+            Ok(cookie)
         }
-        Err(reason) => {
-            // ⚠️ 必须**可见**（`warn`，不是 `verbose`）：
-            // 这条通道失败是静默降级 —— 账号页只会少掉「有效期」那一列，余额数字
-            // 照常显示，用户完全看不出发生了什么（本次就是这么被问上来的）。
-            // 一行 warn 落进日志，至少排查时能立刻看到「票根死了，去重新登录」。
-            //
-            // 按小时节流（见 `claim_warn`）：票根死了之后每次查询都会失败，
-            // 不节流会把日志表刷满，反而淹没别的线索。
-            if claim_warn(account_id) {
-                crate::logging::warn(
-                    "[CodeArts]",
-                    &format!(
-                        "SSO 票根已失效（{reason}）：逐批明细与「有效期」列将不可用，\
-                         请在设置里重新登录一次 CodeArts 以重取票根"
-                    ),
-                );
-            } else {
-                crate::logging::verbose(
-                    "[CodeArts]",
-                    &format!("SSO 票根仍未恢复（{reason}）：本小时已提示过，不再重复"),
-                );
-            }
-            None
+        Err(failed) => {
+            mark_failed(account_id, failed.backoff());
+            note_failure(account_id, &failed);
+            Err(failed)
         }
     }
 }
 
-/// 换票失败时给日志的那句话（要能让用户照着动作）。
+/// 把一次换票失败按**档位**落一条看得懂的日志。
 ///
-/// 与 `mint` 里那句同一说法，避免两处措辞不同让人以为是两个问题。
-const TGC_DEAD: &str = "换票未拿到重定向，TGC 可能已过期";
+/// ── 三档的说法必须不同（2026-11-13 实测的教训）───────────────
+/// 早先不分档，一律 `warn` 说「票根已失效…请重新登录」。而 11-12 23:02、11-13 11:45
+/// 那两次的真实原因是**机器刚从休眠恢复、网络还没通**（同一轮里其它 provider 全在
+/// 报 dns error / timeout）。把网络问题说成票根问题，用户会去白重登一次，日志也
+/// 被十条一样的 warn 淹掉，真正的失效反而看不出来。
+///
+/// 现在：
+///   · 暂时性档 → `verbose`（不落库）：一天几十次开机抖动，落库只会刷屏，
+///     但 `debugMode` 打开时仍能看到；
+///   · 票根被拒 → 每小时一条 `warn`，明说「去重新登录」；
+///   · 形状不符 → 每小时一条 `warn`，但说的是「上游改版」，**不**劝重登。
+fn note_failure(account_id: &str, failed: &Failed) {
+    let reason = failed.reason();
+    if failed.is_transient() {
+        verbose(&format!("CodeArts 换票暂时没成（{reason}）：两分钟后自动重试"));
+        return;
+    }
+    if !failed.dead() {
+        // 形状档不该催用户重登（重登救不了改版），但它是**新情况**，值得一小时说一次。
+        if claim_warn(account_id) {
+            crate::logging::warn(
+                "[CodeArts]",
+                &format!(
+                    "CodeArts 网页会话换票异常（{reason}）：有效期列会缺读数，\
+                     重登不一定能解决，先观察上游是否改版"
+                ),
+            );
+        } else {
+            verbose(&format!("CodeArts 换票仍未成（{reason}）：本小时已提示过"));
+        }
+        return;
+    }
+    if claim_warn(account_id) {
+        crate::logging::warn(
+            "[CodeArts]",
+            &format!(
+                "SSO 票根已失效（{reason}）：逐批明细与「有效期」列将不可用，\
+                 请在设置里重新登录一次 CodeArts 以重取票根"
+            ),
+        );
+    } else {
+        verbose(&format!("SSO 票根仍未恢复（{reason}）：本小时已提示过，不再重复"));
+    }
+}
 
 /// 「票根已失效」这条 warn 的节流窗口。
 ///
@@ -378,65 +555,194 @@ fn claim_warn(account_id: &str) -> bool {
     let Ok(mut marks) = touch_marks().lock() else { return true };
     let key = format!("warn:{account_id}");
     match marks.get(&key) {
-        Some(last) if now.duration_since(*last) < WARN_INTERVAL => false,
+        Some((last, _)) if now.duration_since(*last) < WARN_INTERVAL => false,
         _ => {
-            marks.insert(key, now);
+            marks.insert(key, (now, WARN_INTERVAL));
             true
         }
     }
 }
 
-/// 「票根最近被推过」的节流窗口。
+/// 「票根最近被推过」的节流窗口（进程内兜底）。
 ///
-/// ── 为什么需要节流 ──────────────────────────────────────────
-/// `touch` 会在**每一次成功的明细读取之后**被调用（见 `credits::fetch_renewing_with_state`），
-/// 而余额查询可以由用户连点、也可以被自动查询按「每账号间隔」高频触发。
-/// 每次都真去换一枚票根既浪费一次 SSO 往返，也会在上游留下不必要的登录审计。
+/// ── 这个表只解决「同一瞬间被并发调两次」────────────────────
+/// 真正的节流判据是**账号里的** `ssoTgcPushedAt`（见
+/// [`credentials::SSO_TGC_PUSHED_FIELD`]）：它跨进程存活，重启后仍然知道上次
+/// 什么时候推的。内存表只用来挡住「同一秒内被两个调用点同时问」这一类重复，
+/// 所以它的窗口只需要覆盖一次 SSO 往返（秒级），不必是保活间隔。
 ///
-/// 10 分钟这个值的取法：票根窗口是「闲置 1 小时 ~ 24 小时」这个量级，只要在
-/// 窗口内被推一次就不会倒；而 10 分钟远小于 1 小时，所以即便用户只在一天里
-/// 零星点几次余额，票根也始终被推在窗口以内。反过来它也足够大 —— 连点十次
-/// 余额只会产生一次 SSO 往返。
-const TOUCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// ── 2026-11-13 修的那一处（本次「保活又不生效」的根因之一）────
+/// 早先这里是唯一的节流判据，窗口 10 分钟，而且 `Instant` 只活在本进程里。
+/// 于是：网关一重启表就空 → 第一次调用必然真推（这一点反而是对的），但
+/// **进程活着的那段时间里，只要 cookie 一直没被成功读过，`touch` 根本不会被
+/// 调到** —— 节流窗口反而成了「不推」的借口。现在推票根与 cookie 解耦，
+/// 这个窗口缩到 30 秒，只当防抖用。
+const TOUCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 各类「上次做过」的时刻（进程级节流表）。
 ///
 /// 只用来做节流判断，**不含任何凭据**：键是「用途 + 账号 id」，值是时刻。
-/// 两种键：
+/// 三种键：
 ///   - `{account_id}` —— 上次推票根的时刻（见 [`claim_touch`]）；
-///   - `warn:{account_id}` —— 上次报「票根已失效」的时刻（见 [`claim_warn`]）。
-fn touch_marks() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
-    static MARKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
-        std::sync::OnceLock::new();
+///   - `warn:{account_id}` —— 上次报「票根已失效」的时刻（见 [`claim_warn`]）；
+///   - `fail:{account_id}` —— 上次换票失败的时刻**与该档的退避窗口**
+///     （见 [`mark_failed`]；窗口随档位不同，所以值是一对）。
+fn touch_marks() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, (std::time::Instant, std::time::Duration)>,
+> {
+    static MARKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, std::time::Duration)>>,
+    > = std::sync::OnceLock::new();
     MARKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// 现在是否该推一次票根（并顺手记下这次时刻）。
 ///
-/// 判据是「距上次推超过 [`TOUCH_INTERVAL`]」。锁中毒时不阻断链路：
+/// 判据是「距上次真推超过 [`TOUCH_DEBOUNCE`]」。锁中毒时不阻断链路：
 /// 那就当作可以推（多推一次无害，少推才是问题）。
 fn claim_touch(account_id: &str) -> bool {
     let now = std::time::Instant::now();
     let Ok(mut marks) = touch_marks().lock() else { return true };
     match marks.get(account_id) {
-        Some(last) if now.duration_since(*last) < TOUCH_INTERVAL => false,
+        Some((last, _)) if now.duration_since(*last) < TOUCH_DEBOUNCE => false,
         _ => {
-            marks.insert(account_id.to_string(), now);
+            marks.insert(account_id.to_string(), (now, TOUCH_DEBOUNCE));
             true
         }
     }
 }
 
-/// **滚动续期**：趁会话还活着，把票根往前推一次（后台跑，不阻塞读数）。
+/// 换票失败后的退避窗口（**票根被拒 / 形状不符**两档用这个）。
 ///
-/// ── 为什么必须有这一步（而不是「cookie 挂了再 `renew`」就够）──────
-/// `SSOTGC` 靠「每次使用都被服务端换新」而滑动过期。只在 cookie 失效时才去
-/// 换票的话，cookie 活着的那整段时间里票根一次都不会被推 —— 于是两者**同时**
-/// 到点，一起死（2026-11-11 实测：11-10 12:33 起的票根与 cookie，11-11 13:15
-/// 同时失效，逐批明细整段消失）。
+/// ── 为什么必须有它（2026-11-13 加）───────────────────────────
+/// 票根一旦死了，`due_for_roll` 会因为「落盘时刻不再前进」而**永远判该推** ——
+/// 于是每 [`TOUCH_DEBOUNCE`]（30 秒）就白打一次 SSO 往返，一天数千次，上游看到的
+/// 是一台无休止重试的机器，本机也要多烧流量。
 ///
-/// 这里在每次成功读到明细之后顺手推一次票根，票根的窗口就永远落在
-/// 「最近一次成功查询 + 一个超时窗口」上。**只要网关在跑、余额在查，票根就不会倒。**
+/// 这两档的失败**不会自己好**（要么等用户重登，要么等上游改回来），所以压得久：
+/// 10 分钟 = 144 次/天，而 `claim_warn` 每小时一句提醒照发，用户不会被静默。
+const FAIL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// 暂时性失败的退避窗口（**短**）。
+///
+/// ── 为什么与上面那个差这么多（2026-11-11 / 11-12 的实证）───────
+/// ```text
+///   11-11 14:46:12  warn  SSO 票根已失效（…）
+///   11-11 14:48:34  info  网页会话 cookie 已用 SSO 票根自动重建   ← 同一枚，成功
+///   11-12 15:41:53  warn  SSO 票根已失效（…）
+///   11-12 15:43:50  info  网页会话 cookie 已用 SSO 票根自动重建   ← 又成功
+/// ```
+/// 这类失败**两分钟就自己好了**（开机后网络未就绪、上游限流）。压 10 分钟等于让
+/// 刚恢复的网络白等八分钟；而它一天会发生好几次，所以也不该落 `warn`
+/// （见 `note_failure`）。
+const TRANSIENT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2 * 60);
+
+/// 上次换票失败距今是否还在退避窗口内（窗口长度按**上次失败是什么档**算）。
+///
+/// 锁中毒时返回 `false`（= 不在退避，继续推）：宁可多一次往返，也不要让一个坏
+/// 锁把保活停掉 —— 那正是本次要修的那类静默失效。
+fn backing_off(account_id: &str) -> bool {
+    let now = std::time::Instant::now();
+    let Ok(marks) = touch_marks().lock() else { return false };
+    marks
+        .get(&format!("fail:{account_id}"))
+        .is_some_and(|(last, window)| now.duration_since(*last) < *window)
+}
+
+/// 记下「这次换票失败了」，让接下来的退避窗口安静下来。
+fn mark_failed(account_id: &str, window: std::time::Duration) {
+    let Ok(mut marks) = touch_marks().lock() else { return };
+    marks.insert(format!("fail:{account_id}"), (std::time::Instant::now(), window));
+}
+
+/// 换票成功了：退避立刻解除，不必等窗口自然过期。
+///
+/// 这一条不是可有可无的优化：票根死过一段时间、用户重新登录之后，如果不主动清，
+/// 剩下的退避时间会把「刚恢复的账号」白白压住最多 10 分钟。
+fn clear_failed(account_id: &str) {
+    let Ok(mut marks) = touch_marks().lock() else { return };
+    marks.remove(&format!("fail:{account_id}"));
+}
+
+/// 账号里落盘的「上次推票根」时刻，距今够久了吗（跨进程的**真**判据）。
+///
+/// ── 为什么不看内存表 ────────────────────────────────────────
+/// 网关每天都会重启（用户关电脑）。内存表随之清空，于是「上次什么时候推的」
+/// 这件事只能从账号里读 —— 这就是 `ssoTgcPushedAt` 存在的理由。
+///
+/// `pushed_at <= 0`（字段缺失 / 坏值）一律判**该推**：宁可多一次 SSO 往返，也不要
+/// 因为一个坏字段把保活彻底停掉 —— 那正是本次要修的那类静默失效。
+pub fn due_for_roll(secret: &Value, now_ms: i64) -> bool {
+    let pushed_at = credentials::tgc_pushed_at(secret);
+    if pushed_at <= 0 {
+        return true;
+    }
+    // 时钟回拨（用户改了系统时间 / 换机器恢复备份）时 `now - pushed` 会是负数：
+    // 那也判「该推」—— 拿不准就别省这一次。
+    let elapsed = now_ms.saturating_sub(pushed_at);
+    elapsed < 0 || elapsed >= credentials::SSO_TGC_ROLL_INTERVAL_MS
+}
+
+/// **保活入口**：余额查询每跑一轮就问一次「该推票根了吗」，该推就推。
+///
+/// ── 它凭什么能保活（与早先 `touch` 的根本区别）───────────────
+/// 调用点在 `credits::keepalive`，而那里是**余额查询的固定心跳**：网关的
+/// `usage_query::spawn_sweeper` 每 10 秒扫一轮到期账号，每账号默认 60 秒查一次。
+/// 所以这个函数每账号每分钟都会被问一次，**与 cookie 死活无关**。
+///
+/// 早先的 `touch` 挂在「cookie 读取成功」之后（`credits.rs` 的旧第 302 行）：
+/// cookie 一死或用户不点余额，它就永远不被调用 —— 11-12 那次 15:43→23:02
+/// 七个小时零调用，票根就这么闲置死了。
+///
+/// ── 为什么先 `store::record` 再判 ────────────────────────────
+/// 判据（`ssoTgcPushedAt`）在账号里，而调用方手里通常只有一份 `Credential`
+/// 快照（`Credential` 结构里没有这个字段，也不该有：它是运行状态，不是凭据）。
+/// 一次本地 SQLite 读（走 RPC，百微秒级）换掉一次不必要的 SSO 往返，值得。
+///
+/// 读不到账号就**按参数里的 `credential` 兜底判**：这种情形只可能是账号刚被删，
+/// 那时推不推都无所谓，直接推一次让链路尽快自愈。
+pub async fn keepalive(
+    ctx: &PluginCtx,
+    account_id: &str,
+    credential: &Credential,
+    proxy: Option<&ResolvedProxy>,
+) {
+    if credential.sso_tgc.trim().is_empty() {
+        return;
+    }
+    let now = crate::logging::now_ms();
+    let due = match crate::store::record(ctx, super::PROVIDER_ID, account_id).await {
+        Ok(record) => due_for_roll(&crate::store::secret_view(&record), now),
+        // 读不到账号：拿不到落盘时刻，就按「上一轮大概刚推过」处理是不对的 ——
+        // 那会让一个新账号永远不推。这里判「该推」，让链路尽快自愈。
+        Err(_) => true,
+    };
+    if !due {
+        return;
+    }
+    // 刚失败过就先别试（见 [`FAIL_BACKOFF`]）：`due` 在票根死掉后会恒为真，
+    // 没有这一条就是每 30 秒一次的无休止重试。
+    if backing_off(account_id) {
+        return;
+    }
+    touch(ctx, account_id, credential, proxy);
+}
+
+/// **滚动续期**：把票根往前推一次（后台跑，不阻塞调用方）。
+///
+/// ── 它现在与 cookie 完全无关（2026-11-13 改，这是关键）─────────
+/// 早先这个函数只从 `credits::fetch_renewing_with_state` 的「cookie 读取成功」
+/// 分支里被调用 —— 也就是**只有 cookie 还活着、并且这次真的读到了明细**才推票根。
+/// 那条路径在真实使用节奏下几乎不成立：
+///   · 门户 cookie 是会话级的，机器休眠/浏览器不动它就死；
+///   · 用户是「白天零星点几下余额、晚上关机」，不点的时候一次读数都没有。
+/// 实测（11-12）从 15:43 重建成功到 23:02 票根被清，中间**一次 `touch` 都没发生**，
+/// 票根闲置 7.3 小时后被服务端杀掉 —— 这就是「明明写了滚动续期却还是保不住」。
+///
+/// 现在它由**余额查询这条固定心跳**无条件驱动（见 `credits::keepalive`）：
+/// 每账号每 60 秒一轮查询，每轮都会问一次「该推了吗」，判据是账号里落盘的
+/// `ssoTgcPushedAt` 与 [`credentials::SSO_TGC_ROLL_INTERVAL_MS`]（8 分钟）。
+/// cookie 死不死、明细读没读到，都不影响推票根 —— 票根本来就只需要第 1 跳。
 ///
 /// ── 为什么只走第 1 跳（不是完整三跳）─────────────────────────
 /// 推票根只需要「用票根换一次 ticket」这一步 —— 服务端就是在这一步重置闲置计时器、
@@ -446,11 +752,13 @@ fn claim_touch(account_id: &str) -> bool {
 /// （三跳 + 写 cookie）。
 ///
 /// ── 三条纪律 ────────────────────────────────────────────────
-///   1. **不阻塞调用方**：明细已经拿到，推票根失败不该拖慢或破坏这次读数；
-///   2. **不报错**：失败只落一行 `verbose`（下一步还有 `renew` 兜着），
-///      真正到「换不到」时才由 `renew` 出 `warn`；
+///   1. **不阻塞调用方**：推票根失败不该拖慢或破坏这次余额读数；
+///   2. **失败要可见一次**：早先失败只落 `verbose`，而 `verbose` **不落库**
+///      （见 `logging::verbose`），于是「保活到底跑没跑」在库里查不到任何痕迹 ——
+///      排查时只能靠猜。现在失败按小时节流落一行 `warn`，成功也落一行 `info`
+///      （`票根已往前推`），两类都在库里，能直接对时间线；
 ///   3. **不覆盖坏值**：新票根只在形状合法（[`credentials::looks_like_tgc`]）
-///      时才写回，见 `persist_tgc`。
+///      时才写回，见 [`persist`]。
 ///
 /// 没配票根的账号直接跳过（一次请求都不发）。
 pub fn touch(
@@ -472,19 +780,56 @@ pub fn touch(
     let proxy = proxy.cloned();
     tokio::spawn(async move {
         match roll(&ctx, &account, &tgc, proxy.as_ref()).await {
-            // ⚠️ 与 `renew` 的区别就在这里：`touch` 的成功**不需要**吭声
-            // （`persist_tgc` 已在 `verbose` 里记了「票根已往前推」），
-            // 失败也不必 `warn` —— cookie 还活着，用户无感；真到 cookie 也失效时，
-            // `renew` 会给出那句可见的 warn。
-            Ok(()) => {}
-            Err(reason) => verbose(&format!(
-                "票根滚动续期未成功（{reason}；会话仍可用，下次再试）"
-            )),
+            Ok(outcome) => {
+                clear_failed(&account);
+                outcome.report(&account);
+            }
+            Err(failed) => {
+                mark_failed(&account, failed.backoff());
+                note_failure(&account, &failed);
+            }
         }
     });
 }
 
-/// 只推票根：第 1 跳 + 写回新票根，**不碰 cookie**。
+/// 一次滚动续期的结果。
+///
+/// ── 为什么要把「换到了但没给新票根」单独分出来 ────────────────
+/// 它不是失败：服务端在换票这一步已经重置了闲置计时器（滑动过期的「使用即续」
+/// 那一半生效了）。把它和失败混在一起会让日志说反话 —— 明明保活成功，却写着
+/// 「续期失败」。所以这里分三档，各自说各自的话。
+#[derive(Clone, Copy, Debug)]
+enum Rolled {
+    /// 上游下发了新票根，已写回账号。
+    Renewed,
+    /// 换票成功但这次响应没带新票根（闲置窗口已重置，本地值保留）。
+    Kept,
+}
+
+impl Rolled {
+    /// 落日志。
+    ///
+    /// ── 为什么成功是 `info`、`Kept` 却只是 `verbose`（2026-11-13）────
+    /// `Renewed` 是「保活的证据」：账号里的票根值真的换代了（`ssoTgcPushedAt`
+    /// 同时前进），用户与排查者都需要在库里看到「这台机器在什么时候保过活」。
+    /// `Kept` 只证明「换了一次票」，它每 8 分钟就会来一条 —— 落 `info` 会把日志表
+    /// 灌满（约 180 条/天/账号），真正的失败反而被冲走。保活的证据在两种情形下
+    /// 都由 `ssoTgcPushedAt` 承担（见 `accounts.rs` 的公开视图），不靠日志。
+    fn report(self, account_id: &str) {
+        let tail = crate::store::token_tail(account_id);
+        match self {
+            Rolled::Renewed => crate::logging::log(
+                "[CodeArts]",
+                &format!("SSO 票根已滚动续期并落盘（账号 {tail}）：网页会话可继续自动重建"),
+            ),
+            Rolled::Kept => verbose(&format!(
+                "票根换票成功但本次未下发新票根（闲置窗口已被重置，保留原值；账号 {tail}）"
+            )),
+        }
+    }
+}
+
+/// 只推票根：第 1 跳 + 写回新票根 + 记下推进时刻，**不碰 cookie**。
 ///
 /// 与 [`rebuild`] 共用同一把单飞钥匙：两条路都会用票根换 ticket，并发跑会各拿到
 /// 一枚「代为最新」的票根、互相把对方写旧。
@@ -493,34 +838,54 @@ async fn roll(
     account_id: &str,
     tgc: &str,
     proxy: Option<&ResolvedProxy>,
-) -> Result<(), String> {
+) -> Result<Rolled, Failed> {
     let key = format!("codearts-portal:{account_id}");
     let tgc = tgc.trim().to_string();
     let account = account_id.to_string();
     let ctx = ctx.clone();
     let proxy = proxy.cloned();
-    crate::flight::run(&key, || async move {
+    // 与 `rebuild` 同一理由：`flight::run` 的 `Err` 只收得动 `String`，
+    // 档位用 `tag` / `untag` 带过去（见那两处的说明）。
+    let outcome: Result<Rolled, String> = crate::flight::run(&key, || async move {
         // 进锁后重读（同 `rebuild`）：前一个可能刚把票根写新了。
         let newest = freshest_tgc(&ctx, &account, &tgc).await;
-        let client = strict_client(proxy.as_ref()).ok_or_else(|| TGC_DEAD.to_string())?;
-        let (_, renewed) = exchange(&client, &newest).await.ok_or_else(|| TGC_DEAD.to_string())?;
-        let Some(renewed) = renewed else {
+        let client = match strict_client(proxy.as_ref()) {
+            Some(client) => client,
+            // 客户端建不起来是本地问题，跟票根无关 —— 归到形状档（不劝重登）。
+            None => return Err(tag(&Failed::Shape("HTTP 客户端构造失败".to_string()))),
+        };
+        let (_, renewed) = match exchange(&client, &newest).await {
+            Ok(found) => found,
+            Err(failed) => return Err(tag(&failed)),
+        };
+        match renewed {
             // 换票成功但上游这次没带新票根 —— **不是失败**：滑动过期里「使用即续」
             // 这一半已经生效了（服务端闲置计时器被重置）。没有新值就不该覆盖旧值，
-            // 否则等于把一枚好票根洗成空串。
-            verbose("票根换票成功但本次未下发新票根（闲置窗口已被重置，保留原值）");
-            return Ok(());
-        };
-        persist_tgc(&ctx, &account, &renewed).await;
-        Ok(())
+            // 否则等于把一枚好票根洗成空串。推进时刻照样要写：这次确实「用过」它。
+            None => {
+                persist(&ctx, &account, None, None).await;
+                Ok(Rolled::Kept)
+            }
+            Some(renewed) => {
+                persist(&ctx, &account, None, Some(&renewed)).await;
+                Ok(Rolled::Renewed)
+            }
+        }
     })
-    .await
+    .await;
+    outcome.map_err(|tagged| untag(&tagged))
 }
 
-/// 把新 cookie（以及滚动票根）写回账号 secret。
+/// 把「新 cookie / 新票根 / 推进时刻」写回账号 secret（字段全部可选）。
 ///
 /// 与续期那条链同一纪律：**读最新记录、比较再写**（`store::save` 的 `expect` 语义），
 /// 写不进去只记日志 —— cookie 本身是短命物，丢了下次还能再铸。
+///
+/// ── 为什么合并成一个函数（2026-11-13）─────────────────────────
+/// 早先有两条几乎相同的写回路径：`persist`（cookie + 票根，`renew` 走）与
+/// `persist_tgc`（只有票根，`touch` 走）。两者都漏了同一件事 —— **没记「推的时刻」**，
+/// 于是节流只能靠内存，重启即失效（见 [`credentials::SSO_TGC_PUSHED_FIELD`] 的说明）。
+/// 合并之后只有一条写路径，`ssoTgcPushedAt` 不可能在某个分支被忘掉。
 ///
 /// ── 票根为什么要一起写（这是「保活」的实质）───────────────
 /// 票根是**会话级**的（`Set-Cookie` 无 `Max-Age` / `Expires`，见模块头），
@@ -530,62 +895,46 @@ async fn roll(
 /// （2026-11-11 实测的正是这个）。
 ///
 /// `tgc` 为 `None`（响应里没带新票根）时**不覆盖**旧值 —— 上游某个响应省略这一项
-/// 不该被当成「票根没了」而把账号里的值洗掉。
-async fn persist(ctx: &PluginCtx, account_id: &str, cookie: &str, tgc: Option<&str>) {
+/// 不该被当成「票根没了」而把账号里的值洗掉。但**推进时刻照样写**：这次换票确实
+/// 用过它，服务端的闲置计时器确实被重置了，这一点必须反映到节流判据上。
+async fn persist(
+    ctx: &PluginCtx,
+    account_id: &str,
+    cookie: Option<&str>,
+    tgc: Option<&str>,
+) {
     let record = match crate::store::record(ctx, super::PROVIDER_ID, account_id).await {
         Ok(record) => record,
         Err(error) => {
-            verbose(&format!("重建的 cookie 未能落盘（读账号失败）：{}", error.message));
+            verbose(&format!("票根未能落盘（读账号失败）：{}", error.message));
             return;
         }
     };
     let expect = crate::store::secret_view(&record);
-    let mut fields: Vec<(&str, Value)> = vec![(
-        credentials::SESSION_COOKIE_FIELD,
-        Value::String(cookie.to_string()),
-    )];
+    let mut fields: Vec<(&str, Value)> = Vec::new();
+    if let Some(cookie) = cookie.map(str::trim).filter(|value| !value.is_empty()) {
+        fields.push((
+            credentials::SESSION_COOKIE_FIELD,
+            Value::String(cookie.to_string()),
+        ));
+    }
     let renewed_tgc = tgc.map(str::trim).filter(|value| !value.is_empty());
     if let Some(tgc) = renewed_tgc {
         fields.push((credentials::SSO_TGC_FIELD, Value::String(tgc.to_string())));
     }
+    // 推进时刻**总是**写：换票这一步已经发生过（调用方只在拿到 ticket 之后才来），
+    // 服务端的「最后一次使用」已经被刷新到这个时刻。
+    fields.push((
+        credentials::SSO_TGC_PUSHED_FIELD,
+        Value::from(crate::logging::now_ms()),
+    ));
     let next = crate::store::with_fields(&expect, &fields);
     match crate::store::save(ctx, account_id, &expect, &next).await {
-        Ok(true) => {
-            if renewed_tgc.is_some() {
-                // 写成功才说这句：它是「票根确实被往前推了」的凭据，
-                // 排查「有效期什么时候断的」时就看这条日志的最后一笔。
-                verbose("票根已随新会话一起落盘（票根窗口已往后推）");
-            }
-        }
-        Ok(false) => verbose("重建的 cookie 未能落盘：账号在重建期间被改动"),
-        Err(error) => verbose(&format!("重建的 cookie 未能落盘：{}", error.message)),
-    }
-}
-
-/// 只把新票根写回账号（`touch` 走的这条：**不动 cookie**）。
-///
-/// 与 [`persist`] 同一纪律（读最新、比较再写、写不进去只记日志），差别只在字段：
-/// 这里只写 `ssoTgc`。会话 cookie 保持用户原来那一条 —— 它还活着，没有理由换。
-async fn persist_tgc(ctx: &PluginCtx, account_id: &str, tgc: &str) {
-    let record = match crate::store::record(ctx, super::PROVIDER_ID, account_id).await {
-        Ok(record) => record,
-        Err(error) => {
-            verbose(&format!("新票根未能落盘（读账号失败）：{}", error.message));
-            return;
-        }
-    };
-    let expect = crate::store::secret_view(&record);
-    let fields = [(
-        credentials::SSO_TGC_FIELD,
-        Value::String(tgc.trim().to_string()),
-    )];
-    let next = crate::store::with_fields(&expect, &fields);
-    match crate::store::save(ctx, account_id, &expect, &next).await {
-        // 这条 verbose 是排查「有效期什么时候断的」的唯一凭据：它每次成功滚动
-        // 都会留一笔，最后一笔的时间就是票根被推到的位置。
-        Ok(true) => verbose("票根已往前推并落盘（会话 cookie 未改动）"),
-        Ok(false) => verbose("新票根未能落盘：账号在滚动期间被改动（下一轮再推）"),
-        Err(error) => verbose(&format!("新票根未能落盘：{}", error.message)),
+        // 成功不在这里吭声：调用方（`roll` / `rebuild`）已经有一条带账号尾号、
+        // 落 `info` 的日志了。同一件事说两遍只会让日志更难扫。
+        Ok(true) => {}
+        Ok(false) => verbose("票根未能落盘：账号在换票期间被改动（下一轮再推）"),
+        Err(error) => verbose(&format!("票根未能落盘：{}", error.message)),
     }
 }
 

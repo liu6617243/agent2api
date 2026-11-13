@@ -65,6 +65,7 @@ pub(crate) mod redact;
 pub(crate) mod refresh;
 pub(crate) mod response_stream;
 pub(crate) mod session;
+pub(crate) mod session_window;
 pub(crate) mod signer;
 pub(crate) mod size_gate;
 pub(crate) mod stream_fault;

@@ -267,19 +267,27 @@ async fn portal(
 /// 现在统一成这个形态：**手工 cookie 能用就用，不能用才动票根**。没有 cookie 且
 /// 没有票根时它立刻返回 `(None, NotConfigured)`（一次请求都不发），与从前一样。
 ///
-/// ── 两条腿一起走才叫「保活」（2026-11-11 补上第二条）───────
+/// ── 两条腿一起走才叫「保活」（2026-11-13 重排：票根那条腿必须无条件走）──
 ///   1. **cookie 失效时** → `renew` 用票根现场重铸（旧行为，不变）；
-///   2. **cookie 有效时** → `touch` 在后台把票根往前推一次（新增）。
+///   2. **每次查询都** → `keepalive` 问一次「该推票根了吗」，与 cookie 死活无关。
 ///
-/// 只有第 1 条是**救不了**票根的：cookie 一直有效的那段时间里第 1 条一次都不
-/// 触发，票根就停在签发那一刻，最终与 cookie 同时到点 —— 之后 `renew` 也救不
-/// 回来，逐批明细整段消失（有效期列随之空掉，2026-11-11 实际发生的就是这个）。
-/// 两条腿都在，票根窗口才会一直落在「最近一次成功查询 + 一个超时窗口」上。
+/// ── 第 2 条为什么必须无条件（这是「保活又不生效」的真因）────────
+/// 早先它只在「cookie 读取成功」的分支里被调用。那条分支在真实使用节奏下几乎
+/// 不成立，于是票根一次都没被推过：
+/// ```text
+///   11-12 15:43 重建成功（票根当场签发）
+///   11-12 15:43 → 23:02   零次 touch（cookie 会话级，机器睡了；用户没点余额）
+///   11-12 23:02 票根已被服务端闲置清掉 → renew 必失败 → 有效期列空
+/// ```
+/// 现在票根那条腿挂在**余额查询心跳**上（网关 `usage_query::spawn_sweeper` 每 10 秒
+/// 扫一轮、每账号默认 60 秒查一次），于是每账号每分钟都会问一次，票根的闲置窗口
+/// 永远落在「最近一次查询 + 一个窗口」上 —— 这才是「网关在跑就不会掉」。
 ///
 /// 失败一律静默降级：cookie 过期时这条通道会一直不可用，不该每轮余额查询都报错
 /// （用户没重贴之前没有任何动作可做）。与 Qoder 的 `web_credit_packs` 同一取向。
-/// ⚠️ 例外是「票根已经死了」这一种：`renew` 里落一行 `warn`（见那里的说明），
-/// 因为它是**唯一**需要用户动作的失败形态 —— 不吭声就只剩一个空列让人猜。
+/// ⚠️ 例外只有「票根**确实**被上游拒了」这一档：`renew` 里落一行 `warn`（见
+/// `portal_session::note_failure`），因为它是唯一需要用户动作的失败形态 ——
+/// 不吭声就只剩一个空列让人猜。网络抖动与上游改版都不催用户重登（也是在那里分的档）。
 pub async fn fetch_renewing_with_state(
     ctx: &agent2api_provider_sdk::PluginCtx,
     account_id: &str,
@@ -289,17 +297,20 @@ pub async fn fetch_renewing_with_state(
     // 读取侧也过一遍归一：早期版本可能已经把多行串落了库（见 `normalize_cookie`）。
     let cookie = credentials::normalize_cookie(&credential.session_cookie);
     let has_tgc = !credential.sso_tgc.trim().is_empty();
+    // ── 先无条件推一次票根（再读明细）─────────────────────────
+    // 放在读明细**之前**：明细那三四个请求可能各要几秒，票根这条腿先跑能让
+    // 它尽早落地；而且它不依赖明细结果，放前面才对「只读失败也要保活」成立。
+    // `keepalive` 自己会判节流（8 分钟）并 spawn，不阻塞本次读数。
+    if has_tgc {
+        super::portal_session::keepalive(ctx, account_id, credential, proxy).await;
+    }
+    // ── 再确认一次「窗口够宽」（这是保活的前提，不是补充）──────────
+    // 光靠推票根救不了「关机一夜」：账号的会话超时策略实测只有 60 分钟，
+    // 而用户每天离线 9~14 小时 —— 窗口装不下关机时长，推得再勤也白搭。
+    // 这里把它拉到官方上限（24 小时），票根这才有可能真的不死（见 session_window）。
+    super::session_window::keepalive(ctx, account_id, credential, proxy);
     if !cookie.is_empty() {
         if let Some(credits) = read(&cookie, proxy).await {
-            // ── 会话还活着时也要把票根往前推（这是「保活」的关键一半）──────
-            // 只写不能用的那一路救不了票根：cookie 一直有效时，上面那个分支每次都
-            // 直接 return，`renew` 永远不被调用，票根就一直是签发当时那一枚 ——
-            // 等 cookie 到点一起死，有效期列随即消失（2026-11-11 实测正是如此）。
-            //
-            // 所以这里在后台**顺手推一次**（不阻塞本次读数：明细已经拿到了）：
-            // 用票根换一次 ticket，把上游回的新票根写回账号。成功与否都不影响
-            // 返回值 —— 这是「维持」而不是「修复」。
-            super::portal_session::touch(ctx, account_id, credential, proxy);
             return (Some(credits), WebCreditsState::Ok);
         }
     }
@@ -308,10 +319,14 @@ pub async fn fetch_renewing_with_state(
         return (None, WebCreditsState::NotConfigured);
     }
     // ── 手工 cookie 失效（或压根没贴）→ 看能不能用票根重铸 ────────
-    // 没配票根时 `renew` 立刻返回 `None`，不花一次往返。
-    let Some(fresh) = super::portal_session::renew(ctx, account_id, credential, proxy).await else {
-        // 有凭证但换不到会话 = 票根也死了（`renew` 已落 warn）。
-        return (None, WebCreditsState::Expired);
+    // 没配票根时 `renew` 立刻返回 `Err(Shape)`，不花一次往返。
+    let fresh = match super::portal_session::renew(ctx, account_id, credential, proxy).await {
+        Ok(cookie) => cookie,
+        // ⚠️ 失败**按档位**翻译成用户看得懂的状态（2026-11-13 改）：
+        // 早先一律 `Expired`（「请重新登录」），于是每次开机网络抖动都催用户去重登。
+        // 现在只有「票根真被上游拒了」才算 `Expired`，网络问题给 `Network`
+        // （文案是「稍后自动重试」），上游形状变了给 `Unreadable`。
+        Err(failed) => return (None, state_of(&failed)),
     };
     crate::logging::verbose(
         "[CodeArts]",
@@ -322,6 +337,17 @@ pub async fn fetch_renewing_with_state(
         // 刚铸出来的会话也读不出 JSON：不是凭证问题（那是刚换的），
         // 只可能是上游形状变了 —— 这一档必须和「过期」分开说。
         None => (None, WebCreditsState::Unreadable),
+    }
+}
+
+/// 换票失败档 → 账号页读数状态。
+fn state_of(failed: &super::portal_session::Failed) -> WebCreditsState {
+    if failed.dead() {
+        WebCreditsState::Expired
+    } else if failed.is_transient() {
+        WebCreditsState::Network
+    } else {
+        WebCreditsState::Unreadable
     }
 }
 
@@ -341,6 +367,14 @@ pub enum WebCreditsState {
     Expired,
     /// 凭证还在，但上游回的仍是门户 HTML / 改版后的形状 —— 不是用户的锅。
     Unreadable,
+    /// **网络没通**（DNS / 连接 / 超时）—— 稍后自己就好，别让用户去重登。
+    ///
+    /// ── 为什么要单独一档（2026-11-13 实测）─────────────────────
+    /// 11-12 23:02 与 11-13 11:45 这两次，账号页本来会提示「网页登录态已过期：
+    /// 请重新登录一次 CodeArts」。但真实原因是机器刚从休眠恢复、网络还没就绪
+    /// （同一轮里其它 provider 全在报 dns error / timeout）。用户照着提示重登一遍
+    /// 不会有任何变化 —— 因为票根根本没死。这一档的文案是「稍后自动重试」。
+    Network,
 }
 
 impl WebCreditsState {
@@ -354,7 +388,8 @@ impl WebCreditsState {
     /// 读数」（前端 `partial` 计数就是看 `warnings`），既不是新问题也不可修复 ——
     /// 纯噪音。真想让有效期出现的用户，账号设置里本来就写着怎么登录。
     ///
-    /// 只有 `Expired` / `Unreadable` 是**变化**（昨天还有、今天没了），才值得提示。
+    /// 只有 `Expired` / `Unreadable` / `Network` 是**变化**（昨天还有、今天没了），
+    /// 才值得提示。
     pub fn note(self) -> &'static str {
         match self {
             WebCreditsState::Ok | WebCreditsState::NotConfigured => "",
@@ -363,6 +398,9 @@ impl WebCreditsState {
             }
             WebCreditsState::Unreadable => {
                 "积分明细读取失败（上游返回的不是明细数据）：余额与有效期可能不完整，稍后重试"
+            }
+            WebCreditsState::Network => {
+                "网络暂不可达，这一步没连上华为云：有效期稍后自动重试（不需要重新登录）"
             }
         }
     }

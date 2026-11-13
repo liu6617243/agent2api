@@ -29,7 +29,7 @@ use serde_json::{Map, Value};
 
 use agent2api_provider_protocol as proto;
 
-use super::credentials::Credential;
+use super::credentials::{self, Credential};
 use super::PROVIDER_ID;
 
 /// 账号名长度上限（与网关 `truncate_chars(&record_name, 100)` 同口径）。
@@ -238,6 +238,46 @@ pub(super) fn account_view(secret: &Value) -> Value {
     public.insert(
         "hasSsoTgc".to_string(),
         Value::Bool(credential.as_ref().is_some_and(|value| !value.sso_tgc.trim().is_empty())),
+    );
+    // 「上次把票根往前推」的时刻（毫秒）—— `hasSsoTgc` 只说「配了」，不说「还活着」。
+    //
+    // ── 为什么必须把它端出来（2026-11-13 加）────────────────────
+    // 票根是会话级 + 滑动过期的：值一直存在、形状一直合法，但**可能早已被服务端
+    // 清掉**。于是「配没配」这个布尔永远为真，界面看不出任何异常，有效期列悄悄空掉
+    // （2026-11-12 07:12 那次就是这样，见清单 §10.23）。
+    // 这个时刻是唯一能区分「活着」与「僵着」的读数：它由每 8 分钟一次的保活刷新，
+    // 一旦停止前进，就说明保活链断了 —— 用户能在断链的当天看见，而不是等票根死了
+    // 才发现「怎么又要重新登录」。
+    //
+    // 缺字段（老账号 / 从没推过）给 `null`，界面显示 `—`；不写 0 —— 0 会被误读成
+    // 「1970 年推过一次」，那是比缺字段更糟的谎。读取口径与保活的节流判据**同一份**
+    // （`credentials::tgc_pushed_at`，容忍字符串形态），两处不会各说各话。
+    let pushed_at = credentials::tgc_pushed_at(secret);
+    public.insert(
+        credentials::SSO_TGC_PUSHED_FIELD.to_string(),
+        if pushed_at > 0 {
+            Value::from(pushed_at)
+        } else {
+            Value::Null
+        },
+    );
+    // 账号的「会话超时窗口」（分钟）—— 票根能不能扛过关机，就取决于这个数。
+    //
+    // ── 为什么要让它出现在界面上（2026-11-13）──────────────────
+    // 「保活」看起来是一个动作（定期拿票根换票），其实它有一个前提：窗口要够宽。
+    // 实测这个账号原来是 60 分钟，而用户每天关机 9~14 小时 —— 窗口装不下关机时长，
+    // 于是不管保活写得多勤，睡一觉起来票根必定已被服务端清掉（清单 §10.23）。
+    //
+    // `session_window` 会自动把它拉到官方上限 24 小时；把读数端出来，用户就能
+    // 一眼看出「这台机器上到底是不是 24 小时」—— 没权限调的话这里会一直是 60，
+    // 而不是让人对着一个空的有效期列猜。
+    let window = secret
+        .get(credentials::SESSION_WINDOW_FIELD)
+        .and_then(Value::as_i64)
+        .filter(|minutes| *minutes > 0);
+    public.insert(
+        credentials::SESSION_WINDOW_FIELD.to_string(),
+        window.map(Value::from).unwrap_or(Value::Null),
     );
     public.insert(
         "refreshTokenExpiresAt".to_string(),

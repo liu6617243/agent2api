@@ -54,6 +54,46 @@ pub const SESSION_COOKIE_FIELD: &str = "sessionCookie";
 /// 票根读不到（症状是「配了票根却还是一次性」）。
 pub const SSO_TGC_FIELD: &str = "ssoTgc";
 
+/// **票根上一次被拿去换票的时刻**（毫秒），落盘键。
+///
+/// ── 为什么它必须落盘，而不是只放在内存里（2026-11-13 补）────────
+/// `SSOTGC` 是**滑动过期**的：服务端按「最后一次使用」重新计时，闲置超过账号的
+/// 会话超时策略（15 分钟 ~ 24 小时，[官方文档][iam-pol] 写的默认 1 小时）就当场
+/// 把它清掉。所以「保活」的全部内容就是**在窗口内不断用它换一次 ticket**。
+///
+/// 早先的节流表是进程内的 `HashMap<String, Instant>`：网关一重启（用户每天都会
+/// 关电脑）就归零，而且**重启后第一次必然不会推**（因为没有历史时刻可比）。更要紧
+/// 的是它**无法回答「上一次推是什么时候」** —— 排查时只能看日志，而那条日志是
+/// `verbose`（不落库）。这个字段把时刻写进账号，于是：
+///   1. 重启后仍知道该不该推（不会白推，也不会漏推）；
+///   2. 账号页能显示「上次保活：x 分钟前」，断链子时用户看得见；
+///   3. 排查时读库就知道票根链断在哪一刻，不必再猜日志级别。
+///
+/// [iam-pol]: https://support.huaweicloud.com/usermanual-iam/iam_01_0704.html
+pub const SSO_TGC_PUSHED_FIELD: &str = "ssoTgcPushedAt";
+
+/// 两次「推票根」之间的最小间隔（毫秒）。
+///
+/// ── 为什么是 8 分钟 ────────────────────────────────────────
+/// 会话超时策略的最小可设值是 **15 分钟**（IAM 后台 15m ~ 24h）。取 8 分钟留一半
+/// 余量：即便某一次因为网络抖一下推失败，下一次（8 分钟后）仍在窗口内。间隔再
+/// 小没有收益 —— 每次推就是一次 SSO 往返，8 分钟≈180 次/天，上游看不出异常，本地
+/// 也不心疼。
+pub const SSO_TGC_ROLL_INTERVAL_MS: i64 = 8 * 60 * 1000;
+
+/// **当前生效的会话窗口**（分钟），落盘键。
+///
+/// 这个数字决定票根能扛多久不动。实测账号原来是 **60 分钟**，而用户每天关机
+/// 9~14 小时 —— 窗口装不下关机时长，所以「睡一觉起来有效期列就空了」不是保活
+/// 没跑，而是窗口本身太短（见 `session_window` 模块头的推导）。
+/// `session_window::keepalive` 会把它拉到官方上限 1440（24 小时）并写在这里。
+pub const SESSION_WINDOW_FIELD: &str = "sessionWindowMinutes";
+
+/// 上次**成功确认/调整**会话窗口的时刻（毫秒），落盘键。
+///
+/// 与 [`SSO_TGC_PUSHED_FIELD`] 同一思路：跨进程存活，重启后仍知道上次确认是什么时候。
+pub const SESSION_WINDOW_SET_AT_FIELD: &str = "sessionWindowSetAt";
+
 /// 会话 cookie 的键名（门户下发会话时用的就是这个名）。
 pub const SESSION_COOKIE_KEY: &str = "devclouddevuibjJ_SESSION_ID";
 
@@ -350,6 +390,22 @@ impl Credential {
     pub fn to_value(&self) -> Value {
         serde_json::to_value(self).unwrap_or(Value::Null)
     }
+}
+
+/// 从 secret 里读「票根上次被推的时刻」（毫秒）；没有 / 不是数 → `0`。
+///
+/// ── 为什么容忍字符串 ────────────────────────────────────────
+/// 这个字段会经过账号 PATCH 接口（前端表单可以把任何值写成字符串）。把
+/// `"1794544494318"` 判成「没有时刻」会让节流退化成「每次都推」—— 一天多出
+/// 上百次 SSO 往返，还会把 `ssoTgcPushedAt` 当成坏值反复覆盖。
+pub fn tgc_pushed_at(secret: &Value) -> i64 {
+    let raw = secret.get(SSO_TGC_PUSHED_FIELD);
+    match raw {
+        Some(Value::Number(number)) => number.as_i64().unwrap_or(0),
+        Some(Value::String(text)) => text.trim().parse::<i64>().unwrap_or(0),
+        _ => 0,
+    }
+    .max(0)
 }
 
 fn text_of(value: &Value, keys: &[&str]) -> String {
