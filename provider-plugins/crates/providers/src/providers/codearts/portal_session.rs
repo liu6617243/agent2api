@@ -374,7 +374,8 @@ async fn exchange(
             return Err(Failed::Transient(format!("上游返回 HTTP {status}")));
         }
         // 走到这里说明**请求通了**、服务端明确回答「不给票」—— 票根真被拒。
-        return Err(Failed::Rejected(status));
+        // 把现场一起带出去：状态码是次要的，**服务端有没有当场清票**才是判据。
+        return Err(Failed::Rejected(rejected_detail(status, response.headers())));
     }
     let ticket = match ticket_of(&location) {
         Some(ticket) => ticket,
@@ -385,6 +386,31 @@ async fn exchange(
         }
     };
     Ok((ticket, renewed))
+}
+
+/// 把「服务端拒绝换票」这件事说清楚：**带不带清票指令**是两种完全不同的死法。
+///
+/// ── 为什么不能只报状态码（2026-11-13 实测）──────────────────
+/// 票根真死时服务端回的是 `HTTP 200` + `Set-Cookie: SSOTGC=; Max-Age=0;
+/// Expires=Thu, 01 Jan 1970`（当场清票）—— 光看状态码 `200` 根本看不出「被拒了」，
+/// 而这恰恰是最常见的那一种。把「有没有收到清票指令」写进原因里，用户和日志才
+/// 一眼能分辨「上游把票收了」与「上游回了个奇怪的 200」。
+fn rejected_detail(status: u16, headers: &reqwest::header::HeaderMap) -> String {
+    let prefix = format!("{}=", credentials::SSO_TGC_COOKIE.to_ascii_lowercase());
+    let cleared = headers
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|header| header.to_str().ok())
+        .map(|text| text.trim_start().to_ascii_lowercase())
+        .any(|lower| {
+            lower.starts_with(&prefix)
+                && (lower.contains("max-age=0") || lower.contains("1970"))
+        });
+    if cleared {
+        format!("HTTP {status}，服务端当场清票（Set-Cookie: SSOTGC=; Max-Age=0）")
+    } else {
+        format!("HTTP {status}，未下发 ticket")
+    }
 }
 
 /// 单飞地「换票 + 换会话 + 落盘」。`renew` 走这条（cookie 已经死了，要新的一条）。
