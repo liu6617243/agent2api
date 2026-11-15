@@ -342,6 +342,29 @@ pub fn panel_router(state: ServerState) -> Router {
         // 改造前的两条写路由（relocate / progress）随「三类数据各自一个目录」
         // 的语义一起删除，理由见 `api::storage_api` 的模块头。
         .route("/api/storage", get(api::storage_api::get_storage))
+        // ── 记忆中枢（侧边栏「记忆中枢」，排在「路由」之前）──
+        // 读接口走 GET（可被排障工具按 URL 直接打开），写接口一律 POST。
+        // 全部挂 protected：记忆正文是用户在别处说过的话与项目内部决策，
+        // 与 /api/config、/api/accounts 同一敏感级（见 api::memory 模块头）。
+        // `core` / `digest` 是「注入内容预览」——界面上要能看见模型到底会收到
+        // 什么，否则注入开关等于盲开。
+        .route(
+            "/api/memory/config",
+            get(api::memory::get_config).put(api::memory::put_config),
+        )
+        .route("/api/memory/list", get(api::memory::get_list))
+        .route("/api/memory/get", get(api::memory::get_one))
+        .route("/api/memory/core", get(api::memory::get_core))
+        .route("/api/memory/digest", get(api::memory::get_digest))
+        .route("/api/memory/timeline", get(api::memory::get_timeline))
+        .route("/api/memory/projects", get(api::memory::get_projects))
+        .route("/api/memory/status", get(api::memory::get_status))
+        .route("/api/memory/write", post(api::memory::post_write))
+        .route("/api/memory/update", post(api::memory::post_update))
+        .route("/api/memory/delete", post(api::memory::post_delete))
+        .route("/api/memory/restore", post(api::memory::post_restore))
+        .route("/api/memory/purge", post(api::memory::post_purge))
+        .route("/api/memory/rebuild", post(api::memory::post_rebuild))
         // ── 设置页「版本信息」──
         // 一次取全：版本 / 环境 / 路径 / 开关状态 / 关键计数（见 api::system_info
         // 的模块头）。挂 protected —— 数据目录、可执行文件路径与 Key 数量都属于

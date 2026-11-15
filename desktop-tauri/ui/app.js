@@ -139,16 +139,19 @@ function applyZoom(percent) {
 // ─── 页面导航 ────────────────────────────────
 
 const PAGE_KEY = 'workbuddy-desktop-page';
-const PAGES = ['assistant', 'overview', 'accounts', 'checkin', 'routing', 'gateway', 'agent', 'tools', 'proxies', 'keys', 'docs', 'logs', 'tasks', 'requests', 'plugins', 'settings'];
+const PAGES = ['assistant', 'overview', 'accounts', 'checkin', 'memory', 'routing', 'gateway', 'agent', 'tools', 'proxies', 'keys', 'docs', 'logs', 'tasks', 'requests', 'plugins', 'settings'];
 /** 页签中文名：顶栏面包屑用。overview 的用户可见名是「报表」、gateway 的是「模型管理」
  *  （内部标识保持不变：localStorage 记忆、showPage 与 CSS 的 [data-page] 选择器都依赖它）
  *
- *  `checkin` 是**内置页**（见 index.html 的说明）：页面归网关，签到能力归插件。 */
+ *  `checkin` 是**内置页**（见 index.html 的说明）：页面归网关，签到能力归插件。
+ *  `memory` 同理且更进一步：记忆的存储 / 检索 / 注入全部只能在网关里（插件没有
+ *  持久化与自定义端点），所以它是纯内置页，插件不参与。 */
 const PAGE_LABELS = {
   assistant: wbI18n.t('对话'),
   overview: wbI18n.t('报表'),
   accounts: wbI18n.t('账号'),
   checkin: wbI18n.t('签到中心'),
+  memory: wbI18n.t('记忆中枢'),
   routing: wbI18n.t('路由'),
   gateway: wbI18n.t('模型管理'),
   agent: wbI18n.t('Agent 配置'),

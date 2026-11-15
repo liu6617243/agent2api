@@ -146,7 +146,6 @@
   "余额不足或 Token 周期用量到顶，被限制器拦下，自动恢复后回来": "",
   "余额优先": "",
   "作为 system 消息注入给助手": "Injetado no assistente como mensagem system",
-  "作者尚未提供插件介绍。": "O autor ainda não forneceu uma descrição do plugin.",
   "使用 Cloudflare 账号 ID 与 API Token，接入 Workers AI 对话和在线模型目录。": "Conecte o chat e o catálogo online do Workers AI com o ID da conta Cloudflare e um API Token.",
   "使用 Warp 终端的登录态，接入账号可用模型并查询 AI 请求额度。": "Use o login do terminal Warp para acessar os modelos disponíveis na conta e consultar a cota de solicitações de IA.",
   "使用网关本机 gcloud / ADC 登录，接入 Vertex AI 模型并查询 Google Cloud 促销赠金。": "Use as credenciais gcloud / ADC da máquina do gateway para acessar modelos Vertex AI e consultar créditos promocionais do Google Cloud.",
@@ -828,5 +827,6 @@
   "（可选）": " (opcional)",
   "（未指定）": "(não especificado)",
   "（请下载与该平台对应的插件包）": "(baixe o pacote desta plataforma)",
-  "（默认问候）": "(saudação padrão)"
+  "（默认问候）": "(saudação padrão)",
+  "记忆中枢": "Central de memória"
 }

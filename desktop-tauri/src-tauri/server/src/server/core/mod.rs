@@ -103,6 +103,12 @@ pub mod legacy_api_key;
 pub mod limiter;
 pub mod login;
 pub mod maintenance;
+/// 记忆中枢：长期记忆的 MD 事实源 + 派生索引 + 转发前注入。
+///
+/// 与 `prompt` 的分工：`prompt` 决定「system 用哪一份」（透传/替换/追加），
+/// `memory` 只在**最终形态确定之后**往里追加一段记忆，不改变模式语义。
+/// 见 `memory::inject` 模块头（为什么挂在提示词层之后、脱敏层之前）。
+pub mod memory;
 pub mod model_meta;
 pub mod model_rules;
 pub mod models;

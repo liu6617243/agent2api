@@ -80,6 +80,11 @@
     // /旅行这类专属面板，都由插件申报）。没装插件时页面显示空态并指路，比一个
     // 凭空消失的菜单项清楚得多。
     { key: 'checkin', label: wbI18n.t('签到中心'), icon: 'checkin' },
+    // 记忆中枢：**排在「路由」之前不是排版偏好，而是数据流的顺序** ——
+    // 记忆注入发生在选路之前（转发链路的 ①.5 层，见 core/memory/inject 的
+    // 模块头：提示词层之后、脱敏层之前）。菜单顺序与真实处理顺序一致，
+    // 用户看到的「先记忆、后路由」才对得上实际发生的事。
+    { key: 'memory', label: wbI18n.t('记忆中枢'), icon: 'memory' },
     { key: 'routing', label: wbI18n.t('路由'), icon: 'route' },
     { key: 'gateway', label: wbI18n.t('模型管理'), icon: 'gateway' },
     { key: 'agent', label: wbI18n.t('Agent 配置'), icon: 'agent' },
@@ -231,7 +236,10 @@
         { id: 'g-overview', label: '概览', custom: false, hidden: false,
           items: ['assistant', 'overview', 'accounts', 'checkin'] },
         { id: 'g-forward', label: '转发链路', custom: false, hidden: false,
-          items: ['routing', 'gateway', 'agent', 'tools', 'proxies', 'keys', 'docs'] },
+          // memory 排在最前：它是这条链路的第一段（「给请求带上什么」），
+          // 之后才是「发给谁 / 谁来发 / 从哪出去」。老用户升级时由上面的
+          // 「新菜单补位」逻辑插到 routing 之前，不需要单独迁移。
+          items: ['memory', 'routing', 'gateway', 'agent', 'tools', 'proxies', 'keys', 'docs'] },
         { id: 'g-diag', label: '诊断', custom: false, hidden: false,
           items: ['requests', 'logs', 'tasks'] },
         { id: 'g-system', label: '系统', custom: false, hidden: false,

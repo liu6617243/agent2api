@@ -24,7 +24,7 @@
   "插件清单暂未完整读取": "The plugin catalog is not fully loaded",
   "读取完成的插件会陆续显示，无需停留在此页面等待。": "Plugins appear as their information loads. You can leave this page while loading continues.",
   "请查看上方原因，稍后刷新重试。": "See the reason above and refresh again later.",
-  "作者尚未提供插件介绍。": "The author has not provided a plugin description yet.",
+  "作者尚未提供插件介绍。": "The author has not provided a plugin description.",
   "JSON 格式不正确": "Invalid JSON format",
   "插件参数必须是 JSON 对象": "Plugin options must be a JSON object",
   "插件选项": "Plugin options",
@@ -157,7 +157,6 @@
   "余额不足或 Token 周期用量到顶，被限制器拦下，自动恢复后回来": "",
   "余额优先": "",
   "作为 system 消息注入给助手": "Injected to the assistant as a system message",
-  "作者尚未提供插件介绍。": "The author has not provided a plugin description.",
   "使用 Cloudflare 账号 ID 与 API Token，接入 Workers AI 对话和在线模型目录。": "Connect Workers AI chat and its online model catalog using a Cloudflare Account ID and API Token.",
   "使用 Warp 终端的登录态，接入账号可用模型并查询 AI 请求额度。": "Use your Warp terminal sign-in to access the account's available models and view its AI request allowance.",
   "使用网关本机 gcloud / ADC 登录，接入 Vertex AI 模型并查询 Google Cloud 促销赠金。": "Use gcloud / ADC credentials on the gateway machine to access Vertex AI models and view Google Cloud promotional credits.",
@@ -839,5 +838,6 @@
   "（可选）": " (Optional)",
   "（未指定）": "(not specified)",
   "（请下载与该平台对应的插件包）": "(download the pack built for this platform)",
-  "（默认问候）": "(default greeting)"
+  "（默认问候）": "(default greeting)",
+  "记忆中枢": "Memory Hub"
 }

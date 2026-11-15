@@ -121,6 +121,9 @@ pub mod keys_api;
 pub mod keepalive;
 pub mod logs_api;
 pub mod maintenance;
+// 记忆中枢（`/api/memory/*`）：长期记忆的读写、检索、演化链与注入开关。
+// 全部端点挂 protected —— 记忆正文的敏感度与管理面同级，见该文件模块头
+pub mod memory;
 pub mod model_manage;
 pub(crate) mod model_access;
 // models.dev 模型元数据（开关 / 状态 / 立即刷新）：与「逐家上游目录」的

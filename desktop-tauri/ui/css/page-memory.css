@@ -1,0 +1,329 @@
+/* ─────────────────────────────────────────────
+   记忆中枢页（page-memory.css）
+
+   五个视图共用一条顶部页签（记忆库 / 项目 / 核心记忆 / 回收站 / 设置）。
+   页面骨架类名全部以 .mm- 前缀自持；控件（Badge / Button / Input / Spinner /
+   Switch / Textarea）来自组件库，不在这里画 —— 与签到页同一约定。
+
+   两组配色语义：
+     · .mm-warn  «已被取代 / 可能过时»，用 --warn（不是 --danger）：
+       记忆过时不是错误，只是提醒再看一眼。
+     · .mm-muted «还没有/未记录»，用 --text-3：缺数据时给灰，不伪造内容。
+   ───────────────────────────────────────────── */
+
+.mm-page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+}
+
+/* ── 顶栏 ── */
+.mm-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.mm-tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+.mm-actions { display: flex; align-items: center; gap: 8px; }
+
+.mm-error {
+  padding: 9px 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--danger);
+  background: var(--danger-soft);
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+/* ── 记忆库：左列表 + 右详情 ── */
+.mm-library {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  flex: 1;
+}
+.mm-filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.mm-filters .mm-project-input { max-width: 160px; }
+.mm-select {
+  height: 32px;
+  padding: 0 8px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.mm-split {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(360px, 1.4fr);
+  gap: 12px;
+  min-height: 0;
+  flex: 1;
+}
+@media (max-width: 1100px) {
+  .mm-split { grid-template-columns: 1fr; }
+}
+
+.mm-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow: auto;
+  min-height: 0;
+  padding-right: 2px;
+}
+.mm-row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 9px 11px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: inherit;
+  cursor: pointer;
+}
+.mm-row:hover { background: var(--row-hover); }
+.mm-row.active { border-color: var(--primary-bd); background: var(--primary-soft); }
+.mm-row-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.mm-row-title { font-weight: 600; font-size: 13.5px; }
+.mm-row-summary {
+  margin-top: 3px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.mm-row-meta {
+  margin-top: 5px;
+  display: flex;
+  gap: 10px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.mm-detail {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  padding: 14px 16px;
+  overflow: auto;
+  min-height: 0;
+}
+.mm-detail-head h3 { margin: 0 0 6px; font-size: 15.5px; }
+.mm-detail-meta {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.mm-tags { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 7px; }
+
+.mm-body {
+  margin: 12px 0;
+  padding: 12px 14px;
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+  max-height: 46vh;
+}
+
+.mm-detail-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.mm-timeline, .mm-related { margin-top: 14px; }
+.mm-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin-bottom: 6px;
+}
+.mm-timeline-row {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  padding: 5px 0;
+  border-left: 2px solid var(--hairline);
+  padding-left: 9px;
+  font-size: 12.5px;
+}
+.mm-timeline-row.current { border-left-color: var(--primary); }
+.mm-timeline-date { color: var(--text-3); font-variant-numeric: tabular-nums; }
+.mm-timeline-type { color: var(--text-3); }
+
+.mm-link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--primary);
+  cursor: pointer;
+  font-size: 12.5px;
+  text-align: left;
+}
+.mm-link:hover { text-decoration: underline; }
+
+.mm-empty {
+  padding: 18px 14px;
+  color: var(--text-3);
+  font-size: 12.5px;
+  border: 1px dashed var(--border);
+  border-radius: var(--r-sm);
+}
+
+/* ── 项目卡 ── */
+.mm-projects {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+  overflow: auto;
+  min-height: 0;
+}
+.mm-project-card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  padding: 12px 14px;
+}
+.mm-project-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.mm-project-meta {
+  display: flex;
+  gap: 10px;
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-top: 4px;
+}
+.mm-project-remote {
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+  word-break: break-all;
+}
+.mm-project-latest { margin: 8px 0 0; padding-left: 16px; }
+.mm-project-latest li { margin-bottom: 3px; }
+
+/* ── 核心记忆 ── */
+.mm-core {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  flex: 1;
+}
+.mm-core-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.mm-core .mm-body { max-height: none; flex: 1; }
+
+/* ── 设置 ── */
+.mm-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  overflow: auto;
+  min-height: 0;
+  max-width: 720px;
+}
+.mm-field { display: flex; flex-direction: column; gap: 6px; }
+.mm-field > label { font-size: 13px; font-weight: 600; }
+.mm-hint {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-3);
+  line-height: 1.6;
+}
+.mm-muted { color: var(--text-3); font-size: 12px; }
+
+.mm-status {
+  border-top: 1px solid var(--hairline);
+  padding-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mm-status-grid {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 6px 12px;
+  font-size: 12.5px;
+  align-items: baseline;
+}
+.mm-status-grid > span { color: var(--text-3); }
+.mm-status-grid > code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  word-break: break-all;
+}
+
+/* ── 新建 / 编辑弹层 ── */
+.mm-dialog-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.42);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 60;
+  padding: 24px;
+}
+.mm-dialog {
+  width: min(760px, 100%);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+}
+.mm-dialog-head, .mm-dialog-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 16px;
+}
+.mm-dialog-foot { justify-content: flex-end; }
+.mm-dialog-head { border-bottom: 1px solid var(--hairline); }
+.mm-dialog-foot { border-top: 1px solid var(--hairline); }
+.mm-dialog-body {
+  padding: 14px 16px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mm-dialog-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.mm-label { font-size: 12px; color: var(--text-2); margin-top: 4px; }

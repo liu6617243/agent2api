@@ -118,7 +118,12 @@ function Frame() {
         <div id='page-refresh-actions' />
       </PageHeader>
       <div className='content'><div className='content-inner'>
-        {['assistant', 'overview', 'accounts', 'checkin', 'routing', 'gateway', 'agent', 'tools', 'proxies', 'keys', 'docs', 'logs', 'tasks', 'requests', 'plugins', 'settings'].map(key =>
+        {/* 页面挂载点：**这份数组就是「有哪些页」的事实来源**，与
+            `sidebar-layout.js` 的 MENUS、`app.js` 的 PAGES 必须逐字一致
+            （三处都少一个，页签就点出一个空 section —— 岛找不到挂载点会静默
+            不渲染，界面上看起来「点了没反应」）。`memory` 排在 `routing` 前：
+            记忆注入发生在选路之前，见 core/memory/inject 的模块头。 */}
+        {['assistant', 'overview', 'accounts', 'checkin', 'memory', 'routing', 'gateway', 'agent', 'tools', 'proxies', 'keys', 'docs', 'logs', 'tasks', 'requests', 'plugins', 'settings'].map(key =>
           <section key={key} className={`page${page === key ? ' active' : ''}`} data-page={key} />)}
         <section className={`page${page.startsWith('plugin:') ? ' active' : ''}`} data-page='__plugin__' id='plugin-page-host' />
       </div></div>
