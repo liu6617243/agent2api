@@ -118,7 +118,7 @@ pub async fn get_one(State(_state): State<ServerState>, Query(params): Query<Has
 
 pub async fn get_core(State(_state): State<ServerState>, Query(params): Query<HashMap<String, String>>) -> Response {
     let project = text(&params, "project");
-    let tokens = number(&params, "maxTokens").unwrap_or_else(|| memory::config().inject_tokens);
+    let tokens = number(&params, "maxTokens").unwrap_or_else(|| memory::config().core_max_tokens);
     ok_json(memory::core_text(project.as_deref(), tokens))
 }
 

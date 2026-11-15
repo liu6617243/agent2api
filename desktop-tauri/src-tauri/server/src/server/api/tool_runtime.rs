@@ -258,6 +258,7 @@ async fn mcp_post(state: &ServerState, headers: HeaderMap, body: Bytes, kind: Mc
         McpServerKind::WebSearch => tool_services::WEB_SEARCH_SERVICE_ID,
         McpServerKind::Vision => tool_services::VISION_SERVICE_ID,
         McpServerKind::ImageGeneration => tool_services::IMAGE_GENERATION_SERVICE_ID,
+        McpServerKind::Memory => tool_services::MEMORY_SERVICE_ID,
     };
     if !tool_services::is_enabled(service, protocol) {
         return json_response(
@@ -299,6 +300,14 @@ pub async fn mcp_web_search(State(state): State<ServerState>, headers: HeaderMap
 /// POST /mcp/vision
 pub async fn mcp_vision(State(state): State<ServerState>, headers: HeaderMap, body: Bytes) -> Response {
     mcp_post(&state, headers, body, McpServerKind::Vision).await
+}
+
+/// POST /mcp/memory —— 记忆中枢（11 个工具）。
+///
+/// 与另外三个 MCP 端点同一套骨架：鉴权由 `mcp_post` 内部做（`/mcp` 前缀不在
+/// `require_api_key` 的判定范围里，见 http.rs 的注释）。
+pub async fn mcp_memory(State(state): State<ServerState>, headers: HeaderMap, body: Bytes) -> Response {
+    mcp_post(&state, headers, body, McpServerKind::Memory).await
 }
 
 pub async fn mcp_image_generation(

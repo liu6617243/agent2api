@@ -29,6 +29,8 @@ pub enum McpServerKind {
     WebSearch,
     Vision,
     ImageGeneration,
+    /// 记忆中枢：本地长期记忆的读写与检索（见 `memory_mcp`）
+    Memory,
 }
 
 pub struct McpRequestContext {
@@ -138,6 +140,7 @@ pub fn spec(kind: McpServerKind) -> McpSpec {
         McpServerKind::WebSearch => web_search_spec(),
         McpServerKind::Vision => vision_spec(),
         McpServerKind::ImageGeneration => super::image_mcp::spec(false),
+        McpServerKind::Memory => super::memory_mcp::spec(),
     }
 }
 
@@ -182,6 +185,30 @@ async fn call_tool(
 ) -> Result<Value, ToolCallError> {
     match kind {
         McpServerKind::ImageGeneration => Ok(super::image_mcp::call(name, args, ctx).await),
+        // 记忆是**同步的文件 + SQLite 活**（读 .md、查本地索引）。直接在 async
+        // 上下文里跑会占住一个 worker 线程，几千条记忆时能感觉到卡顿；丢进
+        // `blocking::run`（spawn_blocking），与图片压缩那条路径同一处置。
+        McpServerKind::Memory => {
+            let tool = name.to_string();
+            let payload = args.clone();
+            let outcome = crate::server::core::blocking::run(move || {
+                super::memory_mcp::call(&tool, &payload)
+            })
+            .await;
+            match outcome {
+                Ok(Ok(payload)) => Ok(tool_result(payload)),
+                // 业务失败用 `isError` 结果而不是协议错误：模型看到原因后
+                // 还有机会改参数重试（与 web-search 全部失败时同一处置）
+                Ok(Err(super::memory_mcp::CallError::Failed(message))) => {
+                    logging::log("[Tools]", &format!("MCP memory {name} 失败：{message}"));
+                    Ok(tool_error(message))
+                }
+                Ok(Err(super::memory_mcp::CallError::UnknownTool)) => {
+                    Err(ToolCallError::InvalidParams(format!("Unknown tool: {name}")))
+                }
+                Err(error) => Ok(tool_error(error.message)),
+            }
+        }
         McpServerKind::WebSearch => {
             let operation = if name == "web_search" {
                 "search"

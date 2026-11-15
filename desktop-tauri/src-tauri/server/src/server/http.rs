@@ -1063,6 +1063,12 @@ pub fn gateway_router(state: ServerState) -> Router {
             "/mcp/vision",
             post(api::tool_runtime::mcp_vision).get(api::tool_runtime::mcp_unsupported),
         )
+        // 记忆中枢：11 个工具（记忆库是本机私有数据，鉴权与另外三个端点同口径，
+        // 由 handler 自己做 —— 见上方 `/mcp` 前缀的说明）。
+        .route(
+            "/mcp/memory",
+            post(api::tool_runtime::mcp_memory).get(api::tool_runtime::mcp_unsupported),
+        )
         .route("/mcp/image-generation", post(api::tool_runtime::mcp_image_generation)
             .get(api::tool_runtime::mcp_unsupported).delete(api::tool_runtime::mcp_unsupported))
         .route("/mcp/image-generation/files/{id}", get(api::tool_images::download))

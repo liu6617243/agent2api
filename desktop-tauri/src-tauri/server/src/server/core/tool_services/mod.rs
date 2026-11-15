@@ -37,6 +37,9 @@ pub(crate) mod image_config;
 pub(crate) mod image_jobs;
 mod image_mcp;
 mod mcp;
+/// 记忆中枢的 MCP 规格与工具分发（`/mcp/memory`，11 个工具）。
+/// 独立成文件：11 个工具的描述本身两百多行，塞进 `mcp.rs` 会把分发逻辑淹掉。
+mod memory_mcp;
 mod normalize;
 mod providers;
 mod search;
@@ -74,11 +77,21 @@ use crate::server::core::crypto::{self, SecretScope};
 pub const KEY_TOOL_SERVICES: &str = "toolServices";
 
 /// 固定服务 id（顺序即界面展示顺序）
-pub const SERVICE_IDS: [&str; 3] = [WEB_SEARCH_SERVICE_ID, VISION_SERVICE_ID, IMAGE_GENERATION_SERVICE_ID];
+pub const SERVICE_IDS: [&str; 4] = [
+    WEB_SEARCH_SERVICE_ID,
+    VISION_SERVICE_ID,
+    IMAGE_GENERATION_SERVICE_ID,
+    MEMORY_SERVICE_ID,
+];
 pub const WEB_SEARCH_SERVICE_ID: &str = "web-search";
 pub const VISION_SERVICE_ID: &str = "vision";
 pub const IMAGE_GENERATION_SERVICE_ID: &str = "image-generation";
 pub const IMAGE_GENERATION_VERSION: &str = "1.0.0";
+/// 记忆中枢。**只有 mcp 一种协议** —— 它的工具语义（三级披露、按 id 取全文、
+/// 演化链）在 REST/Skill 上表达不了，而客户端接入只认 MCP。
+/// `service_protocols` 会按 [`endpoint`] 是否为空自动过滤掉不支持的协议。
+pub const MEMORY_SERVICE_ID: &str = "memory";
+pub const MEMORY_VERSION: &str = "1.0.0";
 
 /// 接入协议（顺序即界面展示顺序）。
 ///
@@ -98,16 +111,22 @@ pub const VISION_PACKAGE: &str = VISION_SERVICE_NAME;
 pub const WEB_SEARCH_VERSION: &str = WEB_SEARCH_SKILL_VERSION;
 pub const VISION_VERSION: &str = VISION_SERVICE_VERSION;
 
-pub const CAPABILITY_COUNTS: [(&str, u32); 2] = [
+pub const CAPABILITY_COUNTS: [(&str, u32); 3] = [
     (WEB_SEARCH_SERVICE_ID, 2),
     (VISION_SERVICE_ID, 1),
+    // 记忆中枢的 11 个工具：core / digest / search / get / timeline / write /
+    // update / recent / projects / forget / status（见 tool_services::memory_mcp）
+    (MEMORY_SERVICE_ID, 11),
 ];
 
 /// 工具执行超时（秒）：同一服务各协议共用；服务端强制上限，装 MCP 时写进客户端
 pub const TIMEOUT_MIN_SECONDS: u64 = 5;
 pub const TIMEOUT_MAX_SECONDS: u64 = 600;
-pub const DEFAULT_TIMEOUTS: [(&str, u64); 3] = [
+pub const DEFAULT_TIMEOUTS: [(&str, u64); 4] = [
     (WEB_SEARCH_SERVICE_ID, 30), (VISION_SERVICE_ID, 60), (IMAGE_GENERATION_SERVICE_ID, 300),
+    // 记忆是本地文件 + 本地索引，正常在毫秒级；给 30 秒是为容纳「首次重建索引」
+    // 这种一次性开销（几千条约 1-2 秒）。
+    (MEMORY_SERVICE_ID, 30),
 ];
 
 /// 端点路径（写死：改动会影响已接入的客户端）。
@@ -121,6 +140,7 @@ pub fn endpoint(service: &str, protocol: &str) -> &'static str {
         (WEB_SEARCH_SERVICE_ID, "api") => "/api/web-search",
         (VISION_SERVICE_ID, "mcp") => "/mcp/vision",
         (IMAGE_GENERATION_SERVICE_ID, "mcp") => "/mcp/image-generation",
+        (MEMORY_SERVICE_ID, "mcp") => "/mcp/memory",
         _ => "",
     }
 }
@@ -158,6 +178,8 @@ pub fn package_name(service: &str) -> &'static str {
         WEB_SEARCH_SERVICE_ID => WEB_SEARCH_PACKAGE,
         VISION_SERVICE_ID => VISION_PACKAGE,
         IMAGE_GENERATION_SERVICE_ID => "agent2api-image-generation",
+        // 写进客户端 `mcpServers` 的键。与另外三个服务同构命名，一眼能认出来源。
+        MEMORY_SERVICE_ID => "agent2api-memory",
         _ => "",
     }
 }
@@ -167,6 +189,7 @@ pub fn version(service: &str) -> &'static str {
         WEB_SEARCH_SERVICE_ID => WEB_SEARCH_VERSION,
         VISION_SERVICE_ID => VISION_VERSION,
         IMAGE_GENERATION_SERVICE_ID => IMAGE_GENERATION_VERSION,
+        MEMORY_SERVICE_ID => MEMORY_VERSION,
         _ => "",
     }
 }

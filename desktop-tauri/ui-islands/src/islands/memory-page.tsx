@@ -62,6 +62,8 @@ function MemoryPage(): React.ReactElement {
   const [projects, setProjects] = React.useState<m.MemoryProject[]>([])
   const [core, setCore] = React.useState<{ text: string; tokens: number; truncated: boolean } | null>(null)
   const [draft, setDraft] = React.useState<m.WritePayload | null>(null)
+  // 记忆接入状态（哪些客户端已经配了 agent2api-memory 这条 MCP）
+  const [targets, setTargets] = React.useState<m.InstallTarget[]>([])
 
   const run = React.useCallback(async (task: () => Promise<void>) => {
     setBusy(true)
@@ -104,6 +106,12 @@ function MemoryPage(): React.ReactElement {
       setList(page.items)
       const items = await m.loadProjects()
       setProjects(items.items)
+      // 接入状态单独取：它来自工具服务那套接口，失败不该拖垮整页
+      try {
+        setTargets((await m.loadInstallTargets()).targets)
+      } catch {
+        setTargets([])
+      }
     })
     // 只在首次挂载时拉一次；筛选变化由 refreshList 显式触发
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -128,7 +136,7 @@ function MemoryPage(): React.ReactElement {
       if (next === 'library') await refreshList(false)
       if (next === 'trash') await refreshList(true)
       if (next === 'projects') setProjects((await m.loadProjects()).items)
-      if (next === 'core') setCore(await m.loadCore(undefined, config?.injectTokens))
+      if (next === 'core') setCore(await m.loadCore(undefined, config?.coreMaxTokens))
       if (next === 'settings') await refreshStatus()
     })
   }
@@ -170,7 +178,7 @@ function MemoryPage(): React.ReactElement {
             size='sm'
             variant='ghost'
             onClick={() => void run(async () => {
-              if (tab === 'core') setCore(await m.loadCore(undefined, config?.injectTokens))
+              if (tab === 'core') setCore(await m.loadCore(undefined, config?.coreMaxTokens))
               else if (tab === 'projects') setProjects((await m.loadProjects()).items)
               else await refreshList(tab === 'trash')
             })}
@@ -368,7 +376,7 @@ function MemoryPage(): React.ReactElement {
                 {core ? `${core.tokens} token（估算）${core.truncated ? ' · 已按预算截断' : ''}` : ''}
               </div>
             </div>
-            <Button type='button' size='sm' variant='ghost' onClick={() => void run(async () => setCore(await m.loadCore(undefined, config?.injectTokens)))}>
+            <Button type='button' size='sm' variant='ghost' onClick={() => void run(async () => setCore(await m.loadCore(undefined, config?.coreMaxTokens)))}>
               {t('按当前预算重算')}
             </Button>
           </div>
@@ -379,53 +387,56 @@ function MemoryPage(): React.ReactElement {
       {tab === 'settings' && config ? (
         <div className='mm-settings'>
           <div className='mm-field'>
-            <label>{t('转发时注入记忆')}</label>
-            <Switch checked={config.injectEnabled} onCheckedChange={value => void run(async () => {
-              const saved = await m.saveConfig({ injectEnabled: value })
+            <label>{t('记忆服务开关')}</label>
+            <Switch checked={config.enabled} onCheckedChange={value => void run(async () => {
+              const saved = await m.saveConfig({ enabled: value })
               setConfig(saved.config)
             })} />
-            <p className='mm-hint'>{t('关闭时完全不碰请求体。开启后会改写发给上游的 system 消息，请先用「核心记忆」页确认内容。')}</p>
+            <p className='mm-hint'>{t('关掉后 Agent 的读写类工具一律被拒绝，自检仍可用。用途是临时让 Agent 忘记，不必去每个客户端逐个卸载。')}</p>
           </div>
 
           <div className='mm-field'>
-            <label>{t('注入方式')}</label>
-            <select className='mm-select' value={config.injectMode} onChange={event => void run(async () => {
-              const saved = await m.saveConfig({ injectMode: event.target.value })
-              setConfig(saved.config)
-            })}>
-              <option value='core'>{t('核心记忆（画像 + 项目要点）')}</option>
-              <option value='search'>{t('按本轮输入检索后注入')}</option>
-            </select>
-          </div>
-
-          <div className='mm-field'>
-            <label>{t('注入预算（token）')}</label>
+            <label>{t('核心记忆默认预算（token）')}</label>
             <Input
               type='number'
-              value={String(config.injectTokens)}
+              value={String(config.coreMaxTokens)}
               onChange={event => {
                 const value = Number(event.target.value)
                 if (!Number.isFinite(value)) return
                 void run(async () => {
-                  const saved = await m.saveConfig({ injectTokens: Math.round(value) })
+                  const saved = await m.saveConfig({ coreMaxTokens: Math.round(value) })
                   setConfig(saved.config)
                 })
               }}
             />
-            <p className='mm-hint'>{t('200–4000。超出预算的条目会被整条丢掉，不会截半句。')}</p>
+            <p className='mm-hint'>{t('200–4000。Agent 调用 memory_core 时不传 maxTokens 就用这个值；超出预算的条目整条丢掉，不会截半句。')}</p>
           </div>
 
+          {/* ── 接入方式：不复刻一套安装 UI ──────────────────────
+              记忆中枢是工具服务里的第四个（`SERVICE_IDS` 里登记），
+              「MCP & Skills」页本来就有「选服务 → 选客户端 → 写 mcpServers」
+              的完整流程。这里只指路 —— 再抄一套会立刻和那边漂移。 */}
           <div className='mm-field'>
-            <label>{t('只注入这个项目')}</label>
-            <Input
-              value={config.injectProject ?? ''}
-              placeholder={t('留空 = 全部项目')}
-              onChange={event => setProject(event.target.value)}
-              onBlur={() => void run(async () => {
-                const saved = await m.saveConfig({ injectProject: project.trim() || null })
-                setConfig(saved.config)
-              })}
-            />
+            <label>{t('怎么让 Agent 用上记忆')}</label>
+            <p className='mm-hint'>
+              {t('记忆不做「转发时注入」：网关不知道一条请求属于哪个项目，替客户端塞记忆会跨项目串味。它作为远程 MCP 服务（agent2api-memory）由客户端按需调用 —— 在「MCP & Skills」页选「记忆中枢」，勾选要接入的客户端即可。')}
+            </p>
+            <div className='mm-detail-actions'>
+              <Button type='button' size='sm' onClick={() => {
+                const host = window as unknown as { wbApp?: { showPage?: (page: string) => void } }
+                host.wbApp?.showPage?.('tools')
+              }}>
+                {t('去「MCP & Skills」接入')}
+              </Button>
+            </div>
+            <div className='mm-status-grid'>
+              <span>{t('已接入客户端')}</span>
+              <code>
+                {targets.filter(target => target.installed).length
+                  ? targets.filter(target => target.installed).map(target => target.label).join('、')
+                  : t('尚未接入任何客户端 —— 未接入时 Agent 完全看不到记忆')}
+              </code>
+            </div>
           </div>
 
           <div className='mm-status'>

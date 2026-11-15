@@ -61,13 +61,10 @@ export type MemoryProject = {
 export type MemoryKindOption = { value: string; label: string }
 
 export type MemoryConfig = {
+  /** 记忆服务总开关。关掉后读写类工具一律拒绝（自检仍可用）。 */
   enabled: boolean
-  injectEnabled: boolean
-  injectMode: string
-  injectTokens: number
-  injectProject: string | null
-  injectLimit: number
-  injectMinChars: number
+  /** `memory_core` 的默认 token 预算 */
+  coreMaxTokens: number
 }
 
 export type MemoryStatus = {
@@ -186,4 +183,26 @@ export function purgeEntry(id: string): Promise<{ id: string }> {
 
 export function rebuildIndex(): Promise<{ rebuilt: number; status: MemoryStatus }> {
   return api('POST', '/api/memory/rebuild')
+}
+
+/** 「MCP & Skills」页里那个接入目标的形状（记忆只展示、不在这里改） */
+export type InstallTarget = {
+  key: string
+  label: string
+  path?: string
+  detected?: boolean
+  installed: boolean
+  supported: boolean
+  note?: string | null
+}
+
+/**
+ * 查「记忆已接入哪些客户端」。
+ *
+ * 复用工具服务那套 `/api/tools/install-targets`（记忆在 `SERVICE_IDS` 里是
+ * 第四个服务）：安装/卸载的完整流程在「MCP & Skills」页，这里只读状态 ——
+ * 否则记忆页会在没有任何人操作时静默变成「装了但不知道有没有接上」。
+ */
+export function loadInstallTargets(): Promise<{ targets: InstallTarget[] }> {
+  return api('GET', '/api/tools/install-targets?service=memory&protocol=mcp')
 }

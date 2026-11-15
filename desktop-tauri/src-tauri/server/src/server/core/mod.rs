@@ -103,11 +103,12 @@ pub mod legacy_api_key;
 pub mod limiter;
 pub mod login;
 pub mod maintenance;
-/// 记忆中枢：长期记忆的 MD 事实源 + 派生索引 + 转发前注入。
+/// 记忆中枢：长期记忆的 MD 事实源 + 派生索引 + MCP 工具面。
 ///
-/// 与 `prompt` 的分工：`prompt` 决定「system 用哪一份」（透传/替换/追加），
-/// `memory` 只在**最终形态确定之后**往里追加一段记忆，不改变模式语义。
-/// 见 `memory::inject` 模块头（为什么挂在提示词层之后、脱敏层之前）。
+/// 与转发链路**无关**：记忆不参与拼请求体（早期那版"转发前注入"已删除，
+/// 理由见 `tool_services::memory_mcp` 的模块头 —— 网关不知道请求属于哪个
+/// 项目，替客户端塞必然跨项目串味）。对外只暴露 `/mcp/memory` 的 11 个工具，
+/// 由客户端按需调用。
 pub mod memory;
 pub mod model_meta;
 pub mod model_rules;

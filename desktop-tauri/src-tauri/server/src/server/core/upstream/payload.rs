@@ -265,37 +265,19 @@ pub(super) async fn send_body<'a>(
         }
         None => role_base,
     };
-    // ── ①.5 记忆注入层（记忆中枢）────────────────────────────────────
-    // 位置不是随手挑的，两头都有理由：
-    //   · 在 ① **之后** —— `custom` / `fujiang` 会把 system 整段替换掉，
-    //     先注入等于白写。注入必须落在「system 最终形态」之上。
-    //   · 在 ② **之前** —— 注入的文本也要过一遍指纹脱敏，与「网关自有提示词
-    //     也要过脱敏」是同一条理由：刚写进去的那段没人再过一遍就会漏网。
-    // 默认关闭（`memory::config().inject_enabled`）；关闭时下面这次判断是
-    // 一次内存里的缓存读，不进文件系统，也不克隆请求体。
-    let after_memory = if !ctx.preserve_system_prompt
-        && crate::server::core::memory::config().inject_enabled
-    {
-        match crate::server::core::memory::inject::apply(after_prompt.as_ref()) {
-            Some(next) => Cow::Owned(next),
-            None => after_prompt,
-        }
-    } else {
-        after_prompt
-    };
     // ── ② 指纹脱敏层（核心规则见 `core::sanitize`）─────────────────────
     let body = if ctx.sanitize.applies_to(provider_id) {
-        match crate::server::core::sanitize::sanitize_body(after_memory.as_ref(), &ctx.sanitize.rules) {
+        match crate::server::core::sanitize::sanitize_body(after_prompt.as_ref(), &ctx.sanitize.rules) {
             Some((scrubbed, hits)) => {
                 if !hits.is_empty() {
                     ctx.telemetry.note_sensitive_hits(&hits);
                 }
                 Cow::Owned(scrubbed)
             }
-            None => after_memory,
+            None => after_prompt,
         }
     } else {
-        after_memory
+        after_prompt
     };
     // ── ③ 会话图片压缩层（仅对话链路）─────────────────────────────────
     // 把内嵌 base64 大图缩到长边上限并重编码（参数与开关见

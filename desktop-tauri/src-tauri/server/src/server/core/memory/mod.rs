@@ -19,7 +19,6 @@
 //! · 不做 WebDAV 同步与外部记忆源导入。
 
 pub mod index;
-pub mod inject;
 pub mod model;
 pub mod search;
 pub mod store;
@@ -35,53 +34,36 @@ pub use search::Query;
 
 /// 模块设置。落 `{config_dir}/memory/config.json`（与记忆文件同根，
 /// 一起备份、一起搬走）。
+///
+/// ── 为什么只剩两项 ─────────────────────────────────────────
+/// 早期版本还有 `injectEnabled / injectMode / injectTokens / injectProject /
+/// injectLimit / injectMinChars` 六项 —— 那是「网关转发时改写 system」路线
+/// 的配置。那条路线已删除（层次错位：网关不知道请求属于哪个项目，详见
+/// `tool_services::memory_mcp` 的模块头）。现在记忆只通过 MCP 工具暴露，
+/// **由客户端决定何时读取**，网关不再有「注不注入、注入多少」这种旋钮。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct MemoryConfig {
-    /// 模块总开关。关闭时页面仍可浏览，但转发链路一律不注入。
+    /// 记忆服务总开关。关掉后读写类工具一律拒绝（`memory_status` 仍可用，
+    /// 否则关了之后连「为什么没记忆」都查不了）。用途是临时让 Agent 忘记，
+    /// 不必去每个客户端里逐个卸载。
     pub enabled: bool,
-    /// 是否在转发前注入记忆
-    pub inject_enabled: bool,
-    /// `core`（画像+项目要点）或 `search`（按本轮用户输入检索后注入）
-    pub inject_mode: String,
-    /// 注入预算（token 估算）
-    pub inject_tokens: usize,
-    /// 只在指定项目内注入（空 = 全部）
-    pub inject_project: Option<String>,
-    /// 每轮注入更少但更准：`search` 模式下取前 N 条
-    pub inject_limit: usize,
-    /// `search` 模式至少多长的用户输入才触发检索（太短的「继续」不值得搜）
-    pub inject_min_chars: usize,
+    /// `memory_core` 的默认 token 预算（工具参数可逐个覆盖）
+    pub core_max_tokens: usize,
 }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
         MemoryConfig {
             enabled: true,
-            // 默认**不注入**：注入会改写到上游的请求体，属于「会改变既有行为」
-            // 的能力，必须由用户显式打开（与「提示词层」默认 passthrough 同一取向）。
-            inject_enabled: false,
-            inject_mode: "core".to_string(),
-            inject_tokens: 800,
-            inject_project: None,
-            inject_limit: 6,
-            inject_min_chars: 4,
+            core_max_tokens: 800,
         }
     }
 }
 
 impl MemoryConfig {
     fn sanitized(mut self) -> Self {
-        if !matches!(self.inject_mode.as_str(), "core" | "search") {
-            self.inject_mode = "core".to_string();
-        }
-        self.inject_tokens = self.inject_tokens.clamp(200, 4000);
-        self.inject_limit = self.inject_limit.clamp(1, 20);
-        self.inject_min_chars = self.inject_min_chars.clamp(0, 200);
-        self.inject_project = self
-            .inject_project
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        self.core_max_tokens = self.core_max_tokens.clamp(200, 4000);
         self
     }
 }
@@ -325,6 +307,37 @@ pub fn timeline(id: &str) -> Value {
 }
 
 /// 项目列表（带条数与最近更新）
+/// 最近 N 天更新过的记忆（`memory_recent` 工具用）。
+///
+/// 走索引而不是扫文件：这里要的是「时间段 + 排序」，索引本来就按 `updated_at`
+/// 建了索引列；扫文件要全量解析 frontmatter，只为丢掉大部分行。
+pub fn recent(project: Option<&str>, agent: Option<&str>, days: usize) -> Value {
+    ensure_index_once();
+    let now = crate::server::logging::now_ms();
+    let days = days.clamp(1, 3650) as i64;
+    let since = now - days * 24 * 3600 * 1000;
+    let query = Query {
+        project: project.map(str::to_string),
+        agent: agent.map(str::to_string),
+        limit: 200,
+        ..Default::default()
+    };
+    let page = list(&query);
+    let items: Vec<Value> = page
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("updatedAt").and_then(Value::as_i64).unwrap_or(0) >= since)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let count = items.len();
+    json!({ "days": days, "count": count, "items": items })
+}
+
 pub fn projects() -> Value {
     ensure_index_once();
     let all = store::load_all();
@@ -398,6 +411,8 @@ pub fn status() -> Value {
         "projects": projects().get("items").map(|items| items.as_array().map(Vec::len).unwrap_or(0)).unwrap_or(0),
         "index": { "count": index_count, "fts": index::global().fts_enabled(), "inSync": index_count == live },
         "config": config(),
+        // 内容版本号：每次写入 +1。排障时用来判断「Agent 看到的是不是最新」。
+        "revision": revision(),
     })
 }
 
@@ -684,7 +699,7 @@ mod tests {
 
     #[test]
     fn config_patch_only_touches_given_keys() {
-        let patch = json!({ "injectEnabled": true, "injectTokens": 640, "无关键": 1 });
+        let patch = json!({ "coreMaxTokens": 640, "无关键": 1 });
         let mut current = serde_json::to_value(MemoryConfig::default()).unwrap();
         for (key, value) in patch.as_object().unwrap() {
             if current.get(key).is_some() {
@@ -692,10 +707,24 @@ mod tests {
             }
         }
         let next: MemoryConfig = serde_json::from_value(current).unwrap();
-        assert!(next.inject_enabled);
-        assert_eq!(next.inject_tokens, 640);
+        assert_eq!(next.core_max_tokens, 640);
         // 未传的键保持默认
-        assert_eq!(next.inject_mode, "core");
+        assert!(next.enabled);
+    }
+
+    /// 旧的 `inject*` 配置留在磁盘上时不能把整份配置读崩（升级路径）。
+    #[test]
+    fn legacy_inject_keys_are_ignored() {
+        let legacy = json!({
+            "enabled": true,
+            "injectEnabled": true,
+            "injectMode": "search",
+            "injectTokens": 1200,
+            "coreMaxTokens": 500
+        });
+        let config: MemoryConfig = serde_json::from_value(legacy).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.core_max_tokens, 500);
     }
 
     #[test]
