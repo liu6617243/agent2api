@@ -308,10 +308,15 @@ impl MemoryEntry {
         let mut entry = MemoryEntry {
             id: get("id").filter(|v| !v.is_empty()).unwrap_or_else(|| fallback_id.to_string()),
             title: get("title").filter(|v| !v.is_empty()).unwrap_or_else(|| {
+                // 没有 frontmatter 的手写 .md：第一行往往是 `# 标题`，那它就是标题。
+                // 早先这里跳过了以 `#` 开头的行（照抄 `summary` 的口径），结果
+                // 「# 标题 / 空行 / 正文」的文件标题变成正文第一段 —— 标题与正文
+                // 是两件事，摘要跳过标题是对的，标题不能跳过自己。
                 body.lines()
                     .map(str::trim)
-                    .find(|line| !line.is_empty() && !line.starts_with('#'))
-                    .map(|line| truncate_chars(line, 60))
+                    .find(|line| !line.is_empty())
+                    .map(|line| truncate_chars(line.trim_start_matches('#').trim(), 60))
+                    .filter(|line| !line.is_empty())
                     .unwrap_or_else(|| "未命名记忆".to_string())
             }),
             kind,

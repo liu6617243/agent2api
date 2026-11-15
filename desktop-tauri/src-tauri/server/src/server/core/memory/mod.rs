@@ -424,14 +424,25 @@ pub struct WriteInput {
 ///
 /// 为什么不用递增序号：记忆要能跟着仓库走、能在两台机器之间合并，序号必然撞。
 /// 时间 + 内容哈希既人类可读，又不需要协调。
+///
+/// ── 为什么还要掺一个进程内的自增序号 ────────────────────────
+/// 只用「毫秒时间 + 内容哈希」时，**同一毫秒内两次写入相同内容**会得到同一个
+/// id，而 id 就是文件名 —— 第二次 `save` 会把第一条整个覆盖掉，是静默的数据
+/// 丢失（CI 的 `id_is_time_prefixed_and_unique` 用两条相同内容把它逼出来过）。
+/// 掺一个自增序数就把「同毫秒 + 同内容」拆开了，而时间与内容仍是主成分，
+/// id 依旧人类可读。
 fn make_id(content: &str) -> String {
     use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let now = crate::server::logging::now_ms();
     let date = search::format_date(now).replace('-', "");
     let minutes = (now / 60_000).rem_euclid(24 * 60);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     content.hash(&mut hasher);
     now.hash(&mut hasher);
+    sequence.hash(&mut hasher);
     let digest = format!("{:06x}", hasher.finish() & 0xff_ffff);
     format!("{date}-{:02}{:02}-{digest}", minutes / 60, minutes % 60)
 }
