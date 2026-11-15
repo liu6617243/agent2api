@@ -78,13 +78,13 @@ pub fn supports_credit_expiry(provider: &str) -> bool {
 /// 锁只在这一层持有：调用方拿到快照后随意遍历，不在持锁期间做排序。账号
 /// 规模是几十量级，整表克隆（值都是 `Option<i64>`）比逐账号取锁更划算。
 pub fn credit_expiries_at(now: i64) -> HashMap<String, Option<i64>> {
-    let Ok(facts) = credit_slot().lock() else {
+    let Ok(facts) = usage_slot().lock() else {
         return HashMap::new();
     };
     facts
         .iter()
-        .map(|(id, expiries)| {
-            let soonest = expiries.iter().copied().find(|expiry| *expiry > now);
+        .map(|(id, facts)| {
+            let soonest = facts.credit_expiries.iter().copied().find(|expiry| *expiry > now);
             (id.clone(), soonest)
         })
         .collect()

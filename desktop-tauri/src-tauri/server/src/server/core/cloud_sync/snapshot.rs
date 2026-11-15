@@ -575,8 +575,8 @@ mod tests {
         later.exported_at = 9_999_999;
 
         assert_eq!(
-            first.content_hash(),
-            later.content_hash(),
+            first.content_hash(None),
+            later.content_hash(None),
             "仅导出的时间戳不同，内容哈希必须相等（否则自动同步会无限重传）"
         );
     }
@@ -594,6 +594,6 @@ mod tests {
         };
         let mut changed = base.clone();
         changed.kv.insert("locale".to_string(), "\"zh-CN\"".to_string());
-        assert_ne!(base.content_hash(), changed.content_hash());
+        assert_ne!(base.content_hash(None), changed.content_hash(None));
     }
 }

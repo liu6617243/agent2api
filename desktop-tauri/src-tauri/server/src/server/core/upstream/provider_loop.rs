@@ -1025,6 +1025,9 @@ Err(mut error) => {
                             slot,
                             connections,
                             degraded,
+                            // 与 879 行正常路径同一份预算：整份请求共用，
+                            // 「原地重发还剩几次」不因这次补救而重置。
+                            &mut budget,
                         )
                         .await
                         {
