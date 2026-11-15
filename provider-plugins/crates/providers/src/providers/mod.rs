@@ -67,6 +67,8 @@ pub mod astudio;
 // 本地新增（非上游）：MiniMax 国内站（账号 / 登录续期 / 签到 / 余额 / 转发）
 #[cfg(feature = "minimax")]
 pub mod minimax;
+#[cfg(feature = "quwork")]
+pub mod quwork;
 
 use agent2api_provider_sdk::BoxProvider;
 
@@ -192,6 +194,8 @@ pub fn registry() -> Vec<BoxProvider> {
     // 本地新增（非上游）
     #[cfg(feature = "minimax")]
     list.push(Box::new(minimax::MiniMaxProvider));
+    #[cfg(feature = "quwork")]
+    list.push(Box::new(quwork::QuWorkProvider));
 
     list
 }

@@ -18,7 +18,7 @@ path = "src/main.rs"
 # 只控制「编不编进二进制」，不改变任何行为。
 [features]
 default = ["all"]
-all = ["demo", "commandcode", "modelscope", "orcaterm", "loomy", "lobsterai", "raccoon", "atomcode", "autoclaw", "officeace", "zcode", "workbuddy", "cline", "kuku", "monkeycode", "qoder", "qwenwork", "trae", "catpaw", "accio", "codearts", "antigravity", "doubaowork", "kiro", "astudio", "minimax"]
+all = ["demo", "commandcode", "modelscope", "orcaterm", "loomy", "lobsterai", "raccoon", "atomcode", "autoclaw", "officeace", "zcode", "workbuddy", "cline", "kuku", "monkeycode", "qoder", "qwenwork", "trae", "catpaw", "accio", "codearts", "antigravity", "doubaowork", "kiro", "astudio", "quwork", "minimax"]
 demo = []
 commandcode = []
 modelscope = []
@@ -44,6 +44,9 @@ antigravity = []
 doubaowork = []
 kiro = []
 astudio = []
+quwork = []
+# minimax 是本 fork 新增的国内站 provider（上游 v3.5.0-beta.1 里还没有），
+# 重放时这条 feature 与 `all` 名单里的 "minimax" 都不能丢。
 minimax = []
 
 [build-dependencies]

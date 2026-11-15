@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 use super::PROVIDER_ID;
 use crate::errors::GatewayError;
+use crate::http::AccountRequest;
 
 pub const BASE_URL: &str = "https://www.doubao.com";
 /// 官方客户端（豆包 PC，Chromium 内核）的 UA 形态。抓包（2026-11-08，
@@ -51,9 +52,7 @@ pub fn client(
 ) -> Result<reqwest::Client, GatewayError> {
     type Key = (String, Option<crate::timeouts::Timeouts>);
     static CLIENTS: OnceLock<Mutex<HashMap<Key, reqwest::Client>>> = OnceLock::new();
-    let proxy = proxy
-        .map(proto::WireProxy::to_url)
-        .unwrap_or_else(|| gateway_proxy.trim().to_string());
+    let proxy = crate::http::proxy_url(proxy, gateway_proxy);
     let timeouts = stream.then(crate::timeouts::current);
     let key = (proxy.clone(), timeouts);
     let clients = CLIENTS.get_or_init(Mutex::default);
@@ -507,7 +506,7 @@ pub async fn json_response(
     ug: bool,
 ) -> Result<Value, GatewayError> {
     let mut response = builder
-        .send()
+        .with_account_user_agent().send()
         .await
         .map_err(|error| GatewayError::with_status(502, crate::http::describe(&error)))?;
     // 官方每个响应都经 `x-ms-token` 响应头下发下一颗令牌（抓包 2026-11-08

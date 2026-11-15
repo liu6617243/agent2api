@@ -7,6 +7,8 @@
 
 mod account_view;
 pub mod balance;
+mod client_identity;
+mod conversation;
 pub mod credentials;
 mod desktop;
 mod fallback;
@@ -222,18 +224,14 @@ impl Provider for RaccoonProvider {
             }
             let mut headers: Vec<(String, String)> = vec![
                 ("Content-Type".to_string(), "application/json".to_string()),
-                // 源实现给的是 `Accept: */*`（LLM 网关两种响应形态都可能回）
-                ("Accept".to_string(), "*/*".to_string()),
+                ("Accept".to_string(), "application/json".to_string()),
                 ("Authorization".to_string(), format!("Bearer {token}")),
             ];
             headers::append_org(&mut headers, &org_code)?;
-            // 对话链路与 onboarding / balance / iam 带同一套桌面端身份头：
-            // 少了它们，上游看到的就是一个只会发 Bearer 的裸 API 客户端
-            headers.extend(headers::desktop_client_headers());
-            // 官方客户端每条请求都带新的 X-Request-Id（relay_js_<ms>_<hex>）
-            headers.push(("X-Request-Id".to_string(), headers::request_id()));
+            headers.extend(client_identity::headers());
+            headers.extend(conversation::headers(&req, &token, &org_code));
             headers::append_external(&mut headers);
-            // 本地补丁：并发准入档位（见上方 first_user_text 段落注释）
+// 本地补丁：并发准入档位（见上方 first_user_text 段落注释）
             headers.push((
                 "X-RACCOON-Session-ID".to_string(),
                 session_id_for(&req.account, &req.body),
@@ -241,12 +239,24 @@ impl Provider for RaccoonProvider {
             headers.push(("X-RACCOON-Turn-ID".to_string(), crate::ids::uuid_v4()));
             headers.push(("X-RACCOON-Title".to_string(), header_title(&req.body)));
             headers.push(("X-RACCOON-Call-Kind".to_string(), "main".to_string()));
+            let mut body = reasoning::normalize(&req.body, &req.wire_model)?;
+            if req.stream {
+                body["stream"] = json!(true);
+                if !body.get("stream_options").is_some_and(Value::is_object) {
+                    body["stream_options"] = json!({});
+                }
+                body["stream_options"]["include_usage"] = json!(true);
+            }
             Ok(ChatPlan::chat(
                 format!("{}/chat/completions", llm_base_url()),
                 headers,
-                reasoning::normalize(&req.body, &req.wire_model),
+                body,
             ))
         })
+    }
+
+    fn chat_policy(&self, _body: &Value) -> Value {
+        json!({ "respectModelCooldown": true })
     }
 
     fn supports_image_generation(&self) -> bool {
