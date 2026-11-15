@@ -28,8 +28,15 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use model::{truncate_chars, MemoryEntry, MemoryKind};
+use model::{truncate_chars, MemoryEntry};
 
+/// 对外暴露的两个核心类型。
+///
+/// `MemoryKind` 必须从这里出：`tool_services::memory_mcp` 要用它校验 `type`
+/// 参数。`model` 本身是 `pub mod`，但让调用方写 `memory::model::MemoryKind`
+/// 等于把内部文件布局变成对外契约 —— 改一次 model 的分文件就波及调用方。
+/// re-export 一次之后，调用方只认 `memory::MemoryKind`。
+pub use model::MemoryKind;
 pub use search::Query;
 
 /// 模块设置。落 `{config_dir}/memory/config.json`（与记忆文件同根，
