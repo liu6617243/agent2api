@@ -66,6 +66,8 @@ const EXCLUDED_CONFIG_KEYS: &[&str] = &[
     "kernelDir",
     // 另一把密钥（update-token.key）加密，带过去解不开
     "githubToken",
+    // 登录校验绑定本机域名及独立密钥，不随账号同步切换。
+    crate::server::config::captcha::KEY_PANEL_CAPTCHA,
     // 代理内核的下载出网线路：绑本机网络环境
     "kernelProxy",
     crate::server::config::KEY_INSTALLED_UPDATE_VERSION,
@@ -118,28 +120,15 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
-    /// 内容哈希：用于「本地内容没变就不上传」与 manifest 的 snapshotId。
+/// 业务去重不使用文件字节校验；原始密文和观测时间仍照常导出。
     ///
-    /// 直接哈希**序列化后的字节**：两次构建的字段顺序由 `BTreeMap` 与
-    /// `serde_json` 的结构化序列化保证稳定，不必自己做规范化。
-    ///
-    /// ── 为什么必须把 `exported_at` 抹掉再哈希 ──────────────────────
-    /// 这个哈希的唯一用途是回答「本地业务内容变了没有」（见
-    /// `auto_sync::run_once` 的 `unchanged` 判断）。而 `exported_at` 是
-    /// **每次构建都取当前时间**的元数据，跟内容无关 —— 若把它一起哈希，
-    /// 两次构建的哈希必然不同，`unchanged` 永远为 `false`，于是**每一个
-    /// 自动同步信号都会重传整份快照**（值几 MB），把云盘的上传配额烧光。
-    ///
-    /// 实测代价：坚果云免费账号上传速率被 `TrafficRateExhausted` 拒绝后，
-    /// PUT 一律 403，同步彻底停摆。所以这里只哈希「内容」：把时间戳归零，
-    /// 其余字段（tables / kv / format / version / schemaVersion）照常参与。
-    pub(crate) fn content_hash(&self) -> String {
-        let mut normalized = self.clone();
-        normalized.exported_at = 0;
-        match serde_json::to_vec(&normalized) {
-            Ok(bytes) => super::sha256_hex(&bytes),
-            Err(_) => String::new(),
-        }
+    /// 取上游 v3.5.0-beta.1 的 `fingerprint::content_hash` 替代本地旧实现：
+    /// 上游按**字段级**哈希（表名/行/列逐个入摘要，行哈希排序后归一），
+    /// `exported_at` 根本不进摘要 —— 本地那版「构建完把 exported_at 归零
+    /// 再整体序列化」的做法等价但更脆（依赖 serde 字段顺序稳定），且没有
+    /// 可选的 HMAC 密钥。行为目标一致：内容没变 → 哈希不变 → 不重传。
+    pub(crate) fn content_hash(&self, key: Option<&[u8; 32]>) -> Result<String, String> {
+        super::fingerprint::content_hash(self, key)
     }
 
     /// 行数摘要（界面展示「这份快照里有多少数据」）
@@ -155,12 +144,15 @@ impl Snapshot {
 
 /// 构建本机业务快照。
 ///
-/// 单连接锁内完成全部读：账号、用量、签到三张表与 kv 之间没有跨表一致性要求
-/// （它们不是同一个事务里写的），但**同一个快照里**的账号与配置应当尽量来自
-/// 相近的时刻 —— 一次持锁读完全部是最省事也最接近的做法。
+/// 单连接锁和只读事务固定同一份数据库视图，避免其它连接写入时跨表读到不同时刻。
 pub(crate) fn build(db: &Db) -> Result<Snapshot, String> {
     let exported_at = logging::now_ms();
-    db.with(|conn| build_conn(conn, exported_at))
+    db.with_mut(|conn| {
+        let tx = conn.transaction().map_err(|error| format!("开启同步快照事务失败: {error}"))?;
+        let snapshot = build_conn(&tx, exported_at)?;
+        tx.commit().map_err(|error| format!("结束同步快照事务失败: {error}"))?;
+        Ok(snapshot)
+    })
         .ok_or_else(|| "数据库连接不可用，无法生成同步快照".to_string())?
 }
 
@@ -289,7 +281,11 @@ fn base64_encode(bytes: &[u8]) -> String {
 /// ── 只删同步范围内的 kv ─────────────────────────────────────
 /// 若 `DELETE FROM kv` 全删，本机的面板登录态、桌面设置、任务排期会一起消失 ——
 /// 用户下载一次云同步就被踢出登录。所以 kv 只删 `is_synced_kv_key` 命中的键。
-pub(crate) fn apply(db: &Db, snapshot: &Snapshot) -> Result<Value, String> {
+pub(crate) fn apply(
+    db: &Db,
+    snapshot: &Snapshot,
+    key: Option<&[u8; 32]>,
+) -> Result<(Value, String), String> {
     if snapshot.format != SNAPSHOT_FORMAT {
         return Err(format!(
             "远端快照格式不兼容（format = {}）",
@@ -311,7 +307,7 @@ pub(crate) fn apply(db: &Db, snapshot: &Snapshot) -> Result<Value, String> {
 
     let applied = db.with_mut(|conn| {
         db.invalidate_accounts();
-        let applied = apply_conn(conn, snapshot);
+        let applied = apply_conn(conn, snapshot, key);
         db.invalidate_accounts();
         applied
     })
@@ -320,7 +316,11 @@ pub(crate) fn apply(db: &Db, snapshot: &Snapshot) -> Result<Value, String> {
     applied
 }
 
-fn apply_conn(conn: &mut Connection, snapshot: &Snapshot) -> Result<Value, String> {
+fn apply_conn(
+    conn: &mut Connection,
+    snapshot: &Snapshot,
+    key: Option<&[u8; 32]>,
+) -> Result<(Value, String), String> {
     let tx = conn
         .transaction()
         .map_err(|error| format!("开启同步应用事务失败: {error}"))?;
@@ -380,9 +380,11 @@ fn apply_conn(conn: &mut Connection, snapshot: &Snapshot) -> Result<Value, Strin
     }
     applied.insert("kv".to_string(), json!(snapshot.kv.len()));
 
+    // 在同一事务中读取实际恢复结果，避免把恢复后并发写入误记成已同步。
+    let content_hash = build_conn(&tx, snapshot.exported_at)?.content_hash(key)?;
     tx.commit()
         .map_err(|error| format!("提交同步应用事务失败: {error}"))?;
-    Ok(Value::Object(applied))
+    Ok((Value::Object(applied), content_hash))
 }
 
 fn insert_row(
@@ -548,7 +550,8 @@ mod tests {
             kv: BTreeMap::new(),
         };
         let (db, _guard) = crate::server::db::test_temp::TempDb::open("cloud-sync-newer-schema");
-        assert!(apply(&db, &snapshot).is_err());
+        assert!(apply(&db, &snapshot, None).is_err());
+        drop(db);
     }
 
     /// 关键回归：`exported_at` 不同但内容相同的两份快照，哈希必须一致。
