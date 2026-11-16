@@ -598,19 +598,25 @@ fn merge(current: Value, knob: &Knob, incoming: Value) -> Result<Value, String> 
 }
 
 fn deep_merge(base: Value, over: Value) -> Value {
-    let (Value::Object(mut base_map), Value::Object(over_map)) = (base, over) else {
-        return over;
-    };
-    for (key, value) in over_map {
-        // `remove` 而不是 `get().cloned()`：递归时要那层的所有权，克隆一份
-        // 再丢掉原值等于每层多一次深拷贝，任务表嵌三层时是可见的开销
-        let merged = match base_map.remove(&key) {
-            Some(Value::Object(inner)) if value.is_object() => deep_merge(Value::Object(inner), value),
-            _ => value,
-        };
-        base_map.insert(key, merged);
+    // 用 match 而不是 let-else：let-else 会把被匹配的值移走，else 分支里
+    // 就再也拿不到 `over`（而「类型不是对象就整体覆盖」正是这里要的语义）
+    match (base, over) {
+        (Value::Object(mut base_map), Value::Object(over_map)) => {
+            for (key, value) in over_map {
+                // `remove` 而不是 `get().cloned()`：递归时要那层的所有权，克隆一份
+                // 再丢掉原值等于每层多一次深拷贝，任务表嵌三层时是可见的开销
+                let merged = match base_map.remove(&key) {
+                    Some(Value::Object(inner)) if value.is_object() => {
+                        deep_merge(Value::Object(inner), value)
+                    }
+                    _ => value,
+                };
+                base_map.insert(key, merged);
+            }
+            Value::Object(base_map)
+        }
+        (_, over) => over,
     }
-    Value::Object(base_map)
 }
 
 /// 整份替换（导入配置用）。`enabled` 缺省为 true。

@@ -23,7 +23,7 @@ use std::sync::OnceLock;
 use serde_json::{json, Value};
 
 use super::config;
-use super::model::Layer;
+use super::model::{l2_dir_for, Layer};
 use super::store::{self, GLOBAL_SLUG};
 
 /// 已知托管站：slug 省掉 host（`owner--repo` 已足够唯一）。

@@ -25,7 +25,7 @@
 use serde_json::{json, Value};
 
 use super::mcp::McpSpec;
-use crate::server::core::memory::{self, MemoryKind, Query as MemoryQuery};
+use crate::server::core::memory::{self, MemoryKind, MemoryQuery};
 
 /// 给模型的固定行为约定（`initialize.instructions`）。
 ///

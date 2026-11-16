@@ -46,7 +46,7 @@ use axum::extract::{Query, State};
 use axum::response::Response;
 use serde_json::{json, Value};
 
-use crate::server::core::memory::{self, config as memory_config, MemoryKind, Query as MemoryQuery};
+use crate::server::core::memory::{self, config as memory_config, MemoryKind, MemoryQuery};
 use crate::server::errors;
 use crate::server::http::{ok_json, parse_body};
 use crate::server::ServerState;

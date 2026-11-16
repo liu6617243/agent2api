@@ -455,11 +455,16 @@ impl MemoryIndex {
                 Ok(statement) => statement,
                 Err(_) => continue,
             };
-            if let Ok(rows) = statement.query_map(params![seed], |row| row.get::<_, String>(0)) {
-                for id in rows.flatten() {
-                    if !out.iter().any(|seen| seen == &id) {
-                        out.push(id);
-                    }
+            // 先收成 Vec 再用：`rows` 借用 `statement`，如果借用活到 if-let 的
+            // 块尾，`statement` 会先被析构（borrow checker 报错 E0597）。
+            // 收集一次反而更便宜：这段本来就要遍历全部邻居。
+            let ids: Vec<String> = match statement.query_map(params![seed], |row| row.get::<_, String>(0)) {
+                Ok(rows) => rows.flatten().collect(),
+                Err(_) => Vec::new(),
+            };
+            for id in ids {
+                if !out.iter().any(|seen| seen == &id) {
+                    out.push(id);
                 }
             }
         }
@@ -481,11 +486,15 @@ impl MemoryIndex {
                     Ok(statement) => statement,
                     Err(_) => continue,
                 };
-                if let Ok(rows) = statement.query_map(params![seed], |row| row.get::<_, String>(0)) {
-                    for id in rows.flatten() {
-                        if !out.iter().any(|seen| seen == &id) && !next.iter().any(|seen| seen == &id) {
-                            next.push(id);
-                        }
+                // 同上：先收集再遍历，避免借用活得比 statement 久
+                let ids: Vec<String> =
+                    match statement.query_map(params![seed], |row| row.get::<_, String>(0)) {
+                        Ok(rows) => rows.flatten().collect(),
+                        Err(_) => Vec::new(),
+                    };
+                for id in ids {
+                    if !out.iter().any(|seen| seen == &id) && !next.iter().any(|seen| seen == &id) {
+                        next.push(id);
                     }
                 }
             }

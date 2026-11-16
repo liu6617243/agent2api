@@ -188,7 +188,7 @@ fn score_and_sort(rows: &mut [IndexRow], query: &Query) {
             (0.5f64).powf(age_days / half_life_days)
         };
         let affinity = {
-            let mut score = 0.0;
+            let mut score: f64 = 0.0;
             if let (Some(want), Some(project)) = (&current_project, &row.project) {
                 if super::store::slugify(project) == *want {
                     score += 0.7;
