@@ -1,9 +1,19 @@
 import * as React from 'react'
 import { mountOnPage } from '../island-lazy'
 import { createRoot } from 'react-dom/client'
-import { Badge, Button, Input, Spinner, Switch, Textarea } from '@ui'
+import { Badge, Button, SegmentedControl, Spinner } from '@ui'
 import { t } from '../i18n'
 import * as m from './memory-api'
+import { Dashboard } from './memory-tab-dashboard'
+import { Browse } from './memory-tab-browse'
+import { Projects } from './memory-tab-projects'
+import { Profile } from './memory-tab-profile'
+import { Agents } from './memory-tab-agents'
+import { Auto } from './memory-tab-auto'
+import { Import } from './memory-tab-import'
+import { Sync } from './memory-tab-sync'
+import { Index } from './memory-tab-index'
+import { Settings } from './memory-tab-settings'
 
 /**
  * Agent2API · 记忆中枢（页面岛）。
@@ -11,514 +21,207 @@ import * as m from './memory-api'
  * ── 为什么在网关里，而不是插件里 ────────────────────────────
  * 与签到中心同一决定、同一理由（见 `checkin-page.tsx` 的模块头）：插件只能出
  * 静态 HTML、跑在 iframe 里，读不到宿主的 CSS 变量、拿不到组件库实例；
- * 而「记忆」的后端（存储 + 检索 + 注入）本来就只能由网关提供 —— 插件连端点
- * 都加不了。所以页面归网关，插件不参与本功能。
+ * 而「记忆」的后端（存储 + 检索 + MCP 工具）本来就只能由网关提供 —— 插件连
+ * 端点都加不了。所以页面归网关，插件不参与本功能。
  *
- * ── 五个视图为什么是「同级平铺」而不是设置里的子页 ──────────
- * 记忆的日常动作有三种：找一条（记忆库）、看有哪些项目（项目）、看模型会收到
- * 什么（核心记忆）。三者地位相同、都要一眼可达，藏进设置里的二级页会让人
- * 忘了它的存在。回收站与设置是低频项，排在后面。
+ * ── 为什么是十个页签 ────────────────────────────────────────
+ * 对齐 AgentHub 的记忆中枢之后，这一页承载的不再只是「看记忆」：
  *
- * ── 为什么「核心记忆」要给用户看原文 ────────────────────────
- * 注入开关打开之后会改写发给上游的请求体。用户必须能直接看到「模型到底收到
- * 了哪几行」——否则开关等于盲开，出了问题也没法判断是记忆写坏了还是注入拼
- * 坏了。这一页就是那个「所见即所发」的窗口。
+ *   dashboard 仪表盘  —— 现在什么状态、有什么要处理
+ *   browse    浏览    —— 找一条、改一条、裁决待确认
+ *   projects  项目    —— 按仓库归档、改名、合并
+ *   profile   画像    —— 关于「我」的长期事实，每条带证据
+ *   agents    接入    —— 11 个客户端装没装、真的调过没
+ *   auto      自动化  —— 12 个后台任务的节奏与消耗
+ *   import    导入    —— 把别处的历史会话搬进来
+ *   sync      同步    —— WebDAV 多设备，冲突裁决
+ *   index     索引    —— 派生数据的自检与重建
+ *   settings  配置    —— 一百多个旋钮，schema 驱动
+ *
+ * 十项平铺在一条页签栏里而不是收进二级菜单：记忆的日常动作横跨这十项（看一条 →
+ * 发现过时 → 去改配置 → 回来验证），藏进二级菜单会让人忘了它的存在。
+ *
+ * ── 为什么没有「核心记忆」这个独立页签了 ────────────────────
+ * 原来有一页专门显示「注入给模型的原文」。改成 MCP 之后不存在「网关注入」这件事：
+ * 是 Agent 自己调 `memory_core`。所以那页的语义变成「Agent 会看到的默认内容」，
+ * 收进浏览页的筛选（层级 = l2）与仪表盘的指标里，不再单列 —— 一个不存在的
+ * 注入动作不值得一个页签。
+ *
+ * ── 页签顺序按什么排 ────────────────────────────────────────
+ * 按「日常使用频率」降序：看状态 → 找记忆 → 管项目 → 其余是配置性动作。
+ * 配置排最后是惯例（也是最不容易误入的位置）。
  */
 
-type Tab = 'library' | 'projects' | 'core' | 'trash' | 'settings'
-
-const TABS: { key: Tab; label: string }[] = [
-  { key: 'library', label: '记忆库' },
+const TABS = [
+  { key: 'dashboard', label: '仪表盘' },
+  { key: 'browse', label: '浏览' },
   { key: 'projects', label: '项目' },
-  { key: 'core', label: '核心记忆' },
-  { key: 'trash', label: '回收站' },
-  { key: 'settings', label: '设置' },
-]
+  { key: 'profile', label: '画像' },
+  { key: 'agents', label: '接入' },
+  { key: 'auto', label: '自动化' },
+  { key: 'import', label: '导入' },
+  { key: 'sync', label: '同步' },
+  { key: 'index', label: '索引' },
+  { key: 'settings', label: '配置' },
+] as const
 
-function timeText(timestamp: number): string {
-  if (!timestamp) return '—'
-  const delta = Date.now() - timestamp
-  if (delta < 60_000) return '刚刚'
-  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)} 分钟前`
-  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)} 小时前`
-  if (delta < 30 * 86_400_000) return `${Math.floor(delta / 86_400_000)} 天前`
-  return new Date(timestamp).toLocaleDateString()
-}
+type Tab = typeof TABS[number]['key']
+
+/** 当前页签（组件外也能读：壳切页时判断要不要刷新） */
+let activeTab: Tab = 'dashboard'
 
 function MemoryPage(): React.ReactElement {
-  const [tab, setTab] = React.useState<Tab>('library')
-  const [kinds, setKinds] = React.useState<m.MemoryKindOption[]>([])
+  const [tab, setTab] = React.useState<Tab>(activeTab)
   const [status, setStatus] = React.useState<m.MemoryStatus | null>(null)
-  const [config, setConfig] = React.useState<m.MemoryConfig | null>(null)
-  const [error, setError] = React.useState('')
-  const [busy, setBusy] = React.useState(false)
-
-  const [query, setQuery] = React.useState('')
-  const [kind, setKind] = React.useState('')
-  const [project, setProject] = React.useState('')
-  const [list, setList] = React.useState<m.MemoryEntry[]>([])
-  const [selected, setSelected] = React.useState<m.MemoryEntry | null>(null)
-  const [timeline, setTimeline] = React.useState<m.MemoryTimelineItem[]>([])
+  const [kinds, setKinds] = React.useState<m.MemoryKindOption[]>([])
   const [projects, setProjects] = React.useState<m.MemoryProject[]>([])
-  const [core, setCore] = React.useState<{ text: string; tokens: number; truncated: boolean } | null>(null)
-  const [draft, setDraft] = React.useState<m.WritePayload | null>(null)
-  // 记忆接入状态（哪些客户端已经配了 agent2api-memory 这条 MCP）
-  const [targets, setTargets] = React.useState<m.InstallTarget[]>([])
+  const [projectsLoading, setProjectsLoading] = React.useState(true)
+  const [projectsError, setProjectsError] = React.useState('')
+  const [error, setError] = React.useState('')
+  const [booted, setBooted] = React.useState(false)
+  const [focusId, setFocusId] = React.useState<string | null>(null)
 
-  const run = React.useCallback(async (task: () => Promise<void>) => {
-    setBusy(true)
-    setError('')
+  /**
+   * 首屏一次拉全「壳数据」：状态、类别枚举、项目列表。
+   *
+   * 这三样被多个页签共用（状态在仪表盘与配置页、类别在浏览页、项目在浏览与项目页），
+   * 每个页签各拉一次会得到三份可能不一致的快照 —— 用户刚写完一条记忆，切到仪表盘
+   * 看到旧条数，会以为写入失败了。
+   */
+  const loadShell = React.useCallback(async () => {
     try {
-      await task()
+      const [config, projectList] = await Promise.all([m.loadConfig(), m.loadProjects()])
+      setStatus(config.status)
+      setKinds(config.kinds)
+      setProjects(projectList.items)
+      setProjectsError('')
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught))
+      setProjectsError(caught instanceof Error ? caught.message : String(caught))
     } finally {
-      setBusy(false)
+      setProjectsLoading(false)
+      setBooted(true)
+    }
+  }, [])
+
+  React.useEffect(() => {
+    void loadShell()
+  }, [loadShell])
+
+  const refreshProjects = React.useCallback(async () => {
+    setProjectsLoading(true)
+    try {
+      const projectList = await m.loadProjects()
+      setProjects(projectList.items)
+      setProjectsError('')
+    } catch (caught) {
+      setProjectsError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setProjectsLoading(false)
     }
   }, [])
 
   const refreshStatus = React.useCallback(async () => {
-    const next = await m.loadStatus()
-    setStatus(next)
-    setConfig(next.config)
+    try {
+      setStatus(await m.loadStatus())
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    }
   }, [])
 
-  const refreshList = React.useCallback(async (deleted: boolean) => {
-    const page = await m.loadList({
-      query: query.trim(),
-      type: kind,
-      project: project.trim(),
-      includeDeleted: deleted,
-      includeSuperseded: deleted,
-      limit: 200,
-    })
-    setList(page.items)
-    setSelected(current => (current ? page.items.find(item => item.id === current.id) ?? null : null))
-  }, [query, kind, project])
-
-  React.useEffect(() => {
-    void run(async () => {
-      const payload = await m.loadConfig()
-      setKinds(payload.kinds)
-      setStatus(payload.status)
-      setConfig(payload.config)
-      const page = await m.loadList({ limit: 200 })
-      setList(page.items)
-      const items = await m.loadProjects()
-      setProjects(items.items)
-      // 接入状态单独取：它来自工具服务那套接口，失败不该拖垮整页
-      try {
-        setTargets((await m.loadInstallTargets()).targets)
-      } catch {
-        setTargets([])
-      }
-    })
-    // 只在首次挂载时拉一次；筛选变化由 refreshList 显式触发
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  const openEntry = React.useCallback((id: string) => {
-    void run(async () => {
-      const payload = await m.loadEntry(id)
-      const entry = payload.items[0] ?? null
-      setSelected(entry)
-      setTimeline([])
-      if (entry) {
-        const chain = await m.loadTimeline(entry.id)
-        setTimeline(chain.items)
-      }
-    })
-  }, [run])
+  /** 任何写操作之后：状态与项目都可能变，一起刷。 */
+  const afterChange = React.useCallback(() => {
+    void refreshStatus()
+    void refreshProjects()
+  }, [refreshStatus, refreshProjects])
 
   const switchTab = (next: Tab) => {
+    activeTab = next
     setTab(next)
-    void run(async () => {
-      if (next === 'library') await refreshList(false)
-      if (next === 'trash') await refreshList(true)
-      if (next === 'projects') setProjects((await m.loadProjects()).items)
-      if (next === 'core') setCore(await m.loadCore(undefined, config?.coreMaxTokens))
-      if (next === 'settings') await refreshStatus()
-    })
+    // 切到需要新鲜项目数据的页签时补一次（项目可能在别处被合并/归档）
+    if (next === 'projects' || next === 'browse') void refreshProjects()
   }
 
-  const saveDraft = () => {
-    if (!draft) return
-    if (!draft.content.trim()) {
-      setError('正文不能为空')
-      return
-    }
-    void run(async () => {
-      await m.writeEntry(draft)
-      setDraft(null)
-      await refreshList(tab === 'trash')
-      await refreshStatus()
-    })
+  const openEntryFromProject = (id: string) => {
+    setFocusId(id)
+    switchTab('browse')
   }
 
   return (
     <div className='mm-page'>
       <div className='mm-head'>
         <div className='mm-tabs'>
-          {TABS.map(item => (
-            <Button
-              key={item.key}
-              type='button'
-              size='sm'
-              variant={tab === item.key ? 'default' : 'ghost'}
-              onClick={() => switchTab(item.key)}
-            >
-              {t(item.label)}
-            </Button>
-          ))}
+          <SegmentedControl
+            options={TABS.map(item => ({ value: item.key, label: t(item.label) }))}
+            value={tab}
+            onValueChange={value => switchTab(value as Tab)}
+            aria-label={t('记忆中枢功能分类')}
+          />
         </div>
         <div className='mm-actions'>
-          {busy ? <Spinner /> : null}
+          {status ? (
+            <Badge variant={status.config.enabled ? 'success' : 'outline'} shape='tag'>
+              {status.config.enabled
+                ? t('{n} 条有效记忆', { n: status.live })
+                : t('记忆服务已关闭')}
+            </Badge>
+          ) : null}
+          {status && status.review.pending > 0 ? (
+            <Badge variant='warning' shape='tag'>{t('{n} 条待确认', { n: status.review.pending })}</Badge>
+          ) : null}
           <Button
             type='button'
             size='sm'
             variant='ghost'
-            onClick={() => void run(async () => {
-              if (tab === 'core') setCore(await m.loadCore(undefined, config?.coreMaxTokens))
-              else if (tab === 'projects') setProjects((await m.loadProjects()).items)
-              else await refreshList(tab === 'trash')
-            })}
+            onClick={() => { void loadShell() }}
           >
             {t('刷新')}
-          </Button>
-          <Button type='button' size='sm' onClick={() => setDraft({ content: '', type: 'daily', project: project || undefined })}>
-            {t('新建记忆')}
           </Button>
         </div>
       </div>
 
       {error ? <div className='mm-error'>{error}</div> : null}
 
-      {tab === 'library' || tab === 'trash' ? (
-        <div className='mm-library'>
-          <div className='mm-filters'>
-            <Input
-              value={query}
-              placeholder={t('检索记忆（支持中文按字匹配）')}
-              onChange={event => setQuery(event.target.value)}
-              onKeyDown={event => { if (event.key === 'Enter') void run(async () => refreshList(tab === 'trash')) }}
+      {!booted ? (
+        <div className='mm-boot'>
+          <Spinner />
+          <span>{t('正在读取记忆库…')}</span>
+        </div>
+      ) : (
+        <div className='mm-body-area'>
+          {tab === 'dashboard' ? (
+            <Dashboard status={status} onGo={next => switchTab(next as Tab)} />
+          ) : null}
+
+          {tab === 'browse' ? (
+            <Browse
+              kinds={kinds}
+              projects={projects}
+              onChanged={afterChange}
+              focusId={focusId}
+              onFocusConsumed={() => setFocusId(null)}
             />
-            <select className='mm-select' value={kind} onChange={event => setKind(event.target.value)}>
-              <option value=''>{t('全部类别')}</option>
-              {kinds.map(option => <option key={option.value} value={option.value}>{t(option.label)}</option>)}
-            </select>
-            <Input
-              value={project}
-              placeholder={t('项目 slug')}
-              onChange={event => setProject(event.target.value)}
-              className='mm-project-input'
+          ) : null}
+
+          {tab === 'projects' ? (
+            <Projects
+              projects={projects}
+              loading={projectsLoading}
+              error={projectsError}
+              onReload={() => void refreshProjects()}
+              onOpenEntry={openEntryFromProject}
+              onChanged={afterChange}
             />
-            <Button type='button' size='sm' variant='ghost' onClick={() => void run(async () => refreshList(tab === 'trash'))}>
-              {t('搜索')}
-            </Button>
-          </div>
+          ) : null}
 
-          <div className='mm-split'>
-            <div className='mm-list'>
-              {list.length === 0 && !busy ? (
-                <div className='mm-empty'>
-                  {tab === 'trash' ? t('回收站是空的。') : t('还没有记忆。点右上角「新建记忆」，或在别处用接口写入。')}
-                </div>
-              ) : null}
-              {list.map(item => (
-                <button
-                  key={item.id}
-                  type='button'
-                  className={`mm-row${selected?.id === item.id ? ' active' : ''}`}
-                  onClick={() => openEntry(item.id)}
-                >
-                  <div className='mm-row-top'>
-                    <span className='mm-row-title'>{item.title}</span>
-                    <Badge variant='secondary' shape='tag'>{t(item.typeLabel)}</Badge>
-                    {item.pinned ? <Badge variant='destructive' shape='tag'>{t('置顶')}</Badge> : null}
-                    {item.starred ? <Badge variant='outline' shape='tag'>{t('星标')}</Badge> : null}
-                  </div>
-                  <div className='mm-row-summary'>{item.summary || t('（无摘要）')}</div>
-                  <div className='mm-row-meta'>
-                    {item.project ? <span>{item.project}</span> : <span>{t('全局')}</span>}
-                    <span>{timeText(item.updatedAt)}</span>
-                    {item.supersededBy ? <span className='mm-warn'>{t('已被取代')}</span> : null}
-                  </div>
-                </button>
-              ))}
-            </div>
-
-            <div className='mm-detail'>
-              {!selected ? <div className='mm-empty'>{t('从左侧选一条记忆查看全文。')}</div> : (
-                <>
-                  <div className='mm-detail-head'>
-                    <h3>{selected.title}</h3>
-                    <div className='mm-detail-meta'>
-                      <Badge variant='secondary' shape='tag'>{t(selected.typeLabel)}</Badge>
-                      {selected.project ? <span>{selected.project}</span> : <span>{t('全局')}</span>}
-                      <span>{t('重要度')} {selected.importance.toFixed(2)}</span>
-                      <span>{timeText(selected.updatedAt)}</span>
-                      <span>{selected.chars} {t('字')}</span>
-                    </div>
-                    {selected.tags.length ? (
-                      <div className='mm-tags'>{selected.tags.map(tag => <Badge key={tag} variant='outline' shape='tag'>{tag}</Badge>)}</div>
-                    ) : null}
-                  </div>
-
-                  <pre className='mm-body'>{selected.body ?? selected.summary}</pre>
-
-                  <div className='mm-detail-actions'>
-                    {selected.deletedAt ? (
-                      <>
-                        <Button type='button' size='sm' onClick={() => void run(async () => { await m.restoreEntry(selected.id); await refreshList(tab === 'trash'); await refreshStatus() })}>
-                          {t('恢复')}
-                        </Button>
-                        <Button type='button' size='sm' variant='destructive' onClick={() => void run(async () => { await m.purgeEntry(selected.id); setSelected(null); await refreshList(tab === 'trash') })}>
-                          {t('彻底删除')}
-                        </Button>
-                      </>
-                    ) : (
-                      <>
-                        <Button type='button' size='sm' variant='ghost' onClick={() => void run(async () => {
-                          await m.updateEntry(selected.id, { starred: !selected.starred })
-                          await refreshList(false)
-                        })}>
-                          {selected.starred ? t('取消星标') : t('星标')}
-                        </Button>
-                        <Button type='button' size='sm' variant='ghost' onClick={() => void run(async () => {
-                          await m.updateEntry(selected.id, { pinned: !selected.pinned })
-                          await refreshList(false)
-                        })}>
-                          {selected.pinned ? t('取消置顶') : t('置顶')}
-                        </Button>
-                        <Button type='button' size='sm' variant='ghost' onClick={() => setDraft({
-                          content: '',
-                          title: `${t('更新')}：${selected.title}`,
-                          type: selected.type,
-                          project: selected.project ?? undefined,
-                          supersedes: [selected.id],
-                        })}>
-                          {t('写一条取代它')}
-                        </Button>
-                        <Button type='button' size='sm' variant='destructive' onClick={() => void run(async () => {
-                          await m.deleteEntry(selected.id)
-                          setSelected(null)
-                          await refreshList(false)
-                          await refreshStatus()
-                        })}>
-                          {t('删除')}
-                        </Button>
-                      </>
-                    )}
-                  </div>
-
-                  {timeline.length > 1 ? (
-                    <div className='mm-timeline'>
-                      <div className='mm-section-title'>{t('事实演化链')}</div>
-                      {timeline.map(item => (
-                        <div key={item.id} className={`mm-timeline-row${item.current ? ' current' : ''}`}>
-                          <span className='mm-timeline-date'>{item.validFromText}</span>
-                          <button type='button' className='mm-link' onClick={() => openEntry(item.id)}>{item.title}</button>
-                          <span className='mm-timeline-type'>{t(item.typeLabel)}</span>
-                        </div>
-                      ))}
-                    </div>
-                  ) : null}
-
-                  {selected.related?.length ? (
-                    <div className='mm-related'>
-                      <div className='mm-section-title'>{t('相关记忆')}</div>
-                      {selected.related.map(item => (
-                        <button key={item.id} type='button' className='mm-link' onClick={() => openEntry(item.id)}>{item.line}</button>
-                      ))}
-                    </div>
-                  ) : null}
-                </>
-              )}
-            </div>
-          </div>
+          {tab === 'profile' ? <Profile /> : null}
+          {tab === 'agents' ? <Agents /> : null}
+          {tab === 'auto' ? <Auto /> : null}
+          {tab === 'import' ? <Import /> : null}
+          {tab === 'sync' ? <Sync /> : null}
+          {tab === 'index' ? <Index /> : null}
+          {tab === 'settings' ? <Settings onChanged={afterChange} /> : null}
         </div>
-      ) : null}
-
-      {tab === 'projects' ? (
-        <div className='mm-projects'>
-          {projects.length === 0 ? <div className='mm-empty'>{t('还没有项目。写入记忆时带上 project 就会自动登记。')}</div> : null}
-          {projects.map(item => (
-            <div key={item.slug} className='mm-project-card'>
-              <div className='mm-project-head'>
-                <strong>{item.name}</strong>
-                <Badge variant='secondary' shape='tag'>{item.count} {t('条')}</Badge>
-              </div>
-              <div className='mm-project-meta'>
-                <span>slug: {item.slug}</span>
-                <span>{item.updatedText}</span>
-              </div>
-              {item.remote ? <div className='mm-project-remote'>{item.remote}</div> : <div className='mm-project-remote mm-muted'>{t('未记录远程地址')}</div>}
-              {item.latest.length ? (
-                <ul className='mm-project-latest'>
-                  {item.latest.map(entry => (
-                    <li key={entry.id}>
-                      <button type='button' className='mm-link' onClick={() => { setTab('library'); openEntry(entry.id) }}>{entry.title}</button>
-                    </li>
-                  ))}
-                </ul>
-              ) : null}
-            </div>
-          ))}
-        </div>
-      ) : null}
-
-      {tab === 'core' ? (
-        <div className='mm-core'>
-          <div className='mm-core-head'>
-            <div>
-              <div className='mm-section-title'>{t('注入内容的实际文本')}</div>
-              <div className='mm-muted'>
-                {core ? `${core.tokens} token（估算）${core.truncated ? ' · 已按预算截断' : ''}` : ''}
-              </div>
-            </div>
-            <Button type='button' size='sm' variant='ghost' onClick={() => void run(async () => setCore(await m.loadCore(undefined, config?.coreMaxTokens)))}>
-              {t('按当前预算重算')}
-            </Button>
-          </div>
-          <pre className='mm-body'>{core?.text || t('（没有可注入的内容：先写几条记忆）')}</pre>
-        </div>
-      ) : null}
-
-      {tab === 'settings' && config ? (
-        <div className='mm-settings'>
-          <div className='mm-field'>
-            <label>{t('记忆服务开关')}</label>
-            <Switch checked={config.enabled} onCheckedChange={value => void run(async () => {
-              const saved = await m.saveConfig({ enabled: value })
-              setConfig(saved.config)
-            })} />
-            <p className='mm-hint'>{t('关掉后 Agent 的读写类工具一律被拒绝，自检仍可用。用途是临时让 Agent 忘记，不必去每个客户端逐个卸载。')}</p>
-          </div>
-
-          <div className='mm-field'>
-            <label>{t('核心记忆默认预算（token）')}</label>
-            <Input
-              type='number'
-              value={String(config.coreMaxTokens)}
-              onChange={event => {
-                const value = Number(event.target.value)
-                if (!Number.isFinite(value)) return
-                void run(async () => {
-                  const saved = await m.saveConfig({ coreMaxTokens: Math.round(value) })
-                  setConfig(saved.config)
-                })
-              }}
-            />
-            <p className='mm-hint'>{t('200–4000。Agent 调用 memory_core 时不传 maxTokens 就用这个值；超出预算的条目整条丢掉，不会截半句。')}</p>
-          </div>
-
-          {/* ── 接入方式：不复刻一套安装 UI ──────────────────────
-              记忆中枢是工具服务里的第四个（`SERVICE_IDS` 里登记），
-              「MCP & Skills」页本来就有「选服务 → 选客户端 → 写 mcpServers」
-              的完整流程。这里只指路 —— 再抄一套会立刻和那边漂移。 */}
-          <div className='mm-field'>
-            <label>{t('怎么让 Agent 用上记忆')}</label>
-            <p className='mm-hint'>
-              {t('记忆不做「转发时注入」：网关不知道一条请求属于哪个项目，替客户端塞记忆会跨项目串味。它作为远程 MCP 服务（agent2api-memory）由客户端按需调用 —— 在「MCP & Skills」页选「记忆中枢」，勾选要接入的客户端即可。')}
-            </p>
-            <div className='mm-detail-actions'>
-              <Button type='button' size='sm' onClick={() => {
-                const host = window as unknown as { wbApp?: { showPage?: (page: string) => void } }
-                host.wbApp?.showPage?.('tools')
-              }}>
-                {t('去「MCP & Skills」接入')}
-              </Button>
-            </div>
-            <div className='mm-status-grid'>
-              <span>{t('已接入客户端')}</span>
-              <code>
-                {targets.filter(target => target.installed).length
-                  ? targets.filter(target => target.installed).map(target => target.label).join('、')
-                  : t('尚未接入任何客户端 —— 未接入时 Agent 完全看不到记忆')}
-              </code>
-            </div>
-          </div>
-
-          <div className='mm-status'>
-            <div className='mm-section-title'>{t('状态')}</div>
-            <div className='mm-status-grid'>
-              <span>{t('记忆文件根')}</span><code>{status?.root ?? '—'}</code>
-              <span>{t('派生索引')}</span><code>{status?.indexFile ?? '—'}</code>
-              <span>{t('条数')}</span><code>{status ? `${status.live} 有效 / ${status.deleted} 回收站 / ${status.superseded} 已取代` : '—'}</code>
-              <span>{t('索引')}</span><code>{status ? `${status.index.count} 条 · ${status.index.fts ? 'FTS5' : '内存匹配'} · ${status.index.inSync ? '与事实源一致' : '待重建'}` : '—'}</code>
-            </div>
-            <div className='mm-detail-actions'>
-              <Button type='button' size='sm' variant='ghost' onClick={() => void run(async () => {
-                await m.rebuildIndex()
-                await refreshStatus()
-              })}>
-                {t('重建索引')}
-              </Button>
-            </div>
-            <p className='mm-hint'>{t('索引是派生数据：删掉 index.db 后重建即可，记忆正文在 .md 文件里。')}</p>
-          </div>
-        </div>
-      ) : null}
-
-      {draft ? (
-        <div className='mm-dialog-mask' role='dialog' aria-modal='true'>
-          <div className='mm-dialog'>
-            <div className='mm-dialog-head'>
-              <strong>{draft.supersedes?.length ? t('写一条取代旧记忆') : t('新建记忆')}</strong>
-              <Button type='button' size='sm' variant='ghost' onClick={() => setDraft(null)}>{t('取消')}</Button>
-            </div>
-            <div className='mm-dialog-body'>
-              <label className='mm-label'>{t('标题')}</label>
-              <Input value={draft.title ?? ''} placeholder={t('留空则取正文第一行')} onChange={event => setDraft({ ...draft, title: event.target.value })} />
-
-              <div className='mm-dialog-row'>
-                <div>
-                  <label className='mm-label'>{t('类别')}</label>
-                  <select className='mm-select' value={draft.type ?? 'daily'} onChange={event => setDraft({ ...draft, type: event.target.value })}>
-                    {kinds.map(option => <option key={option.value} value={option.value}>{t(option.label)}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label className='mm-label'>{t('项目')}</label>
-                  <Input value={draft.project ?? ''} placeholder={t('可留空 = 全局')} onChange={event => setDraft({ ...draft, project: event.target.value })} />
-                </div>
-                <div>
-                  <label className='mm-label'>{t('重要度')}</label>
-                  <Input
-                    type='number'
-                    step='0.1'
-                    min='0'
-                    max='1'
-                    value={String(draft.importance ?? 0.5)}
-                    onChange={event => setDraft({ ...draft, importance: Number(event.target.value) })}
-                  />
-                </div>
-              </div>
-
-              <label className='mm-label'>{t('标签（逗号分隔）')}</label>
-              <Input
-                value={(draft.tags ?? []).join(', ')}
-                onChange={event => setDraft({ ...draft, tags: event.target.value.split(',').map(item => item.trim()).filter(Boolean) })}
-              />
-
-              <label className='mm-label'>{t('正文（Markdown）')}</label>
-              <Textarea
-                rows={12}
-                value={draft.content}
-                placeholder={t('写「为什么」而不是「是什么」：决策取舍、避坑经验、接口规矩。')}
-                onChange={event => setDraft({ ...draft, content: event.target.value })}
-              />
-              {draft.supersedes?.length ? (
-                <p className='mm-hint'>{t('保存后旧记忆会被标记为「已被取代」，仍可查看，不进回收站。')}</p>
-              ) : null}
-            </div>
-            <div className='mm-dialog-foot'>
-              <Button type='button' variant='ghost' onClick={() => setDraft(null)}>{t('取消')}</Button>
-              <Button type='button' onClick={saveDraft}>{t('保存')}</Button>
-            </div>
-          </div>
-        </div>
-      ) : null}
+      )}
     </div>
   )
 }
@@ -539,3 +242,22 @@ function mount(): void {
 }
 
 mountOnPage('memory', PAGE_SELECTOR, mount)
+
+declare global {
+  interface Window {
+    /** 记忆中枢（壳侧接口，与 `wbCheckin` / `wbAccountsView` 同一套约定）。 */
+    wbMemory?: {
+      load(): Promise<void>
+      open(tab?: string): void
+    }
+  }
+}
+
+window.wbMemory = {
+  load: async () => { /* 页面自己首屏拉数据，这里只保留接口形状 */ },
+  open: (tab?: string) => {
+    if (!tab) return
+    const next = TABS.find(item => item.key === tab)
+    if (next) activeTab = next.key
+  },
+}

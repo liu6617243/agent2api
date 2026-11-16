@@ -270,7 +270,35 @@ impl MemoryIndex {
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL,
                updated_at INTEGER NOT NULL
-             );",
+             );
+
+             -- 同步冲突：本地与远端同时改了同一个文件，且都不同于上次同步的基线。
+             -- 不自动裁决 —— 记忆是长期事实，猜错一次的代价远大于多问一句。
+             CREATE TABLE IF NOT EXISTS sync_conflict (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               path TEXT NOT NULL,
+               device TEXT NOT NULL,        -- 远端设备 id
+               local_hash TEXT,
+               remote_hash TEXT,
+               base_hash TEXT,
+               detail TEXT,
+               status TEXT NOT NULL DEFAULT 'pending',  -- pending / resolved / ignored
+               created_at INTEGER NOT NULL,
+               resolved_at INTEGER,
+               resolution TEXT
+             );
+             CREATE INDEX IF NOT EXISTS sync_conflict_status ON sync_conflict(status, created_at DESC);
+
+             -- 同步流水：谁在什么时候推了什么、拉了什么
+             CREATE TABLE IF NOT EXISTS sync_log (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               at INTEGER NOT NULL,
+               device TEXT,
+               action TEXT NOT NULL,        -- pull / push / conflict / skip / error
+               detail TEXT,
+               ok INTEGER DEFAULT 1
+             );
+             CREATE INDEX IF NOT EXISTS sync_log_at ON sync_log(at DESC);",
         );
 
         // FTS5 探测：建不起来就退化（编译期选项，不是运行期错误）
@@ -838,11 +866,148 @@ impl MemoryIndex {
         .ok()
     }
 
+    /// 记一条同步冲突。同一个路径重复冲突时更新旧记录而不是不断追加 ——
+    /// 用户没处理之前，同一个文件的冲突记录应该只有一条。
+    pub fn conflict_enqueue(
+        &self,
+        path: &str,
+        device: &str,
+        local: &str,
+        remote: &str,
+        base: &str,
+        detail: &str,
+    ) {
+        let Ok(conn) = self.conn.lock() else { return };
+        let now = crate::server::logging::now_ms();
+        // 同一路径的旧 pending 记录先清掉：用户在「待确认」里看到的应该是一条，
+        // 不是每次同步多一行几乎一样的
+        let _ = conn.execute(
+            "DELETE FROM sync_conflict WHERE path = ?1 AND device = ?2 AND status = 'pending'",
+            params![path, device],
+        );
+        let _ = conn.execute(
+            "INSERT INTO sync_conflict (path, device, local_hash, remote_hash, base_hash, detail, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+            params![path, device, local, remote, base, detail, now],
+        );
+    }
+
+    pub fn conflict_list(&self, limit: usize) -> Vec<Value> {
+        let Ok(conn) = self.conn.lock() else { return Vec::new() };
+        conn.query_map(
+            "SELECT id, path, device, local_hash, remote_hash, base_hash, detail, status, created_at
+             FROM sync_conflict ORDER BY status = 'pending' DESC, created_at DESC LIMIT ?1",
+            params![limit.max(1) as i64],
+            |row| {
+                Ok(json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "path": row.get::<_, String>(1)?,
+                    "device": row.get::<_, String>(2)?,
+                    "localHash": row.get::<_, Option<String>>(3)?,
+                    "remoteHash": row.get::<_, Option<String>>(4)?,
+                    "baseHash": row.get::<_, Option<String>>(5)?,
+                    "detail": row.get::<_, Option<String>>(6)?,
+                    "status": row.get::<_, String>(7)?,
+                    "createdAt": row.get::<_, i64>(8)?,
+                }))
+            },
+        )
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    pub fn conflict_count(&self) -> usize {
+        let Ok(conn) = self.conn.lock() else { return 0 };
+        conn.query_row(
+            "SELECT COUNT(*) FROM sync_conflict WHERE status = 'pending'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize
+    }
+
+    /// 裁决一条冲突。`resolution` = `local` / `remote` / `ignore`。
+    pub fn conflict_resolve(&self, id: i64, resolution: &str) -> usize {
+        let Ok(conn) = self.conn.lock() else { return 0 };
+        let now = crate::server::logging::now_ms();
+        conn.execute(
+            "UPDATE sync_conflict SET status = 'resolved', resolution = ?2, resolved_at = ?3
+             WHERE id = ?1 AND status = 'pending'",
+            params![id, resolution, now],
+        )
+        .unwrap_or(0)
+    }
+
+    /// 冲突详情（裁决「用远端」时要把远端内容落盘，得先拿到它）。
+    pub fn conflict_get(&self, id: i64) -> Option<Value> {
+        let Ok(conn) = self.conn.lock() else { return None };
+        conn.query_row(
+            "SELECT id, path, device, local_hash, remote_hash, base_hash, detail, status, created_at
+             FROM sync_conflict WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "path": row.get::<_, String>(1)?,
+                    "device": row.get::<_, String>(2)?,
+                    "localHash": row.get::<_, Option<String>>(3)?,
+                    "remoteHash": row.get::<_, Option<String>>(4)?,
+                    "baseHash": row.get::<_, Option<String>>(5)?,
+                    "detail": row.get::<_, Option<String>>(6)?,
+                    "status": row.get::<_, String>(7)?,
+                    "createdAt": row.get::<_, i64>(8)?,
+                }))
+            },
+        )
+        .ok()
+    }
+
+    // ── 同步流水 ─────────────────────────────────────────────
+
+    pub fn sync_log_add(&self, device: &str, action: &str, detail: &str, ok: bool) {
+        let Ok(conn) = self.conn.lock() else { return };
+        let now = crate::server::logging::now_ms();
+        let _ = conn.execute(
+            "INSERT INTO sync_log (at, device, action, detail, ok) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![now, device, action, detail, i64::from(ok)],
+        );
+    }
+
+    pub fn sync_log_list(&self, limit: usize) -> Vec<Value> {
+        let Ok(conn) = self.conn.lock() else { return Vec::new() };
+        conn.query_map(
+            "SELECT id, at, device, action, detail, ok FROM sync_log ORDER BY at DESC LIMIT ?1",
+            params![limit.max(1) as i64],
+            |row| {
+                Ok(json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "at": row.get::<_, i64>(1)?,
+                    "device": row.get::<_, Option<String>>(2)?,
+                    "action": row.get::<_, String>(3)?,
+                    "detail": row.get::<_, Option<String>>(4)?,
+                    "ok": row.get::<_, i64>(5).unwrap_or(1) != 0,
+                }))
+            },
+        )
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
     /// 全部表与行数（状态页 / 自检）
     pub fn table_stats(&self) -> Value {
         let Ok(conn) = self.conn.lock() else { return json!({}) };
         let mut out = serde_json::Map::new();
-        for table in ["entries", "review_queue", "recall_log", "llm_call", "agent_beat", "mem_link", "sync_state"] {
+        for table in [
+            "entries",
+            "review_queue",
+            "recall_log",
+            "llm_call",
+            "agent_beat",
+            "mem_link",
+            "sync_state",
+            "sync_conflict",
+            "sync_log",
+        ] {
             let count: i64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
                 .unwrap_or(0);

@@ -362,6 +362,9 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/memory/digest", get(api::memory::get_digest))
         .route("/api/memory/timeline", get(api::memory::get_timeline))
         .route("/api/memory/projects", get(api::memory::get_projects))
+        // 项目卡操作：重命名/置顶/归档只改登记表；合并会逐条搬文件（同步等结果）
+        .route("/api/memory/projects/update", post(api::memory::post_project_update))
+        .route("/api/memory/projects/merge", post(api::memory::post_project_merge))
         .route("/api/memory/status", get(api::memory::get_status))
         // 待确认队列：AI 建议（去重 / 归类 / 事实失效）先进这里，人工点头才落盘。
         // GET 带 ?status=&type= 过滤；POST 裁决（{id, approve} 或 {rejectAll}）。
@@ -369,6 +372,11 @@ pub fn panel_router(state: ServerState) -> Router {
         // 台账：内部 LLM 调用（自动化页的运行统计）与 Agent 心跳（接入页的活跃状态）
         .route("/api/memory/calls", get(api::memory::get_calls))
         .route("/api/memory/agents", get(api::memory::get_agents))
+        // Agent 接入：一键写 MCP 条目 + 提示词受控块 / 卸载 / 校验 / 片段
+        .route("/api/memory/agents/install", post(api::memory::post_agents_install))
+        .route("/api/memory/agents/uninstall", post(api::memory::post_agents_uninstall))
+        .route("/api/memory/agents/verify", post(api::memory::post_agents_verify))
+        .route("/api/memory/agents/snippet", get(api::memory::get_agents_snippet))
         .route("/api/memory/write", post(api::memory::post_write))
         .route("/api/memory/update", post(api::memory::post_update))
         .route("/api/memory/delete", post(api::memory::post_delete))
@@ -384,6 +392,23 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/memory/profile/build", post(api::memory::post_profile_build))
         // 体检：锚定文件改过 / 队列积压 / 索引漂移
         .route("/api/memory/health", get(api::memory::get_health))
+        // 历史导入：来源清单 / 干跑预览 / 真导入。预览与导入是两个端点 ——
+        // 「这个动作不写数据」应该是端点级承诺，不是请求体里的布尔开关。
+        .route("/api/memory/import", get(api::memory::get_import))
+        .route("/api/memory/import/sources", post(api::memory::post_import_sources))
+        .route("/api/memory/import/preview", post(api::memory::post_import_preview))
+        .route("/api/memory/import/run", post(api::memory::post_import_run))
+        // WebDAV 同步：状态 / 测连接 / 立即同步 / 冲突 / 流水 / 预览。
+        // 全部挂 protected —— 响应里含 WebDAV 地址与远端包名。
+        .route("/api/memory/sync", get(api::memory::get_sync))
+        .route("/api/memory/sync/test", post(api::memory::post_sync_test))
+        .route("/api/memory/sync/run", post(api::memory::post_sync_run))
+        .route(
+            "/api/memory/sync/conflicts",
+            get(api::memory::get_sync_conflicts).post(api::memory::post_sync_conflict),
+        )
+        .route("/api/memory/sync/log", get(api::memory::get_sync_log))
+        .route("/api/memory/sync/preview", get(api::memory::get_sync_preview))
         // ── 设置页「版本信息」──
         // 一次取全：版本 / 环境 / 路径 / 开关状态 / 关键计数（见 api::system_info
         // 的模块头）。挂 protected —— 数据目录、可执行文件路径与 Key 数量都属于
@@ -1082,7 +1107,7 @@ pub fn gateway_router(state: ServerState) -> Router {
             "/mcp/vision",
             post(api::tool_runtime::mcp_vision).get(api::tool_runtime::mcp_unsupported),
         )
-        // 记忆中枢：11 个工具（记忆库是本机私有数据，鉴权与另外三个端点同口径，
+        // 记忆中枢：16 个工具（记忆库是本机私有数据，鉴权与另外三个端点同口径，
         // 由 handler 自己做 —— 见上方 `/mcp` 前缀的说明）。
         .route(
             "/mcp/memory",

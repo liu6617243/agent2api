@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 
 use super::config;
 use super::index;
+use super::rt;
 
 /// 一次补全的入参。
 pub struct Request {
@@ -253,7 +254,7 @@ pub fn complete(request: Request) -> Result<Reply, LlmError> {
     let started = crate::server::logging::now_ms();
     let client = crate::server::core::egress::client_for(None);
     let body_for_call = body.clone();
-    let outcome = block_on(async move {
+    let outcome = rt::block_on(async move {
         let response = client
             .post(&url)
             .timeout(Duration::from_secs(timeout))
@@ -272,17 +273,17 @@ pub fn complete(request: Request) -> Result<Reply, LlmError> {
     let latency = crate::server::logging::now_ms() - started;
     let (status, text) = match outcome {
         Ok(pair) => pair,
-        Err(Failure::Timeout) => {
+        Err(rt::Failure::Timeout) => {
             let message = format!("内部模型请求超时（{timeout}s）");
             index::global().log_llm(&request.task, &model, "gateway", 0, 0, latency, false, Some(&message), None);
             return Err(LlmError::Failed(message));
         }
-        Err(Failure::Transport(error)) => {
+        Err(rt::Failure::Transport(error)) => {
             let message = format!("无法连接本机网关：{error}");
             index::global().log_llm(&request.task, &model, "gateway", 0, 0, latency, false, Some(&message), None);
             return Err(LlmError::Failed(message));
         }
-        Err(Failure::NoRuntime) => {
+        Err(rt::Failure::NoRuntime) => {
             return Err(LlmError::Failed(
                 "记忆任务需要多线程运行时（当前是 current_thread，无法安全阻塞等待）".into(),
             ));
@@ -361,42 +362,6 @@ fn logging_note(task: &str, model: &str, latency: i64, tokens: i64) {
         "[Memory]",
         &format!("内部 LLM {task} ok · {model} · {tokens} tokens · {latency}ms"),
     );
-}
-
-enum Failure {
-    Timeout,
-    Transport(reqwest::Error),
-    NoRuntime,
-}
-
-/// 在一个**可能已处于异步上下文**的同步函数里等一个 future。
-///
-/// 三种情形：
-///   · 没有运行时（调度器线程、测试）→ 自己起一个 current_thread 跑完；
-///   · 多线程运行时（网关主路径）→ `block_in_place` 让出 worker 再阻塞；
-///   · current_thread 运行时 → 阻塞会把唯一的 worker 卡死（future 永远没机会
-///     推进），这种情况下只能报错，不能硬等。
-fn block_on<F, T>(future: F) -> Result<T, Failure>
-where
-    F: std::future::Future<Output = Result<T, reqwest::Error>>,
-{
-    use tokio::runtime::{Builder, Handle, RuntimeFlavor};
-    let Ok(handle) = Handle::try_current() else {
-        let runtime = Builder::new_current_thread().enable_all().build().map_err(|_| Failure::NoRuntime)?;
-        return runtime.block_on(future).map_err(classify);
-    };
-    if handle.runtime_flavor() != RuntimeFlavor::MultiThread {
-        return Err(Failure::NoRuntime);
-    }
-    tokio::task::block_in_place(|| handle.block_on(future)).map_err(classify)
-}
-
-fn classify(error: reqwest::Error) -> Failure {
-    if error.is_timeout() {
-        Failure::Timeout
-    } else {
-        Failure::Transport(error)
-    }
 }
 
 /// 让模型输出一段 JSON，并容忍它外面裹了 ``` 围栏。

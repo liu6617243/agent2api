@@ -15,6 +15,14 @@
 //! POST /api/memory/review      裁决（{id, approve} 或 {rejectAll: true}）
 //! GET  /api/memory/calls       内部 LLM 调用台账（?limit=100）
 //! GET  /api/memory/agents      Agent 心跳（接入页的「最近活跃」）
+//! GET  /api/memory/health      体检（孤儿索引、断链、过期条目）
+//! GET  /api/memory/sync        WebDAV 同步状态（含设备、跳过名单、上次结果）
+//! POST /api/memory/sync/test   测连接（只读，不写任何文件）
+//! POST /api/memory/sync/run    立即同步一次（同步等待结果）
+//! GET  /api/memory/sync/conflicts  冲突队列
+//! POST /api/memory/sync/conflicts  裁决冲突（{id, resolution: local|remote|ignore}）
+//! GET  /api/memory/sync/log    同步流水
+//! GET  /api/memory/sync/preview 本地同步包清单（不下发内容）
 //! POST /api/memory/write       写入一条记忆
 //! POST /api/memory/update      更新标题/正文/标签/重要度/层/有效期
 //! POST /api/memory/delete      进回收站
@@ -229,11 +237,128 @@ pub async fn get_calls(State(_state): State<ServerState>, Query(params): Query<H
 }
 
 pub async fn get_agents(State(_state): State<ServerState>) -> Response {
-    let beats = crate::server::core::memory::index::global().beats();
-    ok_json(json!({
-        "items": beats,
-        "enabled": memory_config::strings_of("agents.enabled"),
-    }))
+    // 接入页要的是「卡片 + 心跳」一整套，不再是单纯的心跳列表：
+    // 每张卡都要能回答「装了吗 / 配置在哪 / 写进去了吗 / 提示词块还在吗」。
+    ok_json(memory::agents::list())
+}
+
+/// 一键接入：往选中的客户端写 MCP 条目 + 提示词受控块。
+pub async fn post_agents_install(State(state): State<ServerState>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(error) => return errors::management_error(400, error.message),
+    };
+    let Some(object) = payload.as_object() else {
+        return errors::management_error(400, "请求体必须是 JSON 对象");
+    };
+    let clients: Vec<String> = object
+        .get("clients")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    if clients.is_empty() {
+        return errors::management_error(400, "请至少选择一个客户端");
+    }
+    // 写进客户端的是「客户端访问网关」的地址，不是本进程视角的地址。
+    let base = gateway_base(&headers, &state);
+    let key = match plain_key(object.get("api_key_id").and_then(Value::as_str).unwrap_or("")) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    let outcome = crate::server::core::blocking::run(move || {
+        memory::agents::install(&clients, &base, &key)
+    })
+    .await;
+    match outcome {
+        Ok(value) => ok_json(value),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+pub async fn post_agents_uninstall(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(error) => return errors::management_error(400, error.message),
+    };
+    let clients: Vec<String> = payload
+        .get("clients")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    if clients.is_empty() {
+        return errors::management_error(400, "请至少选择一个客户端");
+    }
+    let outcome = crate::server::core::blocking::run(move || memory::agents::uninstall(&clients)).await;
+    match outcome {
+        Ok(value) => ok_json(value),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+/// 校验：逐个客户端读一遍配置，确认条目还在、提示词块还完整。
+pub async fn post_agents_verify(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let clients: Vec<String> = payload
+        .get("clients")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    let outcome = crate::server::core::blocking::run(move || memory::agents::verify(&clients)).await;
+    match outcome {
+        Ok(value) => ok_json(value),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+/// 配置片段：给自定义客户端 / 手动粘贴用。
+pub async fn get_agents_snippet(State(state): State<ServerState>, headers: axum::http::HeaderMap) -> Response {
+    ok_json(memory::agents::snippet(&gateway_base(&headers, &state)))
+}
+
+/// 「客户端要访问的网关地址」。
+///
+/// 面板端口与网关端口可能不同：客户端连的是网关端口，所以有面板端口时要把
+/// Host 里的端口换回网关端口，否则写进客户端的是一个连不上的地址。
+fn gateway_base(headers: &axum::http::HeaderMap, state: &ServerState) -> String {
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("127.0.0.1:{}", state.port));
+    let host = if state.panel_port.is_some() {
+        replace_port(&host, state.port)
+    } else {
+        host
+    };
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| *value == "https")
+        .unwrap_or("http");
+    format!("{scheme}://{host}")
+}
+
+fn replace_port(host: &str, port: u16) -> String {
+    if let Some(stripped) = host.strip_prefix('[') {
+        if let Some(end) = stripped.find(']') {
+            return format!("[{}]:{port}", &stripped[..end]);
+        }
+    }
+    match host.rsplit_once(':') {
+        Some((name, tail)) if !name.is_empty() && tail.chars().all(|ch| ch.is_ascii_digit()) => {
+            format!("{name}:{port}")
+        }
+        _ => format!("{host}:{port}"),
+    }
+}
+
+fn plain_key(key_id: &str) -> Result<String, Response> {
+    crate::server::core::api_keys::list()
+        .into_iter()
+        .find(|entry| entry.id == key_id && entry.is_usable())
+        .map(|entry| entry.key)
+        .ok_or_else(|| errors::management_error(400, "所选 API Key 不存在、已停用或不可用"))
 }
 
 pub async fn post_write(State(_state): State<ServerState>, body: Bytes) -> Response {
@@ -314,7 +439,7 @@ pub async fn post_rebuild(State(_state): State<ServerState>) -> Response {
 
 // ── 自动化 ───────────────────────────────────────────────────
 
-/// 自动化页顶部：调度线程状态 + 11 个任务的节奏与上次执行。
+/// 自动化页顶部：调度线程状态 + 12 个任务的节奏与上次执行。
 pub async fn get_auto(State(_state): State<ServerState>) -> Response {
     ok_json(memory::schedule::status())
 }
@@ -367,10 +492,202 @@ pub async fn post_profile_build(State(_state): State<ServerState>) -> Response {
     }
 }
 
+// ── 项目卡操作 ───────────────────────────────────────────────
+
+/// 改一张项目卡（重命名 / 置顶 / 归档）。只动登记表，不动记忆文件。
+pub async fn post_project_update(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(error) => return errors::management_error(400, error.message),
+    };
+    let Some(slug) = payload.get("slug").and_then(Value::as_str) else {
+        return errors::management_error(400, "缺少 slug");
+    };
+    match memory::update_project(slug, &payload) {
+        Ok(value) => ok_json(value),
+        Err(message) => errors::management_error(400, message),
+    }
+}
+
+/// 把 `from` 合并进 `into`。会逐条改写记忆的 frontmatter 与落盘路径，
+/// 所以同步等待 —— 用户点完就想看到「迁移了多少条」。
+pub async fn post_project_merge(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(error) => return errors::management_error(400, error.message),
+    };
+    let from = payload.get("from").and_then(Value::as_str).unwrap_or("").to_string();
+    let into = payload.get("into").and_then(Value::as_str).unwrap_or("").to_string();
+    if from.is_empty() || into.is_empty() {
+        return errors::management_error(400, "缺少 from / into");
+    }
+    let outcome = crate::server::core::blocking::run(move || memory::merge_project(&from, &into)).await;
+    match outcome {
+        Ok(Ok(value)) => ok_json(value),
+        Ok(Err(message)) => errors::management_error(400, message),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
 // ── 体检 ─────────────────────────────────────────────────────
 
 pub async fn get_health(State(_state): State<ServerState>, Query(params): Query<HashMap<String, String>>) -> Response {
     ok_json(memory::health(number(&params, "limit").unwrap_or(50)))
+}
+
+// ── 导入 ─────────────────────────────────────────────────────
+
+/// 导入页：来源清单 + 上次结果 + 扫描统计。
+pub async fn get_import(State(_state): State<ServerState>) -> Response {
+    let result = crate::server::core::blocking::run(memory::import::view).await;
+    match result {
+        Ok(value) => ok_json(value),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+/// 干跑预览：**只读文件，不写任何东西**（除了「刚预览过」这个时间戳）。
+///
+/// 单独一个端点而不是给 `run` 加参数，是因为它必须在权限与审计上明显不同 ——
+/// 「这个动作不会改数据」应该是端点级的承诺，不是请求体里的一个布尔。
+pub async fn post_import_preview(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let only = payload.get("path").and_then(Value::as_str).map(str::to_string);
+    let limit = payload.get("limit").and_then(Value::as_u64).unwrap_or(60) as usize;
+    let result = crate::server::core::blocking::run(move || memory::import::preview(only.as_deref(), limit)).await;
+    match result {
+        Ok(value) => ok_json(value),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+/// 真导入。强制先预览（`import.dryRunFirst`），同步等待结果 ——
+/// 用户点了就想知道「写进去多少条、跳过多少条」。
+pub async fn post_import_run(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let only = payload.get("path").and_then(Value::as_str).map(str::to_string);
+    let result = crate::server::core::blocking::run(move || memory::import::run(only.as_deref())).await;
+    match result {
+        Ok(Ok(summary)) => ok_json(json!({ "summary": summary, "view": memory::import::view() })),
+        Ok(Err(message)) => errors::management_error(400, message),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+/// 增删改导入来源。整体替换而不是逐条增删：来源只有几条，整体替换让
+/// 「前端删一条、后端留一条」这类不一致无从发生。
+pub async fn post_import_sources(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(error) => return errors::management_error(400, error.message),
+    };
+    let rows = payload
+        .get("sources")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut items: Vec<memory::import::Source> = Vec::new();
+    for row in &rows {
+        // 接受两种形状：裸字符串（配置里的原始形态）与对象（页面表单）
+        let raw = match row {
+            Value::String(text) => text.clone(),
+            Value::Object(map) => {
+                let path = map.get("path").and_then(Value::as_str).unwrap_or("").trim();
+                if path.is_empty() {
+                    continue;
+                }
+                let format = map.get("format").and_then(Value::as_str).unwrap_or("md");
+                let enabled = map.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                let priority = map.get("priority").and_then(Value::as_i64).unwrap_or(0);
+                format!("{path}|{format}|{enabled}|{priority}")
+            }
+            _ => continue,
+        };
+        if let Some(source) = memory::import::Source::parse(&raw) {
+            items.push(source);
+        }
+    }
+    match memory::import::save_sources(&items) {
+        Ok(()) => ok_json(json!({ "view": memory::import::view() })),
+        Err(message) => errors::management_error(400, message),
+    }
+}
+
+// ── WebDAV 同步 ──────────────────────────────────────────────
+
+/// 同步页顶部：配置摘要 + 设备 + 冲突计数 + 上次结果。
+pub async fn get_sync(State(_state): State<ServerState>) -> Response {
+    let mut payload = memory::sync::status();
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("devices".into(), memory::sync::devices());
+        map.insert("skippedPaths".into(), memory::sync::skip_list());
+    }
+    ok_json(payload)
+}
+
+/// 测连接。**只读**：不做 MKCOL、不传包，避免「点一下测试就在远端留下目录」。
+pub async fn post_sync_test(State(_state): State<ServerState>) -> Response {
+    let result = crate::server::core::blocking::run(memory::sync::test_connection).await;
+    match result {
+        Ok(value) => ok_json(value),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+/// 立即同步。同步等待：用户点「立即同步」就想看到下行/上行/冲突的条数。
+pub async fn post_sync_run(State(_state): State<ServerState>) -> Response {
+    let outcome = crate::server::core::blocking::run(|| memory::sync::run(true)).await;
+    match outcome {
+        Ok(outcome) => ok_json(json!({
+            "outcome": outcome.to_json(),
+            "status": memory::sync::status(),
+        })),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+pub async fn get_sync_conflicts(State(_state): State<ServerState>) -> Response {
+    ok_json(memory::sync::conflicts())
+}
+
+/// 裁决一条冲突。三种裁决的语义见 `sync::resolve_conflict` 的注释。
+pub async fn post_sync_conflict(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(error) => return errors::management_error(400, error.message),
+    };
+    let Some(id) = payload.get("id").and_then(Value::as_i64) else {
+        return errors::management_error(400, "缺少 id");
+    };
+    let resolution = payload
+        .get("resolution")
+        .and_then(Value::as_str)
+        .unwrap_or("local");
+    if !matches!(resolution, "local" | "remote" | "ignore") {
+        return errors::management_error(
+            400,
+            format!("未知的裁决方式：{resolution}（可选 local / remote / ignore）"),
+        );
+    }
+    let resolution = resolution.to_string();
+    let outcome = crate::server::core::blocking::run(move || {
+        memory::sync::resolve_conflict(id, &resolution)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(())) => ok_json(json!({ "ok": true, "conflicts": memory::sync::conflicts() })),
+        Ok(Err(message)) => errors::management_error(400, message),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+pub async fn get_sync_log(State(_state): State<ServerState>, Query(params): Query<HashMap<String, String>>) -> Response {
+    ok_json(memory::sync::log_entries(number(&params, "limit").unwrap_or(100)))
+}
+
+/// 同步预览：本地会打进包的文件清单（不含内容）。
+pub async fn get_sync_preview(State(_state): State<ServerState>) -> Response {
+    ok_json(memory::sync::local_snapshot())
 }
 
 fn with_id(body: Bytes, handler: fn(&str) -> Result<Value, String>) -> Response {

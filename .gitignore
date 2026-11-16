@@ -79,3 +79,10 @@ desktop-tauri/mobile/ios/DerivedData/
 # 提供商插件（独立仓库的本地开发目录，不得进入本仓库历史）
 /agent2api-providers/
 /plugin/
+
+# ── 本地工作目录（.workbuddy）──────────────────────────────────
+# 只有「设计 / 清单 / 说明」这几份 md 入库：它们是可交接的产物，跟代码一起走。
+# 其余一律不入库 —— dist 里有 100MB+ 的安装包、rescue-* 是救援用的仓库副本、
+# probe*.txt 是一次性抓取输出、memory/ 是本机的助手记忆。
+.workbuddy/*
+!.workbuddy/*.md

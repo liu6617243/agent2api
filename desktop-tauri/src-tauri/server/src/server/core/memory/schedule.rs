@@ -43,7 +43,7 @@ use super::{config, index, store};
 const TICK: Duration = Duration::from_secs(60);
 
 /// 任务名清单（顺序即界面上的展示顺序）。
-pub const TASKS: [&str; 11] = [
+pub const TASKS: [&str; 12] = [
     "extract",
     "summarize",
     "tag",
@@ -55,6 +55,7 @@ pub const TASKS: [&str; 11] = [
     "index-scan",
     "cleanup",
     "health",
+    "sync",
 ];
 
 /// 每个任务的默认节奏（分钟），与 `config.rs` 里 `auto.tasks` 的默认值保持一致。
@@ -66,6 +67,7 @@ fn default_interval(task: &str) -> i64 {
         // 这里只是「两次之间至少隔多久」的兜底
         "supersede" | "distill" | "cleanup" | "health" => 1_440,
         "consolidate" | "profile" => 10_080,
+        "sync" => 60,
         _ => 30,
     }
 }
@@ -268,6 +270,7 @@ pub fn run_once(task: &str, project: Option<&str>, manual: bool) -> Outcome {
         "profile" => enrich::build_profile(manual),
         "supersede" => supersede_recent(project),
         "consolidate" => consolidate(project, manual),
+        "sync" => super::sync::run(manual),
         other => Outcome::Skipped(format!("未知任务：{other}")),
     }
 }

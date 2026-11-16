@@ -24,15 +24,19 @@
 //! 文本；而记忆的价值恰恰在「什么时候该读哪一条」。所以记忆只通过 MCP 工具
 //! 暴露，由客户端决定何时读取 —— 这也是 AgentHub 的做法。
 
+pub mod agents;
 pub mod config;
 pub mod enrich;
+pub mod import;
 pub mod index;
 pub mod layout;
 pub mod llm;
 pub mod model;
+pub mod rt;
 pub mod schedule;
 pub mod search;
 pub mod store;
+pub mod sync;
 
 use std::sync::OnceLock;
 
@@ -54,7 +58,7 @@ pub use model::{DedupStatus as MemoryDedupStatus, Layer as MemoryLayer, MemoryKi
 pub use search::Query as MemoryQuery;
 
 /// 自动化任务的中文名（状态页与服务清单共用一份，避免两处漂移）。
-pub const TASK_LABELS: [(&str, &str); 11] = [
+pub const TASK_LABELS: [(&str, &str); 12] = [
     ("extract", "抽取要点"),
     ("summarize", "生成摘要"),
     ("tag", "自动打标签"),
@@ -66,6 +70,7 @@ pub const TASK_LABELS: [(&str, &str); 11] = [
     ("index-scan", "索引对账"),
     ("cleanup", "清理回收站"),
     ("health", "记忆体检"),
+    ("sync", "WebDAV 同步"),
 ];
 
 // ── 设置 ─────────────────────────────────────────────────────
@@ -391,7 +396,8 @@ pub fn recent(project: Option<&str>, agent: Option<&str>, days: usize) -> Value 
 }
 
 /// 项目列表（登记表 + 实际落盘条数 + 分层计数）
-pub fn projects() -> Value {    ensure_index_once();
+pub fn projects() -> Value {
+    ensure_index_once();
     let all = store::load_all();
     let now = crate::server::logging::now_ms();
     let mut stored = store::load_projects();
@@ -455,6 +461,91 @@ pub fn projects() -> Value {    ensure_index_once();
         })
         .collect();
     json!({ "items": items })
+}
+
+/// 改一张项目卡：重命名 / 置顶 / 归档。
+///
+/// 只改登记表（`projects.json`），不动记忆文件 —— 项目名是展示名，slug 才是
+/// 目录名。改 slug 等于搬家，那是 [`merge_project`] 的事，且必须逐条重写
+/// frontmatter 与路径，风险高一个量级。
+pub fn update_project(slug: &str, patch: &Value) -> Result<Value, String> {
+    let slug = store::slugify(slug);
+    let mut projects = store::load_projects();
+    let Some(project) = projects.iter_mut().find(|item| item.slug == slug) else {
+        return Err(format!("找不到项目 {slug}"));
+    };
+    if let Some(name) = patch.get("name").and_then(Value::as_str) {
+        let name = name.trim();
+        if !name.is_empty() {
+            project.name = name.to_string();
+        }
+    }
+    if let Some(pinned) = patch.get("pinned").and_then(Value::as_bool) {
+        project.pinned = pinned;
+    }
+    if let Some(archived) = patch.get("archived").and_then(Value::as_bool) {
+        project.archived = archived;
+    }
+    project.updated_at = crate::server::logging::now_ms();
+    store::save_projects(&projects)?;
+    bump_revision();
+    Ok(json!({ "slug": slug, "items": projects()["items"] }))
+}
+
+/// 把 `from` 合并进 `into`：改写所有记忆的 `project` 字段与落盘路径，
+/// 旧卡标记 `merged_into` 后从列表里隐藏（但保留记录，合并可追溯）。
+///
+/// 为什么不是「删掉旧卡、改数据库字段」：记忆的事实源是 `.md` 文件，frontmatter
+/// 里的 `project` 与文件所在的目录必须一致，否则下次全量扫描会把它们重新归到
+/// 旧项目。所以这里逐条 `save`（会写新路径并删旧文件），不是批量 UPDATE。
+pub fn merge_project(from: &str, into: &str) -> Result<Value, String> {
+    let from_slug = store::slugify(from);
+    let into_slug = store::slugify(into);
+    if from_slug == into_slug {
+        return Err("不能合并到自己".into());
+    }
+    if from_slug == store::GLOBAL_SLUG {
+        return Err("通用项目不能合并".into());
+    }
+    let mut projects = store::load_projects();
+    if !projects.iter().any(|item| item.slug == into_slug) {
+        return Err(format!("目标项目 {into_slug} 不存在"));
+    }
+    let mut moved = 0usize;
+    for mut entry in store::load_all() {
+        let Some(project) = entry.project.as_deref() else { continue };
+        if store::slugify(project) != from_slug {
+            continue;
+        }
+        let old_path = entry.path.clone();
+        entry.project = Some(into_slug.clone());
+        // 清空 path 让 `entry_path` 按新项目重算 —— 否则它仍指向旧目录
+        entry.path = String::new();
+        entry.path = store::rel(&store::entry_path(&entry, false));
+        store::save(&entry)?;
+        let _ = index::global().upsert(&entry);
+        // 旧文件在新路径不同时删掉（同一天同一条可能算出同一路径）
+        if old_path != entry.path && !old_path.is_empty() {
+            let old = store::abs(&old_path);
+            if old.is_file() && !store::is_daily_container(&old_path) {
+                let _ = std::fs::remove_file(&old);
+            }
+        }
+        moved += 1;
+    }
+    for project in projects.iter_mut() {
+        if project.slug == from_slug {
+            project.merged_into = Some(into_slug.clone());
+            project.updated_at = crate::server::logging::now_ms();
+        }
+    }
+    store::save_projects(&projects)?;
+    bump_revision();
+    crate::server::logging::log(
+        "[Memory]",
+        &format!("项目合并：{from_slug} → {into_slug}，迁移 {moved} 条"),
+    );
+    Ok(json!({ "moved": moved, "items": projects()["items"] }))
 }
 
 /// 画像页视图：四类画像 + 生成门槛是否已达 + 上一版生成时间。
@@ -603,6 +694,65 @@ fn make_id(content: &str) -> String {
 }
 
 pub fn write(input: WriteInput) -> Result<Value, String> {
+    write_inner(input, None)
+}
+
+/// 批量写入器（导入用）。
+///
+/// ── 为什么需要这一层 ────────────────────────────────────────
+/// `write` 的精确去重要 `store::load_all()` 把整个记忆库读一遍再逐条比对。单条
+/// 写入时这没问题（几百条记忆、几十毫秒），但导入一次是几千条：每条都全盘扫，
+/// 复杂度直接变成 O(n²)，800 条笔记能让请求挂上几分钟 —— 而且扫的是同一批文件。
+///
+/// 所以这里在**构造时**把「现存 l1 的 hash」收成一个集合，之后每条只查集合；
+/// 每写成功一条就把它的 hash 补进去，同一次导入里的重复也一并挡住。语义与
+/// `write` 一致，只是把「每条约一次全盘读」换成「整批一次」。
+///
+/// 为什么是持久的写入器而不是一个 `write_batch(Vec<..>)` 函数：调用方要分批
+/// 写入（每批之间让出线程），函数形态会让每批都重新扫一遍库 —— 分批本身又把
+/// 全盘读带回来了。
+pub struct BatchWriter {
+    /// `None` = 去重关掉了，不做任何 hash 判断
+    seen: Option<std::collections::HashSet<String>>,
+}
+
+impl BatchWriter {
+    pub fn new() -> Self {
+        let seen = if dedup_on() {
+            Some(
+                store::load_all()
+                    .into_iter()
+                    .filter(|entry| entry.is_live() && entry.layer == Layer::L1)
+                    .map(|entry| entry.hash)
+                    .filter(|hash| !hash.is_empty())
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        BatchWriter { seen }
+    }
+
+    pub fn write(&mut self, input: WriteInput) -> Result<Value, String> {
+        write_inner(input, self.seen.as_mut())
+    }
+}
+
+impl Default for BatchWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 精确去重是否生效（两把开关都在 `dedup.enabled` / `dedup.l1.enabled` 上）。
+fn dedup_on() -> bool {
+    config::bool_of("dedup.enabled") && config::bool_of("dedup.l1.enabled")
+}
+
+fn write_inner(
+    input: WriteInput,
+    mut seen: Option<&mut std::collections::HashSet<String>>,
+) -> Result<Value, String> {
     let content = input.content.trim().to_string();
     if content.is_empty() {
         return Err("正文不能为空".into());
@@ -630,8 +780,23 @@ pub fn write(input: WriteInput) -> Result<Value, String> {
     let hash = model::content_hash(&content);
 
     // ── 去重：L1 精确哈希（同内容不写第二份）──
-    if config::bool_of("dedup.enabled") && config::bool_of("dedup.l1.enabled") {
-        if let Some(existing) = find_hash_duplicate(&hash) {
+    if dedup_on() {
+        // 批量通道：集合里已经有这个 hash 就说明库里或本批前面已经写过，
+        // 不必再全盘读一次。返回的形状与单条路径一致（`duplicate: true`），
+        // 只是拿不到 existing —— 调用方只看这个布尔。
+        //
+        // 只在**写成功之后**才把 hash 记进集合：先记后写的话，一次落盘失败
+        // 会让后面真正该写的那条被误判成重复，导入就会静默少一条。
+        if let Some(set) = seen.as_deref() {
+            if set.contains(&hash) {
+                return Ok(json!({
+                    "id": "",
+                    "entry": Value::Null,
+                    "duplicate": true,
+                    "superseded": 0,
+                }));
+            }
+        } else if let Some(existing) = find_hash_duplicate(&hash) {
             crate::server::logging::log(
                 "[Memory]",
                 &format!("写入跳过：与 {} 内容完全相同（hash 去重）", existing.id),
@@ -701,6 +866,10 @@ pub fn write(input: WriteInput) -> Result<Value, String> {
     store::save(&entry)?;
     index::global().upsert(&entry)?;
     bump_revision();
+    // 写成功了才把 hash 记进批量集合（见上面去重分支的注释）
+    if let Some(set) = seen.as_deref_mut() {
+        set.insert(entry.hash.clone());
+    }
 
     // ── 被取代的旧记忆：标 superseded_by（不删 —— 演化链要能倒着走回去）──
     let mut marked = 0usize;

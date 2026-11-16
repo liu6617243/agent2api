@@ -200,7 +200,8 @@ static SCHEMA: &[Knob] = &[
           \"profile\":{\"enabled\":false,\"weekly\":1,\"weeklyTime\":\"11:10\"},\
           \"index-scan\":{\"enabled\":true,\"intervalMin\":360},\
           \"cleanup\":{\"enabled\":true,\"daily\":\"11:20\"},\
-          \"health\":{\"enabled\":true,\"daily\":\"11:30\"}}"),
+          \"health\":{\"enabled\":true,\"daily\":\"11:30\"},\
+          \"sync\":{\"enabled\":false,\"intervalMin\":60}}"),
 
     // ===== 去重 =====
     knob("dedup.enabled", Kind::Bool, Tier::Basic, "去重", "去重总开关", "true"),
@@ -277,6 +278,16 @@ static SCHEMA: &[Knob] = &[
     // ===== WebDAV 同步 =====
     knob("sync.enabled", Kind::Bool, Tier::Basic, "同步", "同步总开关", "true"),
     knob("sync.auto", Kind::Bool, Tier::Basic, "同步", "自动定时同步", "true"),
+    knob_d("sync.url", Kind::Text, Tier::Basic, "同步", "WebDAV 地址",
+        "留空 = 不同步；例 https://dav.example.com/agent2api", "\"\""),
+    knob_d("sync.username", Kind::Text, Tier::Basic, "同步", "WebDAV 用户名",
+        "留空 = 不带认证", "\"\""),
+    knob_d("sync.password", Kind::Text, Tier::Basic, "同步", "WebDAV 密码",
+        "只存在本机 config.json，不随记忆同步上行", "\"\""),
+    knob_d("sync.deviceName", Kind::Text, Tier::Advanced, "同步", "本机显示名",
+        "留空 = 用设备 id", "\"\""),
+    knob_d("sync.remoteDir", Kind::Text, Tier::Advanced, "同步", "远端目录名",
+        "同一账号下的多台设备共用这个目录", "\"agent2api-memory\""),
     range(knob("sync.intervalMin", Kind::Number, Tier::Advanced, "同步", "同步间隔（分钟）", "60"), 5.0, 1440.0),
     range(knob("sync.packSizeLimitMB", Kind::Number, Tier::Internal, "同步", "单包体积上限 (MB)", "50"), 1.0, 2048.0),
     knob_d("sync.excludeIndex", Kind::Bool, Tier::Internal, "同步", "索引库不入同步包",
