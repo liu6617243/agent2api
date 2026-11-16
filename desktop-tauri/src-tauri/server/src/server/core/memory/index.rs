@@ -894,26 +894,30 @@ impl MemoryIndex {
 
     pub fn conflict_list(&self, limit: usize) -> Vec<Value> {
         let Ok(conn) = self.conn.lock() else { return Vec::new() };
-        conn.query_map(
+        // `query_map` 挂在 `Statement` 上，不挂在 `Connection` 上：先 prepare 再查
+        let Ok(mut statement) = conn.prepare(
             "SELECT id, path, device, local_hash, remote_hash, base_hash, detail, status, created_at
              FROM sync_conflict ORDER BY status = 'pending' DESC, created_at DESC LIMIT ?1",
-            params![limit.max(1) as i64],
-            |row| {
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "path": row.get::<_, String>(1)?,
-                    "device": row.get::<_, String>(2)?,
-                    "localHash": row.get::<_, Option<String>>(3)?,
-                    "remoteHash": row.get::<_, Option<String>>(4)?,
-                    "baseHash": row.get::<_, Option<String>>(5)?,
-                    "detail": row.get::<_, Option<String>>(6)?,
-                    "status": row.get::<_, String>(7)?,
-                    "createdAt": row.get::<_, i64>(8)?,
-                }))
-            },
-        )
-        .map(|rows| rows.flatten().collect())
-        .unwrap_or_default()
+        ) else {
+            return Vec::new();
+        };
+        let mapped = statement.query_map(params![limit.max(1) as i64], |row| {
+            Ok(json!({
+                "id": row.get::<_, i64>(0)?,
+                "path": row.get::<_, String>(1)?,
+                "device": row.get::<_, String>(2)?,
+                "localHash": row.get::<_, Option<String>>(3)?,
+                "remoteHash": row.get::<_, Option<String>>(4)?,
+                "baseHash": row.get::<_, Option<String>>(5)?,
+                "detail": row.get::<_, Option<String>>(6)?,
+                "status": row.get::<_, String>(7)?,
+                "createdAt": row.get::<_, i64>(8)?,
+            }))
+        });
+        match mapped {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     pub fn conflict_count(&self) -> usize {
@@ -975,22 +979,25 @@ impl MemoryIndex {
 
     pub fn sync_log_list(&self, limit: usize) -> Vec<Value> {
         let Ok(conn) = self.conn.lock() else { return Vec::new() };
-        conn.query_map(
+        let Ok(mut statement) = conn.prepare(
             "SELECT id, at, device, action, detail, ok FROM sync_log ORDER BY at DESC LIMIT ?1",
-            params![limit.max(1) as i64],
-            |row| {
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "at": row.get::<_, i64>(1)?,
-                    "device": row.get::<_, Option<String>>(2)?,
-                    "action": row.get::<_, String>(3)?,
-                    "detail": row.get::<_, Option<String>>(4)?,
-                    "ok": row.get::<_, i64>(5).unwrap_or(1) != 0,
-                }))
-            },
-        )
-        .map(|rows| rows.flatten().collect())
-        .unwrap_or_default()
+        ) else {
+            return Vec::new();
+        };
+        let mapped = statement.query_map(params![limit.max(1) as i64], |row| {
+            Ok(json!({
+                "id": row.get::<_, i64>(0)?,
+                "at": row.get::<_, i64>(1)?,
+                "device": row.get::<_, Option<String>>(2)?,
+                "action": row.get::<_, String>(3)?,
+                "detail": row.get::<_, Option<String>>(4)?,
+                "ok": row.get::<_, i64>(5).unwrap_or(1) != 0,
+            }))
+        });
+        match mapped {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// 全部表与行数（状态页 / 自检）

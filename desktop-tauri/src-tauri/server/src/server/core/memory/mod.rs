@@ -470,8 +470,9 @@ pub fn projects() -> Value {
 /// frontmatter 与路径，风险高一个量级。
 pub fn update_project(slug: &str, patch: &Value) -> Result<Value, String> {
     let slug = store::slugify(slug);
-    let mut projects = store::load_projects();
-    let Some(project) = projects.iter_mut().find(|item| item.slug == slug) else {
+    // 变量不能叫 `projects`：会和同模块的 `projects()` 函数互相遮蔽（E0618）
+    let mut cards = store::load_projects();
+    let Some(project) = cards.iter_mut().find(|item| item.slug == slug) else {
         return Err(format!("找不到项目 {slug}"));
     };
     if let Some(name) = patch.get("name").and_then(Value::as_str) {
@@ -487,7 +488,7 @@ pub fn update_project(slug: &str, patch: &Value) -> Result<Value, String> {
         project.archived = archived;
     }
     project.updated_at = crate::server::logging::now_ms();
-    store::save_projects(&projects)?;
+    store::save_projects(&cards)?;
     bump_revision();
     Ok(json!({ "slug": slug, "items": projects()["items"] }))
 }
@@ -507,8 +508,8 @@ pub fn merge_project(from: &str, into: &str) -> Result<Value, String> {
     if from_slug == store::GLOBAL_SLUG {
         return Err("通用项目不能合并".into());
     }
-    let mut projects = store::load_projects();
-    if !projects.iter().any(|item| item.slug == into_slug) {
+    let mut cards = store::load_projects();
+    if !cards.iter().any(|item| item.slug == into_slug) {
         return Err(format!("目标项目 {into_slug} 不存在"));
     }
     let mut moved = 0usize;
@@ -533,13 +534,13 @@ pub fn merge_project(from: &str, into: &str) -> Result<Value, String> {
         }
         moved += 1;
     }
-    for project in projects.iter_mut() {
+    for project in cards.iter_mut() {
         if project.slug == from_slug {
             project.merged_into = Some(into_slug.clone());
             project.updated_at = crate::server::logging::now_ms();
         }
     }
-    store::save_projects(&projects)?;
+    store::save_projects(&cards)?;
     bump_revision();
     crate::server::logging::log(
         "[Memory]",

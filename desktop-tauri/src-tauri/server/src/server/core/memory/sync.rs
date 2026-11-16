@@ -899,8 +899,10 @@ pub fn test_connection() -> Value {
     let method = reqwest::Method::from_bytes(b"PROPFIND").unwrap_or(reqwest::Method::GET);
     let body = r#"<?xml version="1.0" encoding="utf-8" ?>
 <D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/></D:prop></D:propfind>"#;
+    // `async move` 会把 `url` 所有权搬进协程，后面拼结果还要用它，先克隆一份给请求
+    let probe = url.clone();
     let outcome = rt::block_on(async move {
-        let response = auth_headers(client.request(method, &url))
+        let response = auth_headers(client.request(method, &probe))
             .timeout(std::time::Duration::from_secs(20))
             .header("depth", "0")
             .header("content-type", "application/xml; charset=utf-8")
