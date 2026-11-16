@@ -77,8 +77,18 @@ pub fn trash_root() -> PathBuf {
     root().join("trash")
 }
 
+/// 配置文件本身的路径：**固定**在默认目录下，绝不调用 [`root()`]。
+///
+/// 为什么不能写成 `root().join("config.json")`：`root()` 要读 `storage.root`，
+/// 读配置要先进 `config::stored()`，而 `config::stored()` 又要 `config_file()`
+/// 才能知道去哪读 —— 三者首尾相接，形成无穷递归。在 test 线程（默认 2MB 栈）
+/// 上表现为 `stack overflow, aborting`，在主线程上是启动即崩。
+///
+/// 「决定根目录在哪」这份配置只能放在一个不依赖根目录的地方，这是唯一解。
 pub fn config_file() -> PathBuf {
-    root().join("config.json")
+    crate::server::config::config_dir()
+        .join("memory")
+        .join("config.json")
 }
 
 pub fn projects_file() -> PathBuf {
@@ -879,5 +889,21 @@ mod tests {
         let second = device_id();
         assert_eq!(first, second);
         assert_eq!(first.len(), 16);
+    }
+
+    /// 回归：`config_file()` 曾经写成 `root().join("config.json")`，而 `root()`
+    /// 又要读 `storage.root` 配置，读配置又要先知道配置文件在哪 —— 三个函数首尾
+    /// 相扣，`config::stored()` 一调就是无穷递归。测试线程栈只有 2MB，表现成
+    /// `stack overflow, aborting`；主线程上是启动即崩。
+    ///
+    /// 这个测试的意义不在断言值，而在**它能在不爆栈的前提下跑完**：一旦有人
+    /// 把 `config_file()` 改回依赖 `root()`，这里立刻复现那个环。
+    #[test]
+    fn config_path_does_not_depend_on_itself() {
+        let path = config_file();
+        assert!(path.ends_with("config.json"), "实际 {}", path.display());
+        // 读一次配置（`stored()` 内部会去 stat 这个路径）必须能返回
+        let verbose = crate::server::core::memory::config::bool_of("search.synonymsEnabled");
+        let _ = verbose;
     }
 }
