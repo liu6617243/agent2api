@@ -1045,11 +1045,29 @@ mod tests {
 
     #[test]
     fn remote_deletion_propagates() {
+        // 基线有、远端没有、本地还在且相对基线没改过 → 远端删了，本地跟着删
         let mut base = BTreeMap::new();
         base.insert("a.md".to_string(), entry("h1"));
-        let local = BTreeMap::new();
+        let mut local = BTreeMap::new();
+        local.insert("a.md".to_string(), entry("h1"));
         let remote = Manifest::empty("dev");
         let result = merge(&base, &local, &remote, &BTreeMap::new());
         assert_eq!(result.delete.len(), 1);
+        assert!(result.conflicts.is_empty());
+    }
+
+    #[test]
+    fn local_deletion_alone_is_not_propagated() {
+        // 本地已经删了、远端还在：不该反过来去删远端，也不该把文件又拉下来
+        // （`(None, Some(_))` 分支只处理「远端新增」，这里远端相对基线没变）
+        let mut base = BTreeMap::new();
+        base.insert("a.md".to_string(), entry("h1"));
+        let local = BTreeMap::new();
+        let mut remote = Manifest::empty("dev");
+        remote.files.insert("a.md".to_string(), entry("h1"));
+        let result = merge(&base, &local, &remote, &BTreeMap::new());
+        assert!(result.delete.is_empty());
+        assert!(result.down.is_empty());
+        assert!(result.conflicts.is_empty());
     }
 }

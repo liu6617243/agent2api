@@ -118,7 +118,8 @@ const fn cold(mut item: Knob) -> Knob {
 static SCHEMA: &[Knob] = &[
     // ===== 存储 =====
     knob_d("storage.root", Kind::Path, Tier::Basic, "存储", "记忆根目录",
-        "空 = 默认 {配置目录}/memory。改动后需重启并自动迁移", "\"\""),
+        "空 = 默认 {配置目录}/memory。改完下一次读取即生效；旧目录里的文件不会自动搬",
+        "\"\""),
     knob_d("storage.backupBeforeWrite", Kind::Bool, Tier::Basic, "存储", "改写前备份 .bak",
         "", "true"),
     range(knob("storage.backupKeep", Kind::Number, Tier::Advanced, "存储", "备份保留份数", "5"), 1.0, 50.0),

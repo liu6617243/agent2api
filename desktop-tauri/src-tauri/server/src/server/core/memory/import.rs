@@ -39,7 +39,14 @@ use super::{config, index, store, WriteInput};
 const MAX_FILE_CHARS: usize = 24_000;
 
 /// 一条记忆正文的下限：太短的（「ok」「继续」）不是记忆，是噪声。
-const MIN_BODY_CHARS: usize = 40;
+///
+/// 按**字符**算而不是字节：中文一个字等于三个字节，用字节数当门槛会让
+/// 「端口固定 3065」这种确实有信息量的短笔记被判成噪声（17 字 = 51 字节，
+/// 刚好在 40 的边缘上反复）。
+///
+/// 12 是反复试出来的下限：能过的都是成句的结论（「网关端口固定 3065，
+/// 客户端写死了」），过不了的都是「ok」「继续」「1」这类纯应答。
+const MIN_BODY_CHARS: usize = 12;
 
 /// 预览记录的有效期。超过这个时间的预览不算「刚看过」。
 const PREVIEW_TTL_MS: i64 = 30 * 60 * 1000;
@@ -377,8 +384,13 @@ fn line_to_turn(line: &str) -> Option<(String, String)> {
     Some((speaker.to_string(), text))
 }
 
-/// 递归收文本：只认 `text` 键与字符串形态的 `content` 键，且不重复收同一段
+/// 递归收文本：只认 `text` / `content` / `message` 三个键，且不重复收同一段
 /// （父节点已经把 `content` 收过时，子节点里的 `text` 是同一条）。
+///
+/// 为什么要专门挖 `message`：Claude Code 的会话记录是
+/// `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"…"}]}}`
+/// —— 对话正文包在 `message` 里一层。不挖这一层，这种格式的行一条都读不出来，
+/// 表现为「导入 0 条」，而不是报错，最难查。
 fn collect_text(value: &Value, out: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
@@ -392,6 +404,8 @@ fn collect_text(value: &Value, out: &mut Vec<String>) {
                             collect_text(sub, out);
                         }
                     }
+                    // `message` 是会话信封，正文在它下面
+                    ("message", Value::Object(_)) => collect_text(item, out),
                     // 其余键一律不深挖：`toolUseResult`、`usage` 这些里没有对话
                     _ => {}
                 }
@@ -865,6 +879,26 @@ mod tests {
         assert_eq!(candidate.title, "端口固定 3065");
         assert!(!candidate.body.contains("# 端口固定 3065"), "H1 不该在正文里出现第二次");
         assert!(candidate.skip.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 短句（「ok」「继续」）该被跳过，但**成句的短中文**不该 —— 这条把两个方向
+    /// 都钉住，防止有人把门槛又调回按字节算。
+    #[test]
+    fn short_filler_is_skipped_but_short_sentence_is_kept() {
+        let dir = std::env::temp_dir().join(format!("mem-import-short-{}", crate::server::logging::now_ms()));
+        std::fs::create_dir_all(&dir).ok();
+
+        let filler = dir.join("ok.md");
+        std::fs::write(&filler, "# ok\n\n好的\n").ok();
+        let candidate = from_markdown(&filler, None);
+        assert!(candidate.skip.is_some(), "纯应答不该被当成记忆");
+
+        let sentence = dir.join("端口.md");
+        std::fs::write(&sentence, "# 端口\n\n网关端口固定 3065，客户端写死了。\n").ok();
+        let candidate = from_markdown(&sentence, None);
+        assert!(candidate.skip.is_none(), "短但有信息的句子应当保留");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

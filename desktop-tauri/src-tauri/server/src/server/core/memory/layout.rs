@@ -106,19 +106,35 @@ pub fn normalize_remote(raw: &str) -> Option<Remote> {
         return None;
     }
     let slug_source = if KNOWN_HOSTS.contains(&host.as_str()) {
-        format!("{owner}--{repo}")
+        slug_join(&[&owner, &repo])
     } else {
-        format!("{host}--{owner}--{repo}")
+        slug_join(&[&host, &owner, &repo])
     };
     Some(Remote {
         display: format!("{owner}/{repo}"),
         url: format!("{host}/{owner}/{repo}"),
-        slug: sanitize_slug(&slug_source),
+        slug: slug_source,
         host,
         owner,
         repo,
         name: String::new(),
     })
+}
+
+/// 用 `--` 把若干段拼成 slug。
+///
+/// 为什么不是先拼再 [`sanitize_slug`]：那个函数会把连续分隔符压成一个，
+/// `aimod-cc` + `Agent2API` 拼出来的 `aimod-cc--agent2api` 会被压成
+/// `aimod-cc-agent2api`，owner 与 repo 的边界就此丢失 —— 而这条边界正是 slug
+/// 存在的理由（同一个 owner 下的 `a/b` 与 owner `a-b` 的 `b` 必须区分开）。
+/// 所以每段各自合法化，再用 `--` 这个**不会被压掉**的分隔符连接。
+fn slug_join(parts: &[&str]) -> String {
+    let joined = parts
+        .iter()
+        .map(|part| sanitize_slug(part))
+        .collect::<Vec<_>>()
+        .join("--");
+    super::model::truncate_chars(&joined, 120)
 }
 
 /// slug 合法化：小写 + 只留 `[a-z0-9._-]` + 压掉连续分隔符。
