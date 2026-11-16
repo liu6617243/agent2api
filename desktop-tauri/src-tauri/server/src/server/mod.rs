@@ -905,6 +905,9 @@ impl ServerState {
         if let Some(db) = self.db().cloned() {
             core::cloud_sync::auto_sync::spawn_worker(db);
         }
+        // 记忆中枢的自动化调度。放在这里而不是 `bootstrap`：它要做文件扫描，
+        // 不该挡住端口监听；而它自己的第一轮也只在 `auto.enabled` 打开时才动。
+        core::memory::schedule::spawn();
         // swap 保证重复调用（桌面壳重启后端时 start 可能被再次调用）只跑一轮。
         if self.startup_maintenance.swap(true, Ordering::SeqCst) {
             return;

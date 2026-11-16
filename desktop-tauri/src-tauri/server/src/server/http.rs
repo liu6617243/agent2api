@@ -352,6 +352,10 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/memory/config",
             get(api::memory::get_config).put(api::memory::put_config),
         )
+        .route(
+            "/api/memory/config/reset",
+            post(api::memory::post_config_reset),
+        )
         .route("/api/memory/list", get(api::memory::get_list))
         .route("/api/memory/get", get(api::memory::get_one))
         .route("/api/memory/core", get(api::memory::get_core))
@@ -359,12 +363,27 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/memory/timeline", get(api::memory::get_timeline))
         .route("/api/memory/projects", get(api::memory::get_projects))
         .route("/api/memory/status", get(api::memory::get_status))
+        // 待确认队列：AI 建议（去重 / 归类 / 事实失效）先进这里，人工点头才落盘。
+        // GET 带 ?status=&type= 过滤；POST 裁决（{id, approve} 或 {rejectAll}）。
+        .route("/api/memory/review", get(api::memory::get_review).post(api::memory::post_review))
+        // 台账：内部 LLM 调用（自动化页的运行统计）与 Agent 心跳（接入页的活跃状态）
+        .route("/api/memory/calls", get(api::memory::get_calls))
+        .route("/api/memory/agents", get(api::memory::get_agents))
         .route("/api/memory/write", post(api::memory::post_write))
         .route("/api/memory/update", post(api::memory::post_update))
         .route("/api/memory/delete", post(api::memory::post_delete))
         .route("/api/memory/restore", post(api::memory::post_restore))
         .route("/api/memory/purge", post(api::memory::post_purge))
+        .route("/api/memory/trash/purge", post(api::memory::post_trash_purge))
         .route("/api/memory/rebuild", post(api::memory::post_rebuild))
+        // 自动化：状态 + 立即执行（同步等结果 —— 点了就要看到跑成什么样）
+        .route("/api/memory/auto", get(api::memory::get_auto))
+        .route("/api/memory/auto/run", post(api::memory::post_auto_run))
+        // 画像：视图 + 强制重生成（不等门槛）
+        .route("/api/memory/profile", get(api::memory::get_profile))
+        .route("/api/memory/profile/build", post(api::memory::post_profile_build))
+        // 体检：锚定文件改过 / 队列积压 / 索引漂移
+        .route("/api/memory/health", get(api::memory::get_health))
         // ── 设置页「版本信息」──
         // 一次取全：版本 / 环境 / 路径 / 开关状态 / 关键计数（见 api::system_info
         // 的模块头）。挂 protected —— 数据目录、可执行文件路径与 Key 数量都属于

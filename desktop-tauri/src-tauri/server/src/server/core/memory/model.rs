@@ -18,6 +18,80 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+/// 记忆层。`l1` = 原始日常（一天一文件多节），`l2` = 蒸馏/沉淀（一文件一条）。
+///
+/// ── 为什么要有这一层 ────────────────────────────────────────
+/// 「原始流水」与「沉淀后的结论」是两种东西：前者量大、时效短、单条价值低；后者
+/// 量小、长期有效、值得进核心记忆。混在一个池子里排序，结果是流水把结论挤下去。
+/// 分层之后检索可以给 l2 加权（`search.weightLayer`），核心记忆只喂 l2。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Layer {
+    /// 原始日常：这次聊了什么、做到哪一步
+    #[default]
+    L1,
+    /// 蒸馏/沉淀：决策、知识、画像结论、洞见
+    L2,
+}
+
+impl Layer {
+    pub fn parse(raw: &str) -> Self {
+        if raw.trim().eq_ignore_ascii_case("l2") { Layer::L2 } else { Layer::L1 }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Layer::L1 => "l1",
+            Layer::L2 => "l2",
+        }
+    }
+}
+
+/// l2 的子目录（按类别分）。白名单外的一律进 `summary`。
+///
+/// `pitfall` 与 `insight` 合并到 `insight/`：两者都是「从经验里提炼出的判断」，
+/// 分开只是多一个目录，检索上没有任何区别。
+pub fn l2_dir_for(kind: &str) -> &'static str {
+    match kind {
+        "decision" => "decisions",
+        "knowledge" => "knowledge",
+        "insight" | "pitfall" => "insight",
+        _ => "summary",
+    }
+}
+
+/// 去重状态。只用于展示与统计 —— 「是否被取代」看 `superseded_by`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DedupStatus {
+    /// 独一无二
+    #[default]
+    Unique,
+    /// 已被判为重复并合并（旧条目仍在，标 superseded_by）
+    Merged,
+    /// 疑似重复，进了待确认队列
+    Pending,
+}
+
+impl DedupStatus {
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "merged" => DedupStatus::Merged,
+            "pending" => DedupStatus::Pending,
+            _ => DedupStatus::Unique,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DedupStatus::Unique => "unique",
+            DedupStatus::Merged => "merged",
+            DedupStatus::Pending => "pending",
+        }
+    }
+}
 
 /// 记忆类别。`other` 是兜底：手写 frontmatter 写了不认识的 type 时不让整条
 /// 记忆失效（类别只影响筛选与展示，不是权限）。
@@ -36,6 +110,8 @@ pub enum MemoryKind {
     Pitfall,
     /// 画像：关于用户本人的长期事实
     Profile,
+    /// 洞见：跨项目可复用的规律（蒸馏产物）
+    Insight,
     Other,
 }
 
@@ -48,6 +124,7 @@ impl MemoryKind {
             "preference" => MemoryKind::Preference,
             "pitfall" => MemoryKind::Pitfall,
             "profile" => MemoryKind::Profile,
+            "insight" => MemoryKind::Insight,
             _ => MemoryKind::Other,
         }
     }
@@ -60,6 +137,7 @@ impl MemoryKind {
             MemoryKind::Preference => "preference",
             MemoryKind::Pitfall => "pitfall",
             MemoryKind::Profile => "profile",
+            MemoryKind::Insight => "insight",
             MemoryKind::Other => "other",
         }
     }
@@ -73,33 +151,61 @@ impl MemoryKind {
             MemoryKind::Preference => "偏好",
             MemoryKind::Pitfall => "避坑",
             MemoryKind::Profile => "画像",
+            MemoryKind::Insight => "洞见",
             MemoryKind::Other => "其他",
         }
     }
 
-    pub const ALL: [MemoryKind; 7] = [
+    /// 这个类别是否天然属于沉淀层（写入时可以据此默认 layer）。
+    pub fn prefers_l2(self) -> bool {
+        matches!(
+            self,
+            MemoryKind::Decision | MemoryKind::Knowledge | MemoryKind::Insight | MemoryKind::Profile
+        )
+    }
+
+    pub const ALL: [MemoryKind; 8] = [
         MemoryKind::Daily,
         MemoryKind::Decision,
         MemoryKind::Knowledge,
         MemoryKind::Preference,
         MemoryKind::Pitfall,
         MemoryKind::Profile,
+        MemoryKind::Insight,
         MemoryKind::Other,
     ];
 }
 
 /// 一条记忆。字段与 frontmatter 一一对应（`type` 因为与 Rust 关键字冲突，
 /// 在结构体里叫 `kind`，落到文件上仍是 `type`）。
+///
+/// ── 为什么后面那批字段都带 `#[serde(default)]` ────────────────
+/// 这些是「对齐 AgentHub 全量能力」时新增的：`layer` / `dedup_status` / `device` /
+/// `session` / `valid_to` / `evidence` / `hash` / `access_count` / `last_hit_at`。
+/// 存量用户的 `.md` 里没有它们，而**事实源是文件**——读不出来就等于把用户已有
+/// 的记忆全部作废。全部给默认值之后，老文件照常读、照常进索引，下次保存时自然
+/// 补上。给默认值不是偷懒，是「磁盘格式只能加不能减」这条约束的实现。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub id: String,
     pub title: String,
     #[serde(rename = "type")]
     pub kind: MemoryKind,
+    /// 层：`l1` 原始日常 / `l2` 沉淀结论。缺省 `l1`（老文件全是「一条一个文件」
+    /// 的形态，按原始记录处理最保守）。
+    #[serde(default)]
+    pub layer: Layer,
     /// 项目 slug。`None` = 不属于任何项目（全局记忆）
     pub project: Option<String>,
     /// 写入方（agent 名 / `manual` / `import`）
     pub agent: Option<String>,
+    /// 写入设备 id（`device.json` 里那个）。跨机同步后用来分辨「这条是谁写的」，
+    /// 也是冲突三方合并的「base」定位依据之一。
+    #[serde(default)]
+    pub device: Option<String>,
+    /// 会话标识（同一次对话的多条 l1 共享）。缺省 `None`。
+    #[serde(default)]
+    pub session: Option<String>,
     pub tags: Vec<String>,
     /// 0.0–1.0，检索排序的加权项；缺省 0.5
     pub importance: f64,
@@ -114,10 +220,39 @@ pub struct MemoryEntry {
     pub updated_at: i64,
     /// 事实生效时间（与 created_at 不同的场景：补录历史记忆）
     pub valid_from: i64,
+    /// 事实失效时间。`Some` = 这条只在 `valid_to` 之前成立（如「旧版 API 的字段名」）。
+    /// 与 `superseded_by` 是两条独立的时间轴：前者是「客观过期」，后者是「被新结论顶掉」。
+    #[serde(default)]
+    pub valid_to: Option<i64>,
     /// 被谁取代（由 `supersedes` 的反向维护写入）
     pub superseded_by: Option<String>,
     /// 回收站时间。`Some` = 已删除但可恢复
     pub deleted_at: Option<i64>,
+    /// 去重结论（只用于展示与统计；「是否被取代」看 `superseded_by`）
+    #[serde(default)]
+    pub dedup_status: DedupStatus,
+    /// 证据链锚点：指向支撑这条结论的原始记忆 id 或 `files` 里的路径 + `#hash`。
+    /// 深层画像用它在界面上「点结论看依据」。
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    /// 正文归一化后的 SHA-256 前 32 位十六进制。L1 精确去重靠它：
+    /// 同一段话被两个 Agent 各写一遍时，第二次能直接命中而不必做全文比较。
+    #[serde(default)]
+    pub hash: String,
+    /// 被 `memory_search` / `memory_get` 命中的累计次数（索引侧维护，回写 frontmatter）。
+    /// 检索的 `weightHeat` 项用它 —— 「反复被查到的记忆」比「写完就没人看」的更值得排前。
+    #[serde(default)]
+    pub access_count: u64,
+    /// 最近一次被命中的时间。热度的衰减基准。
+    #[serde(default)]
+    pub last_hit_at: Option<i64>,
+    /// 模型生成的一句话摘要。空 = 还没生成（此时 `summary()` 回退到正文首段）。
+    ///
+    /// 为什么不直接覆盖 `body`：摘要会丢证据。原文是这条记忆存在的理由，
+    /// 模型产出的东西只能作为**附加物**存在 —— 用户不信时可以删掉摘要、
+    /// 原文仍然完整。
+    #[serde(default)]
+    pub summary_text: String,
     /// 正文（frontmatter 之后的部分）。索引里存一份用于检索，源仍在 .md
     pub body: String,
     /// 文件相对路径（相对 memory 根）。恢复/重写时按它定位
@@ -125,8 +260,50 @@ pub struct MemoryEntry {
 }
 
 impl MemoryEntry {
-    /// 摘要：正文第一段非空文本，压到 `limit` 字符。索引与「紧凑索引行」用它。
+    /// 骨架构造：字段多起来之后（20+ 个），测试与「只关心少数几项」的调用点
+    /// 逐个列全字段既啰嗦又容易漏掉新字段。这个函数给出全部默认值，调用方按需
+    /// 改三五个字段即可。
+    pub fn draft(id: impl Into<String>, title: impl Into<String>, kind: MemoryKind, body: impl Into<String>) -> Self {
+        let now = now_ms();
+        let body = body.into();
+        MemoryEntry {
+            id: id.into(),
+            title: title.into(),
+            kind,
+            layer: if kind.prefers_l2() { Layer::L2 } else { Layer::L1 },
+            project: None,
+            agent: None,
+            device: None,
+            session: None,
+            tags: Vec::new(),
+            importance: 0.5,
+            files: Vec::new(),
+            supersedes: Vec::new(),
+            pinned: false,
+            starred: false,
+            created_at: now,
+            updated_at: now,
+            valid_from: now,
+            valid_to: None,
+            superseded_by: None,
+            deleted_at: None,
+            dedup_status: DedupStatus::Unique,
+            evidence: Vec::new(),
+            hash: content_hash(&body),
+            access_count: 0,
+            last_hit_at: None,
+            summary_text: String::new(),
+            body,
+            path: String::new(),
+        }
+    }
+
+    /// 摘要：优先用模型写过的一句摘要，其次正文第一段非空文本，压到 `limit` 字符。
+    /// 索引与「紧凑索引行」用它。
     pub fn summary(&self, limit: usize) -> String {
+        if !self.summary_text.trim().is_empty() {
+            return truncate_chars(self.summary_text.trim(), limit);
+        }
         let first = self
             .body
             .lines()
@@ -157,9 +334,14 @@ impl MemoryEntry {
         )
     }
 
-    /// 该记忆是否仍然有效（未被取代、未进回收站）
+    /// 该记忆是否仍然有效（未被取代、未进回收站、未过有效期）
     pub fn is_live(&self) -> bool {
-        self.superseded_by.is_none() && self.deleted_at.is_none()
+        self.superseded_by.is_none() && self.deleted_at.is_none() && !self.is_expired(now_ms())
+    }
+
+    /// 是否已超过声明的有效期（`valid_to` 为 `None` 时永不过期）。
+    pub fn is_expired(&self, now: i64) -> bool {
+        matches!(self.valid_to, Some(until) if until > 0 && now > until)
     }
 
     /// 接口响应形状。正文按需附带（列表不带全文，`get` 才带）
@@ -169,8 +351,11 @@ impl MemoryEntry {
             "title": self.title,
             "type": self.kind.as_str(),
             "typeLabel": self.kind.label(),
+            "layer": self.layer.as_str(),
             "project": self.project,
             "agent": self.agent,
+            "device": self.device,
+            "session": self.session,
             "tags": self.tags,
             "importance": self.importance,
             "files": self.files,
@@ -181,8 +366,15 @@ impl MemoryEntry {
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
             "validFrom": self.valid_from,
+            "validTo": self.valid_to,
             "deletedAt": self.deleted_at,
+            "dedupStatus": self.dedup_status.as_str(),
+            "evidence": self.evidence,
+            "hash": self.hash,
+            "accessCount": self.access_count,
+            "lastHitAt": self.last_hit_at,
             "summary": self.summary(180),
+            "summaryText": self.summary_text,
             "chars": self.body.chars().count(),
             "path": self.path,
         });
@@ -191,6 +383,45 @@ impl MemoryEntry {
         }
         value
     }
+}
+
+/// 正文归一化哈希：SHA-256 前 32 位十六进制。
+///
+/// 归一化做三件事：CRLF → LF、每行去尾部空白、整体去首尾空白。**不做**大小写
+/// 折叠 —— 「不要用 rm」与「不要用 RM」在中文语境里是两条记忆，折叠会误合并。
+pub fn content_hash(text: &str) -> String {
+    let normalized = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    let digest = hasher.finalize();
+    digest.iter().take(16).map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn now_ms() -> i64 {
+    crate::server::logging::now_ms()
+}
+
+/// 画像条目的稳定 id：`profile-<sub>-<内容哈希前 10 位>`。
+///
+/// 为什么按内容算而不是按时间：画像每次重生成都会得到一批「说法相同、时间不同」
+/// 的条目。按内容算 id 让同一句结论落在同一个文件上（覆盖而不是新增），
+/// 用户在回收站/演化链里看到的是「这句结论换过几次说法」，不是「同一句话被
+/// 重复生成了 20 次」。
+pub fn make_profile_id(sub: &str, body: &str) -> String {
+    let safe: String = sub
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+        .collect();
+    let sub = if safe.is_empty() { "profile".to_string() } else { safe };
+    format!("profile-{sub}-{}", &content_hash(body)[..10])
 }
 
 /// 按**字符**截断（不按字节）：中文正文按字节切会切出半个字。
@@ -256,19 +487,32 @@ fn yaml_list(items: &[String]) -> String {
 impl MemoryEntry {
     /// 整条记忆 → 带 frontmatter 的 Markdown 文本
     pub fn to_markdown(&self) -> String {
-        let mut out = String::with_capacity(self.body.len() + 512);
+        let mut out = String::with_capacity(self.body.len() + 640);
         out.push_str("---\n");
         out.push_str(&format!("id: {}\n", yaml_scalar(&self.id)));
         out.push_str(&format!("title: {}\n", yaml_scalar(&self.title)));
         out.push_str(&format!("type: {}\n", self.kind.as_str()));
+        // `l1` 是缺省值：不写出来，让存量文件的 diff 保持最小
+        if self.layer != Layer::L1 {
+            out.push_str(&format!("layer: {}\n", self.layer.as_str()));
+        }
         if let Some(project) = &self.project {
             out.push_str(&format!("project: {}\n", yaml_scalar(project)));
         }
         if let Some(agent) = &self.agent {
             out.push_str(&format!("agent: {}\n", yaml_scalar(agent)));
         }
+        if let Some(device) = &self.device {
+            out.push_str(&format!("device: {}\n", yaml_scalar(device)));
+        }
+        if let Some(session) = &self.session {
+            out.push_str(&format!("session: {}\n", yaml_scalar(session)));
+        }
         out.push_str(&format!("tags: {}\n", yaml_list(&self.tags)));
         out.push_str(&format!("importance: {}\n", self.importance));
+        if !self.summary_text.trim().is_empty() {
+            out.push_str(&format!("summary: {}\n", yaml_scalar(self.summary_text.trim())));
+        }
         if !self.files.is_empty() {
             out.push_str(&format!("files: {}\n", yaml_list(&self.files)));
         }
@@ -287,8 +531,27 @@ impl MemoryEntry {
         out.push_str(&format!("created_at: {}\n", self.created_at));
         out.push_str(&format!("updated_at: {}\n", self.updated_at));
         out.push_str(&format!("valid_from: {}\n", self.valid_from));
+        if let Some(until) = self.valid_to {
+            out.push_str(&format!("valid_to: {until}\n"));
+        }
         if let Some(deleted) = self.deleted_at {
             out.push_str(&format!("deleted_at: {deleted}\n"));
+        }
+        if self.dedup_status != DedupStatus::Unique {
+            out.push_str(&format!("dedup_status: {}\n", self.dedup_status.as_str()));
+        }
+        if !self.evidence.is_empty() {
+            out.push_str(&format!("evidence: {}\n", yaml_list(&self.evidence)));
+        }
+        if !self.hash.is_empty() {
+            out.push_str(&format!("hash: {}\n", yaml_scalar(&self.hash)));
+        }
+        // 热度两项只在真被读过时写：绝大多数记忆永远停在 0，写出去只是噪音
+        if self.access_count > 0 {
+            out.push_str(&format!("access_count: {}\n", self.access_count));
+        }
+        if let Some(hit) = self.last_hit_at {
+            out.push_str(&format!("last_hit_at: {hit}\n"));
         }
         out.push_str("---\n\n");
         out.push_str(&self.body);
@@ -303,7 +566,7 @@ impl MemoryEntry {
     pub fn from_markdown(text: &str, fallback_id: &str, path: &str) -> Self {
         let (meta, body) = split_frontmatter(text);
         let get = |key: &str| meta_get(&meta, key);
-        let now = crate::server::logging::now_ms();
+        let now = now_ms();
         let kind = MemoryKind::parse(&get("type").unwrap_or_default());
         let mut entry = MemoryEntry {
             id: get("id").filter(|v| !v.is_empty()).unwrap_or_else(|| fallback_id.to_string()),
@@ -320,8 +583,17 @@ impl MemoryEntry {
                     .unwrap_or_else(|| "未命名记忆".to_string())
             }),
             kind,
+            // 没写 `layer` 时按类别推断：决策/知识/洞见/画像天然是沉淀层。
+            // 这比一律当 l1 更准 —— 存量文件里的 `type: decision` 本就该进核心记忆。
+            layer: match get("layer") {
+                Some(raw) => Layer::parse(&raw),
+                None if kind.prefers_l2() => Layer::L2,
+                None => Layer::L1,
+            },
             project: get("project").filter(|v| !v.is_empty()),
             agent: get("agent").filter(|v| !v.is_empty()),
+            device: get("device").filter(|v| !v.is_empty()),
+            session: get("session").filter(|v| !v.is_empty()),
             tags: parse_list(get("tags").as_deref()),
             importance: get("importance").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.5).clamp(0.0, 1.0),
             files: parse_list(get("files").as_deref()),
@@ -331,8 +603,15 @@ impl MemoryEntry {
             created_at: get("created_at").and_then(|v| v.parse::<i64>().ok()).unwrap_or(now),
             updated_at: get("updated_at").and_then(|v| v.parse::<i64>().ok()).unwrap_or(now),
             valid_from: get("valid_from").and_then(|v| v.parse::<i64>().ok()).unwrap_or(now),
+            valid_to: get("valid_to").and_then(|v| v.parse::<i64>().ok()).filter(|value| *value > 0),
             superseded_by: get("superseded_by").filter(|v| !v.is_empty()),
             deleted_at: get("deleted_at").and_then(|v| v.parse::<i64>().ok()),
+            dedup_status: DedupStatus::parse(&get("dedup_status").unwrap_or_default()),
+            evidence: parse_list(get("evidence").as_deref()),
+            hash: get("hash").filter(|v| !v.is_empty()).unwrap_or_else(|| content_hash(&body)),
+            access_count: get("access_count").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
+            last_hit_at: get("last_hit_at").and_then(|v| v.parse::<i64>().ok()).filter(|value| *value > 0),
+            summary_text: get("summary").unwrap_or_default(),
             body,
             path: path.to_string(),
         };
@@ -381,6 +660,16 @@ fn meta_get(meta: &[(String, String)], key: &str) -> Option<String> {
         .find(|(name, _)| name == key)
         .map(|(_, value)| unquote(value))
         .filter(|value| !value.is_empty())
+}
+
+/// 供 `store` 读「容器头」用的只读切分：返回 `(头部键值, 正文)`。
+///
+/// 容器（`l1/<agent>/<date>.md`）的头部只有 date/agent/project 三个键，而正文
+/// 里每一节又有自己的标记行 —— 逐节解析归 store，这里只负责把「头部」和
+/// 「内容」切开，免得 store 再抄一份 frontmatter 解析。
+pub fn split_frontmatter_public(text: &str) -> (std::collections::BTreeMap<String, String>, String) {
+    let (meta, body) = split_frontmatter(text);
+    (meta.into_iter().collect(), body)
 }
 
 /// 去掉写出时加的引号、还原转义。空引号串 `""` 视为空值。
@@ -440,26 +729,23 @@ mod tests {
     use super::*;
 
     fn sample() -> MemoryEntry {
-        MemoryEntry {
-            id: "m1".into(),
-            title: "别用 rm -rf 清缓存".into(),
-            kind: MemoryKind::Pitfall,
-            project: Some("agent2api".into()),
-            agent: Some("manual".into()),
-            tags: vec!["磁盘".into(), "误删".into()],
-            importance: 0.9,
-            files: vec!["desktop-tauri/ui/app.js".into()],
-            supersedes: vec![],
-            pinned: true,
-            starred: false,
-            created_at: 1_700_000_000_000,
-            updated_at: 1_700_000_000_000,
-            valid_from: 1_700_000_000_000,
-            superseded_by: None,
-            deleted_at: None,
-            body: "清了 node_modules 之后整机半小时不能工作。\n\n用 npm ci 重装即可。".into(),
-            path: "projects/agent2api/m1.md".into(),
-        }
+        let mut entry = MemoryEntry::draft(
+            "m1",
+            "别用 rm -rf 清缓存",
+            MemoryKind::Pitfall,
+            "清了 node_modules 之后整机半小时不能工作。\n\n用 npm ci 重装即可。",
+        );
+        entry.project = Some("agent2api".into());
+        entry.agent = Some("manual".into());
+        entry.tags = vec!["磁盘".into(), "误删".into()];
+        entry.importance = 0.9;
+        entry.files = vec!["desktop-tauri/ui/app.js".into()];
+        entry.pinned = true;
+        entry.created_at = 1_700_000_000_000;
+        entry.updated_at = 1_700_000_000_000;
+        entry.valid_from = 1_700_000_000_000;
+        entry.path = "projects/agent2api/m1.md".into();
+        entry
     }
 
     #[test]
@@ -476,6 +762,64 @@ mod tests {
         assert!(back.pinned);
         assert!((back.importance - 0.9).abs() < 1e-9);
         assert_eq!(back.body.trim(), entry.body.trim());
+    }
+
+    /// 新增字段（layer / valid_to / dedup / evidence / 热度）必须能往返。
+    #[test]
+    fn markdown_round_trip_keeps_new_fields() {
+        let mut entry = sample();
+        entry.layer = Layer::L2;
+        entry.device = Some("dev-01".into());
+        entry.session = Some("sess-9".into());
+        entry.valid_to = Some(1_800_000_000_000);
+        entry.dedup_status = DedupStatus::Merged;
+        entry.evidence = vec!["m0".into(), "docs/api.md#a1b2".into()];
+        entry.access_count = 7;
+        entry.last_hit_at = Some(1_700_000_500_000);
+        let text = entry.to_markdown();
+        let back = MemoryEntry::from_markdown(&text, "fallback", &entry.path);
+        assert_eq!(back.layer, Layer::L2);
+        assert_eq!(back.device.as_deref(), Some("dev-01"));
+        assert_eq!(back.session.as_deref(), Some("sess-9"));
+        assert_eq!(back.valid_to, Some(1_800_000_000_000));
+        assert_eq!(back.dedup_status, DedupStatus::Merged);
+        assert_eq!(back.evidence, entry.evidence);
+        assert_eq!(back.access_count, 7);
+        assert_eq!(back.last_hit_at, Some(1_700_000_500_000));
+        assert_eq!(back.hash, entry.hash);
+    }
+
+    /// 存量文件（没有 layer / dedup_status / hash）必须照常读得出来，
+    /// 而且 `decision` 类要自动落到 l2 —— 这是「磁盘格式只加不减」的底线。
+    #[test]
+    fn legacy_file_without_new_keys_still_loads() {
+        let legacy = "---\nid: m9\ntitle: 老决策\ntype: decision\ntags: []\nimportance: 0.5\ncreated_at: 1\nupdated_at: 1\nvalid_from: 1\n---\n\n正文\n";
+        let back = MemoryEntry::from_markdown(legacy, "fallback", "projects/o--r/m9.md");
+        assert_eq!(back.id, "m9");
+        assert_eq!(back.layer, Layer::L2, "决策类无 layer 时按类别推断");
+        assert_eq!(back.dedup_status, DedupStatus::Unique);
+        assert!(!back.hash.is_empty(), "hash 缺失时按正文补算");
+        assert_eq!(back.access_count, 0);
+        assert_eq!(back.valid_to, None);
+    }
+
+    #[test]
+    fn content_hash_ignores_line_endings_and_trailing_spaces() {
+        assert_eq!(content_hash("a\nb"), content_hash("a\r\nb"));
+        assert_eq!(content_hash("a\nb"), content_hash("a   \nb\t\n"));
+        assert_ne!(content_hash("用 rm"), content_hash("用 RM"));
+    }
+
+    #[test]
+    fn expired_entry_is_not_live() {
+        let mut entry = sample();
+        entry.deleted_at = None;
+        entry.superseded_by = None;
+        assert!(entry.is_live());
+        entry.valid_to = Some(now_ms() - 1_000);
+        assert!(!entry.is_live());
+        entry.valid_to = Some(now_ms() + 1_000_000);
+        assert!(entry.is_live());
     }
 
     #[test]

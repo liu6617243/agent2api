@@ -37,8 +37,8 @@ pub(crate) mod image_config;
 pub(crate) mod image_jobs;
 mod image_mcp;
 mod mcp;
-/// 记忆中枢的 MCP 规格与工具分发（`/mcp/memory`，11 个工具）。
-/// 独立成文件：11 个工具的描述本身两百多行，塞进 `mcp.rs` 会把分发逻辑淹掉。
+/// 记忆中枢的 MCP 规格与工具分发（`/mcp/memory`，14 个工具）。
+/// 独立成文件：工具描述本身三百多行，塞进 `mcp.rs` 会把分发逻辑淹掉。
 mod memory_mcp;
 mod normalize;
 mod providers;
@@ -114,9 +114,11 @@ pub const VISION_VERSION: &str = VISION_SERVICE_VERSION;
 pub const CAPABILITY_COUNTS: [(&str, u32); 3] = [
     (WEB_SEARCH_SERVICE_ID, 2),
     (VISION_SERVICE_ID, 1),
-    // 记忆中枢的 11 个工具：core / digest / search / get / timeline / write /
-    // update / recent / projects / forget / status（见 tool_services::memory_mcp）
-    (MEMORY_SERVICE_ID, 11),
+    // 记忆中枢的 14 个工具：core / digest / search / get / timeline / write /
+    // update / recent / projects / forget / status + review_list / review_resolve /
+    // health（见 tool_services::memory_mcp）。前 11 个是 v1 就有的、名字与语义
+    // 不变；后 3 个是「对齐 AgentHub 全量能力」新增的。
+    (MEMORY_SERVICE_ID, 14),
 ];
 
 /// 工具执行超时（秒）：同一服务各协议共用；服务端强制上限，装 MCP 时写进客户端

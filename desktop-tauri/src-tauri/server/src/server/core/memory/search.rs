@@ -14,13 +14,30 @@
 //! 界面上的记忆页用同一套函数取数，于是「界面上看到的」与「注入给模型的」
 //! 出自同一份代码 —— 不会出现「界面说有 3 条、模型只看到 1 条」的分叉。
 //!
-//! ── 排序为什么把 importance 与 recency 混进去 ───────────────
+//! ── 排序为什么是七项混排，而不是纯 bm25 ─────────────────────
 //! 纯 bm25 会给「长正文里的偶然命中」高分，而记忆的实际价值在「这条是决策、
-//! 当时标了高重要度、而且是最近写的」。三项混排之后，同一批命中里先出的是
-//! 「你当时认为重要、且还新鲜」的那几条。
+//! 当时标了高重要度、属于我正在做的项目、而且是最近写的、还被反复查过」。
+//! 所以七项各自归一化到 0..1 后加权求和（权重来自 `config`，默认值见
+//! `config::SCHEMA` 的 `search.weight*`）：
+//!
+//! | 项 | 归一口径 |
+//! |---|---|
+//! | `bm25` | `-rank` 除以本批最大值；退化模式用命中词数 |
+//! | `recency` | 按 `search.timeDecayHalfLife` 做半衰期衰减 |
+//! | `importance` | 原值（0..1） |
+//! | `affinity` | 项目匹配 + 同 agent 的加成 |
+//! | `graph` | `mem_link` 里与本批命中相连的条目（一次性扩散） |
+//! | `heat` | `access_count` 的对数尺度 + `last_hit_at` 衰减 |
+//! | `layer` | `l2` 得满分，`l1` 得 0（结论压过流水） |
+//!
+//! 置顶与星标不占权重位：它们改成**硬排序前缀**（置顶 > 星标 > 其余），
+//! 因为「用户手动钉住」是明确意图，混进加权里会被一堆小项稀释掉。
 
+use std::collections::HashSet;
+
+use super::config;
 use super::index::{self, IndexRow};
-use super::model::{estimate_tokens, truncate_chars, MemoryEntry};
+use super::model::{estimate_tokens, truncate_chars, MemoryEntry, MemoryKind};
 
 /// 检索条件。字段全空 = 「按时间列一批」。
 #[derive(Debug, Default, Clone)]
@@ -29,12 +46,16 @@ pub struct Query {
     pub project: Option<String>,
     pub agent: Option<String>,
     pub kind: Option<String>,
+    /// `l1` / `l2`。空 = 不限层
+    pub layer: Option<String>,
     pub tag: Option<String>,
     pub starred: Option<bool>,
     pub pinned: Option<bool>,
     /// 包含已被取代的记忆（默认不含：旧结论留着只会误导）
     pub include_superseded: bool,
     pub include_deleted: bool,
+    /// 包含已过有效期（`valid_to`）的记忆
+    pub include_expired: bool,
     pub limit: usize,
 }
 
@@ -42,7 +63,7 @@ fn now_ms() -> i64 {
     crate::server::logging::now_ms()
 }
 
-/// 一次检索：取候选 → 过滤 → 打分排序 → 截断。
+/// 一次检索：取候选 → 过滤 → 打分排序 → 截断 → 记热度。
 pub fn search(query: &Query) -> Vec<IndexRow> {
     let mut rows = if query.text.trim().is_empty() {
         index::global().rows(query.include_deleted)
@@ -50,9 +71,14 @@ pub fn search(query: &Query) -> Vec<IndexRow> {
         index::global().search(&query.text)
     };
     rows.retain(|row| keep(row, query));
-    score_and_sort(&mut rows, &query.text);
+    score_and_sort(&mut rows, query);
     let limit = if query.limit == 0 { 30 } else { query.limit.min(500) };
     rows.truncate(limit);
+    // 热度只记「关键词检索」的命中：无关键词的列表浏览不算「用户要看这条」
+    if !query.text.trim().is_empty() {
+        let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+        index::global().hit(&ids);
+    }
     rows
 }
 
@@ -62,6 +88,13 @@ fn keep(row: &IndexRow, query: &Query) -> bool {
     }
     if row.superseded_by.is_some() && !query.include_superseded {
         return false;
+    }
+    if !query.include_expired {
+        if let Some(until) = row.valid_to {
+            if until > 0 && now_ms() > until {
+                return false;
+            }
+        }
     }
     if let Some(project) = &query.project {
         let want = super::store::slugify(project);
@@ -78,6 +111,11 @@ fn keep(row: &IndexRow, query: &Query) -> bool {
     }
     if let Some(kind) = &query.kind {
         if !kind.is_empty() && row.kind != *kind {
+            return false;
+        }
+    }
+    if let Some(layer) = &query.layer {
+        if !layer.is_empty() && row.layer != *layer {
             return false;
         }
     }
@@ -99,33 +137,115 @@ fn keep(row: &IndexRow, query: &Query) -> bool {
     true
 }
 
-/// 综合打分：相关度 + 重要度 + 置顶/星标 + 新鲜度。
-fn score_and_sort(rows: &mut [IndexRow], text: &str) {
+/// 七项混排。权重从配置读，缺省值保证「不配也合理」。
+fn score_and_sort(rows: &mut [IndexRow], query: &Query) {
     let now = now_ms();
-    let seven_days = 7 * 24 * 3600 * 1000;
+    let half_life_days = config::number("search.timeDecayHalfLife");
+    let w_bm25 = config::number("search.weightBm25");
+    let w_recency = config::number("search.weightRecency");
+    let w_importance = config::number("search.weightImportance");
+    let w_affinity = config::number("search.weightAffinity");
+    let w_graph = config::number("search.weightGraph");
+    let w_heat = config::number("search.weightHeat");
+    let w_layer = config::number("search.weightLayer");
+
+    // bm25 归一需要先拿到本批最大值：绝对分值随查询长度变化，不归一就不可比
+    let max_relevance = rows
+        .iter()
+        .map(|row| if row.rank != 0.0 { -row.rank } else { row.hits as f64 })
+        .fold(0.0f64, f64::max);
+
+    // 图扩散：本批已命中的 id 出发，一跳邻居额外加分（只做一层，不做迭代传播）
+    let seeds: HashSet<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+    let graph_boost: HashSet<String> = if w_graph > 0.0 {
+        index::global()
+            .neighbors(&seeds.iter().map(|id| id.to_string()).collect::<Vec<_>>())
+            .into_iter()
+            .filter(|id| !seeds.contains(id.as_str()))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    let current_project = query.project.as_deref().map(super::store::slugify);
+    let current_agent = query.agent.as_deref();
+
     for row in rows.iter_mut() {
-        // FTS5 的 bm25 是负分（越小越相关），取反后与 hits 同向
         let relevance = if row.rank != 0.0 { -row.rank } else { row.hits as f64 };
-        let recency = if now - row.updated_at < seven_days && row.updated_at > 0 {
-            1.0
+        let bm25 = if max_relevance > 0.0 {
+            (relevance / max_relevance).clamp(0.0, 1.0)
         } else {
             0.0
         };
-        row.rank = relevance
-            + row.importance * 2.0
-            + if row.pinned { 3.0 } else { 0.0 }
-            + if row.starred { 1.0 } else { 0.0 }
-            + recency;
+        let recency = if half_life_days <= 0.0 {
+            // 半衰期 0 = 不衰减，全部记满分（让其它项决定排序）
+            1.0
+        } else if row.updated_at <= 0 {
+            0.0
+        } else {
+            let age_days = ((now - row.updated_at).max(0) as f64) / 86_400_000.0;
+            // 0.5^(age/halfLife)：标准半衰期衰减
+            (0.5f64).powf(age_days / half_life_days)
+        };
+        let affinity = {
+            let mut score = 0.0;
+            if let (Some(want), Some(project)) = (&current_project, &row.project) {
+                if super::store::slugify(project) == *want {
+                    score += 0.7;
+                }
+            }
+            if let (Some(want), Some(agent)) = (current_agent, row.agent.as_deref()) {
+                if agent == want {
+                    score += 0.3;
+                }
+            }
+            score.min(1.0)
+        };
+        let graph = if graph_boost.contains(&row.id) { 1.0 } else { 0.0 };
+        let heat = {
+            if row.access_count <= 0 {
+                0.0
+            } else {
+                // log 尺度：1 次 ≈ 0.34，10 次 ≈ 0.67，100 次 ≈ 1.0。
+                // 线性会让「被机器批量读过 100 次」的条目永久霸榜
+                let frequency = (1.0 + row.access_count as f64).ln() / 11.0_f64.ln();
+                let freshness = match row.last_hit_at {
+                    Some(at) if half_life_days > 0.0 => {
+                        let age_days = ((now - at).max(0) as f64) / 86_400_000.0;
+                        (0.5f64).powf(age_days / half_life_days)
+                    }
+                    Some(_) => 1.0,
+                    None => 0.5,
+                };
+                (frequency * freshness).clamp(0.0, 1.0)
+            }
+        };
+        let layer = if row.layer == "l2" { 1.0 } else { 0.0 };
+
+        row.rank = bm25 * w_bm25
+            + recency * w_recency
+            + row.importance * w_importance
+            + affinity * w_affinity
+            + graph * w_graph
+            + heat * w_heat
+            + layer * w_layer;
     }
-    if text.trim().is_empty() {
-        // 无关键词：置顶优先、然后按更新时间（`rows()` 已按 updated_at 排好，
-        // 这里只把置顶的提上来，稳定排序保住同分区内的顺序）
-        rows.sort_by(|a, b| b.pinned.cmp(&a.pinned));
+
+    // 置顶 / 星标 / 过期 作为硬前缀：明确意图不该被加权稀释。
+    // 有置顶时置顶排前面；同等条件下星标次之；已过期（用户显式要求包含时）沉底。
+    if query.text.trim().is_empty() {
+        // 无关键词：置顶优先，其余保持 `rows()` 给的时间序（稳定排序）
+        rows.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.starred.cmp(&a.starred)));
     } else {
         rows.sort_by(|a, b| {
-            b.rank
-                .partial_cmp(&a.rank)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.pinned
+                .cmp(&a.pinned)
+                .then(b.starred.cmp(&a.starred))
+                .then(
+                    b.rank
+                        .partial_cmp(&a.rank)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
                 .then(b.updated_at.cmp(&a.updated_at))
         });
     }
@@ -137,7 +257,7 @@ fn score_and_sort(rows: &mut [IndexRow], text: &str) {
 /// token，而模型通常只需要「知道有这几条、叫什么」，真正要引用的再 `get`。
 pub fn compact_line(row: &IndexRow, now: i64) -> String {
     let mut parts = Vec::new();
-    parts.push(format!("[{}] {}", row.kind, row.title));
+    parts.push(format!("[{}] {}", kind_label(&row.kind), row.title));
     if let Some(project) = &row.project {
         parts.push(project.clone());
     }
@@ -147,11 +267,24 @@ pub fn compact_line(row: &IndexRow, now: i64) -> String {
     if row.pinned {
         parts.push("置顶".to_string());
     }
+    if row.starred {
+        parts.push("星标".to_string());
+    }
+    if row.layer == "l2" {
+        parts.push("沉淀".to_string());
+    }
     if row.superseded_by.is_some() {
         parts.push("已过时".to_string());
+    } else if matches!(row.valid_to, Some(until) if until > 0 && now > until) {
+        parts.push("已失效".to_string());
     }
     parts.push(relative_time(row.updated_at, now));
     format!("{} · `{}`", parts.join(" · "), row.id)
+}
+
+/// 索引里存的是 `type` 字符串，界面上要中文。走 `MemoryKind` 保持单一来源。
+fn kind_label(kind: &str) -> &'static str {
+    MemoryKind::parse(kind).label()
 }
 
 /// 相对时间：今天 / 3 天前 / 2026-11-03。
@@ -203,6 +336,9 @@ pub fn format_date(timestamp: i64) -> String {
 ///
 /// 结构：画像条目 → 按项目的「最重要 + 最近」几条要点。预算按 token 估算逐步
 /// 收缩，超出就丢最不重要的行（不是硬截断半句话 —— 半句话对模型是噪音）。
+///
+/// 只喂 `l2`（沉淀结论）+ 画像 + 置顶：`l1` 是原始流水，把它塞进 800 token
+/// 的核心预算里，等于用「今天聊了啥」把「长期结论」挤出去。
 pub fn core_text(entries: &[MemoryEntry], project: Option<&str>, max_tokens: usize) -> (String, usize, bool) {
     let now = now_ms();
     let budget = max_tokens.clamp(200, 4000);
@@ -211,8 +347,12 @@ pub fn core_text(entries: &[MemoryEntry], project: Option<&str>, max_tokens: usi
     for entry in entries.iter().filter(|entry| entry.is_live()) {
         let is_profile = matches!(
             entry.kind,
-            super::model::MemoryKind::Profile | super::model::MemoryKind::Preference
+            MemoryKind::Profile | MemoryKind::Preference
         );
+        // l1 且非画像、非置顶 → 不进核心记忆
+        if entry.layer != super::model::Layer::L2 && !is_profile && !entry.pinned {
+            continue;
+        }
         if let Some(want) = project {
             let want = super::store::slugify(want);
             let same = entry.project.as_deref().map(super::store::slugify).as_deref() == Some(want.as_str());
@@ -229,7 +369,8 @@ pub fn core_text(entries: &[MemoryEntry], project: Option<&str>, max_tokens: usi
         );
         let weight = entry.importance
             + if entry.pinned { 0.6 } else { 0.0 }
-            + if is_profile { 0.3 } else { 0.0 };
+            + if is_profile { 0.3 } else { 0.0 }
+            + if entry.layer == super::model::Layer::L2 { 0.2 } else { 0.0 };
         lines.push((weight, text));
     }
 
@@ -280,7 +421,8 @@ pub fn digest_text(entries: &[MemoryEntry], max_lines: usize) -> String {
             out.push_str("…（已截断）\n");
             break;
         }
-        out.push_str(&format!("\n## {}（{} 条）\n", project, items.len()));
+        let name = if project == super::store::GLOBAL_SLUG { "通用" } else { project.as_str() };
+        out.push_str(&format!("\n## {name}（{} 条）\n", items.len()));
         lines += 2;
         let mut sorted: Vec<&&MemoryEntry> = items.iter().collect();
         sorted.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -345,30 +487,67 @@ mod tests {
     fn core_text_respects_budget() {
         let mut entries = Vec::new();
         for index in 0..50 {
-            entries.push(super::super::model::MemoryEntry {
-                id: format!("m{index}"),
-                title: format!("第 {index} 条很长的标题用于测试预算收缩"),
-                kind: super::super::model::MemoryKind::Knowledge,
-                project: Some("demo".into()),
-                agent: None,
-                tags: vec![],
-                importance: 0.5,
-                files: vec![],
-                supersedes: vec![],
-                pinned: false,
-                starred: false,
-                created_at: 1,
-                updated_at: 1,
-                valid_from: 1,
-                superseded_by: None,
-                deleted_at: None,
-                body: "正文".into(),
-                path: String::new(),
-            });
+            let mut entry = MemoryEntry::draft(
+                format!("m{index}"),
+                format!("第 {index} 条很长的标题用于测试预算收缩"),
+                MemoryKind::Knowledge,
+                "正文",
+            );
+            entry.project = Some("demo".into());
+            entry.layer = super::super::model::Layer::L2;
+            entry.created_at = 1;
+            entry.updated_at = 1;
+            entry.valid_from = 1;
+            entries.push(entry);
         }
         let (text, used, truncated) = core_text(&entries, None, 200);
         assert!(used <= 210, "used={used}");
         assert!(truncated);
         assert!(text.contains("未展开"));
+    }
+
+    /// l1 流水不该进核心记忆（否则 800 token 会被「今天聊了啥」占满）。
+    #[test]
+    fn core_text_skips_l1_noise() {
+        let mut daily = MemoryEntry::draft("d1", "今天调了半小时端口", MemoryKind::Daily, "流水");
+        daily.layer = super::super::model::Layer::L1;
+        let mut decision = MemoryEntry::draft("d2", "端口固定 3065", MemoryKind::Decision, "结论");
+        decision.layer = super::super::model::Layer::L2;
+        let (text, _, _) = core_text(&[daily, decision], None, 800);
+        assert!(text.contains("端口固定"), "结论必须在核心记忆里");
+        assert!(!text.contains("调了半小时端口"), "l1 流水不该进核心记忆");
+    }
+
+    #[test]
+    fn compact_line_marks_layer_and_expiry() {
+        let now = 1_700_000_000_000;
+        let row = IndexRow {
+            id: "m1".into(),
+            project: Some("demo".into()),
+            agent: None,
+            kind: "decision".into(),
+            layer: "l2".into(),
+            title: "用 rustls".into(),
+            summary: String::new(),
+            tags: vec![],
+            importance: 0.9,
+            pinned: false,
+            starred: false,
+            created_at: now,
+            updated_at: now,
+            valid_to: Some(now - 1),
+            superseded_by: None,
+            deleted_at: None,
+            dedup_status: "unique".into(),
+            access_count: 0,
+            last_hit_at: None,
+            path: String::new(),
+            rank: 0.0,
+            hits: 0,
+        };
+        let line = compact_line(&row, now);
+        assert!(line.contains("决策"), "类型要显示中文：{line}");
+        assert!(line.contains("沉淀"), "l2 要标出来：{line}");
+        assert!(line.contains("已失效"), "过期要标出来：{line}");
     }
 }

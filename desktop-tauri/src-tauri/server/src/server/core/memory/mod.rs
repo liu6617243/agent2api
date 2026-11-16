@@ -1,25 +1,36 @@
-//! 记忆中枢 · 模块门面（配置 / 写入 / 注入 / 自检）。
+//! 记忆中枢 · 模块门面。
 //!
 //! ── 这一层为什么存在 ────────────────────────────────────────
-//! 上层（HTTP API 与转发链路）只该看到「一条记忆进来、一段文本出去」，不该
-//! 关心 frontmatter 怎么写、索引怎么建。所以 `model`（形状）/ `store`（文件）/
-//! `index`（检索）/ `search`（排序与披露）四块都在内部，本文件是唯一出口。
+//! 上层（HTTP API 与 MCP 工具）只该看到「一条记忆进来、一段文本出去」，不该
+//! 关心 frontmatter 怎么写、索引怎么建、slug 怎么推。所以
+//! `model`（形状）/ `store`（文件）/ `index`（检索与队列）/ `search`（排序与披露）/
+//! `layout`（项目归类）/ `config`（可调项）六块都在内部，本文件是唯一出口。
 //!
 //! ── 与 AgentHub「记忆中枢」的关系 ────────────────────────────
 //! **功能对齐、代码重写。** 设计参考自 AgentHub（作者：沐晖 / HUIdada1，
 //! https://github.com/HUIdada1/AgentHub）的记忆中枢：MD 事实源 + 派生索引、
-//! 三级披露、`supersedes` 事实演化、`files` 时效预警、回收站。原项目该模块的
-//! 文件头写明「禁止未经授权直接搬运代码」，因此本项目**未复制其实现**，只按
-//! 上述功能规格用 Rust 重写；行为等价之处是设计对齐的结果，不是代码搬运。
+//! 分层（l1 流水 / l2 沉淀）、三级披露、`supersedes` 事实演化、待确认队列、
+//! 深层画像、自动化调度、WebDAV 同步、回收站。原项目该模块的文件头写明
+//! 「禁止未经授权直接搬运代码」，因此本项目**未复制其实现**，只按上述功能规格
+//! 用 Rust 重写；行为等价之处是设计对齐的结果，不是代码搬运。
 //!
-//! ── 与 AgentHub 的有意简化（v1）────────────────────────────
-//! · 不做「daily 一文件多节」：所有记忆都是一个文件一条，`type=daily` 只表示
-//!   类别。少一层分节解析，代价是当天的多条记忆不在同一个文件里。
-//! · 不做 LLM 自动抽取与「待确认」队列：v1 由用户手工写、或由 API 写。
-//! · 不做 WebDAV 同步与外部记忆源导入。
+//! ── 磁盘格式是跨实现的契约 ──────────────────────────────────
+//! `config.json` / `projects.json` / `general/` / `projects/<slug>/` /
+//! `profile/` / `trash/` 这套布局与 frontmatter 键名和 AgentHub 一致：两边的
+//! 记忆目录可以互相直接读。所以这些名字改动要当成协议变更处理。
+//!
+//! ── 记忆为什么不经由网关注入 system prompt ───────────────────
+//! 网关不知道「这个请求属于哪个项目」，只能在请求体里塞一段与上下文无关的
+//! 文本；而记忆的价值恰恰在「什么时候该读哪一条」。所以记忆只通过 MCP 工具
+//! 暴露，由客户端决定何时读取 —— 这也是 AgentHub 的做法。
 
+pub mod config;
+pub mod enrich;
 pub mod index;
+pub mod layout;
+pub mod llm;
 pub mod model;
+pub mod schedule;
 pub mod search;
 pub mod store;
 
@@ -28,26 +39,47 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use model::{truncate_chars, MemoryEntry};
+use layout::Classified;
+use model::{truncate_chars, DedupStatus, Layer, MemoryEntry};
+use search::Query;
 
-/// 对外暴露的两个核心类型。
+/// 对外暴露的核心类型。
 ///
-/// `MemoryKind` 必须从这里出：`tool_services::memory_mcp` 要用它校验 `type`
-/// 参数。`model` 本身是 `pub mod`，但让调用方写 `memory::model::MemoryKind`
-/// 等于把内部文件布局变成对外契约 —— 改一次 model 的分文件就波及调用方。
-/// re-export 一次之后，调用方只认 `memory::MemoryKind`。
-pub use model::MemoryKind;
-pub use search::Query;
+/// `MemoryKind` 必须从这里出：`tool_services::memory_mcp` 与 `api::memory`
+/// 要用它校验 `type` 参数、给界面列出可选类别。`model` 本身是 `pub mod`，但
+/// 让调用方写 `memory::model::MemoryKind` 等于把内部文件布局变成对外契约 ——
+/// 改一次 model 的分文件就波及调用方。re-export 一次之后，调用方只认
+/// `memory::MemoryKind`。
+pub use model::{DedupStatus as MemoryDedupStatus, Layer as MemoryLayer, MemoryKind};
+pub use search::Query as MemoryQuery;
 
-/// 模块设置。落 `{config_dir}/memory/config.json`（与记忆文件同根，
-/// 一起备份、一起搬走）。
+/// 自动化任务的中文名（状态页与服务清单共用一份，避免两处漂移）。
+pub const TASK_LABELS: [(&str, &str); 11] = [
+    ("extract", "抽取要点"),
+    ("summarize", "生成摘要"),
+    ("tag", "自动打标签"),
+    ("classify", "项目归类"),
+    ("supersede", "事实失效判定"),
+    ("distill", "蒸馏结论"),
+    ("consolidate", "合并重复结论"),
+    ("profile", "画像生成"),
+    ("index-scan", "索引对账"),
+    ("cleanup", "清理回收站"),
+    ("health", "记忆体检"),
+];
+
+// ── 设置 ─────────────────────────────────────────────────────
+
+/// 模块设置的**兼容视图**。
 ///
-/// ── 为什么只剩两项 ─────────────────────────────────────────
-/// 早期版本还有 `injectEnabled / injectMode / injectTokens / injectProject /
-/// injectLimit / injectMinChars` 六项 —— 那是「网关转发时改写 system」路线
-/// 的配置。那条路线已删除（层次错位：网关不知道请求属于哪个项目，详见
-/// `tool_services::memory_mcp` 的模块头）。现在记忆只通过 MCP 工具暴露，
-/// **由客户端决定何时读取**，网关不再有「注不注入、注入多少」这种旋钮。
+/// 真实配置在 `config`（一百多个扁平点号键，schema 驱动）。这里只投影出两个
+/// 老字段，因为它们在两处被高频读取：`enabled`（每个 MCP 工具调用都要判）
+/// 与 `core_max_tokens`（`memory_core` 的默认预算）。
+///
+/// ── 为什么还要保留这个结构 ─────────────────────────────────
+/// `api/memory.rs` 的 `GET /api/memory/config` 与 `memory_mcp` 的状态输出都
+/// 以它为形状；直接换成整棵 schema 树会让这两个响应变成「一百个键的大对象」，
+/// 而它们只需要「开没开、给多少预算」。完整配置走 `config::schema_json()`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct MemoryConfig {
@@ -68,66 +100,32 @@ impl Default for MemoryConfig {
     }
 }
 
-impl MemoryConfig {
-    fn sanitized(mut self) -> Self {
-        self.core_max_tokens = self.core_max_tokens.clamp(200, 4000);
-        self
-    }
-}
-
-/// 读模块设置。
-///
-/// ── 为什么带缓存，而且按 **mtime** 失效 ──────────────────────
-/// 这个函数在转发链路上每请求调用一次（决定要不要注入）。每次真去
-/// `read_to_string` + `serde_json::from_str` 等于给每个请求加一次文件 IO ——
-/// 在 3065 端口那种 QPS 下是纯粹的浪费。按 mtime 判断「文件变了没有」：
-/// 命中缓存时只多一次 `metadata()`，改配置（本机页面或手编文件）后下一次
-/// 请求就能生效，不需要重启进程。
+/// 读模块设置（每次调用都是缓存命中，成本是一次 `metadata()`）。
 pub fn config() -> MemoryConfig {
-    use std::sync::Mutex;
-    static CACHE: OnceLock<Mutex<(Option<std::time::SystemTime>, MemoryConfig)>> = OnceLock::new();
-    let path = store::config_file();
-    let stamp = std::fs::metadata(&path).ok().and_then(|meta| meta.modified().ok());
-    let cache = CACHE.get_or_init(|| Mutex::new((None, MemoryConfig::default())));
-    let Ok(mut slot) = cache.lock() else {
-        return MemoryConfig::default();
-    };
-    if slot.0 == stamp {
-        return slot.1.clone();
+    MemoryConfig {
+        enabled: config::bool_of(config::ENABLE_KEY),
+        core_max_tokens: config::usize_of("agents.coreMaxTokens").clamp(200, 4000),
     }
-    let loaded = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<MemoryConfig>(&text).ok())
-        .map(MemoryConfig::sanitized)
-        .unwrap_or_default();
-    *slot = (stamp, loaded.clone());
-    loaded
 }
 
-/// 部分更新：只改传进来的键。返回更新后的完整配置。
+/// 部分更新：只改传进来的键。返回更新后的兼容视图。
+///
+/// 接受三种形状（页面与 MCP 都在用）：
+/// * `{"agents.coreMaxTokens": 900}` —— 扁平点号键
+/// * `{"coreMaxTokens": 900}` —— v1 旧键（自动映射）
+/// * `{"enabled": false}`
 pub fn save_config(patch: &Value) -> Result<MemoryConfig, String> {
-    let mut current = serde_json::to_value(config()).map_err(|error| error.to_string())?;
-    let incoming = patch.as_object().ok_or("配置必须是对象")?;
-    for (key, value) in incoming {
-        if current.get(key).is_some() {
-            current[key] = value.clone();
-        }
-    }
-    let next: MemoryConfig = serde_json::from_value(current).map_err(|error| format!("配置值无效：{error}"))?;
-    let next = next.sanitized();
-    store::ensure_layout()?;
-    let text = serde_json::to_string_pretty(&next).map_err(|error| error.to_string())?;
-    store::write_atomic(&store::config_file(), &text)?;
-    Ok(next)
+    config::patch(patch)?;
+    bump_revision();
+    Ok(config())
 }
 
 // ── 索引保鲜 ─────────────────────────────────────────────────
 
 /// 记忆内容的「版本号」：每次写入 / 更新 / 删除 / 恢复 / 重建都 +1。
 ///
-/// 注入链路拿它做缓存键 —— `core` 模式要把全部记忆读出来拼文本，每请求做一次
-/// 目录扫描在 3065 那种 QPS 下是不可接受的。有版本号之后：内容没变时命中缓存
-/// （零 IO），内容一变立即失效（没有 TTL 带来的「刚写的记忆 N 秒后才生效」）。
+/// 页面与 MCP 用它判断「手里这份是不是过期了」。有版本号之后：内容没变时命中
+/// 缓存（零 IO），内容一变立即失效（没有 TTL 带来的「刚写的记忆 N 秒后才生效」）。
 static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub fn revision() -> u64 {
@@ -141,15 +139,15 @@ fn bump_revision() {
 /// 进程内只做一次「事实源 vs 索引」的一致性检查：条数或最新更新时间对不上
 /// 就整表重建。索引是派生的，重建永远安全。
 ///
-/// 为什么不做文件监听：v1 的写入都经过本模块（写文件的同时更新索引），外力
-/// 改动（用户手编 .md）只需要「下次启动/下次点重建」生效，这比一个跨平台的
+/// 为什么不做文件监听：写入都经过本模块（写文件的同时更新索引），外力改动
+/// （用户手编 .md）只需要「下次启动 / 下次点重建」生效，这比一个跨平台的
 /// 文件监听器简单得多，也不会在编辑器保存的瞬间读到半个文件。
 fn ensure_index_once() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
         let entries = store::load_all();
         let index = index::global();
-        let live = entries.iter().filter(|entry| entry.deleted_at.is_none()).count();
+        let live = entries.iter().filter(|entry| entry.is_live()).count();
         if index.count() != live {
             match index.rebuild(&entries) {
                 Ok(count) => crate::server::logging::log(
@@ -161,8 +159,37 @@ fn ensure_index_once() {
                     &format!("⚠️ 记忆索引重建失败：{error}"),
                 ),
             }
+            // 重建时顺手把 id 之间的关联补齐（同项目 + 共享标签）
+            relink(&entries);
         }
     });
+}
+
+/// 补 `mem_link`：同项目且共享标签的活条目之间连线。
+///
+/// 为什么在重建时做而不是每次写入做：连线的成本是 O(同项目条目数)，写入路径
+/// 上做会把「写一条记忆」从毫秒级拖到几十毫秒；而连线不是实时需求 —— 检索时
+/// 差几分钟的关联，用户感知不到。
+fn relink(entries: &[MemoryEntry]) {
+    let live: Vec<&MemoryEntry> = entries.iter().filter(|entry| entry.is_live()).collect();
+    let mut links = 0usize;
+    for (index, left) in live.iter().enumerate() {
+        for right in live.iter().skip(index + 1) {
+            if left.project != right.project {
+                continue;
+            }
+            if !left.tags.is_empty() && left.tags.iter().any(|tag| right.tags.contains(tag)) {
+                index::global().link(&left.id, &right.id, "same_topic");
+                links += 1;
+            } else if !left.supersedes.is_empty() && left.supersedes.contains(&right.id) {
+                index::global().link(&left.id, &right.id, "relates");
+                links += 1;
+            }
+        }
+    }
+    if links > 0 {
+        crate::server::logging::log("[Memory]", &format!("记忆关联图已更新：{links} 条边"));
+    }
 }
 
 /// 全量重建（「重建索引」按钮 / 索引损坏时）
@@ -170,6 +197,7 @@ pub fn rebuild() -> Result<usize, String> {
     store::ensure_layout()?;
     let entries = store::load_all();
     let count = index::global().rebuild(&entries)?;
+    relink(&entries);
     bump_revision();
     Ok(count)
 }
@@ -181,6 +209,14 @@ pub fn list(query: &Query) -> Value {
     let now = crate::server::logging::now_ms();
     let rows = search::search(query);
     let items: Vec<Value> = rows.iter().map(|row| row.to_json()).collect();
+    index::global().log_recall(
+        "search",
+        &query.text,
+        items.len(),
+        0,
+        query.agent.as_deref(),
+        query.project.as_deref(),
+    );
     json!({
         "items": items,
         "lines": rows.iter().map(|row| search::compact_line(row, now)).collect::<Vec<_>>(),
@@ -219,6 +255,9 @@ pub fn get(ids: &[String], body_limit: usize) -> Value {
                 if other.kind == entry.kind {
                     score += 1;
                 }
+                if other.layer == entry.layer {
+                    score += 1;
+                }
                 score += other
                     .tags
                     .iter()
@@ -238,12 +277,17 @@ pub fn get(ids: &[String], body_limit: usize) -> Value {
                         "id": other.id,
                         "title": other.title,
                         "type": other.kind.as_str(),
+                        "layer": other.layer.as_str(),
                         "line": search_compact(other, now),
                     })
                 })
                 .collect(),
         );
         items.push(value);
+    }
+    if !ids.is_empty() {
+        index::global().hit(ids);
+        index::global().log_recall("get", &ids.join(","), items.len(), 0, None, None);
     }
     json!({ "items": items })
 }
@@ -303,7 +347,9 @@ pub fn timeline(id: &str) -> Value {
             "title": entry.title,
             "type": entry.kind.as_str(),
             "typeLabel": entry.kind.label(),
+            "layer": entry.layer.as_str(),
             "validFrom": entry.valid_from,
+            "validTo": entry.valid_to,
             "updatedAt": entry.updated_at,
             "validFromText": search::format_date(entry.valid_from),
             "relative": search::relative_time(entry.updated_at, now),
@@ -313,7 +359,6 @@ pub fn timeline(id: &str) -> Value {
     })
 }
 
-/// 项目列表（带条数与最近更新）
 /// 最近 N 天更新过的记忆（`memory_recent` 工具用）。
 ///
 /// 走索引而不是扫文件：这里要的是「时间段 + 排序」，索引本来就按 `updated_at`
@@ -345,8 +390,8 @@ pub fn recent(project: Option<&str>, agent: Option<&str>, days: usize) -> Value 
     json!({ "days": days, "count": count, "items": items })
 }
 
-pub fn projects() -> Value {
-    ensure_index_once();
+/// 项目列表（登记表 + 实际落盘条数 + 分层计数）
+pub fn projects() -> Value {    ensure_index_once();
     let all = store::load_all();
     let now = crate::server::logging::now_ms();
     let mut stored = store::load_projects();
@@ -359,14 +404,19 @@ pub fn projects() -> Value {
         if !stored.iter().any(|project| project.slug == slug) {
             stored.push(store::Project {
                 slug: slug.clone(),
-                name: if slug == store::GLOBAL_SLUG { "全局".to_string() } else { slug },
+                name: if slug == store::GLOBAL_SLUG { "通用".to_string() } else { slug },
                 remote: None,
                 path: None,
                 created_at: entry.created_at,
                 updated_at: entry.updated_at,
+                remotes: Vec::new(),
+                merged_into: None,
+                pinned: false,
+                archived: false,
             });
         }
     }
+    stored.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(a.name.cmp(&b.name)));
     let items: Vec<Value> = stored
         .iter()
         .map(|project| {
@@ -378,19 +428,28 @@ pub fn projects() -> Value {
                 })
                 .collect();
             entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            let l1 = entries.iter().filter(|entry| entry.layer == Layer::L1).count();
+            let l2 = entries.iter().filter(|entry| entry.layer == Layer::L2).count();
+            let latest = entries.first().map(|entry| entry.updated_at).unwrap_or(project.updated_at);
             json!({
                 "slug": project.slug,
                 "name": project.name,
                 "remote": project.remote,
+                "remotes": project.remotes,
                 "path": project.path,
+                "mergedInto": project.merged_into,
+                "pinned": project.pinned,
+                "archived": project.archived,
                 "count": entries.len(),
-                "updatedAt": entries.first().map(|entry| entry.updated_at).unwrap_or(project.updated_at),
-                "updatedText": search::relative_time(
-                    entries.first().map(|entry| entry.updated_at).unwrap_or(project.updated_at), now),
+                "l1": l1,
+                "l2": l2,
+                "updatedAt": latest,
+                "updatedText": search::relative_time(latest, now),
                 "latest": entries.iter().take(3).map(|entry| json!({
                     "id": entry.id,
                     "title": entry.title,
                     "type": entry.kind.as_str(),
+                    "layer": entry.layer.as_str(),
                 })).collect::<Vec<_>>(),
             })
         })
@@ -398,7 +457,62 @@ pub fn projects() -> Value {
     json!({ "items": items })
 }
 
-/// 自检：文件根、条数、索引状态、回收站
+/// 画像页视图：四类画像 + 生成门槛是否已达 + 上一版生成时间。
+///
+/// 为什么按 `sub`（`tags[0]`）分类而不是按标题关键词：模型写出来的标题措辞每次
+/// 都不一样，而 `sub` 是我们在 prompt 里固定要求输出的四个枚举值之一，稳定。
+pub fn profile_view() -> Value {
+    ensure_index_once();
+    let all = store::load_all();
+    let live: Vec<&MemoryEntry> = all.iter().filter(|entry| entry.is_live()).collect();
+    let profiles: Vec<&MemoryEntry> = live
+        .iter()
+        .copied()
+        .filter(|entry| entry.kind == MemoryKind::Profile)
+        .collect();
+    let now = crate::server::logging::now_ms();
+    let min = config::usize_of("deep.personaMinMemories").max(5);
+    let newest = profiles.iter().map(|entry| entry.updated_at).max().unwrap_or(0);
+    let fresh = live.iter().filter(|entry| entry.updated_at > newest).count();
+    let groups: Vec<Value> = ["preference", "habit", "expertise", "context"]
+        .iter()
+        .map(|sub| {
+            let items: Vec<Value> = profiles
+                .iter()
+                .filter(|entry| entry.tags.first().map(String::as_str) == Some(*sub))
+                .map(|entry| {
+                    let mut value = entry.to_json(true);
+                    value["evidenceCount"] = json!(entry.evidence.len());
+                    value
+                })
+                .collect();
+            json!({
+                "sub": sub,
+                "label": match *sub {
+                    "preference" => "偏好",
+                    "habit" => "习惯",
+                    "expertise" => "擅长",
+                    _ => "背景",
+                },
+                "items": items,
+            })
+        })
+        .collect();
+    json!({
+        "groups": groups,
+        "count": profiles.len(),
+        "total": live.len(),
+        "minMemories": min,
+        "ready": live.len() >= min,
+        "freshSinceProfile": fresh,
+        "generatedAt": if newest > 0 { json!(newest) } else { Value::Null },
+        "generatedText": if newest > 0 { json!(search::relative_time(newest, now)) } else { Value::Null },
+        "enabled": config::bool_of("deep.enabled") && config::bool_of("deep.personaEnabled"),
+        "evidenceRequired": config::bool_of("deep.evidenceRequired"),
+    })
+}
+
+/// 自检：文件根、条数、索引状态、回收站、队列积压、表行数
 pub fn status() -> Value {
     let entries = store::load_all();
     let live = entries.iter().filter(|entry| entry.is_live()).count();
@@ -407,16 +521,26 @@ pub fn status() -> Value {
         .iter()
         .filter(|entry| entry.superseded_by.is_some() && entry.deleted_at.is_none())
         .count();
+    let l1 = entries.iter().filter(|entry| entry.is_live() && entry.layer == Layer::L1).count();
+    let l2 = entries.iter().filter(|entry| entry.is_live() && entry.layer == Layer::L2).count();
     let index_count = index::global().count();
     json!({
         "root": store::root().to_string_lossy(),
         "indexFile": store::index_file().to_string_lossy(),
+        "device": store::device_id(),
         "total": entries.len(),
         "live": live,
+        "l1": l1,
+        "l2": l2,
         "deleted": deleted,
         "superseded": superseded,
         "projects": projects().get("items").map(|items| items.as_array().map(Vec::len).unwrap_or(0)).unwrap_or(0),
+        "review": {
+            "pending": index::global().review_count(),
+            "warnThreshold": config::usize_of("dedup.pendingWarnThreshold"),
+        },
         "index": { "count": index_count, "fts": index::global().fts_enabled(), "inSync": index_count == live },
+        "tables": index::global().table_stats(),
         "config": config(),
         // 内容版本号：每次写入 +1。排障时用来判断「Agent 看到的是不是最新」。
         "revision": revision(),
@@ -425,12 +549,15 @@ pub fn status() -> Value {
 
 // ── 写 ───────────────────────────────────────────────────────
 
-/// 写入请求（HTTP 与内部调用共用）
+/// 写入请求（HTTP 与 MCP 共用）
 #[derive(Debug, Default, Clone)]
 pub struct WriteInput {
     pub content: String,
     pub title: Option<String>,
     pub kind: Option<String>,
+    /// `l1` / `l2`。不传时按类别推断（`decision` / `knowledge` / `insight` /
+    /// `profile` 进 `l2`，其余进 `l1`）
+    pub layer: Option<String>,
     pub project: Option<String>,
     pub agent: Option<String>,
     pub tags: Vec<String>,
@@ -440,6 +567,12 @@ pub struct WriteInput {
     pub pinned: Option<bool>,
     pub starred: Option<bool>,
     pub cwd: Option<String>,
+    /// 会话标识（同一次对话的多条 l1 共享）
+    pub session: Option<String>,
+    /// 事实失效时间（「这条只在某时点前成立」）
+    pub valid_to: Option<i64>,
+    /// 证据链锚点（画像条目用）
+    pub evidence: Vec<String>,
 }
 
 /// 生成 id：`20261115-2213-a1b2c3`（日期 + 时分 + 内容哈希前 6 位）。
@@ -476,35 +609,72 @@ pub fn write(input: WriteInput) -> Result<Value, String> {
     }
     store::ensure_layout()?;
     let now = crate::server::logging::now_ms();
-    let project = input
-        .project
-        .as_deref()
-        .map(store::slugify)
-        .filter(|value| !value.is_empty() && value != store::GLOBAL_SLUG);
-    if let (Some(name), Some(cwd)) = (input.project.as_deref(), input.cwd.as_deref()) {
-        store::touch_project(name, Some(cwd));
-    } else if let Some(name) = input.project.as_deref() {
-        store::touch_project(name, None);
+
+    // ── 归类：显式项目名 > cwd 的 git 身份 > 模糊建议（进 general + 待确认）──
+    let classified: Classified = match (input.project.as_deref(), input.cwd.as_deref()) {
+        (Some(name), cwd) => layout::classify_explicit(name, cwd),
+        (None, Some(cwd)) => layout::classify(cwd, input.agent.as_deref()),
+        (None, None) => layout::classify("", None),
+    };
+    let project = classified
+        .slug
+        .clone()
+        .filter(|slug| !slug.is_empty() && slug != store::GLOBAL_SLUG);
+
+    let kind = MemoryKind::parse(input.kind.as_deref().unwrap_or("daily"));
+    let layer = match input.layer.as_deref() {
+        Some(raw) => Layer::parse(raw),
+        None if kind.prefers_l2() => Layer::L2,
+        None => Layer::L1,
+    };
+    let hash = model::content_hash(&content);
+
+    // ── 去重：L1 精确哈希（同内容不写第二份）──
+    if config::bool_of("dedup.enabled") && config::bool_of("dedup.l1.enabled") {
+        if let Some(existing) = find_hash_duplicate(&hash) {
+            crate::server::logging::log(
+                "[Memory]",
+                &format!("写入跳过：与 {} 内容完全相同（hash 去重）", existing.id),
+            );
+            return Ok(json!({
+                "id": existing.id,
+                "entry": existing.to_json(true),
+                "duplicate": true,
+                "superseded": 0,
+            }));
+        }
     }
+
     let id = make_id(&content);
+    // 归类建议要用**最终 id** 作 target：早先这里又调了一次 `make_id`，
+    // 拿到的 id 与真正落盘的那条不是同一个，于是「批准归类」永远找不到目标
+    if categorized_pending(&classified) {
+        index::global().enqueue(
+            "classify",
+            &id,
+            &json!({
+                "suggestion": classified.suggestion,
+                "confidence": classified.confidence,
+                "cwd": input.cwd,
+            }),
+            classified.confidence,
+        );
+    }
     let title = input
         .title
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            content
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty() && !line.starts_with('#'))
-                .map(|line| truncate_chars(line, 60))
-                .unwrap_or_else(|| "未命名记忆".to_string())
-        });
+        .unwrap_or_else(|| infer_title(&content));
+    let agent = input.agent.clone().or_else(|| Some("manual".to_string()));
     let mut entry = MemoryEntry {
         id: id.clone(),
         title,
-        kind: MemoryKind::parse(input.kind.as_deref().unwrap_or("daily")),
-        project,
-        agent: input.agent.clone().or_else(|| Some("manual".to_string())),
+        kind,
+        layer,
+        project: project.clone(),
+        agent: agent.clone(),
+        device: Some(store::device_id()),
+        session: input.session.clone(),
         tags: dedup(input.tags),
         importance: input.importance.unwrap_or(0.5).clamp(0.0, 1.0),
         files: dedup(input.files),
@@ -514,50 +684,218 @@ pub fn write(input: WriteInput) -> Result<Value, String> {
         created_at: now,
         updated_at: now,
         valid_from: now,
+        valid_to: input.valid_to,
         superseded_by: None,
         deleted_at: None,
+        dedup_status: DedupStatus::Unique,
+        evidence: dedup(input.evidence),
+        hash,
+        access_count: 0,
+        last_hit_at: None,
+        summary_text: String::new(),
         body: content,
         path: String::new(),
     };
     entry.path = relative_path(&entry);
+    // 容器（l1 daily）里追加一节时不动容器头的 project/agent，所以这里先写文件
     store::save(&entry)?;
     index::global().upsert(&entry)?;
     bump_revision();
 
-    // 被取代的旧记忆：标 superseded_by（不删 —— 演化链要能倒着走回去）
+    // ── 被取代的旧记忆：标 superseded_by（不删 —— 演化链要能倒着走回去）──
     let mut marked = 0usize;
-    for previous in &entry.supersedes {
-        if let Some(mut old) = store::load_all().into_iter().find(|item| &item.id == previous) {
-            if old.superseded_by.as_deref() == Some(id.as_str()) {
-                continue;
+    if !entry.supersedes.is_empty() {
+        // 只在真要标记时才扫全量：绝大多数写入不带 supersedes
+        let all = store::load_all();
+        for previous in &entry.supersedes {
+            if let Some(mut old) = all.iter().find(|item| &item.id == previous).cloned() {
+                if old.superseded_by.as_deref() == Some(id.as_str()) {
+                    continue;
+                }
+                old.superseded_by = Some(id.clone());
+                old.updated_at = now;
+                old.path = relative_path(&old);
+                store::save(&old)?;
+                index::global().upsert(&old)?;
+                index::global().link(&entry.id, &old.id, "relates");
+                marked += 1;
             }
-            old.superseded_by = Some(id.clone());
-            old.updated_at = now;
-            old.path = relative_path(&old);
-            store::save(&old)?;
-            index::global().upsert(&old)?;
-            marked += 1;
+        }
+    }
+
+    // ── L2 近似去重：只产建议，不动数据。归类错了比不归类更糟，同理，
+    //    判重判错了会 silently 合并两条不同的结论。`review.autoConfirmDedup`
+    //    是唯一的例外，且它**只标取代、不物理删除**（旧条目仍可恢复）──
+    if config::bool_of("dedup.enabled") && config::bool_of("dedup.l2.enabled") && layer == Layer::L2 {
+        if let Some((candidate, score)) = near_duplicate(&entry) {
+            if config::bool_of("review.autoConfirmDedup")
+                && score >= config::number("dedup.l2.autoMergeThreshold")
+            {
+                if let Err(error) = apply_dedup(&entry.id, &candidate) {
+                    crate::server::logging::log("[Memory]", &format!("⚠️ 自动采纳去重失败：{error}"));
+                }
+            } else {
+                index::global().enqueue(
+                    "dedup",
+                    &entry.id,
+                    &json!({ "candidate": candidate, "score": score }),
+                    score,
+                );
+            }
         }
     }
 
     crate::server::logging::log(
         "[Memory]",
         &format!(
-            "写入记忆 {id}（{}，{} 字，取代 {marked} 条）",
+            "写入记忆 {id}（{}/{}, {} 字，取代 {marked} 条）",
+            entry.layer.as_str(),
             entry.kind.label(),
             entry.body.chars().count()
         ),
     );
-    Ok(json!({ "id": id, "entry": entry.to_json(true), "superseded": marked }))
+    Ok(json!({
+        "id": id,
+        "entry": entry.to_json(true),
+        "superseded": marked,
+        "classified": classified.to_json(),
+        "duplicate": false,
+    }))
+}
+
+/// 模糊归类的建议要不要进队列。`suggest` 才进 —— 其余结论都是确定的。
+fn categorized_pending(classified: &Classified) -> bool {
+    classified.origin == "suggest" && classified.suggestion.is_some() && !config::bool_of("review.autoConfirmClassify")
+}
+
+/// 标题兜底：第一段非空、非标题行；全篇都是标题时退回第一个标题。
+fn infer_title(content: &str) -> String {
+    content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| truncate_chars(line, 60))
+        .or_else(|| {
+            content
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(|line| truncate_chars(line.trim_start_matches('#').trim(), 60))
+        })
+        .unwrap_or_else(|| "未命名记忆".to_string())
+}
+
+/// 按 hash 找已存在的活条目（读文件确认，不只信索引）。
+fn find_hash_duplicate(hash: &str) -> Option<MemoryEntry> {
+    store::load_all()
+        .into_iter()
+        .filter(|entry| entry.is_live() && entry.hash == hash)
+        // 只有 l1 走精确去重：l2 的两条结论可能一字不差但语境不同
+        // （例如同一个决定在两个项目里各下了一次），合并会丢掉项目归属
+        .find(|entry| entry.layer == Layer::L1)
+}
+
+/// L2 近似重复的候选：词面相似度（Dice + 编辑距离）超过 `dedup.l2.candidateThreshold`。
+///
+/// 为什么不用向量：这里不想为了「找相似标题」引入 embedding 模型与一次额外
+/// 的模型调用；而沉淀结论的标题通常很短，词面相似度已经能抓住绝大多数重复。
+/// 阈值之上只产建议（`review_queue`），裁决由人做。
+fn near_duplicate(entry: &MemoryEntry) -> Option<(String, f64)> {
+    let threshold = config::number("dedup.l2.candidateThreshold");
+    let w_dice = config::number("dedup.l2.wDice");
+    let w_edit = config::number("dedup.l2.wEdit");
+    let w_title = config::number("dedup.l2.wTitle");
+    let mut best: Option<(String, f64)> = None;
+    for other in store::load_all() {
+        if other.id == entry.id || !other.is_live() || other.layer != Layer::L2 {
+            continue;
+        }
+        if other.kind != entry.kind {
+            continue;
+        }
+        let dice = dice_coefficient(&entry.body, &other.body);
+        let chars = entry.body.chars().count().max(other.body.chars().count()).max(1);
+        let edit = 1.0 - (levenshtein(&entry.body, &other.body) as f64) / chars as f64;
+        let title_score = similarity(&entry.title, &other.title);
+        // 三项各算各的再加权：早先这里把 Dice 与编辑距离都算成了 `similarity()`
+        // 的均值，等于同一个数用了两遍，权重配置（wDice / wEdit）实际没生效
+        let score = (dice * w_dice + edit * w_edit + title_score * w_title)
+            / (w_dice + w_edit + w_title).max(0.001);
+        if score < threshold {
+            continue;
+        }
+        if best.as_ref().map(|(_, current)| score > *current).unwrap_or(true) {
+            best = Some((other.id, score));
+        }
+    }
+    best
+}
+
+/// 词面相似度：字符二元组 Dice 系数与归一化编辑距离的均值。
+fn similarity(left: &str, right: &str) -> f64 {
+    let a = index::normalize(left);
+    let b = index::normalize(right);
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    if a == b {
+        return 1.0;
+    }
+    let dice = dice_coefficient(&a, &b);
+    let edit = 1.0 - (levenshtein(&a, &b) as f64) / a.chars().count().max(b.chars().count()) as f64;
+    ((dice + edit) / 2.0).clamp(0.0, 1.0)
+}
+
+fn dice_coefficient(left: &str, right: &str) -> f64 {
+    let bigrams = |text: &str| -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() < 2 {
+            return vec![text.to_string()];
+        }
+        chars.windows(2).map(|pair| pair.iter().collect()).collect()
+    };
+    let a = bigrams(left);
+    let b = bigrams(right);
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let mut used = vec![false; b.len()];
+    let mut hits = 0usize;
+    for item in &a {
+        if let Some(index) = b.iter().enumerate().find(|(index, other)| !used[*index] && other == &item).map(|(index, _)| index) {
+            used[index] = true;
+            hits += 1;
+        }
+    }
+    2.0 * hits as f64 / (a.len() + b.len()) as f64
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let a: Vec<char> = left.chars().collect();
+    let b: Vec<char> = right.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        current[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            current[j] = (previous[j] + 1).min(current[j - 1] + 1).min(previous[j - 1] + cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()]
 }
 
 fn relative_path(entry: &MemoryEntry) -> String {
     let deleted = entry.deleted_at.is_some();
     let absolute = store::entry_path(entry, deleted);
-    absolute
-        .strip_prefix(store::root())
-        .map(|rest| rest.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| format!("projects/{}/{}", store::GLOBAL_SLUG, entry.id))
+    store::rel(&absolute)
 }
 
 fn dedup(items: Vec<String>) -> Vec<String> {
@@ -571,7 +909,7 @@ fn dedup(items: Vec<String>) -> Vec<String> {
     out
 }
 
-/// 更新（标题/正文/标签/重要度/星标/置顶）
+/// 更新（标题/正文/标签/重要度/星标/置顶/层/有效期/证据）
 pub fn update(id: &str, patch: &Value) -> Result<Value, String> {
     let all = store::load_all();
     let mut entry = all
@@ -586,10 +924,14 @@ pub fn update(id: &str, patch: &Value) -> Result<Value, String> {
     if let Some(body) = patch.get("body").and_then(Value::as_str) {
         if !body.trim().is_empty() {
             entry.body = body.to_string();
+            entry.hash = model::content_hash(&entry.body);
         }
     }
     if let Some(kind) = patch.get("type").and_then(Value::as_str) {
         entry.kind = MemoryKind::parse(kind);
+    }
+    if let Some(layer) = patch.get("layer").and_then(Value::as_str) {
+        entry.layer = Layer::parse(layer);
     }
     if let Some(tags) = patch.get("tags").and_then(Value::as_array) {
         entry.tags = dedup(tags.iter().filter_map(|tag| tag.as_str().map(str::to_string)).collect());
@@ -603,8 +945,35 @@ pub fn update(id: &str, patch: &Value) -> Result<Value, String> {
     if let Some(pinned) = patch.get("pinned").and_then(Value::as_bool) {
         entry.pinned = pinned;
     }
+    if let Some(project) = patch.get("project").and_then(Value::as_str) {
+        let slug = store::slugify(project);
+        entry.project = if slug == store::GLOBAL_SLUG { None } else { Some(slug) };
+    }
+    // `validTo: 0` / `null` 都表示「取消有效期」
+    if let Some(value) = patch.get("validTo") {
+        entry.valid_to = value.as_i64().filter(|stamp| *stamp > 0);
+    }
+    if let Some(evidence) = patch.get("evidence").and_then(Value::as_array) {
+        entry.evidence = dedup(
+            evidence
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect(),
+        );
+    }
     entry.updated_at = crate::server::logging::now_ms();
-    entry.path = relative_path(&entry);
+    // 换层 / 换类型 / 换项目 / 换日期都会换目录。旧形态可能是「容器里的一节」，
+    // 也可能是独立的 `.md`，只有 detach_live 两种都认。
+    let previous = entry.clone();
+    let next_path = {
+        entry.path.clear();
+        store::entry_path(&entry, false)
+    };
+    let stays = store::entry_path(&previous, false) == next_path;
+    if !stays {
+        store::detach_live(&previous)?;
+    }
+    entry.path = store::rel(&next_path);
     store::save(&entry)?;
     index::global().upsert(&entry)?;
     bump_revision();
@@ -621,10 +990,9 @@ pub fn remove(id: &str) -> Result<Value, String> {
     if entry.deleted_at.is_some() {
         return Ok(json!({ "id": id, "already": true }));
     }
-    let previous_path = store::entry_path(&entry, false);
-    if previous_path.exists() {
-        let _ = std::fs::remove_file(&previous_path);
-    }
+    // 摘活形态要在改 deleted_at 之前做：detach_live 按「活着的路径」找文件，
+    // 而进过回收站的 entry 路径已经变成 trash/<id>.md 了
+    store::detach_live(&entry)?;
     entry.deleted_at = Some(crate::server::logging::now_ms());
     entry.updated_at = entry.deleted_at.unwrap_or(entry.updated_at);
     entry.path = relative_path(&entry);
@@ -645,13 +1013,13 @@ pub fn restore(id: &str) -> Result<Value, String> {
         return Ok(json!({ "id": id, "already": true }));
     }
     let previous = store::entry_path(&entry, true);
-    if previous.exists() {
-        let _ = std::fs::remove_file(&previous);
-    }
     entry.deleted_at = None;
     entry.updated_at = crate::server::logging::now_ms();
     entry.path = relative_path(&entry);
     store::save(&entry)?;
+    if previous.exists() {
+        let _ = std::fs::remove_file(&previous);
+    }
     index::global().upsert(&entry)?;
     bump_revision();
     Ok(json!({ "id": id, "restored": true }))
@@ -670,13 +1038,220 @@ pub fn purge(id: &str) -> Result<Value, String> {
     Ok(json!({ "id": id, "purged": true }))
 }
 
+/// 清空回收站（`storage.trashKeepDays` 到期的清理任务也走它）。
+pub fn purge_trash() -> Value {
+    let days = config::usize_of("storage.trashKeepDays").max(1);
+    let removed = store::purge_expired_trash(days);
+    bump_revision();
+    json!({ "removed": removed, "keepDays": days })
+}
+
+// ── 待确认队列 ───────────────────────────────────────────────
+
+pub fn review_list(status: Option<&str>, kind: Option<&str>, limit: usize) -> Value {
+    let rows = index::global().review_list(status, kind, limit);
+    let now = crate::server::logging::now_ms();
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let mut value = row.to_json();
+            value["createdText"] = Value::String(search::relative_time(row.created_at, now));
+            value
+        })
+        .collect();
+    json!({
+        "items": items,
+        "total": items.len(),
+        "pending": index::global().review_count(),
+    })
+}
+
+/// 裁决一条建议。`approve` 为真时按建议内容落盘：
+///
+/// * `classify` —— 把记忆搬进建议的项目
+/// * `dedup` —— 把新条目取代旧条目（旧条目进回收站，可恢复）
+/// * `supersede` —— 标记旧事实失效
+/// * `conflict` —— 保留当前版本，清掉冲突记录
+///
+/// 拒绝只改队列状态，不动数据。**永不物理删除**：任何裁决都可以反悔。
+pub fn review_resolve(id: i64, approve: bool) -> Result<Value, String> {
+    let rows = index::global().review_list(None, None, 500);
+    let row = rows
+        .into_iter()
+        .find(|row| row.id == id)
+        .ok_or_else(|| format!("找不到待确认项 {id}"))?;
+    if row.status != "pending" {
+        return Ok(json!({ "id": id, "status": row.status, "already": true }));
+    }
+    if approve {
+        match row.kind.as_str() {
+            "classify" => {
+                let slug = row
+                    .payload
+                    .get("suggestion")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !slug.is_empty() {
+                    apply_classification(&row.target, slug)?;
+                }
+            }
+            "dedup" => {
+                let candidate = row
+                    .payload
+                    .get("candidate")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !candidate.is_empty() {
+                    apply_dedup(&row.target, candidate)?;
+                }
+            }
+            "supersede" => {
+                // 载荷里两个 id 都带：`oldId` 是被取代的那条，`newId` 是取代者。
+                // 早先这里只读一个叫 `superseded` 的键，而 `detect_supersede`
+                // 写的是 `oldId` —— 于是「批准失效」永远什么都没做却照样标记成功。
+                let old_id = row
+                    .payload
+                    .get("oldId")
+                    .and_then(Value::as_str)
+                    .or_else(|| row.payload.get("superseded").and_then(Value::as_str))
+                    .unwrap_or_default();
+                let new_id = row
+                    .payload
+                    .get("newId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&row.target);
+                if !old_id.is_empty() {
+                    apply_supersede(new_id, old_id)?;
+                }
+            }
+            "distill" | "consolidate" => apply_derived(&row.payload)?,
+            _ => {}
+        }
+    }
+    index::global().review_resolve(&[id], if approve { "approved" } else { "rejected" }, Some(if approve { "manual" } else { "manual-reject" }));
+    bump_revision();
+    Ok(json!({ "id": id, "approved": approve, "type": row.kind }))
+}
+
+/// 批量拒绝（「全部忽略」）。不批量批准：一批建议里几乎必然有一条是错的，
+/// 而错的那条会把记忆搬进错误项目，代价远高于逐条点多几下。
+pub fn review_reject_all(kind: Option<&str>) -> Value {
+    let changed = index::global().review_reject_all(kind);
+    bump_revision();
+    json!({ "rejected": changed })
+}
+
+fn apply_classification(memory_id: &str, slug: &str) -> Result<(), String> {
+    let mut entry = store::load_all()
+        .into_iter()
+        .find(|entry| entry.id == memory_id)
+        .ok_or_else(|| format!("找不到记忆 {memory_id}"))?;
+    let before = entry.clone();
+    let slug = store::slugify(slug);
+    entry.project = if slug == store::GLOBAL_SLUG { None } else { Some(slug) };
+    entry.updated_at = crate::server::logging::now_ms();
+    entry.path.clear();
+    let next_path = store::entry_path(&entry, false);
+    // 归档会把记忆从 general/ 搬进 projects/<slug>/，活形态可能是容器一节
+    if store::entry_path(&before, false) != next_path {
+        store::detach_live(&before)?;
+    }
+    entry.path = store::rel(&next_path);
+    store::save(&entry)?;
+    index::global().upsert(&entry)?;
+    Ok(())
+}
+
+fn apply_dedup(new_id: &str, old_id: &str) -> Result<(), String> {
+    let all = store::load_all();
+    let mut old = all
+        .iter()
+        .find(|entry| entry.id == old_id)
+        .cloned()
+        .ok_or_else(|| format!("找不到记忆 {old_id}"))?;
+    if old.superseded_by.as_deref() == Some(new_id) {
+        return Ok(());
+    }
+    old.superseded_by = Some(new_id.to_string());
+    old.dedup_status = DedupStatus::Merged;
+    old.updated_at = crate::server::logging::now_ms();
+    store::save(&old)?;
+    index::global().upsert(&old)?;
+    index::global().link(new_id, old_id, "relates");
+    Ok(())
+}
+
+fn apply_supersede(new_id: &str, old_id: &str) -> Result<(), String> {
+    // 与 dedup 同一条路径：区别只在语义（「换了个说法」vs「事实变了」）
+    apply_dedup(new_id, old_id)
+}
+
+/// 把一条「派生建议」（蒸馏 / 合并）落成真正的记忆条目。
+///
+/// 载荷形状由 `enrich::distill` / `schedule::consolidate` 产出。合并类载荷带
+/// `sources`：落盘新条目后把来源逐条标记为「被这条取代」—— 不删除来源，
+/// 演化链要能倒着走回去（这是全模块的一条硬约束）。
+fn apply_derived(payload: &Value) -> Result<(), String> {
+    let body = payload.get("body").and_then(Value::as_str).unwrap_or("").trim();
+    if body.chars().count() < 20 {
+        return Err("建议内容太短，无法落成记忆".into());
+    }
+    let sources: Vec<String> = payload
+        .get("sources")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(|id| id.as_str().map(str::to_string)).collect())
+        .unwrap_or_else(|| {
+            payload
+                .get("evidence")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(|id| id.as_str().map(str::to_string)).collect())
+                .unwrap_or_default()
+        });
+    let input = WriteInput {
+        content: body.to_string(),
+        title: payload.get("title").and_then(Value::as_str).map(str::to_string),
+        kind: payload.get("type").and_then(Value::as_str).map(str::to_string),
+        layer: Some("l2".to_string()),
+        project: payload.get("project").and_then(Value::as_str).map(str::to_string),
+        agent: Some("review".to_string()),
+        tags: Vec::new(),
+        importance: payload.get("importance").and_then(Value::as_f64),
+        files: Vec::new(),
+        supersedes: sources.clone(),
+        pinned: Some(false),
+        starred: Some(false),
+        cwd: None,
+        session: None,
+        valid_to: None,
+        evidence: sources.clone(),
+    };
+    let written = write(input)?;
+    let new_id = written.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+    // `write()` 已经按 `supersedes` 标了旧条目的 `superseded_by`；这里只需补图边，
+    // 让图扩散检索也能从新条目走到来源
+    for source in &sources {
+        index::global().link(&new_id, source, "derived");
+    }
+    Ok(())
+}
+
+/// 把一条记忆标记为「被另一条取代」。
+///
+/// 对外公开是给 `enrich::detect_supersede` 的自动应用路径用的（本地 LLM 判定
+/// + 两个开关都打开时）。与 `apply_supersede` 的区别只在可见性，逻辑同一份 ——
+/// 分两份实现迟早会出现「自动应用的历史链与人工批准的不一样」。
+pub fn mark_superseded(old_id: &str, new_id: &str) -> Result<(), String> {
+    apply_supersede(new_id, old_id)
+}
+
 // ── 三级披露的对外入口 ───────────────────────────────────────
 
-/// 核心记忆文本（注入用；也供页面「核心记忆」视图预览）
+/// 核心记忆文本（MCP `memory_core` 的产出；也供页面预览）
 pub fn core_text(project: Option<&str>, max_tokens: usize) -> Value {
     ensure_index_once();
     let entries = store::load_all();
     let (text, used, truncated) = search::core_text(&entries, project, max_tokens);
+    index::global().log_recall("core", project.unwrap_or(""), entries.len(), used, None, project);
     json!({
         "text": text,
         "tokens": used,
@@ -690,6 +1265,83 @@ pub fn digest_text(max_lines: usize) -> Value {
     let entries = store::load_all();
     let text = search::digest_text(&entries, max_lines);
     json!({ "text": text, "lines": text.lines().count() })
+}
+
+// ── 体检：记忆可能过时 ───────────────────────────────────────
+
+/// 记忆体检：找出「写这条时锚定的文件后来改过」的条目，外加队列与索引的一致性。
+///
+/// ── 为什么用「文件 mtime > 记忆 updated_at」这个判据 ─────────
+/// 记忆里存的是**判断**（「这里要这么改，因为…」），而代码会继续变。当锚定文件
+/// 在记忆写下之后又被修改，「这条判断基于的代码已经变了」—— 它不是错的，而是
+/// **需要复核**。没有这个信号，模型会拿三个月前的判断去改刚重构过的文件。
+///
+/// 不做内容哈希比对：`files` 是用户手填的相对路径，路径在仓库里搬来搬去很常见，
+/// 而 mtime 检查的目标只是「提个醒」，误报的代价（多看一眼）远低于漏报。
+pub fn health(limit: usize) -> Value {
+    ensure_index_once();
+    let entries = store::load_all();
+    let root = store::root();
+    let limit = limit.clamp(1, 200);
+    let mut stale: Vec<Value> = Vec::new();
+    for entry in entries.iter().filter(|entry| entry.is_live()) {
+        if entry.files.is_empty() {
+            continue;
+        }
+        let mut touched: Vec<Value> = Vec::new();
+        for file in &entry.files {
+            // `files` 是相对路径，但相对的是**记忆根**还是**项目目录**？
+            // 约定是相对记忆根（与 `path` 同口径），同时对「相对 cwd」的写法宽容：
+            // 两种都试，任一命中就算改动过。
+            let candidates = [root.join(file), root.join("projects").join(file)];
+            for path in candidates {
+                let Ok(meta) = std::fs::metadata(&path) else { continue };
+                let Ok(modified) = meta.modified() else { continue };
+                let Ok(age) = modified.duration_since(std::time::UNIX_EPOCH) else { continue };
+                let stamp = age.as_millis() as i64;
+                if stamp > entry.updated_at {
+                    touched.push(json!({
+                        "file": file,
+                        "changedAt": stamp,
+                        "changedText": search::relative_time(stamp, crate::server::logging::now_ms()),
+                    }));
+                    break;
+                }
+            }
+        }
+        if touched.is_empty() {
+            continue;
+        }
+        stale.push(json!({
+            "id": entry.id,
+            "title": entry.title,
+            "type": entry.kind.as_str(),
+            "layer": entry.layer.as_str(),
+            "updatedAt": entry.updated_at,
+            "updatedText": search::relative_time(entry.updated_at, crate::server::logging::now_ms()),
+            "files": touched,
+        }));
+        if stale.len() >= limit {
+            break;
+        }
+    }
+    let pending = index::global().review_count();
+    let warn = config::usize_of("dedup.pendingWarnThreshold");
+    json!({
+        "stale": stale,
+        "staleCount": stale.len(),
+        "review": { "pending": pending, "warnThreshold": warn, "backlogged": pending >= warn },
+        "index": {
+            "count": index::global().count(),
+            "inSync": index::global().count() == entries.iter().filter(|entry| entry.is_live()).count(),
+            "fts": index::global().fts_enabled(),
+        },
+        "note": if stale.is_empty() {
+            "没有发现可能过时的记忆。"
+        } else {
+            "这些记忆锚定的文件在记忆写下之后被改过：结论可能仍成立，但值得复核。"
+        },
+    })
 }
 
 #[cfg(test)]
@@ -706,37 +1358,38 @@ mod tests {
 
     #[test]
     fn config_patch_only_touches_given_keys() {
-        let patch = json!({ "coreMaxTokens": 640, "无关键": 1 });
-        let mut current = serde_json::to_value(MemoryConfig::default()).unwrap();
-        for (key, value) in patch.as_object().unwrap() {
-            if current.get(key).is_some() {
-                current[key] = value.clone();
-            }
-        }
-        let next: MemoryConfig = serde_json::from_value(current).unwrap();
-        assert_eq!(next.core_max_tokens, 640);
-        // 未传的键保持默认
-        assert!(next.enabled);
-    }
-
-    /// 旧的 `inject*` 配置留在磁盘上时不能把整份配置读崩（升级路径）。
-    #[test]
-    fn legacy_inject_keys_are_ignored() {
-        let legacy = json!({
-            "enabled": true,
-            "injectEnabled": true,
-            "injectMode": "search",
-            "injectTokens": 1200,
-            "coreMaxTokens": 500
-        });
-        let config: MemoryConfig = serde_json::from_value(legacy).unwrap();
-        assert!(config.enabled);
-        assert_eq!(config.core_max_tokens, 500);
+        // 走真实写盘路径会把测试机配置改掉，这里只验「未知键被丢弃」这条语义
+        assert!(config::find("injectEnabled").is_none());
+        assert!(config::find("agents.coreMaxTokens").is_some());
+        assert_eq!(
+            config::find("agents.coreMaxTokens").map(|knob| knob.kind),
+            Some(config::Kind::Number)
+        );
     }
 
     #[test]
     fn dedup_keeps_order_and_drops_blank() {
         let out = dedup(vec![" a ".into(), "a".into(), "".into(), "b".into()]);
         assert_eq!(out, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn infer_title_skips_heading_but_falls_back_to_it() {
+        assert_eq!(infer_title("# 标题\n\n正文第一段"), "正文第一段");
+        assert_eq!(infer_title("# 只有标题"), "只有标题");
+    }
+
+    #[test]
+    fn similarity_flags_same_sentence_rewrites() {
+        let a = "用 npm ci 重装依赖，不要 rm -rf node_modules";
+        let b = "用 npm ci 重装依赖，别 rm -rf node_modules";
+        assert!(similarity(a, b) > 0.8, "近似改写应被判相似");
+        assert!(similarity(a, "把端口固定到 3065") < 0.3);
+    }
+
+    #[test]
+    fn dice_and_levenshtein_sanity() {
+        assert!((dice_coefficient("abcd", "abcd") - 1.0).abs() < 1e-9);
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
     }
 }
