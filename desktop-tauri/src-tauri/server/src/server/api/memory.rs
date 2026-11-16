@@ -626,11 +626,106 @@ pub async fn get_sync(State(_state): State<ServerState>) -> Response {
 }
 
 /// 测连接。**只读**：不做 MKCOL、不传包，避免「点一下测试就在远端留下目录」。
-pub async fn post_sync_test(State(_state): State<ServerState>) -> Response {
-    let result = crate::server::core::blocking::run(memory::sync::test_connection).await;
+///
+/// ── 为什么带一个可选 body ──────────────────────────────────
+/// 配置页的「测连接」坐在三个输入框旁边，用户想「用刚填的值先验一下再保存」。
+/// 带 body 就用 body 里的值（空的字段沿用已保存的），不带就测已保存的那份 ——
+/// 「同步状态」卡里那个「测连接」发的正是空 body。
+pub async fn post_sync_test(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let probe = if body.is_empty() {
+        None
+    } else {
+        match parse_body(&body) {
+            Ok(value) if value.is_null() || value.as_object().map(|map| map.is_empty()).unwrap_or(false) => None,
+            Ok(value) => match serde_json::from_value::<memory::sync::Probe>(value) {
+                Ok(probe) => Some(probe),
+                Err(error) => return errors::management_error(400, format!("测试请求格式不对：{error}")),
+            },
+            Err(error) => return errors::management_error(400, error.message),
+        }
+    };
+    let result = match probe {
+        Some(probe) => {
+            crate::server::core::blocking::run(move || memory::sync::test_connection_with(probe)).await
+        }
+        None => crate::server::core::blocking::run(memory::sync::test_connection).await,
+    };
     match result {
         Ok(value) => ok_json(value),
         Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+/// 「保存设置」：同步页那张凭据卡 + 模块目录卡的统一保存入口。
+///
+/// ── 为什么单独一个端点，而不是让它走 `PUT /api/memory/config` ────
+/// 那张卡片的语义是「这一组字段一起保存」，不参与配置页的草稿层（配置页是
+/// 「改一堆、最后统一保存」）。若走同一个端点，用户点完这里配置页的草稿会被
+/// 顶上来的新值覆盖，而配置页还以为自己没保存 —— 两个正交的界面互相打架。
+///
+/// ── 接受哪些键 ────────────────────────────────────────────
+/// **只接受 `sync.` 开头的旋钮**（清单从 schema 里现取，不在这里抄一份）。
+/// 于是加一个同步旋钮时这个端点自动跟上，而它永远不可能变成「任意写配置」
+/// 的后门。秘密字段（密码 / 口令）沿用 `config::apply_one` 的空串语义：
+/// 空串 = 保留库里那份，界面从不下发原文。
+pub async fn post_sync_setup(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(error) => return errors::management_error(400, error.message),
+    };
+    let Some(object) = payload.as_object() else {
+        return errors::management_error(400, "请求体必须是 JSON 对象");
+    };
+    let mut patch = serde_json::Map::new();
+    for (key, value) in object {
+        if !key.starts_with("sync.") {
+            return errors::management_error(400, format!("{key} 不属于同步设置"));
+        }
+        if memory_config::find(key).is_none() {
+            return errors::management_error(400, format!("未知的同步配置项：{key}"));
+        }
+        // 远端目录名会被直接拼进 URL 路径，`../` 能跑出远端目录 —— 在入口
+        // 拦住比在拼 URL 处拦更早，且错误信息能指到具体字段。
+        if key.ends_with("remoteDir") || key.starts_with("sync.modules.") {
+            if let Some(text) = value.as_str() {
+                if text.contains("..") || text.contains('\\') {
+                    return errors::management_error(400, format!("{key} 不能包含 .. 或反斜杠"));
+                }
+            }
+        }
+        patch.insert(key.clone(), value.clone());
+    }
+    if patch.is_empty() {
+        return errors::management_error(400, "没有要保存的字段");
+    }
+    // 走 `memory::save_config` 而不是裸 `config::patch`：它是配置写入的唯一
+    // 入口，除了落盘还会把内存版本号 +1 —— 页面据此判断「手里这份是不是过期了」。
+    // 在这里绕过去，配置改了但版本号不动，页面就不会重取 schema / status。
+    match memory::save_config(&Value::Object(patch)) {
+        Ok(_) => ok_json(json!({
+            "values": memory_config::flat(),
+            "status": memory::sync::status(),
+        })),
+        Err(message) => errors::management_error(400, message),
+    }
+}
+
+/// 「清除配置」：把 `sync.` 下的自定义值全部恢复默认（凭据一起清掉）。
+///
+/// 只动 `sync.*`：清除同步配置不该顺手把记忆的检索权重、自动化节奏一起重置。
+/// 已同步的数据与远端包**不动** —— 这个按钮清的是「怎么连」，不是「同步过什么」。
+pub async fn post_sync_reset(State(_state): State<ServerState>) -> Response {
+    let keys: Vec<String> = memory_config::schema()
+        .iter()
+        .filter(|knob| knob.key.starts_with("sync."))
+        .map(|knob| knob.key.to_string())
+        .collect();
+    match memory_config::reset(&keys) {
+        Ok(_) => ok_json(json!({
+            "values": memory_config::flat(),
+            "status": memory::sync::status(),
+        })),
+        Err(message) => errors::management_error(400, message),
     }
 }
 

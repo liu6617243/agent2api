@@ -220,10 +220,15 @@ fn base_url() -> String {
 
 fn remote_dir() -> String {
     let configured = config::text_of("sync.remoteDir").trim().to_string();
-    if configured.is_empty() {
+    // 用户手填时经常带前导斜杠（`/agent2api-memory`），而 `remote_url()` 自己会
+    // 补那一个 —— 不剥掉就拼出 `https://host//agent2api-memory`。多数 WebDAV
+    // 服务端能容忍双斜杠，但有些（含部分反代）会 404，而错误信息里那串双斜杠
+    // 看起来像客户端 bug。同理，尾随斜杠会让空目录变成一个多余的段。
+    let trimmed = configured.trim_matches('/').to_string();
+    if trimmed.is_empty() {
         "agent2api-memory".to_string()
     } else {
-        configured
+        trimmed
     }
 }
 
@@ -232,8 +237,89 @@ fn remote_url() -> String {
     format!("{}/{}", base_url(), remote_dir())
 }
 
+/// 一个模块的同步目录：名字 + 本仓是否真的实现了它。
+///
+/// ── 为什么把「未实现」写进结构里而不是藏起来 ──────────────────
+/// 界面上要有「模块根目录」那一组输入框（五个模块在同一个网盘里各占一个目录），
+/// 否则用户没法理解「记忆同步只是这一套里的一支」。但本仓只有记忆实现了同步，
+/// 另外四个的目录名只是**存下来备用**。把 `implemented` 一起下发，页面就能给
+/// 未实现的模块画灰按钮 + 写「未实现」，而不是做一个点了没反应的「立即同步」。
+pub struct ModuleDir {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub key: &'static str,
+    pub def: &'static str,
+    pub implemented: bool,
+}
+
+pub const MODULES: &[ModuleDir] = &[
+    ModuleDir { id: "skills", label: "技能仓库", key: "sync.modules.skills", def: "/agent-skills", implemented: false },
+    ModuleDir { id: "dosage", label: "用量统计", key: "sync.modules.dosage", def: "/dosage-sync", implemented: false },
+    ModuleDir { id: "pool", label: "号池管家号池", key: "sync.modules.pool", def: "/agenthub-proxy", implemented: false },
+    // 记忆自己的目录走 `sync.remoteDir`（历史键，已有用户在用）。这里只作为
+    // 展示行出现，读写都落到 `sync.remoteDir`，避免同一件事两个键。
+    ModuleDir { id: "memory", label: "记忆中枢", key: "sync.modules.memory", def: "/agenthub-memory", implemented: true },
+    ModuleDir { id: "prompts", label: "提示词库", key: "sync.modules.prompts", def: "/agenthub-prompts", implemented: false },
+];
+
+/// 模块目录的生效值。
+///
+/// 记忆那行恒等于 `sync.remoteDir`（见 `MODULES` 注释）。其余四个：
+///   · 没显式配过 → 用默认名（界面上显示 `/agent-skills` 这种）；
+///   · 显式配成空串 → **空串**，语义是「这个模块不参与同步」，界面把这一行
+///     画成「已关闭」而不是回落到默认名 —— 否则用户没法表达「我不要它」。
+pub fn module_dir(item: &ModuleDir) -> String {
+    if item.id == "memory" {
+        return format!("/{}", remote_dir());
+    }
+    let explicit = config::stored().values.contains_key(item.key);
+    resolve_module_path(item.def, &config::text_of(item.key), explicit)
+}
+
+/// 「默认 / 显式空 / 自定义」三态归一成最终目录（`module_dir` 的纯函数内核）。
+///
+/// 单独拆出来是为了**可测**：`module_dir` 要读磁盘上的 config.json，测试里没法
+/// 断言「显式配成空串」这种只存在于内存的状态；这里三个入参把那种状态直接表达
+/// 成 `explicit = true, raw = ""`。
+fn resolve_module_path(def: &str, raw: &str, explicit: bool) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        // 显式配成空 = 用户主动关掉这个模块；没配过 = 用默认。
+        // 这两者在界面上是「已关闭」与「/agent-skills」，不能混成一个。
+        return if explicit { String::new() } else { def.to_string() };
+    }
+    if raw.starts_with('/') {
+        raw.to_string()
+    } else {
+        format!("/{raw}")
+    }
+}
+
+/// 模块目录清单（同步页「模块根目录」那一组）。
+///
+/// `def` 一起下发：界面要在标签后面写「（默认 /agent-skills）」—— 用户改过目录
+/// 之后得知道「原来应该长什么样」，否则想还原只能去翻文档。
+pub fn modules_json() -> Value {
+    Value::Array(
+        MODULES
+            .iter()
+            .map(|item| {
+                json!({
+                    "id": item.id,
+                    "label": item.label,
+                    "key": item.key,
+                    "dir": module_dir(item),
+                    "def": item.def,
+                    "implemented": item.implemented,
+                })
+            })
+            .collect(),
+    )
+}
+
 fn auth_headers(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     let user = config::text_of("sync.username").trim().to_string();
+    // `text_of` 对 Secret 类的键会解密，这里拿到的就是明文（只在本次请求的内存里）
     let password = config::text_of("sync.password").to_string();
     if user.is_empty() {
         return builder;
@@ -850,6 +936,28 @@ pub fn status() -> Value {
         "configured": configured,
         "url": base_url(),
         "remoteDir": remote_dir(),
+        // 协议里写什么就是什么；界面据此把「S3 兼容对象存储」那一档画成未实现。
+        "provider": {
+            let provider = config::text_of("sync.provider");
+            if provider.trim().is_empty() { "webdav".to_string() } else { provider.trim().to_string() }
+        },
+        // 远端完整地址（地址 + 目录）。地址为空时给空串而不是「/目录」——
+        // 后者在界面上看起来像「配置了一半」，实际上就是没配。
+        "remoteUrl": if configured { remote_url() } else { String::new() },
+        // 凭据的三个事实：账号有没有、密码有没有。密码是 Secret 键，这里只问
+        // 「配过没有」，不去解它 —— 解出来唯一需要的地方是发请求时的
+        // `auth_headers`。
+        "username": config::text_of("sync.username"),
+        "hasPassword": config::secret_set("sync.password"),
+        // 号池包口令：留空 = 沿用 WebDAV 密码，所以「有没有」要单独说清，
+        // 不然界面分不出「没配」和「沿用」。
+        "hasConfirmPhrase": config::secret_set("sync.confirmPhrase"),
+        // 预设只影响「填默认值」，不改变行为；这里照实回给界面好让它把下拉
+        // 停在用户上次选的那一项（而不是每次都跳回「自定义」）。
+        "preset": {
+            let preset = config::text_of("sync.preset");
+            if preset.trim().is_empty() { "custom".to_string() } else { preset.trim().to_string() }
+        },
         "device": device,
         "deviceName": config::text_of("sync.deviceName"),
         "enabled": config::bool_of("sync.enabled"),
@@ -863,6 +971,9 @@ pub fn status() -> Value {
         "lastSyncAt": last_at,
         "lastResult": last_result,
         "localFiles": local_manifest().files.len(),
+        // 五个模块的目录与「本仓实现了没有」。页面上的「模块根目录」与
+        // 「快速同步」两张卡都读这一份，免得两处各拼一遍。
+        "modules": modules_json(),
         // 本机记忆根目录：界面上要显示「同步的是哪个目录」，否则用户没法确认
         // 自己到底在同步哪一份数据（换过 storage.root 的人尤其需要这个）。
         "localDir": store::root().to_string_lossy().to_string(),
@@ -1000,19 +1111,112 @@ pub fn log_entries(limit: usize) -> Value {
 ///
 /// 单独做一个「测试」而不是让用户点「立即同步」看结果：同步会真的写文件，
 /// 而用户在这个阶段只想确认地址、账号、密码对不对。这里只读不写。
-pub fn test_connection() -> Value {
-    if base_url().is_empty() {
-        return json!({ "ok": false, "message": "未填写 WebDAV 地址" });
+// ── 连接探测（可带临时凭据）──────────────────────────────────
+
+/// 一组「待测」的 WebDAV 凭据。
+///
+/// ── 为什么测试连接要能覆盖配置 ──────────────────────────────
+/// 界面上「测连接」坐在地址 / 账号 / 密码三个输入框旁边，用户改完就想先验一下
+/// 再保存。若只能测「已保存的那份」，那么「改错了密码」与「旧密码失效」在界面上
+/// 是同一个结果，用户只能先保存再测、测完再把错的改回来。与
+/// `cloud_sync::test_connection` 同一取向：用「库里已存 + 表单新值」拼一份临时
+/// 配置来测。
+///
+/// 字段是 `Option` 而不是空串：`Some("")` 表示「用户把它清空了」，`None` 表示
+/// 「这个框没动，沿用库里的」。密码框尤其需要这个区分 —— 它回显的是占位符而
+/// 不是原文，一旦被当成空串就会把已保存的密码测成「未配置」。
+///
+/// `rename_all = camelCase` 不能省：前端 `testSync()` 发的键是 `remoteDir`
+/// （与 `SyncStatus` 的字段名一致），不带这条 rename 的话 serde 只认
+/// `remote_dir` —— 那个键永远收不到，`remoteDir` 被静默忽略，于是「测连接」
+/// 永远在测已保存的目录，用户改了目录名再点测试会得到上一个目录的结果。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Probe {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub remote_dir: Option<String>,
+}
+
+struct Credentials {
+    url: String,
+    username: String,
+    password: String,
+    remote_dir: String,
+}
+
+impl Credentials {
+    fn saved() -> Self {
+        Self {
+            url: base_url(),
+            username: config::text_of("sync.username").trim().to_string(),
+            password: config::text_of("sync.password"),
+            remote_dir: remote_dir(),
+        }
     }
-    let url = remote_url();
+
+    fn with_probe(probe: &Probe) -> Self {
+        let mut next = Self::saved();
+        if let Some(url) = &probe.url {
+            next.url = url.trim().trim_end_matches('/').to_string();
+        }
+        if let Some(user) = &probe.username {
+            next.username = user.trim().to_string();
+        }
+        // 密码只在给了**非空**值时才覆盖：空串是「没动这一栏」，不是「清空」。
+        // 要真正清掉已保存的密码，走 `PUT /api/memory/config` 传空串（那里
+        // `apply_one` 同样是沿用语义），或直接 reset 那个键。
+        if let Some(password) = &probe.password {
+            if !password.is_empty() {
+                next.password = password.clone();
+            }
+        }
+        if let Some(dir) = &probe.remote_dir {
+            let trimmed = dir.trim().trim_matches('/').to_string();
+            next.remote_dir = if trimmed.is_empty() { "agent2api-memory".to_string() } else { trimmed };
+        }
+        next
+    }
+
+    fn remote_url(&self) -> String {
+        if self.url.is_empty() {
+            String::new()
+        } else {
+            format!("{}/{}", self.url, self.remote_dir)
+        }
+    }
+
+    fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.username.is_empty() {
+            return builder;
+        }
+        builder.basic_auth(&self.username, Some(&self.password))
+    }
+}
+
+/// 用给定凭据探一次 PROPFIND（Depth: 0）。
+///
+/// 返回 `(status, 列表里的包数)`。`packages` 只在这台服务器愿意回 Depth:1 时
+/// 才有值 —— 有些实现（坚果云的根路径、部分 S3 网关）会拒绝或多回，那种情况下
+/// 保持 `None`，界面上只报「连接正常」，不编一个数字出来。
+fn probe_with(creds: &Credentials) -> (bool, String, Option<usize>) {
+    if creds.url.is_empty() {
+        return (false, "未填写 WebDAV 地址".to_string(), None);
+    }
+    let url = creds.remote_url();
     let client = crate::server::core::egress::client_for(None);
     let method = reqwest::Method::from_bytes(b"PROPFIND").unwrap_or(reqwest::Method::GET);
     let body = r#"<?xml version="1.0" encoding="utf-8" ?>
 <D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/></D:prop></D:propfind>"#;
-    // `async move` 会把 `url` 所有权搬进协程，后面拼结果还要用它，先克隆一份给请求
     let probe = url.clone();
     let outcome = rt::block_on(async move {
-        let response = auth_headers(client.request(method, &probe))
+        let response = creds
+            .apply(client.request(method, &probe))
             .timeout(std::time::Duration::from_secs(20))
             .header("depth", "0")
             .header("content-type", "application/xml; charset=utf-8")
@@ -1024,34 +1228,94 @@ pub fn test_connection() -> Value {
         Ok::<_, reqwest::Error>((status, text))
     });
     match outcome {
-        Ok((status, _)) if status.is_success() => json!({
-            "ok": true,
-            "message": format!("连接正常（HTTP {}）", status.as_u16()),
-            "url": url,
-            "packages": list_remote_packs().len(),
-        }),
+        Ok((status, _)) if status.is_success() => {
+            // 目录可读，再数一次包。列表失败不算连接失败 —— 连接本身已经通了。
+            let count = if creds.url == base_url() && creds.remote_dir == remote_dir() {
+                list_remote_packs().len()
+            } else {
+                list_packs_with(creds).len()
+            };
+            (true, format!("连接正常（HTTP {}）", status.as_u16()), Some(count))
+        }
         // 404 说明服务器在、目录还没建 —— 这不算连接失败，第一次同步会自动建
-        Ok((status, _)) if status.as_u16() == 404 => json!({
-            "ok": true,
-            "message": "服务器可达，远端目录尚未创建（首次同步会自动创建）",
-            "url": url,
-            "packages": 0,
-        }),
-        Ok((status, _)) if status.as_u16() == 401 || status.as_u16() == 403 => json!({
-            "ok": false,
-            "message": format!("认证失败（HTTP {}）：检查用户名与密码", status.as_u16()),
-            "url": url,
-        }),
-        Ok((status, text)) => json!({
-            "ok": false,
-            "message": format!(
+        Ok((status, _)) if status.as_u16() == 404 => (
+            true,
+            "服务器可达，远端目录尚未创建（首次同步会自动创建）".to_string(),
+            Some(0),
+        ),
+        Ok((status, _)) if status.as_u16() == 401 || status.as_u16() == 403 => (
+            false,
+            format!("认证失败（HTTP {}）：检查用户名与密码", status.as_u16()),
+            None,
+        ),
+        Ok((status, text)) => (
+            false,
+            format!(
                 "服务器返回 HTTP {}{}",
                 status.as_u16(),
-                if text.is_empty() { String::new() } else { format!(" · {}", text.chars().take(160).collect::<String>()) }
+                if text.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", text.chars().take(160).collect::<String>())
+                }
             ),
-            "url": url,
-        }),
-        Err(error) => json!({ "ok": false, "message": error.message(), "url": url }),
+            None,
+        ),
+        Err(error) => (false, error.message(), None),
+    }
+}
+
+/// 列出给定凭据下远端目录里的包（`probe_with` 的辅助，不读已保存配置）。
+fn list_packs_with(creds: &Credentials) -> Vec<RemotePack> {
+    let url = creds.remote_url();
+    if url.is_empty() {
+        return Vec::new();
+    }
+    let client = crate::server::core::egress::client_for(None);
+    let method = reqwest::Method::from_bytes(b"PROPFIND").unwrap_or(reqwest::Method::GET);
+    let body = r#"<?xml version="1.0" encoding="utf-8" ?>
+<D:propfind xmlns:D="DAV:"><D:prop><D:displayname/><D:getcontentlength/><D:getlastmodified/></D:prop></D:propfind>"#;
+    let outcome = rt::block_on(async move {
+        let response = creds
+            .apply(client.request(method, &url))
+            .timeout(std::time::Duration::from_secs(30))
+            .header("depth", "1")
+            .header("content-type", "application/xml; charset=utf-8")
+            .body(body.to_string())
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        Ok::<_, reqwest::Error>((status, text))
+    });
+    let Ok((status, text)) = outcome else {
+        return Vec::new();
+    };
+    if !status.is_success() {
+        return Vec::new();
+    }
+    parse_propfind(&text)
+}
+
+/// 测试连接（同步页「测连接」按钮）。
+pub fn test_connection() -> Value {
+    let creds = Credentials::saved();
+    let url = creds.remote_url();
+    let (ok, message, packages) = probe_with(&creds);
+    match packages {
+        Some(count) => json!({ "ok": ok, "message": message, "url": url, "packages": count }),
+        None => json!({ "ok": ok, "message": message, "url": url }),
+    }
+}
+
+/// 用表单里当前填的值测连接（配置页「测连接」按钮）。
+pub fn test_connection_with(probe: Probe) -> Value {
+    let creds = Credentials::with_probe(&probe);
+    let url = creds.remote_url();
+    let (ok, message, packages) = probe_with(&creds);
+    match packages {
+        Some(count) => json!({ "ok": ok, "message": message, "url": url, "packages": count }),
+        None => json!({ "ok": ok, "message": message, "url": url }),
     }
 }
 
@@ -1226,5 +1490,57 @@ mod tests {
         assert_eq!(packs.len(), 1);
         assert_eq!(packs[0].name, "dev-a.tar.gz");
         assert!(packs[0].modified_at > 0);
+    }
+
+    #[test]
+    fn module_path_keeps_three_states_apart() {
+        // 三态是这套目录配置的全部难点：没配过 / 显式关掉 / 自定义。
+        // 混掉任意两个都会出现「用户说不要了，界面又给回默认名」这种鬼故事。
+        assert_eq!(resolve_module_path("/agent-skills", "", false), "/agent-skills");
+        assert_eq!(resolve_module_path("/agent-skills", "   ", false), "/agent-skills");
+        assert_eq!(resolve_module_path("/agent-skills", "", true), "");
+        assert_eq!(resolve_module_path("/agent-skills", "/mine/skills", true), "/mine/skills");
+        // 没写前导斜杠的按「相对根」补齐：用户填 `skills` 时不该得到一个
+        // 拼出来是 `https://host/davskills` 的地址。
+        assert_eq!(resolve_module_path("/agent-skills", "skills", true), "/skills");
+    }
+
+    #[test]
+    fn probe_accepts_the_camel_case_keys_the_page_sends() {
+        // 回归：`Probe` 少了 `rename_all = "camelCase"`，前端发的 `remoteDir`
+        // 被 serde 静默忽略，于是「改了远端目录再点测试连接」测的永远是旧目录 ——
+        // 一个只在界面上能看出来的错，后端测试不锁住就再也发现不了。
+        let probe: Probe = serde_json::from_value(json!({
+            "url": "https://dav.example.com/dav/",
+            "username": "me",
+            "password": "",
+            "remoteDir": "my-memory"
+        }))
+        .expect("页面发的形状必须能被解析");
+        assert_eq!(probe.remote_dir.as_deref(), Some("my-memory"));
+        assert_eq!(probe.url.as_deref(), Some("https://dav.example.com/dav/"));
+        // 空串密码保留 `Some("")`：它不是「沿用」，是「这一栏被清空」——
+        // 由 `Credentials::with_probe` 决定要不要覆盖（它只在非空时覆盖）。
+        assert_eq!(probe.password.as_deref(), Some(""));
+        // 缺字段是 `None`（沿用已保存值），不是 `Some("")`（清空）
+        let sparse: Probe = serde_json::from_value(json!({})).expect("空对象也合法");
+        assert!(sparse.url.is_none() && sparse.remote_dir.is_none());
+    }
+
+    #[test]
+    fn module_list_covers_every_module_and_only_memory_is_live() {
+        // 界面上「模块根目录」与「快速同步」两张卡都按这份清单渲染：漏一个
+        // 模块，用户就会觉得「少了一格」；多标一个 implemented，页面就会
+        // 给一个点了没反应的「立即同步」。
+        let ids: Vec<&str> = MODULES.iter().map(|item| item.id).collect();
+        for expected in ["skills", "dosage", "pool", "memory", "prompts"] {
+            assert!(ids.contains(&expected), "模块清单缺 {expected}");
+        }
+        assert_eq!(ids.len(), 5);
+        let live: Vec<&str> = MODULES.iter().filter(|item| item.implemented).map(|item| item.id).collect();
+        assert_eq!(live, vec!["memory"], "只有记忆中枢实现了同步");
+        for item in MODULES {
+            assert!(item.def.starts_with('/'), "{} 的默认目录要以 / 开头", item.id);
+        }
     }
 }

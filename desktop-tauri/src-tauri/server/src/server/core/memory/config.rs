@@ -39,6 +39,12 @@ pub enum Kind {
     Bool,
     /// 单行文本
     Text,
+    /// 单行文本，但**落盘加密、回显只给「已设置」**（WebDAV 密码 / 口令）。
+    ///
+    /// 与 `Text` 分开的理由：加密是**存储层**的属性，不是界面的属性。若靠前端
+    /// 记住「这个框别显示」，接口一旦被直接 curl 就泄露明文；做成一种 kind
+    /// 之后，「`GET /api/memory/config` 不回显秘密」由后端一处保证。
+    Secret,
     /// 路径（字符串，但前端给目录选择器）
     Path,
     /// 枚举（`options` 里选一个）
@@ -277,22 +283,53 @@ static SCHEMA: &[Knob] = &[
     knob_d("privacy.pause", Kind::Bool, Tier::Advanced, "隐私", "隐私模式（暂停一切采集）", "", "false"),
 
     // ===== WebDAV 同步 =====
+    //
+    // ── 为什么这里有一整组 `sync.modules.*` ──────────────────────
+    // 记忆同步原本只同步「记忆」自己（general / projects / profile）。界面上
+    // 要能一眼说清「同一个网盘里，谁在哪个目录」，所以每个可能上云的模块都
+    // 有一个**根目录名**旋钮，默认值与 AgentHub 对齐（`/agent-skills` 这些）。
+    // 目录名留空 = 该模块不参与同步 —— 这比另加一个「启用」开关少一个可能与
+    // 目录名不一致的状态。
+    //
+    // 但**本仓只有记忆实现了同步**（见 `sync::MODULES` 里 `implemented: true` 那一条）。
+    // 其余几个旋钮照实存在、照实落盘、也照实显示，只是运行时不读它们 —— 界面上
+    // 明确标注「未实现」，不做一个点了没反应的「立即同步」。
     knob("sync.enabled", Kind::Bool, Tier::Basic, "同步", "同步总开关", "true"),
+    opts(knob_d("sync.provider", Kind::Enum, Tier::Basic, "同步", "存储类型",
+        "本仓只实现 WebDAV；S3 需要重写打包与列目录，尚未接入",
+        "\"webdav\""), &["webdav", "s3"]),
     knob("sync.auto", Kind::Bool, Tier::Basic, "同步", "自动定时同步", "true"),
     knob_d("sync.url", Kind::Text, Tier::Basic, "同步", "WebDAV 地址",
         "留空 = 不同步；例 https://dav.example.com/agent2api", "\"\""),
     knob_d("sync.username", Kind::Text, Tier::Basic, "同步", "WebDAV 用户名",
         "留空 = 不带认证", "\"\""),
-    knob_d("sync.password", Kind::Text, Tier::Basic, "同步", "WebDAV 密码",
-        "只存在本机 config.json，不随记忆同步上行", "\"\""),
+    knob_d("sync.password", Kind::Secret, Tier::Basic, "同步", "WebDAV 密码",
+        "经系统密钥加密后落 config.json，接口只回「已设置」；不进同步包", "\"\""),
     knob_d("sync.deviceName", Kind::Text, Tier::Advanced, "同步", "本机显示名",
         "留空 = 用设备 id", "\"\""),
     knob_d("sync.remoteDir", Kind::Text, Tier::Advanced, "同步", "远端目录名",
         "同一账号下的多台设备共用这个目录", "\"agent2api-memory\""),
+    opts(knob_d("sync.preset", Kind::Enum, Tier::Advanced, "同步", "存储预设",
+        "仅备忘：帮你记住这台服务器是哪家的，不改变任何同步行为", "\"custom\""),
+        &["custom", "jianguoyun", "nextcloud", "synology", "fnos"]),
+    knob_d("sync.confirmPhrase", Kind::Secret, Tier::Advanced, "同步", "号池包加密口令",
+        "留空 = 沿用 WebDAV 密码；用于号池账号包，本仓尚未实现号池同步", "\"\""),
     range(knob("sync.intervalMin", Kind::Number, Tier::Advanced, "同步", "同步间隔（分钟）", "60"), 5.0, 1440.0),
     range(knob("sync.packSizeLimitMB", Kind::Number, Tier::Internal, "同步", "单包体积上限 (MB)", "50"), 1.0, 2048.0),
     knob_d("sync.excludeIndex", Kind::Bool, Tier::Internal, "同步", "索引库不入同步包",
         "索引可重建，且是二进制无法三方合并", "true"),
+
+    // ===== 各模块同步根目录 =====
+    knob_d("sync.modules.skills", Kind::Text, Tier::Advanced, "同步目录", "技能仓库根目录",
+        "空 = 不参与；本仓尚未实现技能同步", "\"/agent-skills\""),
+    knob_d("sync.modules.dosage", Kind::Text, Tier::Advanced, "同步目录", "用量统计根目录",
+        "空 = 不参与；本仓尚未实现用量同步", "\"/dosage-sync\""),
+    knob_d("sync.modules.pool", Kind::Text, Tier::Advanced, "同步目录", "号池管家号池根目录",
+        "空 = 不参与；本仓尚未实现号池同步", "\"/agenthub-proxy\""),
+    knob_d("sync.modules.memory", Kind::Text, Tier::Advanced, "同步目录", "记忆中枢根目录",
+        "本仓唯一实现了同步的模块", "\"/agenthub-memory\""),
+    knob_d("sync.modules.prompts", Kind::Text, Tier::Advanced, "同步目录", "提示词库根目录",
+        "空 = 不参与；本仓尚未实现提示词库同步", "\"/agenthub-prompts\""),
 
     // ===== 界面 =====
     range(knob("ui.pageSize", Kind::Number, Tier::Basic, "界面", "列表每页条数", "50"), 10.0, 500.0),
@@ -417,6 +454,11 @@ pub fn bool_of(key: &str) -> bool {
 }
 
 pub fn text_of(key: &str) -> String {
+    // 秘密字段要从密文里解，普通文本直接取。走同一个入口是为了让调用方不用
+    // 关心「这个键是不是加密存的」—— `sync::auth_headers` 只想要那个密码。
+    if find(key).map(|item| item.kind) == Some(Kind::Secret) {
+        return secret_of(key);
+    }
     get(key).and_then(|value| value.as_str().map(str::to_string)).unwrap_or_default()
 }
 
@@ -432,6 +474,15 @@ pub fn object_of(key: &str) -> Map<String, Value> {
 }
 
 /// 整份生效配置（扁平键 → 值）。页面拿它渲染表单。
+///
+/// ── 秘密字段在这里被替换成空串 ──────────────────────────────
+/// 这是**唯一**的下发给页面的入口（`GET/PUT /api/memory/config` 都走它），
+/// 所以脱敏放在这里一处就够：`Secret` 类的值只回 `""`，页面据此知道「这个
+/// 输入框现在是空的」，另有 `secret_set` 告诉它「库里有没有值」。
+///
+/// 不要把密文原样发下去再让前端「不许显示」—— 接口能被 curl，那条约束只在
+/// 浏览器里有意义。真正要用的地方（`sync::auth_headers`）走
+/// [`secret_of`] 自己解。
 pub fn flat() -> BTreeMap<String, Value> {
     let cache = stored();
     let mut out = BTreeMap::new();
@@ -442,9 +493,49 @@ pub fn flat() -> BTreeMap<String, Value> {
             .cloned()
             .or_else(|| default_of(item.key))
             .unwrap_or(Value::Null);
+        let value = if item.kind == Kind::Secret && !value.as_str().unwrap_or("").is_empty() {
+            // 有值就回一个空串，语义是「别回显，但你知道我配过」
+            json!("")
+        } else {
+            value
+        };
         out.insert(item.key.to_string(), value);
     }
     out
+}
+
+/// 秘密字段是否已在磁盘上配置过（给页面显示「已保存口令」）。
+pub fn secret_set(key: &str) -> bool {
+    find(key)
+        .filter(|item| item.kind == Kind::Secret)
+        .and_then(|_| stored().values.get(key))
+        .and_then(Value::as_str)
+        .map(|text| !text.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// 解出秘密字段的明文（仅供后端自用，**不要**放进任何 JSON 响应）。
+///
+/// 三种情况都回落空串而不是报错：
+///   · 没配过（值就是空）；
+///   · 值是明文（老版本 / 手工编辑 `config.json` 写进去的）；
+///   · 密文解开失败（密钥文件被换过）—— 此时当作没配，让用户重填一次，
+///     比抛一个「解密失败」把整条同步流程卡死要好。
+pub fn secret_of(key: &str) -> String {
+    let Some(value) = stored().values.get(key).and_then(Value::as_str) else {
+        return String::new();
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+    if !crate::server::core::crypto::is_envelope(value) {
+        return value.to_string();
+    }
+    crate::server::core::crypto::open(value, crate::server::core::crypto::SecretScope::MemorySync)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default()
 }
 
 /// 只取显式设置过的键（导出/同步用：不把默认值写死在别人机器上）。
@@ -502,6 +593,12 @@ pub fn coerce(knob: &Knob, value: &Value) -> Result<Value, String> {
             .map(|flag| json!(flag))
             .ok_or_else(|| format!("「{label}」必须是布尔值")),
         Kind::Text | Kind::Path => value
+            .as_str()
+            .map(|text| json!(text))
+            .ok_or_else(|| format!("「{label}」必须是字符串")),
+        // 加密在 `apply_one` 里做（那里要判断「空串 = 沿用」，coerce 看不到旧值）。
+        // 这里只做类型校验，免得 `coerce` 单独被调用时把明文当合法值放行。
+        Kind::Secret => value
             .as_str()
             .map(|text| json!(text))
             .ok_or_else(|| format!("「{label}」必须是字符串")),
@@ -581,6 +678,22 @@ fn apply_one(next: &mut Stored, key: &str, value: &Value) -> Result<(), String> 
         // 未知键静默丢弃：老版本配置里有、新版本删掉的键不该让整份配置保存失败
         return Ok(());
     };
+    if knob.kind == Kind::Secret {
+        // 秘密字段的空串 = **沿用库里那份**（与 `cloud_sync::settings` 同语义）。
+        // 界面拿到的是「已设置」而不是原文，所以它每次保存必然发空串 —— 若把
+        // 空串当成「清空」，用户改一个不相干的旋钮就会把密码抹掉。
+        // 想真正清空用 `reset`（那里走的是把键从 values 里删掉）。
+        let incoming = value.as_str().ok_or_else(|| format!("「{}」必须是字符串", knob.label))?;
+        if incoming.is_empty() {
+            return Ok(());
+        }
+        let sealed = crate::server::core::crypto::seal(
+            incoming.as_bytes(),
+            crate::server::core::crypto::SecretScope::MemorySync,
+        )?;
+        next.values.insert(mapped, json!(sealed));
+        return Ok(());
+    }
     if knob.kind == Kind::Map || knob.kind == Kind::List {
         // 对象/列表类做**深合并**：`auto.tasks` 只发改动的那一个任务时，
         // 其余任务的配置必须保留（整体替换会把用户其他任务的开关抹掉）
@@ -685,6 +798,7 @@ pub fn schema_json() -> Value {
                         Kind::Bool => "boolean",
                         Kind::Text => "string",
                         Kind::Path => "path",
+                        Kind::Secret => "secret",
                         Kind::Enum => "enum",
                         Kind::Multi => "multiselect",
                         Kind::List => "list",
@@ -699,6 +813,9 @@ pub fn schema_json() -> Value {
                     "max": item.max,
                     "options": item.options,
                     "hot": item.hot,
+                    // 只有秘密字段有：库里有没有值。页面据此把占位符写成
+                    // 「已保存口令，输入任意字符即进入修改」而不是「未设置」。
+                    "set": if item.kind == Kind::Secret { Some(secret_set(item.key)) } else { None },
                 })
             })
             .collect(),
@@ -801,5 +918,61 @@ mod tests {
         let merged = deep_merge(base, over);
         assert_eq!(merged.pointer("/extract/enabled"), Some(&json!(false)));
         assert_eq!(merged.pointer("/extract/intervalMin"), Some(&json!(30)));
+    }
+
+    #[test]
+    fn secret_knobs_are_marked_secret_and_expose_set_flag() {
+        // 前端凭 `kind === 'secret'` 决定渲染密码框、凭 `set` 决定占位符；
+        // 两个字段少一个，界面就会把一个秘密当普通文本回显出来。
+        let schema = schema_json();
+        let rows = schema.as_array().expect("schema 是数组");
+        for key in ["sync.password", "sync.confirmPhrase"] {
+            let row = rows
+                .iter()
+                .find(|item| item["key"] == json!(key))
+                .unwrap_or_else(|| panic!("schema 里没有 {key}"));
+            assert_eq!(row["kind"], json!("secret"), "{key} 必须是 secret 类");
+            assert!(row["set"].is_boolean(), "{key} 必须下发 set 标记");
+        }
+        // 密码不是 path、账号不是 secret：这两处错一位就会「把账号当密码掩掉」
+        // 或「把密码当路径给目录选择器」。
+        let password = find("sync.password").expect("存在");
+        assert_eq!(password.kind, Kind::Secret);
+        let username = find("sync.username").expect("存在");
+        assert_eq!(username.kind, Kind::Text);
+    }
+
+    #[test]
+    fn secret_rejects_non_string_and_accepts_plain_text() {
+        // `coerce` 只做类型校验（加密在 `apply_one` 里，因为那里才知道「空串 = 沿用」）。
+        let knob = find("sync.password").expect("存在");
+        assert!(coerce(knob, &json!(42)).is_err());
+        assert_eq!(coerce(knob, &json!("s3cret")).unwrap(), json!("s3cret"));
+        assert_eq!(coerce(knob, &json!("")).unwrap(), json!(""));
+    }
+
+    #[test]
+    fn sync_preset_options_cover_the_frontend_list() {
+        // 前端 `PRESETS` 是手写的（`memory-tab-sync.tsx`），后端是 Enum：两边
+        // 一旦不一致，用户选中某个预设点保存就会拿到「不在可选范围内」的报错。
+        let knob = find("sync.preset").expect("存在");
+        for preset in ["custom", "jianguoyun", "nextcloud", "synology", "fnos"] {
+            assert!(knob.options.contains(&preset), "预设缺 {preset}");
+        }
+    }
+
+    #[test]
+    fn every_module_has_a_directory_knob() {
+        // 页面「模块根目录」按 `sync::MODULES` 渲染，而那一组旋钮必须真实存在：
+        // 少一个键，保存时 `apply_one` 会把它当未知键静默丢弃，用户改完没反应。
+        for key in [
+            "sync.modules.skills",
+            "sync.modules.dosage",
+            "sync.modules.pool",
+            "sync.modules.memory",
+            "sync.modules.prompts",
+        ] {
+            assert!(find(key).is_some(), "缺旋钮 {key}");
+        }
     }
 }

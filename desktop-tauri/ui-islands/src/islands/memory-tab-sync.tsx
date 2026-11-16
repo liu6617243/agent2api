@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Button } from '@ui'
+import { Button, Input, SegmentedControl } from '@ui'
 import { t } from '../i18n'
 import * as m from './memory-api'
 import { Empty, Panel, StateBadge, fullTime, timeText, useLoad } from './memory-shared'
@@ -20,13 +20,27 @@ import { Empty, Panel, StateBadge, fullTime, timeText, useLoad } from './memory-
  * 两边的旧版本 —— 这比静默丢数据好。
  *
  * ── 为什么不显示 WebDAV 密码 ────────────────────────────
- * 这个响应会出现在浏览器里、会被贴进 issue。凭据只显示「已配置」这一个事实，
- * 要改就去配置页改。
+ * 这个响应会出现在浏览器里、会被贴进 issue。密码是 `Kind::Secret`，后端落盘
+ * 加密、`flat()` 只回空串，所以这里永远拿不到原文；输入框只按 `hasPassword`
+ * 画一串掩码点，空串的语义是「沿用已保存的那份」（`config::apply_one`）。
  *
  * ── 为什么这里没有「进度条」──────────────────────────────
  * 一次同步是同步阻塞跑完的，后端不落中间态，没有真实的百分比可显示。假装有
  * 进度条，要么是匀速动画（跟实际无关），要么卡在 90%（更糟）。所以只在按钮上
  * 写「同步中…」，跑完把 summary 说成一句人能读的话。
+ *
+ * ── 为什么凭据也能在这一页改 ──────────────────────────────
+ * 原来「凭据」只有一个「修改凭据」的跳转，指向配置页的「同步」分组。真用过
+ * 一次就知道那句话是废话：填地址 / 账号 / 密码、测连接、看远端有没有包，
+ * 这三件事是**同一个动作的上下一步**，中间夹一次页签跳转（还把用户刚改的
+ * 草稿留在配置页）纯属自找麻烦。所以这一页直接给一组输入框，保存走
+ * `POST /api/memory/sync/setup`（只接受 `sync.*` 键，不碰配置页草稿）。
+ *
+ * ── 为什么「模块根目录」里四个模块写着未实现 ──────────────
+ * 这五个目录是「同一个网盘里各模块各占一个」，这件事本身要显示出来，否则
+ * 用户看不懂记忆同步到底占了远端的哪一格。但本仓**只有记忆实现了同步**
+ * （见 `sync::MODULES`）。所以另外四个：输入框照给（值会被保存，将来实现了
+ * 就直接生效）、按钮不给 —— 画一个点了没反应的「立即同步」比不画更糟。
  */
 
 /**
@@ -113,17 +127,169 @@ function runBadge(configured: boolean, running: boolean, lastRun: m.Outcome | nu
   return { state: 'bad', label: t('失败') }
 }
 
+/**
+ * 「多久以前」：设备列表与快速同步里用。
+ *
+ * 与 `timeText` 的分工：那个给的是「11-16 19:18」这种绝对时刻 —— 适合「上次同步
+ * 发生在哪一天」；这里是「58 分钟前」，适合「那台机器还活不活」。两者都在
+ * `title` 里带上对方的形态，悬停就能互换。
+ */
+function agoText(timestamp: number | null | undefined): string {
+  if (!timestamp) return t('从未同步')
+  const delta = Date.now() - timestamp
+  if (delta < 0) return t('刚刚')
+  const minutes = Math.floor(delta / 60000)
+  if (minutes < 1) return t('刚刚')
+  if (minutes < 60) return t('{n} 分钟前', { n: minutes })
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return t('{n} 小时前', { n: hours })
+  const days = Math.floor(hours / 24)
+  if (days < 30) return t('{n} 天前', { n: days })
+  return clockText(timestamp)
+}
+
+/**
+ * 存储类型的可选档位。
+ *
+ * `s3` 存得下、跑不起来（打包与列目录还是 WebDAV 那套），所以它带 `disabled`：
+ * 让用户看得见「这条路在这里没通」，而不是选完之后报一个看不懂的错。
+ */
+const PROVIDERS = [
+  { value: 'webdav', label: t('WebDAV 网盘') },
+  { value: 's3', label: t('S3 兼容对象存储'), disabled: true, title: t('本仓尚未接入 S3：打包、列目录、三方合并都还是 WebDAV 那一套') },
+] as const
+
+/**
+ * 存储预设：只是「这台机器接的是谁家的网盘」的备忘。
+ *
+ * 为什么要有它而不是干脆去掉：同一份配置在多设备之间同步时，值会因为换机而
+ * 变成另一家的地址，届时「上一次是哪家」这个信息只有用户自己记得。它不改变
+ * 任何行为——地址、账号、目录都还是各自那一格里的值。
+ *
+ * 取值必须与后端 `sync.preset` 的 `options` 一致（`config.rs` 的
+ * `["custom","jianguoyun","nextcloud","synology","fnos"]`）：后端是 Enum，
+ * 传进去不认的值会被 `apply_one` 拒掉，界面上表现为「保存设置」报错。
+ */
+const PRESETS = [
+  { value: 'custom', label: '自定义' },
+  { value: 'jianguoyun', label: '坚果云' },
+  { value: 'nextcloud', label: 'Nextcloud' },
+  { value: 'synology', label: '群晖 DSM' },
+  { value: 'fnos', label: '飞牛 fnOS' },
+] as const
+
+/**
+ * 「快速同步」里的行标题。
+ *
+ * 为什么不用后端下发的 `label`：那张卡的动词是「同步」，标题写「技能仓库」等于
+ * 让人自己把名词翻译成动作；而上面「模块根目录」那张卡的动词是「配目录」，标题
+ * 就该是数据源的名字（「技能仓库」）。同一个模块在两张卡里读法不同，所以名字
+ * 也不同 —— 一处叫 `label`（源），一处叫 `action`（动作）。
+ *
+ * 缺键时回落到 `label`：后端将来加第六个模块，这里没跟上也不会渲染出一个空行。
+ */
+const QUICK_ACTIONS: Record<string, string> = {
+  skills: '技能同步',
+  dosage: '用量同步',
+  pool: '号池管家 · 号池同步',
+  memory: '记忆中枢同步',
+  prompts: '提示词同步',
+}
+
+/**
+ * 「快速同步」里的行序。
+ *
+ * 与「模块根目录」那张卡不同序，照抄目标界面：那张卡按「记忆中枢排第二列」的
+ * 两列网格成对排（技能 | 用量、号池 | 记忆、提示词 | 预设），而这张卡是一列
+ * 竖排，顺序按「用户平常先同步哪一份」——先把白拿的数据（用量、技能）列出来，
+ * 再把要打包上传的（号池、记忆）放后面。两张卡的顺序不一样不是笔误。
+ *
+ * 未列出的模块按后端顺序追加在后面，这样后端加模块时这里不用改也不会漏行。
+ */
+const QUICK_ORDER = ['dosage', 'skills', 'pool', 'memory', 'prompts']
+
+type SetupForm = {
+  provider: string
+  url: string
+  username: string
+  password: string
+  confirmPhrase: string
+  remoteDir: string
+  deviceName: string
+  preset: string
+  modules: Record<string, string>
+}
+
+/**
+ * 从状态拼出表单初值。
+ *
+ * 密码 / 口令恒为空串：后端从不下发原文，空串的语义是「沿用已保存的那份」
+ * （`config::apply_one` 的 Secret 分支）。所以「用户没动密码框」与「密码本来是
+ * 空的」在提交时是同一个值，区别只体现在占位符上（`hasPassword`）。
+ */
+function formOf(data: m.SyncStatus): SetupForm {
+  return {
+    provider: data.provider ?? 'webdav',
+    url: data.url ?? '',
+    username: data.username ?? '',
+    password: '',
+    confirmPhrase: '',
+    remoteDir: data.remoteDir ?? '',
+    deviceName: data.deviceName ?? '',
+    preset: String(data.preset ?? 'custom'),
+    modules: Object.fromEntries((data.modules ?? []).map(item => [item.id, item.dir])),
+  }
+}
+
 function Sync(): React.ReactElement {
   const { data, loading, error, reload } = useLoad(() => m.loadSync(), [])
   const conflicts = useLoad(() => m.loadSyncConflicts(), [])
   const log = useLoad(() => m.loadSyncLog(50), [])
   const [busy, setBusy] = React.useState('')
   const [actionError, setActionError] = React.useState('')
-  const [test, setTest] = React.useState<{ ok: boolean; message: string } | null>(null)
+  // 测连接的结果带一个来源：两张卡各有一个「测连接 / 测试连接」按钮，结果只该
+  // 出现在按下去的那张卡里。同一个结果在两处同时冒出来，用户会以为「我点了两次？」
+  const [test, setTest] = React.useState<{ ok: boolean; message: string; from: 'setup' | 'status' } | null>(null)
   const [lastRun, setLastRun] = React.useState<m.Outcome | null>(null)
   const [showLog, setShowLog] = React.useState(false)
   const [showPreview, setShowPreview] = React.useState(false)
   const preview = useLoad(() => (showPreview ? m.loadSyncPreview() : Promise.resolve(null)), [showPreview])
+
+  // ── 凭据与目录的草稿 ──
+  //
+  // 这一份草稿只属于同步页：保存走 `/sync/setup`，不经过配置页那套草稿层。
+  // 初值来自 `data`，但在 `data` 因为别的原因重载（比如刚同步完）时**不覆盖**
+  // 用户正在改的内容 —— 所以用 `drafted` 记「用户动过没有」，动过就不铺初值。
+  const [form, setForm] = React.useState<SetupForm | null>(null)
+  const drafted = React.useRef(false)
+  const [confirmReset, setConfirmReset] = React.useState(false)
+
+  // 凭据卡在本页最上面。状态卡那一行「修改凭据」不再跨页签跳转，而是把它滚到
+  // 视野里并让地址框获得焦点 —— 用户点这个按钮的意图就是「我要改那个地址」，
+  // 在这里直接满足，比跳去配置页再让他自己找回来快一步。
+  const credentialCard = React.useRef<HTMLElement | null>(null)
+  const gotoCredentials = () => {
+    const node = credentialCard.current
+    if (!node) return
+    node.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    const input = node.querySelector<HTMLInputElement>('input')
+    input?.focus({ preventScroll: true })
+  }
+
+  React.useEffect(() => {
+    if (!data || drafted.current) return
+    setForm(formOf(data))
+  }, [data])
+
+  const put = (patch: Partial<SetupForm>) => {
+    drafted.current = true
+    setForm(current => (current ? { ...current, ...patch } : current))
+  }
+
+  const putModule = (id: string, dir: string) => {
+    drafted.current = true
+    setForm(current => (current ? { ...current, modules: { ...current.modules, [id]: dir } } : current))
+  }
 
   const act = async (key: string, task: () => Promise<unknown>) => {
     setBusy(key)
@@ -149,46 +315,427 @@ function Sync(): React.ReactElement {
   const summary = (lastRun?.result ?? data.lastResult ?? null) as LastSummary | null
   const running = busy === 'run'
   const badge = runBadge(data.configured, running, lastRun, data.lastSyncAt)
-
-  /**
-   * 跳到配置页。
-   *
-   * 配置页的「同步」分组没法靠 URL 直达（页签与分组都是页面岛内部状态），
-   * 所以两边约定一个自定义事件：`memory-page` 收到 `mm:tab` 就切页签，
-   * 配置页收到 `mm:group` 就切分组。任一环节没挂上就只是切页签，不会报错。
-   */
-  const gotoConfig = () => {
-    window.dispatchEvent(new CustomEvent('mm:tab', { detail: { tab: 'settings' } }))
-    window.dispatchEvent(new CustomEvent('mm:group', { detail: { group: '同步' } }))
-  }
+  const modules = data.modules ?? []
+  // 快速同步的行序见 `QUICK_ORDER`：固定的五个先按那个顺序，后端将来新增的
+  // 模块（不在表里）按原顺序接在后面。
+  const quick = React.useMemo(() => {
+    const rank = (id: string) => {
+      const at = QUICK_ORDER.indexOf(id)
+      return at < 0 ? QUICK_ORDER.length : at
+    }
+    return [...modules].sort((a, b) => rank(a.id) - rank(b.id))
+  }, [modules])
+  const current = form ?? formOf(data)
 
   return (
     <div className='mm-sync'>
       {actionError ? <div className='mm-error'>{actionError}</div> : null}
 
-      {/* ── 顶部：一句话说清这页在干什么 + 主操作 ── */}
+      {/* ── 顶部：一句话说清这页在干什么 ──
+          主操作不在这儿：截图里这张卡是纯说明条，真正的「立即同步」在下面的
+          「快速同步」里（那里每个模块一个按钮，用户要按的是「哪一份数据」，
+          而不是笼统的「同步」）。顶栏再放一个同名按钮会让人以为有两个入口。 */}
       <div className='mm-sync-bar'>
         <span className='mm-sync-bar-text'>
           {t('把记忆文件夹整体打包上传/下载，两边都改且不一样时进冲突队列等你裁决')}
         </span>
-        <div className='mm-inline-actions'>
-          {/* 顶栏只放「立即同步」一个动作。刷新不在这儿：一次同步跑完 act()
-              已经把状态 / 冲突 / 日志三个端点一起重拉，手动刷新只在看日志时
-              才需要 —— 那个按钮在日志卡展开后。 */}
+      </div>
+
+      {/* ── WebDAV 服务器（凭据）──
+          截图里这张卡自带账号 / 密码 / 口令三个框和三个按钮。这里照做，但
+          「测连接」测的是**当前输入框里的值**（后端 `post_sync_test` 接 body），
+          这样可以「先验再存」；密码框从不下发原文，占位符说明「已保存」与否。 */}
+      <section className='mm-cfg-card' ref={credentialCard}>
+        <div className='mm-cfg-card-head'>
+          <div className='mm-cfg-card-title'>{t('统一 WebDAV 服务器')}</div>
+          <span className='mm-cfg-card-note'>
+            {t('密码经系统密钥加密保存，界面只显示掩码')}
+          </span>
+        </div>
+
+        <div className='mm-sync-field'>
+          <span className='mm-sync-field-label'>{t('存储类型')}</span>
+          <SegmentedControl
+            className='mm-sync-seg'
+            aria-label={t('存储类型')}
+            options={PROVIDERS}
+            value={current.provider === 's3' ? 's3' : 'webdav'}
+            onValueChange={next => put({ provider: next })}
+          />
+          {current.provider === 's3' ? (
+            <span className='mm-sync-field-hint mm-sync-pending'>
+              {t('S3 只存得下配置，跑不起来：打包、列目录、三方合并都还是 WebDAV 那一套。选 WebDAV 才有可用的同步。')}
+            </span>
+          ) : null}
+        </div>
+
+        <div className='mm-sync-pair'>
+          <label className='mm-sync-field'>
+            <span className='mm-sync-field-label'>{t('服务器地址（WebDAV）')}</span>
+            <Input
+              value={current.url}
+              placeholder='https://dav.jianguoyun.com/dav/'
+              spellCheck={false}
+              onChange={event => put({ url: event.target.value })}
+            />
+          </label>
+          <label className='mm-sync-field'>
+            <span className='mm-sync-field-label'>{t('账号')}</span>
+            <Input
+              value={current.username}
+              spellCheck={false}
+              autoComplete='username'
+              onChange={event => put({ username: event.target.value })}
+            />
+          </label>
+        </div>
+
+        {/* 远端目录必须在这一张卡里：它跟地址、账号、密码一样是「怎么连」的一部分
+            —— URL 的最后一段就是它，缺了它这张卡的三个输入框拼不出一个可用地址。
+            下面「模块根目录」里记忆那一行只是它的只读投影（同一个值，一个入口）。 */}
+        <label className='mm-sync-field'>
+          <span className='mm-sync-field-label'>
+            {t('远端目录')}
+            <span className='mm-sync-field-aside'>
+              {t('（记忆中枢在网盘上的根目录；与「模块根目录」里那一行是同一个值）')}
+            </span>
+          </span>
+          <Input
+            value={current.remoteDir}
+            spellCheck={false}
+            placeholder='agent2api-memory'
+            onChange={event => put({ remoteDir: event.target.value })}
+          />
+        </label>
+
+        <label className='mm-sync-field'>
+          {/* 标签只写「密码」：目标界面那句「同时作为号池同步压缩包的默认加密
+              口令」描述的是号池同步，而本仓没有号池同步 —— 把一句实现不了的话
+              写在字段名里，等于承诺了一个不存在的行为。*/}
+          <span className='mm-sync-field-label'>
+            {t('密码')}
+            <span className='mm-sync-field-aside'>{t('（WebDAV 密码，多设备必须一致；经系统密钥加密保存）')}</span>
+          </span>
+          <Input
+            type='password'
+            autoComplete='new-password'
+            value={current.password}
+            /* 已经存过就画一串掩码点（跟真密码的显示一模一样），而不是写一句
+               「已保存」。理由：这里的位置语义就是「密码框」，用户扫一眼就知道
+               「这格填过了」；写一句话反而让人怀疑这格是不是不用填。
+               真正的事实放在 title 里，悬停能看到「留空 = 沿用」。 */
+            placeholder={
+              data.hasPassword
+                ? '••••••••'
+                : t('未设置（留空 = 沿用已保存的密码）')
+            }
+            title={t('留空 = 沿用已保存的密码；输入任意字符即覆盖')}
+            onChange={event => put({ password: event.target.value })}
+          />
+        </label>
+
+        <label className='mm-sync-field'>
+          <span className='mm-sync-field-label'>
+            {t('号池加密口令')}
+            <span className='mm-sync-field-aside'>{t('（可选，留空沿用上面的密码；本仓尚未实现号池同步）')}</span>
+          </span>
+          <Input
+            type='password'
+            autoComplete='new-password'
+            value={current.confirmPhrase}
+            placeholder={
+              data.hasConfirmPhrase
+                ? '••••••••'
+                : t('留空 = 沿用上面的密码')
+            }
+            title={t('单独给号池包设口令时填；留空 = 沿用 WebDAV 密码')}
+            onChange={event => put({ confirmPhrase: event.target.value })}
+          />
+        </label>
+
+        <div className='mm-sync-actions'>
           <Button
             type='button'
             size='sm'
-            disabled={running || !data.configured}
-            onClick={() => void act('run', async () => {
-              const result = await m.runSync()
-              setLastRun(result.outcome)
-            })}
+            variant='outline'
+            disabled={busy === 'probe'}
+            onClick={() =>
+              void act('probe', async () => {
+                const result = await m.testSync({
+                  url: current.url,
+                  username: current.username,
+                  // 空串 = 没动这一栏，交给后端沿用已保存的密码
+                  password: current.password,
+                  remoteDir: current.remoteDir,
+                })
+                setTest({ ...result, from: 'setup' })
+              })
+            }
           >
-            {running ? t('同步中…') : t('立即同步')}
+            {busy === 'probe' ? t('测试中…') : t('测试连接')}
+          </Button>
+          <Button
+            type='button'
+            size='sm'
+            variant='default'
+            disabled={busy === 'setup'}
+            onClick={() =>
+              void act('setup', async () => {
+                await m.saveSyncSetup({
+                  'sync.provider': current.provider,
+                  'sync.url': current.url,
+                  'sync.username': current.username,
+                  'sync.password': current.password,
+                  'sync.confirmPhrase': current.confirmPhrase,
+                  'sync.remoteDir': current.remoteDir,
+                  'sync.preset': current.preset,
+                  'sync.deviceName': current.deviceName,
+                })
+                // 保存成功后草稿清空：下一次 `data` 回来就铺新值
+                drafted.current = false
+                setForm(null)
+              })
+            }
+          >
+            {busy === 'setup' ? t('保存中…') : t('保存设置')}
+          </Button>
+          <Button
+            type='button'
+            size='sm'
+            variant='destructive'
+            onClick={() => setConfirmReset(true)}
+          >
+            {t('清除配置')}
           </Button>
         </div>
-      </div>
 
+        {confirmReset ? (
+          <div className='mm-cfg-confirm'>
+            <span>
+              {t('会清掉地址 / 账号 / 密码 / 目录 / 口令这些同步配置（远端包与本机已同步的数据不动）。确定？')}
+            </span>
+            <div className='mm-inline-actions'>
+              <Button
+                type='button'
+                size='sm'
+                variant='destructive'
+                onClick={() =>
+                  void act('reset', async () => {
+                    await m.resetSyncSetup()
+                    drafted.current = false
+                    setForm(null)
+                    setTest(null)
+                    setConfirmReset(false)
+                  })
+                }
+              >
+                {t('确认清除')}
+              </Button>
+              <Button type='button' size='sm' variant='ghost' onClick={() => setConfirmReset(false)}>
+                {t('取消')}
+              </Button>
+            </div>
+          </div>
+        ) : null}
+
+        {test?.from === 'setup' ? (
+          <p className={`mm-outcome ${test.ok ? 'mm-outcome-done' : 'mm-outcome-fail'}`}>
+            {test.ok ? t('连接正常：') : t('连接失败：')}{test.message}
+          </p>
+        ) : null}
+      </section>
+
+      {/* ── 模块根目录 ──
+          五个模块在同一个网盘里各占一格。记忆那行才是本仓真正会读的
+          （`sync.remoteDir`），其余四行是「先占个位、将来接上就用」——
+          所以它们的「立即同步」按钮在下面那张卡里是灰的。 */}
+      <section className='mm-cfg-card'>
+        <div className='mm-cfg-card-head'>
+          <div className='mm-cfg-card-title'>{t('模块根目录')}</div>
+          <span className='mm-cfg-card-note'>
+            {t('五个模块在同一网盘上的隔离目录 · 改根目录 = 换一个全新数据位置（旧数据不搬）')}
+          </span>
+        </div>
+
+        <div className='mm-sync-pair'>
+          {modules.map(item => (
+            <label key={item.id} className='mm-sync-field'>
+              <span className='mm-sync-field-label'>
+                {t(item.label)}
+                {/* 记忆这一格**不写「（默认 …）」**：它真正的默认值是 `agent2api-memory`
+                    （见 `sync::remote_dir`），而 `MODULES` 里那个 `/agenthub-memory`
+                    只是「对齐别的模块长什么样」的参考名。写出来会让用户以为默认是后者。 */}
+                {item.id === 'memory' ? null : (
+                  <span className='mm-sync-field-aside'>
+                    {t('（默认 {dir}）', { dir: item.def })}
+                  </span>
+                )}
+                {item.implemented ? null : <span className='mm-sync-tag'>{t('未实现')}</span>}
+              </span>
+              <Input
+                value={current.modules[item.id] ?? ''}
+                spellCheck={false}
+                placeholder={item.dir}
+                /* 记忆这一行是只读的：它真正生效的值是 `sync.remoteDir`（在上一张
+                   卡的「远端目录」里改）。两处都能写会变成「改了这里没生效」，
+                   所以这里只显示、不可编辑，并把它指回真正的那一格。 */
+                disabled={item.id === 'memory'}
+                title={item.id === 'memory' ? t('这一项由上一张卡的「远端目录」决定，改了会同步到那里') : undefined}
+                onChange={event => putModule(item.id, event.target.value)}
+              />
+            </label>
+          ))}
+
+          {/* 存储预设排在最后一个「模块目录」位置：它跟这五个目录一样，是
+              「这台机器接的是谁家的网盘」这类元信息，属于同一次保存。 */}
+          <label className='mm-sync-field'>
+            <span className='mm-sync-field-label'>
+              {t('存储预设')}
+              <span className='mm-sync-field-aside'>{t('（仅备忘，帮你记服务器是哪家的）')}</span>
+            </span>
+            <select
+              className='mm-select mm-sync-select'
+              value={current.preset}
+              onChange={event => put({ preset: event.target.value })}
+            >
+              {PRESETS.map(item => (
+                <option key={item.value} value={item.value}>{t(item.label)}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        <div className='mm-sync-inline mm-sync-inline-end'>
+          <label className='mm-sync-field mm-sync-field-grow'>
+            <span className='mm-sync-field-label'>{t('电脑名（用量统计在多设备列表中显示）')}</span>
+            <Input
+              value={current.deviceName}
+              spellCheck={false}
+              placeholder={data.device}
+              onChange={event => put({ deviceName: event.target.value })}
+            />
+          </label>
+          <Button
+            type='button'
+            size='sm'
+            variant='outline'
+            disabled={busy === 'dirs'}
+            onClick={() =>
+              void act('dirs', async () => {
+                await m.saveSyncSetup({
+                  'sync.deviceName': current.deviceName,
+                  'sync.preset': current.preset,
+                  ...Object.fromEntries(
+                    modules
+                      .filter(item => item.id !== 'memory')
+                      .map(item => [item.key, current.modules[item.id] ?? ''])
+                  ),
+                })
+                drafted.current = false
+                setForm(null)
+              })
+            }
+          >
+            {busy === 'dirs' ? t('保存中…') : t('保存预设与电脑名')}
+          </Button>
+        </div>
+
+        <div className='mm-sync-note'>
+          {t('记忆中枢用的是「远端目录」那一项（')}
+          <code>/{current.remoteDir || 'agent2api-memory'}</code>
+          {t('），它在上一张卡里改；此处这一行只是把它显示出来对齐。其余四个模块的目录名会被保存，但本仓还没有它们的同步实现。')}
+        </div>
+      </section>
+
+      {/* ── 快速同步 ──
+          截图里这张卡是「每个模块一行 + 立即同步」，并且每行带「根目录 + 就绪状态」。
+          这里照做，但只有记忆那行是真的：
+            · 记忆：按钮可用，就绪状态直接读同步状态（有没有地址 / 有没有密码）；
+            · 其余四行：目录名照显（那是用户填的），按钮 **disabled** 并标「未实现」。
+          不做假按钮是这条界面的底线：点一下没反应比没有按钮更让人怀疑整个功能。
+
+          页头不放「刷新状态」：每次动作（保存 / 测连接 / 同步）之后 `act()` 已经
+          重载了状态，再给一个手动刷新按钮等于承认「显示的可能过期」—— 而它并不会。 */}
+      <section className='mm-cfg-card'>
+        <div className='mm-cfg-card-head'>
+          <div className='mm-cfg-card-title'>{t('快速同步')}</div>
+          <span className='mm-cfg-card-note'>
+            {t('每个模块一个按钮：按「哪一份数据」同步，而不是笼统的一个同步键')}
+          </span>
+        </div>
+
+        {quick.map(item => {
+          // 记忆那行才需要「就绪」判断：地址与密码是它跑起来的前提。
+          const ready = data.configured && data.hasPassword !== false
+          const blocked = !data.configured
+            ? t('还没填 WebDAV 地址')
+            : t('还没填 WebDAV 密码')
+          const enabled = item.implemented && ready
+          return (
+            <div key={item.id} className='mm-quick-row'>
+              <div className='mm-quick-main'>
+                <div className='mm-quick-title'>
+                  {t(QUICK_ACTIONS[item.id] ?? item.label)}
+                  <span
+                    className='mm-sync-info'
+                    title={
+                      item.implemented
+                        ? t('把 general / projects / profile 打包上传；远端有别人的包时做三方合并')
+                        : t('这个模块的同步本仓还没实现：目录名会被保存，但按钮点了不会传任何东西 —— 所以它是灰的。')
+                    }
+                  >
+                    i
+                  </span>
+                </div>
+                {/* 号池那行多一句「传的是什么、怎么合并」：它是五个模块里唯一
+                    涉及账号凭据的，光看「根目录」两个字根本不知道包里有密码。
+                    其余四行不加：它们传的就是那个目录里的文件，一句话说不说都一样，
+                    加了只会让这张卡变成五行注释。 */}
+                {item.id === 'pool' ? (
+                  <div className='mm-quick-desc'>
+                    {t('号池账号（含凭据）加密打包同步到他机，按账号去重合并；本机删号会同步删他机账号')}
+                  </div>
+                ) : null}
+                <div className='mm-quick-sub'>
+                  {t('根目录')} <code>{current.modules[item.id] || item.dir || '—'}</code>
+                </div>
+                <div className={enabled ? 'mm-quick-ok' : 'mm-quick-off'}>
+                  {item.implemented ? (ready ? t('已就绪') : blocked) : t('未实现')}
+                  {item.implemented && data.lastSyncAt ? (
+                    <>
+                      <span className='mm-sync-sep'> · </span>
+                      {t('上次同步 {when}', { when: agoText(data.lastSyncAt) })}
+                    </>
+                  ) : null}
+                </div>
+              </div>
+              <Button
+                type='button'
+                size='sm'
+                /* 三态共用一个形状：可用 = 主色描边（`.mm-quick-run`），未实现 /
+                   未就绪 = 普通描边按钮的禁用态。不给未实现的模块画「幽灵按钮」
+                   （无描边的灰字），那样它看起来像一句说明而不是一个控件 ——
+                   用户会去点它，然后怀疑整个页面。 */
+                variant='outline'
+                className={enabled ? 'mm-quick-run' : undefined}
+                disabled={!enabled || running}
+                title={item.implemented ? undefined : t('本仓尚未实现该模块的同步')}
+                onClick={
+                  item.implemented
+                    ? () =>
+                        void act('run', async () => {
+                          const result = await m.runSync()
+                          setLastRun(result.outcome)
+                        })
+                    : undefined
+                }
+              >
+                {running && item.implemented ? t('同步中…') : t('立即同步')}
+              </Button>
+            </div>
+          )
+        })}
+      </section>
       {/* ── 同步状态 ── */}
       <section className='mm-cfg-card'>
         <div className='mm-sync-head'>
@@ -211,8 +758,9 @@ function Sync(): React.ReactElement {
           <div className='mm-sync-cell'>
             <code>{data.url || t('未填写 WebDAV 地址')}</code>
             {/* 「修改凭据」和「测连接」都只跟服务器地址有关，所以都放在这一行，
-                而不是散在页头 —— 用户要改/验的就是眼前这一个地址。 */}
-            <Button type='button' size='sm' variant='outline' onClick={gotoConfig}>
+                而不是散在页头 —— 用户要改/验的就是眼前这一个地址。
+                「修改凭据」不再跳页签：凭据输入框就在本页最上面，点它滚过去即可。 */}
+            <Button type='button' size='sm' variant='outline' onClick={gotoCredentials}>
               {t('修改凭据')}
             </Button>
             <Button
@@ -220,7 +768,12 @@ function Sync(): React.ReactElement {
               size='sm'
               variant='ghost'
               disabled={busy === 'test' || !data.configured}
-              onClick={() => void act('test', async () => { setTest(await m.testSync()) })}
+              onClick={() =>
+                void act('test', async () => {
+                  const result = await m.testSync()
+                  setTest({ ...result, from: 'status' })
+                })
+              }
             >
               {busy === 'test' ? t('测试中…') : t('测连接')}
             </Button>
@@ -284,7 +837,7 @@ function Sync(): React.ReactElement {
           </span>
         </div>
 
-        {test ? (
+        {test?.from === 'status' ? (
           <p className={`mm-outcome ${test.ok ? 'mm-outcome-done' : 'mm-outcome-fail'}`}>
             {test.ok ? t('连接正常：') : t('连接失败：')}{test.message}
           </p>
@@ -389,7 +942,10 @@ function Sync(): React.ReactElement {
                   className={item.self ? 'mm-device-when self' : 'mm-device-when'}
                   title={item.lastSyncAt ? fullTime(item.lastSyncAt) : undefined}
                 >
-                  {item.lastSyncAt ? timeText(item.lastSyncAt) : '—'}
+                  {/* 「多久以前」是这一列真正要回答的问题：它在读的时候是
+                      「另一台还活着吗」，而不是「那是哪一天」。绝对时刻放
+                      title 里，要精确定位时悬停即可。 */}
+                  {item.lastSyncAt ? agoText(item.lastSyncAt) : '—'}
                 </span>
               </div>
             ))}

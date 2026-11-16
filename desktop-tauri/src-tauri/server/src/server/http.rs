@@ -403,6 +403,10 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/memory/sync", get(api::memory::get_sync))
         .route("/api/memory/sync/test", post(api::memory::post_sync_test))
         .route("/api/memory/sync/run", post(api::memory::post_sync_run))
+        // 「保存设置 / 清除配置」：只动 `sync.*` 旋钮，不参与配置页的草稿层
+        // （理由见 `post_sync_setup` 的注释）。
+        .route("/api/memory/sync/setup", post(api::memory::post_sync_setup))
+        .route("/api/memory/sync/reset", post(api::memory::post_sync_reset))
         .route(
             "/api/memory/sync/conflicts",
             get(api::memory::get_sync_conflicts).post(api::memory::post_sync_conflict),

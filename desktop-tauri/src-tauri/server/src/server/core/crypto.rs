@@ -110,6 +110,22 @@ pub enum SecretScope {
     CodingSessions,
     /// 登录校验凭据与部署域名绑定，不参与账号云同步。
     PanelCaptcha,
+    /// 记忆同步的 WebDAV 密码（`core::memory::sync`）。
+    ///
+    /// ── 为什么不能借用 CloudSync 域 ────────────────────────────
+    /// 两者在磁盘上的落点不同：`CloudSync` 那把密钥服务的是「设置 → 数据 →
+    /// 云同步」的 `cloudSync` kv 键，而记忆同步的凭据存在记忆自己的
+    /// `config.json` 里（随记忆目录走）。共用一把钥匙意味着「重装 / 换机后
+    /// 云同步密钥变了」会连带把记忆同步的密码弄成解不开的密文，而用户看到的
+    /// 是「密码没改却说密码错」—— 与 `CloudSync` 当初独立出来的理由同一类。
+    ///
+    /// ── 为什么记忆同步的密码本身不能跟着记忆同步走 ──────────────
+    /// 它是「读远端」的凭据，必须在本机可用；若它进同步包，换机后第一次拉取
+    /// 需要旧密码才能解开新密码，又成环。所以它在 `config.json` 里以密文存在，
+    /// 而同步包只装 `general / projects / profile` 三个子目录（见
+    /// `memory::sync::sync_roots`）—— `config.json` 在记忆根目录上、不在包里，
+    /// 这层隔离靠的是**打包范围**，不是排除名单。
+    MemorySync,
 }
 
 impl SecretScope {
@@ -124,6 +140,7 @@ impl SecretScope {
             SecretScope::CloudSync => "cloud-sync.key",
             SecretScope::CodingSessions => "coding-sessions.key",
             SecretScope::PanelCaptcha => "panel-captcha.key",
+            SecretScope::MemorySync => "memory-sync.key",
         }
     }
 
@@ -138,6 +155,7 @@ impl SecretScope {
             SecretScope::CloudSync => "在「设置 → 数据 → 云同步」里重新输入同步密码即可自愈",
             SecretScope::CodingSessions => "在 AI 助手的编程会话连接设置里重新输入密钥即可自愈",
             SecretScope::PanelCaptcha => "在机器人校验设置中重新保存 Turnstile 服务端密钥即可恢复",
+            SecretScope::MemorySync => "在「记忆中枢 → 同步」里重新输入 WebDAV 密码即可自愈",
         }
     }
 }
@@ -161,12 +179,15 @@ fn cache_for(scope: SecretScope) -> &'static std::sync::Mutex<Option<[u8; KEY_LE
         std::sync::OnceLock::new();
     static PANEL_CAPTCHA: std::sync::OnceLock<std::sync::Mutex<Option<[u8; KEY_LEN]>>> =
         std::sync::OnceLock::new();
+    static MEMORY_SYNC: std::sync::OnceLock<std::sync::Mutex<Option<[u8; KEY_LEN]>>> =
+        std::sync::OnceLock::new();
     match scope {
         SecretScope::UpdateToken => UPDATE_TOKEN.get_or_init(|| std::sync::Mutex::new(None)),
         SecretScope::Accounts => ACCOUNTS.get_or_init(|| std::sync::Mutex::new(None)),
         SecretScope::CloudSync => CLOUD_SYNC.get_or_init(|| std::sync::Mutex::new(None)),
         SecretScope::CodingSessions => CODING_SESSIONS.get_or_init(|| std::sync::Mutex::new(None)),
         SecretScope::PanelCaptcha => PANEL_CAPTCHA.get_or_init(|| std::sync::Mutex::new(None)),
+        SecretScope::MemorySync => MEMORY_SYNC.get_or_init(|| std::sync::Mutex::new(None)),
     }
 }
 

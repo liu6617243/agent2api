@@ -860,6 +860,151 @@
   cursor: help;
   vertical-align: middle;
 }
+/* ── 凭据卡 / 模块目录卡 / 快速同步卡的排版件 ──
+   这一组是「表单区」而不是「键值区」：目标界面在这几张卡里给的是带标签的
+   输入框（服务器地址、账号、密码、五个模块目录），跟上面状态卡那种
+   「标签 — 值」两列清单是两种读法 —— 前者要填，后者只要看。所以不复用
+   `.mm-sync-grid`，单独给一套。 */
+.mm-sync-pair {
+  display: grid;
+  /* 两列而不是 auto-fit：目标界面就是「服务器地址 | 账号」「技能仓库 | 用量统计」
+     这种成对排法，两列读起来是「一组同级的字段」。auto-fit 在宽屏会排成三列，
+     第二列末尾的标签（「（默认 /agent-skills）」）正好被挤到宽度临界点，标签
+     就折成两行 —— 那不是信息密度更高，只是更难读。
+     窄屏（<640px）由下面的媒体查询落成一列。 */
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 12px;
+}
+.mm-sync-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+/* 标签行按文字流排（不用 flex）：名字 + 「（默认 …）」+「未实现」三段长度不一，
+   flex 下会各自成为一个不可断的盒，挤了就整段跳行；文字流只会在空格处断，
+   断出来的两行读起来仍是同一句话。 */
+.mm-sync-field-label {
+  display: block;
+  font-size: 11.5px;
+  color: var(--text-3);
+  line-height: 1.5;
+}
+/* 「未实现」小标：跟在模块名后面。用描边而不是填充 —— 四个模块都带这个标，
+   填成色块会让「模块根目录」这张卡看起来满屏告警。 */
+.mm-sync-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  vertical-align: 1px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  font-size: 10px;
+  line-height: 15px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+/* 标签后的补充说明（「（默认 /agent-skills）」「（仅备忘…）」）。
+   比标签再浅一档、不加粗：它解释标签，不该跟标签抢同一层的注意力。
+   用按钮字重 400 + text-3，与 .mm-sync-tag 的区别是「这是说明」而不是「这是状态」。 */
+.mm-sync-field-aside {
+  margin-left: 2px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-3);
+}
+/* 字段下方的一句提示（目前只用于「选了 S3」那条警告） */
+.mm-sync-field-hint { font-size: 11px; line-height: 1.6; }
+/* 存储类型那组档位：靠左不拉伸。目标界面里它是「贴着标签下沿的一小段」，
+   拉满整行会看起来像一个输入框。 */
+.mm-sync-seg { align-self: flex-start; }
+/* 存储预设的下拉：跟旁边的输入框同高同宽，免得这一格比周围矮一截 */
+.mm-sync-select { width: 100%; height: 30px; }
+
+/* 「电脑名 + 保存按钮」那一行：按钮贴底对齐（它跟输入框同高，不跟标签同高） */
+.mm-sync-inline-end { align-items: flex-end; }
+.mm-sync-field-grow { flex: 1 1 auto; }
+
+/* 卡片底部的按钮组：左对齐、等间距。放右对齐会跟上面的输入框脱开 ——
+   这几个按钮作用于整张卡，贴着左边界读起来才是「对上面这些字段的操作」。 */
+.mm-sync-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+/* 一行里「输入框 + 一个按钮」：按钮不参与拉伸，输入框吃掉剩余宽度 */
+.mm-sync-inline { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.mm-sync-inline > button { flex: none; }
+
+/* 选中未实现的存储类型时那句提醒：留一行字而不是弹错误，因为「选了 S3」
+   本身是合法配置，只是跑不通。 */
+.mm-sync-pending { color: var(--warn); }
+
+/* ── 快速同步：一行一个模块 ──
+   左侧三行（名字 / 根目录 / 就绪状态），右侧一个按钮。用 grid 两列而不是
+   flex + margin-left:auto：按钮要在不同长度的那三行之间垂直居中，grid 的
+   align-items:center 一句话就够，flex 下得给按钮自己加 align-self。 */
+.mm-quick-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+.mm-quick-row:last-child { border-bottom: none; }
+.mm-quick-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.mm-quick-title {
+  display: flex;
+  align-items: center;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text);
+}
+/* 号池那行专属的一句「包里是什么」（含凭据、按账号去重）。单独一类而不是复用
+   `.mm-quick-sub`：那一类是 `nowrap + ellipsis` 的单行值（根目录），这句话有两行
+   长，用同一套样式会被截成「号池账号（含凭据）加密打包同…」—— 恰好把「按账号
+   去重」这半句吃掉，而那半句才是「为什么可以放心同步」的理由。 */
+.mm-quick-desc {
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--text-3);
+  white-space: normal;
+}
+.mm-quick-sub {
+  font-size: 11.5px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mm-quick-sub code { font-family: var(--font-mono); font-size: 11px; color: var(--text-2); }
+/* 就绪 / 未就绪两态只在颜色上区分（绿 / 灰）。不画状态点：这一列本来就短，
+   再加一个圆点会把「已就绪」挤到第二行。 */
+.mm-quick-ok { font-size: 11px; color: var(--ok); }
+.mm-quick-off { font-size: 11px; color: var(--text-3); }
+/* 可用的「立即同步」按钮：主色描边 + 主色文字，但底是透明的 —— 这一行里
+   已经有「已就绪」的绿色，按钮再填成实心主色块会把整行压成两个彩色块。
+   与禁用态一眼能分开：禁用是灰字 + 灰描边 + 整体 45% 透明度（组件库自带）。 */
+.mm-quick-run {
+  border-color: var(--primary-bd);
+  background: transparent;
+  color: var(--primary-fg);
+  font-weight: 500;
+}
+.mm-quick-run:hover {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  color: var(--primary-fg);
+}
+/* 禁用态的「立即同步」：把描边再压淡一档。组件库的 disabled 只给 45% 透明度，
+   那一档在深色底上几乎看不见边框，五行里就有四个「不存在的按钮」，
+   看起来像渲染坏了 —— 明确给一条更淡但存在的描边。 */
+.mm-quick-row > button:disabled { border-color: var(--hairline); }
+
+/* 字段网格在 <640px 收成一列：两列时每格只有 200 出头，「（默认 /agenthub-prompts）」
+   这种标签必然折成两行，而它折行后看起来像另一个字段的名字。一列之后标签一行放得下。 */
+@media (max-width: 640px) {
+  .mm-sync-pair { grid-template-columns: minmax(0, 1fr); }
+}
+
 .mm-conflict {
   border: 1px solid var(--border);
   border-left: 3px solid var(--warn);
@@ -1453,4 +1598,10 @@
   }
   .mm-device-head { display: none; }
   .mm-device-when { padding-left: 16px; font-size: 11.5px; }
+
+  /* 凭据卡与模块目录卡的字段网格在这个断点**不收成一列**：两列各 210px 下限在
+     500px 宽度下仍排得下（500 - 28 内距 - 12 间距 = 460 > 432），而「地址 / 账号」
+     并排是与目标界面一致的信息密度。只在真正放不下时（<440px）由 auto-fit 自己
+     落成一列，这里不写死。 */
+  .mm-quick-row > button { justify-self: end; }
 }

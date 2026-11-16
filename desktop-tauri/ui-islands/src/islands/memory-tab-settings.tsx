@@ -762,6 +762,28 @@ function KnobControl({
           onChange={event => onChange(event.target.value)}
         />
       )
+
+    // ── 秘密字段 ──
+    //
+    // 后端从不下发原文（只给 `set`），所以这里的 value 永远从空串开始。
+    // 空串的语义是「沿用已保存的那份」，不是「清空」—— 与
+    // `config::apply_one` 的 Secret 分支同一约定。占位符把这件事写清楚：
+    // 配过就写「已保存口令，输入任意字符即进入修改」，没配过就写「未设置」。
+    case 'secret':
+      return (
+        <Input
+          className='mm-cfg-text'
+          type='password'
+          autoComplete='new-password'
+          value={typeof value === 'string' ? value : ''}
+          placeholder={
+            knob.set
+              ? t('已保存口令，输入任意字符即进入修改')
+              : t('未设置')
+          }
+          onChange={event => onChange(event.target.value)}
+        />
+      )
   }
 }
 

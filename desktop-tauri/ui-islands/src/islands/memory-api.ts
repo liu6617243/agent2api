@@ -150,7 +150,7 @@ export type ListParams = {
 
 /* ─── 配置 schema（config::schema_json）────────────────────── */
 
-export type KnobKind = 'number' | 'boolean' | 'string' | 'path' | 'enum' | 'multiselect' | 'list' | 'map'
+export type KnobKind = 'number' | 'boolean' | 'string' | 'path' | 'secret' | 'enum' | 'multiselect' | 'list' | 'map'
 export type KnobTier = 'basic' | 'advanced' | 'internal'
 
 export type Knob = {
@@ -165,6 +165,13 @@ export type Knob = {
   max?: number
   options?: string[]
   hot?: boolean
+  /**
+   * 只有 `secret` 类有：库里**有没有值**。
+   *
+   * 秘密字段下发的 `value` 恒为空串（后端 `flat()` 脱敏），所以「空输入框」
+   * 有两种含义 —— 没配过、配过但没回显。这个字段是唯一的区分依据。
+   */
+  set?: boolean
 }
 
 export type ConfigPayload = {
@@ -321,6 +328,22 @@ export type SyncStatus = {
   configured: boolean
   url: string
   remoteDir: string
+  /**
+   * 存储类型。本仓只实现了 `webdav`；`s3` 是**存得下、跑不起来**的配置
+   * （`sync.provider` 可以选，但打包与列目录都还是 WebDAV 那套）。界面据此
+   * 把 S3 画成「未实现」，不给它一个假的「立即同步」。
+   */
+  provider?: string
+  /** 远端完整地址（地址 + 目录）；未配置时为空串 */
+  remoteUrl?: string
+  /** WebDAV 账号（不是秘密，照实回显） */
+  username?: string
+  /** 有没有存过 WebDAV 密码（密码本身永不下发） */
+  hasPassword?: boolean
+  /** 有没有单独配过号池包口令（留空 = 沿用 WebDAV 密码） */
+  hasConfirmPhrase?: boolean
+  /** 存储预设 id（只用来填默认值，不改变同步行为） */
+  preset?: string
   device: string
   deviceName: string
   enabled: boolean
@@ -337,11 +360,29 @@ export type SyncStatus = {
   package: string
   /** 本机记忆根目录（同步的就是这个目录下的 general / projects / profile） */
   localDir?: string
+  /** 五个模块各自的远端目录，以及本仓有没有实现它的同步 */
+  modules?: SyncModuleDir[]
   devices?: {
     devices: { package: string; device: string; self: boolean; lastSyncAt?: number }[]
     configured: boolean
   }
   skippedPaths?: { paths: string[] }
+}
+
+/**
+ * 模块目录（`sync::MODULES`）。
+ *
+ * `id` 是稳定的机器名，`dir` 是生效值（可能为空串 = 该模块不参与同步），
+ * `implemented` 是本仓**真的实现了同步**的那一个 —— 五个里只有 `memory`。
+ */
+export type SyncModuleDir = {
+  id: string
+  label: string
+  key: string
+  dir: string
+  /** 默认目录名（如 `/agent-skills`）：界面用它写「（默认 …）」并在改过后提示怎么还原 */
+  def: string
+  implemented: boolean
 }
 
 export type SyncConflict = {
@@ -625,8 +666,25 @@ export function verifyAgents(clients: string[]): Promise<{ rows: Record<string, 
   return api('POST', '/api/memory/agents/verify', { clients })
 }
 
-export function testSync(): Promise<{ ok: boolean; message: string; url?: string; packages?: number }> {
-  return api('POST', '/api/memory/sync/test')
+/**
+ * 测连接。
+ *
+ * 带 `probe` 就用它去测（配置页那三个输入框里的当前值），不带就测已保存的
+ * 那份配置（同步状态卡里那个按钮）。`probe` 里缺的字段沿用已保存值；密码
+ * 只在给了**非空**字符串时才覆盖 —— 空串是「没动这一栏」。
+ */
+export function testSync(probe?: { url?: string; username?: string; password?: string; remoteDir?: string }): Promise<{ ok: boolean; message: string; url?: string; packages?: number }> {
+  return api('POST', '/api/memory/sync/test', probe ?? {})
+}
+
+/** 保存同步设置（只接受 `sync.` 开头的键；秘密字段空串 = 沿用已保存的那份）。 */
+export function saveSyncSetup(patch: Record<string, unknown>): Promise<{ values: Record<string, unknown>; status: SyncStatus }> {
+  return api('POST', '/api/memory/sync/setup', patch)
+}
+
+/** 清除同步配置：`sync.*` 全部恢复默认（已同步的数据与远端包不动）。 */
+export function resetSyncSetup(): Promise<{ values: Record<string, unknown>; status: SyncStatus }> {
+  return api('POST', '/api/memory/sync/reset')
 }
 
 export function runSync(): Promise<{ outcome: Outcome; status: SyncStatus }> {
