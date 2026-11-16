@@ -134,6 +134,25 @@ function MemoryPage(): React.ReactElement {
     void refreshProjects()
   }, [refreshStatus, refreshProjects])
 
+  /**
+   * 监听页签切换请求（`mm:tab`）。
+   *
+   * 为什么用自定义事件而不是 props 回调：发起方是「同步页里的『修改凭据』」
+   * 这类深层子组件，一层层把 `switchTab` 传下去会让每个中间层都多一个自己
+   * 不用的 prop。事件是解耦的 —— 谁想切页签就发一个，开关在页面这一层。
+   */
+  React.useEffect(() => {
+    const onTab = (event: Event) => {
+      const next = (event as CustomEvent<{ tab?: string }>).detail?.tab
+      if (next && TABS.some(item => item.key === next)) switchTab(next as Tab)
+    }
+    window.addEventListener('mm:tab', onTab)
+    return () => window.removeEventListener('mm:tab', onTab)
+    // switchTab 每个渲染周期都是新函数，但只依赖 setTab 与 refreshProjects（都稳定），
+    // 挂一次就够；列进依赖会让监听器每帧重挂，反而漏事件。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   const switchTab = (next: Tab) => {
     activeTab = next
     setTab(next)

@@ -335,7 +335,12 @@ export type SyncStatus = {
   lastSyncAt: number
   lastResult: unknown
   package: string
-  devices?: { devices: { package: string; device: string; self: boolean }[]; configured: boolean }
+  /** 本机记忆根目录（同步的就是这个目录下的 general / projects / profile） */
+  localDir?: string
+  devices?: {
+    devices: { package: string; device: string; self: boolean; lastSyncAt?: number }[]
+    configured: boolean
+  }
   skippedPaths?: { paths: string[] }
 }
 
@@ -536,7 +541,7 @@ export function loadSyncConflicts(): Promise<{ conflicts: SyncConflict[]; count:
   return api('GET', '/api/memory/sync/conflicts')
 }
 
-export function loadSyncLog(limit = 100): Promise<{ entries: SyncLogRow[] }> {
+export function loadSyncLog(limit = 100): Promise<{ entries: SyncLogRow[]; total: number }> {
   return api('GET', `/api/memory/sync/log${query({ limit })}`)
 }
 

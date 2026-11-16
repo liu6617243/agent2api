@@ -94,7 +94,11 @@
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--surface);
-  min-height: 0;
+  /* 卡片是内容块，永远不参与父级 flex 收缩。
+     父级（.mm-settings-page / .mm-dashboard / …）是固定高度的滚动列，
+     留默认 flex-shrink:1 + min-height:0 会让卡片被压得比内容还矮；
+     卡片本身不裁剪溢出，内容就画到下一张卡上 —— 表现为「重影」。 */
+  flex: 0 0 auto;
 }
 .mm-section-head {
   display: flex;
@@ -736,6 +740,126 @@
   min-height: 0;
   padding-bottom: 4px;
 }
+
+/* 顶部操作条：一句话说清这页在干什么 + 主操作。
+   不用 .mm-cfg-card 是因为它不是内容块而是工具条 —— 圆角更小、内边距更扁，
+   用户在扫视时应该先看到按钮，而不是又一格卡片标题。
+   竖直内边距 15px 是量出来的：目标界面这条高 61px，里面只有一行 18px 的文字和
+   一个 26px 的按钮 —— 上下各留 15px 才撑到这个高度，按钮才不像贴在边框上。 */
+.mm-sync-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 15px 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  flex: 0 0 auto;
+}
+.mm-sync-bar-text { font-size: 12.5px; color: var(--text-2); line-height: 1.6; }
+
+/* 状态卡的头：标题 + 服务端地址 + 状态徽标。
+   做成三列 grid 而不是普通 flex，是为了让地址精确落在下方「值列」的起点上 ——
+   目标界面就是这么排的：标题在标签列，地址在值列，眼睛顺着一条竖线往下看。
+   flex 做不到这点（地址会紧贴标题末尾，宽度随标题字数浮动）。 */
+.mm-sync-head {
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0;
+}
+.mm-sync-head-url {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 键值网格：标签列 160px，与 .mm-sync-head 的第一列同宽（见上）。
+   值列允许内联按钮，所以用 flex 而不是裸 code。
+   行距为 0：每一行高 20px（12.5px 字 × 1.55 行高），行与行紧贴成一条竖排清单
+   —— 这是目标界面的节奏。加 gap 会让五行散开，整张卡凭空长高一截，
+   「五行数据」就不再是一块可以一眼扫完的块。列间距同样由 160px 的标签列让出来，
+   否则值列会比标题下的地址右移，两处对不齐。 */
+.mm-sync-grid {
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr);
+  gap: 0;
+  font-size: 12.5px;
+  line-height: 20px;
+  align-items: center;
+}
+.mm-sync-grid > span { color: var(--text-3); }
+.mm-sync-cell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+  color: var(--text);
+  word-break: break-all;
+}
+.mm-sync-cell code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-2);
+  word-break: break-all;
+}
+
+/* 说明块：讲清边界（同步哪几块、本地目录在哪、按什么节奏）。
+   不画上边界线 —— 目标界面里这句脚注就是紧接着「冲突」行往下排的一行小字，
+   多一条线会让它变成「另一个区块」，而它只是这张卡的收尾说明。 */
+.mm-sync-note {
+  margin-top: 2px;
+  font-size: 11.5px;
+  line-height: 1.85;
+  color: var(--text-3);
+}
+.mm-sync-note code { font-family: var(--font-mono); font-size: 11px; color: var(--text-2); }
+/* 同一行里几个小事实之间的分隔符。用 · 而不是空格：这几个数值彼此独立，
+   读者需要知道「这儿断了」，而不是把「每 30 分钟自动同步 218 个文件」读成一件事。 */
+.mm-sync-sep { padding: 0 4px; color: var(--border-strong, var(--border)); }
+.mm-sync-on { color: var(--ok); }
+/* 有待裁决冲突时的计数：换成暖色，让人不用读数字也知道「这里有活了」 */
+.mm-sync-flag-warn { font-size: 11.5px; color: var(--warn); font-weight: 600; }
+
+/* 空态：冲突 / 设备 / 日志三处共用。留白比文字重要 —— 它替用户确认「真的没有」。 */
+.mm-sync-empty {
+  padding: 26px 0;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+/* 小圆圈 i：只承载 title 悬停，不弹窗、不占布局 */
+.mm-sync-info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  margin-left: 6px;
+  border: 1px solid var(--border-strong, var(--border));
+  border-radius: 50%;
+  font-size: 9px;
+  line-height: 1;
+  color: var(--text-3);
+  cursor: help;
+  vertical-align: middle;
+}
 .mm-conflict {
   border: 1px solid var(--border);
   border-left: 3px solid var(--warn);
@@ -767,15 +891,60 @@
 }
 .mm-conflict-hashes code { font-family: var(--font-mono); font-size: 11px; }
 
-.mm-device-list { display: flex; flex-direction: column; gap: 4px; }
+/* 设备表：两列（设备 / 最后同步）。
+   为什么不用 <table>：这里最多三五台设备，没有排序、没有跨列、没有分页 —— 
+   一张真表格只会多出 th/td 的默认样式要覆盖。用 grid 行，表头与行共享同一份
+   列宽，对齐天然一致。
+   设备列 124px 是量出来的：机器名最长 `DESKTOP-P68A0QR`（15 字符）在 11.5px
+   mono 下约 99px，加左侧留白刚好放得下 —— 再窄就会截成 `DESKTOP-P68…`，
+   而「哪台设备」正是这一列唯一的用途。 */
+.mm-device-table { display: flex; flex-direction: column; }
 .mm-device-row {
+  display: grid;
+  /* 120px 是量出来的：设备名从内容左边缘 +10px 起（.mm-device-name 的内边距），
+     而「最后同步」的值落在 +120px。两列之间不设 gap —— gap 会把时间列推右，
+     表头的「最后同步」就与数据错开。 */
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 0;
+  align-items: center;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 12.5px;
+}
+.mm-device-row:last-child { border-bottom: 0; }
+.mm-device-head {
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+/* 表头居中在数据上方，数据左对齐 —— 这是目标界面的排法：
+   列标题是一层级标签，读者扫的是「哪一列讲什么」，居中最省眼动。
+   第二列只给 5px 缩进：它要和数据的值列同起点（120px），多了就错位。 */
+.mm-device-head > span:first-child { text-align: center; }
+.mm-device-head > span:last-child { padding-left: 5px; }
+.mm-device-name {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 12.5px;
-  padding: 4px 0;
+  gap: 6px;
+  min-width: 0;
+  padding-left: 10px;
 }
-.mm-device-row code { font-family: var(--font-mono); font-size: 11.5px; word-break: break-all; }
+.mm-device-name code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 本机：名字提亮一档、时间加粗。不用「本机」徽标 —— 那是横向占位，
+   而「这是我」这件事用亮度和字重说一次就够（徽标会把设备名挤成省略号）。 */
+.mm-device-row.is-self .mm-device-name code { color: var(--text); }
+.mm-device-when { font-size: 12px; color: var(--text-3); padding-left: 6px; }
+/* 本机那一行时间是「25 分钟前」这种近实时读数，加粗强调；其他设备是远端包的
+   修改时间，弱一档即可 —— 两者可信程度不同，视觉上也该不同。 */
+.mm-device-when.self { color: var(--text); font-weight: 600; }
 
 .mm-file-list {
   display: flex;
@@ -796,13 +965,18 @@
 
 .mm-log-row {
   display: grid;
-  grid-template-columns: 86px 62px 110px 1fr;
+  /* 时刻列 84px：`11-16 19:18` 在 11.5px mono 下约 72px，留余量。
+     action 列 62px：`pull` / `push` / `error` 三个词最长 5 字符。 */
+  grid-template-columns: 84px 56px 62px minmax(0, 1fr);
   gap: 8px;
   align-items: baseline;
-  font-size: 12px;
-  padding: 4px 0;
+  font-size: 11.5px;
+  padding: 5px 0;
   border-bottom: 1px solid var(--hairline);
 }
+.mm-log-row:last-child { border-bottom: 0; }
+.mm-log-when { font-family: var(--font-mono); }
+.mm-log-action { font-family: var(--font-mono); color: var(--text-2); }
 
 /* ── 索引 / 体检 ── */
 .mm-index {
@@ -876,24 +1050,7 @@
   border-bottom: 1px solid var(--hairline);
 }
 
-/* ── 配置 ── */
-.mm-settings-page {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  overflow: auto;
-  min-height: 0;
-  padding-bottom: 4px;
-  max-width: 900px;
-}
-.mm-field { display: flex; flex-direction: column; gap: 6px; }
-.mm-field > label {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 13px;
-  font-weight: 600;
-}
+/* ── 通用小字（多页签共用：说明、次要信息、警告） ── */
 .mm-hint {
   margin: 0;
   font-size: 11.5px;
@@ -903,53 +1060,296 @@
 .mm-muted { color: var(--text-3); font-size: 12px; }
 .mm-warn { color: var(--warn); font-size: 11.5px; }
 
-.mm-tier { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; }
-.mm-tier-head {
+/* ══ 配置页（复刻 AgentHub 配置页结构） ══════════════════════
+
+   结构自上而下：
+     页头（标题 + 事实源 + 已同步 / 恢复默认 / 保存配置）
+     模块与存储卡（启用状态 / 当前根目录 / 配置备份）
+     供应商提示条（蓝）
+     按标签的路由卡 + 链路说明（青）
+     分组 chip 导航
+     当前分组的旋钮卡
+
+   旋钮行三段：左「标签 + key + 说明」、中「控件」、右「默认值提示 + [默认]」。
+   右段贴卡片右缘 —— 这是它和「控件钉在 50% 处」那种半成品观感的区别。 */
+
+.mm-cfg {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: auto;
+  min-height: 0;
+  padding-bottom: 6px;
+}
+
+/* 页头 */
+.mm-cfg-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 2px 2px 0;
+}
+.mm-cfg-head-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.mm-cfg-title { font-size: 15px; font-weight: 600; color: var(--text); }
+.mm-cfg-sub { font-size: 11.5px; color: var(--text-3); word-break: break-all; }
+.mm-cfg-head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* 恢复默认的二次确认：破坏性操作，不能点一下就跑 */
+.mm-cfg-confirm {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding-bottom: 5px;
-  border-bottom: 1px solid var(--hairline);
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  border: 1px solid var(--warn);
+  border-radius: var(--r-sm);
+  background: var(--warn-soft);
+  font-size: 12px;
+  color: var(--text-2);
 }
-.mm-tier-head .mm-muted { font-size: 11.5px; }
 
-.mm-group { display: flex; flex-direction: column; gap: 6px; }
-.mm-group-title {
-  font-size: 11.5px;
-  font-weight: 600;
-  color: var(--text-3);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  margin-top: 4px;
+/* 卡片 */
+.mm-cfg-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 13px 15px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  /* 与 .mm-section 同一理由：卡片是内容块，永不被父级 flex 压扁（压扁=重影） */
+  flex: 0 0 auto;
 }
-.mm-knob {
-  display: grid;
-  grid-template-columns: minmax(200px, 1.1fr) minmax(180px, 1fr);
-  gap: 4px 12px;
+.mm-cfg-card-head {
+  display: flex;
   align-items: center;
-  padding: 5px 0;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.mm-cfg-card-title { font-size: 14px; font-weight: 600; color: var(--text); letter-spacing: .01em; }
+.mm-cfg-card-note { font-size: 11.5px; color: var(--text-3); }
+.mm-cfg-card-sub { font-size: 11.5px; color: var(--text-3); line-height: 1.6; }
+.mm-cfg-card-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* 同步页的卡用更松的边距。
+   目标界面这张页的卡片是「20px 上内距 + 14px 下内距」，标题 14px、正文 12.5px，
+   整个卡片的呼吸感来自这圈留白，而不是行间距 —— 直接改 .mm-cfg-card 会把
+   配置页的几十张旋钮卡一起改松，所以只在同步页覆盖。 */
+.mm-sync .mm-cfg-card {
+  gap: 6px;
+  padding: 18px 18px 14px;
+}
+
+/* 模块与存储：固定三行，标签列左、内容右 */
+.mm-cfg-item {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 4px 12px;
+  padding: 8px 0;
   border-bottom: 1px solid var(--hairline);
 }
-.mm-knob-label {
+.mm-cfg-item:last-of-type { border-bottom: 0; }
+.mm-cfg-item-label { font-size: 12.5px; font-weight: 600; color: var(--text-2); }
+.mm-cfg-item-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.mm-cfg-item-control { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mm-cfg-item-desc { font-size: 11.5px; color: var(--text-3); line-height: 1.6; }
+.mm-cfg-path code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+  background: var(--surface-inset);
+  border-radius: var(--r-xs);
+  padding: 3px 7px;
+  word-break: break-all;
+}
+
+/* 蓝色提示条 */
+.mm-cfg-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 9px 13px;
+  border: 1px solid var(--info-bd);
+  border-radius: var(--r-md);
+  background: var(--info-soft);
+  font-size: 12px;
+  color: var(--text-2);
+  flex: 0 0 auto;
+}
+
+/* 青绿说明块（链路怎么看） */
+.mm-cfg-note {
+  padding: 9px 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--ok-bd);
+  background: var(--ok-soft);
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--text-2);
+}
+
+/* 路由表 */
+.mm-route { display: flex; flex-direction: column; }
+.mm-route-row {
+  display: grid;
+  grid-template-columns: 116px 108px minmax(150px, 1.1fr) 92px 132px minmax(140px, 1fr);
+  gap: 10px;
+  align-items: center;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 12px;
+}
+.mm-route-row:last-child { border-bottom: 0; }
+.mm-route-head {
+  padding: 4px 0;
+  font-size: 11.5px;
+  color: var(--text-3);
+  border-bottom: 1px solid var(--border);
+}
+.mm-route-task { display: flex; align-items: baseline; gap: 6px; color: var(--text); }
+.mm-route-task code { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-3); }
+.mm-route-fixed { color: var(--text-3); font-size: 11.5px; }
+.mm-route-tag { color: var(--ok); font-size: 11.5px; }
+.mm-route-resolved { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.mm-route-resolved code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mm-route-resolved em {
+  font-style: normal;
+  font-size: 10.5px;
+  color: var(--text-3);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-xs);
+  padding: 0 5px;
+  white-space: nowrap;
+}
+.mm-select-sm { height: 26px; font-size: 11.5px; padding: 0 6px; max-width: 100%; }
+
+/* 不调模型的任务（分类 / 去重）：后三列合并成一句说明。
+   它们真的在跑，只是没有模型可配 —— 摆三个禁用下拉等于假装能配。 */
+.mm-route-inert {
+  grid-column: 3 / -1;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+/* 后端还没有的任务：整行压暗，避免看着像能配 */
+.mm-route-row.todo .mm-route-task { color: var(--text-3); }
+.mm-route-todo {
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--warn);
+  border: 1px solid var(--warn);
+  border-radius: var(--r-xs);
+  padding: 0 4px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+/* 分组导航 chips */
+.mm-cfg-nav { display: flex; flex-wrap: wrap; gap: 6px; flex: 0 0 auto; }
+.mm-cfg-nav-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 29px;
+  padding: 0 11px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+.mm-cfg-nav-item:hover { background: var(--row-hover); }
+.mm-cfg-nav-item.on {
+  border-color: var(--primary-bd);
+  background: var(--primary-soft);
+  color: var(--primary-fg);
+}
+.mm-cfg-nav-icon { display: inline-flex; align-items: center; color: inherit; opacity: 0.85; }
+
+/* 旋钮行 */
+.mm-cfg-knob {
+  display: grid;
+  /* 三段左对齐：标签列定宽 250px，控件自然宽度，最后是「默认值提示 + [默认]」。
+     不用 1fr 撑满 —— 那会把控件推到卡片中间，右边空一大片，是半成品观感。 */
+  grid-template-columns: 250px auto auto;
+  justify-content: start;
+  gap: 4px 14px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+.mm-cfg-knob:last-child { border-bottom: 0; }
+/* JSON 类旋钮（数组 / 对象）控件很宽，单独一行放，别挤成 200px 的窄条 */
+.mm-cfg-knob.wide { grid-template-columns: minmax(200px, 250px) minmax(0, 1fr); }
+.mm-cfg-knob.wide .mm-cfg-knob-default { grid-column: 1 / -1; }
+.mm-cfg-knob.dirty { background: linear-gradient(90deg, var(--warn-soft), transparent 62%); }
+.mm-cfg-knob-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.mm-cfg-knob-label {
   display: flex;
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
   font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
 }
-.mm-knob-key {
+.mm-cfg-hot {
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--warn);
+  border: 1px solid var(--warn);
+  border-radius: var(--r-xs);
+  padding: 0 4px;
+  line-height: 1.5;
+}
+.mm-cfg-dirty {
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--warn);
+}
+.mm-cfg-knob-key { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-3); }
+.mm-cfg-knob-desc { font-size: 11.5px; color: var(--text-3); line-height: 1.6; margin-top: 1px; }
+.mm-cfg-knob-control { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.mm-cfg-knob-default { display: flex; align-items: center; gap: 6px; justify-content: flex-start; }
+.mm-cfg-default-hint { font-size: 11px; color: var(--text-3); white-space: nowrap; }
+.mm-cfg-number { width: 88px; }
+.mm-cfg-text { width: 230px; }
+.mm-cfg-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.mm-cfg-empty { padding: 10px 0; font-size: 12px; color: var(--text-3); }
+
+.mm-cfg-json { display: flex; flex-direction: column; gap: 5px; width: 100%; }
+.mm-cfg-json-input {
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-inset);
+  color: var(--text);
   font-family: var(--font-mono);
-  font-size: 10.5px;
-  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.5;
+  resize: vertical;
 }
-.mm-knob-control { display: flex; align-items: center; gap: 6px; }
-.mm-knob-number { max-width: 110px; }
-.mm-knob-desc {
-  grid-column: 1 / -1;
-  font-size: 11.5px;
-  color: var(--text-3);
-  line-height: 1.6;
-}
+.mm-cfg-json-input.invalid { border-color: var(--danger); }
 
 .mm-multi { display: flex; gap: 4px; flex-wrap: wrap; }
 .mm-chip {
@@ -966,22 +1366,6 @@
   background: var(--primary-soft);
   color: var(--primary-fg);
 }
-
-.mm-json { display: flex; flex-direction: column; gap: 5px; width: 100%; }
-.mm-json-input {
-  width: 100%;
-  padding: 7px 9px;
-  border-radius: var(--r-sm);
-  border: 1px solid var(--border);
-  background: var(--surface-inset);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  line-height: 1.55;
-  resize: vertical;
-}
-.mm-json-input.invalid { border-color: var(--danger); }
-.mm-json-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 
 /* ── 弹层 ── */
 .mm-dialog-mask {
@@ -1031,7 +1415,15 @@
 .mm-label { font-size: 12px; color: var(--text-2); margin-top: 4px; }
 
 @media (max-width: 860px) {
-  .mm-knob { grid-template-columns: 1fr; }
+  /* 窄屏：旋钮行与路由行改成单列堆叠。原来是 grid 多列，窄屏下会被挤成
+     一条条竖排的窄字（"重（heavy）" 折成三行），不如直接叠起来。 */
+  .mm-cfg-knob { grid-template-columns: minmax(0, 1fr); }
+  .mm-cfg-knob-default { justify-content: flex-start; }
+  .mm-route-row { grid-template-columns: minmax(90px, 1fr) minmax(0, 1.4fr); }
+  /* 窄屏只有两列，合并列改成从第 2 列起（写 3 / -1 在这里会越界） */
+  .mm-route-inert { grid-column: 2 / -1; }
+  .mm-route-head { display: none; }
+  .mm-cfg-item { grid-template-columns: minmax(0, 1fr); }
   .mm-task-row { grid-template-columns: minmax(110px, 1fr) 46px 84px 80px; }
   .mm-task-row > :nth-child(5), .mm-task-row > :nth-child(6) { display: none; }
   .mm-call-row { grid-template-columns: 74px 1fr 1fr 62px; }
@@ -1040,4 +1432,25 @@
   .mm-preview-row > :nth-child(4) { display: none; }
   .mm-dialog-row { grid-template-columns: 1fr; }
   .mm-dialog-wide { grid-column: span 1; }
+
+  /* 同步页：状态卡的「标题 / 地址 / 徽标」三列在窄屏放不下（地址会被截成半截
+     URL，那是这页最要紧的字符串之一），改成标题独立一行、地址与徽标同行。 */
+  .mm-sync-head { grid-template-columns: auto minmax(0, 1fr); row-gap: 6px; }
+  .mm-sync-head > .mm-cfg-card-title { grid-column: 1 / -1; }
+  .mm-sync-head > .mm-cfg-card-actions { justify-content: flex-end; }
+  /* 18px 的卡内距在 500px 宽下占掉 7% 的可用宽度，地址与按钮就开始互相挤。
+     窄屏收到 14px：省下的 8px 正好让「修改凭据 / 测连接」两个按钮并排。 */
+  .mm-sync .mm-cfg-card { padding: 14px 14px 12px; }
+  /* 键值网格：标签列压到 78px，值列才有地方放地址与两个按钮；
+     实在放不下时按钮自己换行（.mm-sync-cell 是 flex-wrap）。 */
+  .mm-sync-grid { grid-template-columns: 78px minmax(0, 1fr); }
+  /* 窄屏下设备表改成两行堆叠，而不是把设备名截成 `DESKTOP-P68A…`：
+     这一列唯一的信息就是「哪台设备」，截断等于把答案删掉。 */
+  .mm-device-row {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 2px;
+    align-items: start;
+  }
+  .mm-device-head { display: none; }
+  .mm-device-when { padding-left: 16px; font-size: 11.5px; }
 }

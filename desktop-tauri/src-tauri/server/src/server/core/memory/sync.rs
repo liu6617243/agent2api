@@ -254,12 +254,22 @@ fn remote_exists(url: &str) -> bool {
     matches!(outcome, Ok(status) if status.is_success())
 }
 
+/// 一个远端包：文件名 + 服务器上的修改时刻（epoch ms，取不到就是 0）。
+///
+/// 带修改时间是给「设备列表 → 最后同步」用的。PROPFIND 本来就在请求
+/// `getlastmodified`，原来只是解析时把这段丢掉了 —— 于是界面只能说
+/// 「远端有这个包」，说不出「它上次是什么时候传的」。
+pub struct RemotePack {
+    pub name: String,
+    pub modified_at: i64,
+}
+
 /// 列出远端目录下的包（PROPFIND，Depth: 1）。
 ///
 /// 不用 XML 解析器：只取 `<D:href>` 的值，够用了 —— 少一个依赖，也少一处
 /// 「不同 WebDAV 实现的命名空间前缀不一样」的坑（我们按 `href` 里是否以
 /// `.tar.gz` 结尾来筛，不看 displayname）。
-fn list_remote() -> Vec<String> {
+fn list_remote_packs() -> Vec<RemotePack> {
     let url = remote_url();
     let client = crate::server::core::egress::client_for(None);
     let method = reqwest::Method::from_bytes(b"PROPFIND").unwrap_or(reqwest::Method::GET);
@@ -287,6 +297,18 @@ fn list_remote() -> Vec<String> {
         );
         return Vec::new();
     }
+    let mut out = parse_propfind(&text);
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.dedup_by(|a, b| a.name == b.name);
+    out
+}
+
+/// 把一个 PROPFIND 响应文本里的包列表取出来（供测试与网络版共用）。
+///
+/// 单独成函数是为了能离线测（`list_remote_packs` 里有网络与鉴权）。测试覆盖
+/// 的是这段最容易错的字符串游标逻辑 —— 它曾经用错偏移量，把每个包的时间都
+/// 从文档开头取。
+fn parse_propfind(text: &str) -> Vec<RemotePack> {
     let mut out = Vec::new();
     // 不同 WebDAV 实现的命名空间前缀大小写不一（`<D:href>` / `<d:href>` /
     // 无前缀的 `<href>`）。不解析 XML，只按「`href>` 到下一个 `<`」取文本，
@@ -301,13 +323,58 @@ fn list_remote() -> Vec<String> {
         let href = text[start..start + end].trim();
         let name = href.rsplit('/').next().unwrap_or("").to_string();
         if name.ends_with(".tar.gz") {
-            out.push(name);
+            // `<D:response>` 是一个响应块：从这次 href 结束的位置往后找同块里的
+            // `getlastmodified`。找不到就往后看「够不够近」—— 块与块之间通常
+            // 只隔几十字节的属性，取 1200 字节这个上限足够，又不会跨到
+            // 下一个包的 response 块里。
+            //
+            // 注意 `end` 是相对 `text[start..]` 的偏移，绝对位置得加上 `start`。
+            // 直接拿 `end` 切片会指回文档开头（撞巧还能切在 UTF-8 字符中间 panic）。
+            let after = start + end;
+            let window_end = char_boundary_at_or_before(text, (after + 1200).min(text.len()));
+            let window = &text[after..window_end];
+            out.push(RemotePack {
+                name,
+                modified_at: last_modified(window),
+            });
         }
         cursor = start + end;
     }
-    out.sort();
-    out.dedup();
     out
+}
+
+/// 把一个字节下标收到最近的「字符起点」上（向前收）。
+///
+/// 只用来给字符串切片算窗口终点：`after + 1200` 是字节算术，中文目录名会把
+/// 它落到某个字符的中间，Rust 切片在这里会 panic。往回收一个字符不影响窗口
+/// 用途 —— 我们只是想「往后看足够远」，少一两个字节没有意义。
+fn char_boundary_at_or_before(text: &str, index: usize) -> usize {
+    let mut at = index.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// 从一个 `<D:response>` 块里取 `getlastmodified`，转成 epoch ms。
+///
+/// WebDAV 的 `getlastmodified` 是 RFC 1123 格式（`Tue, 15 Nov 1994 08:12:31 GMT`），
+/// 而 `chrono::DateTime::parse_from_rfc2822` 认的正是这个。有些实现会带
+/// 毫秒或时区偏移，`parse_from_rfc3339` 兜一次。
+fn last_modified(block: &str) -> i64 {
+    let lowered = block.to_ascii_lowercase();
+    let Some(found) = lowered.find("getlastmodified>") else {
+        return 0;
+    };
+    let start = found + "getlastmodified>".len();
+    let Some(end) = block[start..].find('<') else {
+        return 0;
+    };
+    let raw = block[start..start + end].trim();
+    chrono::DateTime::parse_from_rfc2822(raw)
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(raw))
+        .map(|time| time.timestamp_millis())
+        .unwrap_or(0)
 }
 
 /// 下载一个远端包。
@@ -505,13 +572,17 @@ pub fn run(manual: bool) -> super::enrich::Outcome {
     let mut deleted = 0usize;
     let mut conflicted = 0usize;
     let mut skipped = 0usize;
+    // 本次上行的包体大小（字节）。界面上的「上传 5.3 MB」说的是这个，
+    // 不是「记忆正文总量」—— 包里还有 frontmatter 与 manifest。
+    let mut pushed_bytes = 0usize;
 
     ensure_remote_dir();
 
     // ── 下行：拉其他设备的包 ──
     let base = load_base();
     let skip = load_skip();
-    for name in list_remote() {
+    for pack in list_remote_packs() {
+        let name = pack.name;
         if name == own_package_name(&device) {
             continue;
         }
@@ -598,22 +669,32 @@ pub fn run(manual: bool) -> super::enrich::Outcome {
         index::global().sync_log_add(&device, "error", &message, false);
         return Outcome::Skipped(message);
     }
-    match pack(&manifest, &contents) {
-        Ok(bytes) => match push_package(&own_package_name(&device), &bytes) {
-            Ok(()) => {
-                pushed += 1;
-                index::global().sync_log_add(&device, "push", &format!("上行 {} 个文件", contents.len()), true);
+    let packed_files = match pack(&manifest, &contents) {
+        Ok(bytes) => {
+            let packed = contents.len();
+            match push_package(&own_package_name(&device), &bytes) {
+                Ok(()) => {
+                    pushed += 1;
+                    pushed_bytes = bytes.len();
+                    index::global().sync_log_add(
+                        &device,
+                        "push",
+                        &format!("上行 {} 个文件 / {}", packed, size_mb(bytes.len())),
+                        true,
+                    );
+                    packed
+                }
+                Err(error) => {
+                    index::global().sync_log_add(&device, "error", &error, false);
+                    return Outcome::Failed(error);
+                }
             }
-            Err(error) => {
-                index::global().sync_log_add(&device, "error", &error, false);
-                return Outcome::Failed(error);
-            }
-        },
+        }
         Err(error) => {
             index::global().sync_log_add(&device, "error", &error, false);
             return Outcome::Failed(error);
         }
-    }
+    };
 
     // ── 基线更新 ──
     // 注意：基线只记「同步完成后双方一致的状态」。冲突条目不进基线 ——
@@ -636,6 +717,10 @@ pub fn run(manual: bool) -> super::enrich::Outcome {
         "conflicts": conflicted,
         "skipped": skipped,
         "files": manifest.files.len(),
+        // 真正进包的文件数。`files` 是「本地清单里有多少个」，两者可能差几个
+        // —— 读不到内容的文件进不了包。界面上说「上传 N 个文件」时要用这个。
+        "packed": packed_files,
+        "bytes": pushed_bytes,
     });
     let now = crate::server::logging::now_ms();
     index::global().sync_set(LAST_KEY, &now.to_string());
@@ -655,6 +740,17 @@ fn conflicted_paths() -> Vec<String> {
 
 fn own_package_name(device: &str) -> String {
     format!("{device}.tar.gz")
+}
+
+/// 字节 → 「5.3 MB」。同步日志里写体积是为了让人能判断「这次传了多少」，
+/// 而不是拿一串八位数字去心算。
+fn size_mb(bytes: usize) -> String {
+    let mb = bytes as f64 / 1024.0 / 1024.0;
+    if mb >= 1.0 {
+        format!("{mb:.1} MB")
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    }
 }
 
 // ── 文件读写 ─────────────────────────────────────────────────
@@ -767,6 +863,9 @@ pub fn status() -> Value {
         "lastSyncAt": last_at,
         "lastResult": last_result,
         "localFiles": local_manifest().files.len(),
+        // 本机记忆根目录：界面上要显示「同步的是哪个目录」，否则用户没法确认
+        // 自己到底在同步哪一份数据（换过 storage.root 的人尤其需要这个）。
+        "localDir": store::root().to_string_lossy().to_string(),
         "package": own_package_name(&device),
     })
 }
@@ -777,13 +876,21 @@ pub fn devices() -> Value {
         return json!({ "devices": [], "configured": false });
     }
     let own = own_package_name(&store::device_id());
-    let devices: Vec<Value> = list_remote()
+    let last_at = index::global()
+        .sync_get(LAST_KEY)
+        .and_then(|(raw, _)| raw.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let devices: Vec<Value> = list_remote_packs()
         .into_iter()
-        .map(|name| {
+        .map(|pack| {
+            let is_self = pack.name == own;
             json!({
-                "package": name,
-                "device": name.trim_end_matches(".tar.gz").to_string(),
-                "self": name == own,
+                // 本机的「最后同步」用本机记录的同步时刻；别的设备只能靠远端包的
+                // 修改时间 —— 那个包是它上传的那一刻写的，语义上就是它的最后同步。
+                "lastSyncAt": if is_self { last_at } else { pack.modified_at },
+                "package": pack.name,
+                "device": pack.name.trim_end_matches(".tar.gz").to_string(),
+                "self": is_self,
             })
         })
         .collect();
@@ -883,7 +990,10 @@ pub fn resolve_conflict(id: i64, resolution: &str) -> Result<(), String> {
 
 /// 同步流水。
 pub fn log_entries(limit: usize) -> Value {
-    json!({ "entries": index::global().sync_log_list(limit.clamp(1, 500)) })
+    json!({
+        "entries": index::global().sync_log_list(limit.clamp(1, 500)),
+        "total": index::global().sync_log_count(),
+    })
 }
 
 /// 测连接：PROPFIND 远端目录。
@@ -918,7 +1028,7 @@ pub fn test_connection() -> Value {
             "ok": true,
             "message": format!("连接正常（HTTP {}）", status.as_u16()),
             "url": url,
-            "packages": list_remote().len(),
+            "packages": list_remote_packs().len(),
         }),
         // 404 说明服务器在、目录还没建 —— 这不算连接失败，第一次同步会自动建
         Ok((status, _)) if status.as_u16() == 404 => json!({
@@ -1069,5 +1179,52 @@ mod tests {
         assert!(result.delete.is_empty());
         assert!(result.down.is_empty());
         assert!(result.conflicts.is_empty());
+    }
+
+    /// 把一个 PROPFIND 响应切成「包名 + 修改时间」的纯函数版（`list_remote_packs`
+    /// 的网络部分抽出来），只为让下面的回归测试能离线跑。
+    fn packs_from(text: &str) -> Vec<RemotePack> {
+        let mut out = parse_propfind(text);
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    #[test]
+    fn propfind_window_uses_absolute_offset() {
+        // 回归：窗口起点曾经写成 `end`（相对 href 文本的偏移），于是每个包都从
+        // 文档开头截 1200 字节 —— 只要第一个响应块里的时间不是最后一个包的，
+        // 结果就会串位；多字节字符撞上切片边界还会 panic。
+        // 星期几必须写对：chrono 的 RFC 2822 解析会校验它与日期是否一致。
+        let response = concat!(
+            "<D:multistatus xmlns:D=\"DAV:\">",
+            "<D:response><D:href>/dav/memory/dev-a.tar.gz</D:href>",
+            "<D:propstat><D:prop><D:getlastmodified>Sun, 15 Nov 2026 08:12:31 GMT</D:getlastmodified>",
+            "</D:prop></D:propstat></D:response>",
+            "<D:response><D:href>/dav/memory/dev-b.tar.gz</D:href>",
+            "<D:propstat><D:prop><D:getlastmodified>Mon, 16 Nov 2026 09:30:00 GMT</D:getlastmodified>",
+            "</D:prop></D:propstat></D:response>",
+            "</D:multistatus>"
+        );
+        let packs = packs_from(response);
+        assert_eq!(packs.len(), 2);
+        assert_eq!(packs[0].name, "dev-a.tar.gz");
+        assert_eq!(packs[1].name, "dev-b.tar.gz");
+        // 两个包各自的时间必须不同 —— 串位时两者会取到同一个值
+        assert!(packs[0].modified_at > 0, "第一个包的修改时间没解析出来");
+        assert!(packs[1].modified_at > packs[0].modified_at, "两个包的时间串位了");
+    }
+
+    #[test]
+    fn propfind_window_survives_multibyte_chars() {
+        // 中文目录名会让字节偏移与字符边界错开；按字符安全切片不应 panic。
+        let response = concat!(
+            "<D:response><D:href>/dav/记忆中枢/dev-a.tar.gz</D:href>",
+            "<D:propstat><D:prop><D:getlastmodified>Mon, 16 Nov 2026 09:30:00 GMT</D:getlastmodified>",
+            "</D:prop></D:propstat></D:response>"
+        );
+        let packs = packs_from(response);
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].name, "dev-a.tar.gz");
+        assert!(packs[0].modified_at > 0);
     }
 }

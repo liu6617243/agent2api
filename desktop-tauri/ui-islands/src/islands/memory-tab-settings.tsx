@@ -2,54 +2,189 @@ import * as React from 'react'
 import { Badge, Button, Input, Switch } from '@ui'
 import { t } from '../i18n'
 import * as m from './memory-api'
-import { Empty, Panel, Section, StateBadge, Grid, useLoad } from './memory-shared'
+import { Empty, Panel, useLoad } from './memory-shared'
 
 /**
- * 配置页：schema 驱动的自动表单，三档折叠。
+ * 配置页：模块与存储 + 按标签的路由 + 按分组的旋钮。
  *
- * ── 为什么是「schema 驱动」而不是手写表单 ────────────────────
- * 后端有一百多个旋钮（`config.rs` 的 SCHEMA 表）。前端手抄一份枚举的代价不是
- * 「多写一次」，是**必然漂移**：后端加了键，前端不知道，用户在页面上永远改不到
- * 它；后端删了键，前端还在提交一个不存在的键，静默失效。把 schema 取回来按
- * `kind` 渲染、按 `tier` 折叠，前端就永远不需要知道「有哪些旋钮」。
+ * ── 为什么有「草稿」这一层 ──────────────────────────────────
+ * 原来每改一个旋钮就 `PUT` 一次。调一屏参数（比如把检索权重试三组）等于
+ * 连续写十几次 config.json，中间任何一次都是「已经生效的半成品」；而且没有
+ * 「我刚才改了什么」的回退点 —— 页头的「已同步 / N 项未保存」也就无从谈起。
  *
- * ── 三档是什么意思 ──────────────────────────────────────────
- *   · basic    —— 日常要改的（开关、预算、保留天数）。默认展开。
- *   · advanced —— 调行为偏好的（阈值、权重档、同步策略）。默认折叠。
- *   · internal —— 排障与深度定制（具体权重数值、prompt 覆盖、正则）。默认折叠且
- *                 带一句「改之前先知道自己在改什么」。
+ * 现在改动先进本地 `draft`，点「保存配置」一次性 `PUT`。刻意**不做**自动保存：
+ * 这个页面里有 `storage.root`（换根目录）这种改错就要重启并手工搬数据的键，
+ * 自动落盘会让「手滑」直接变成事故。
  *
- * 分档不是权限，是**认知负荷**：一百个旋钮平铺等于没有旋钮。
+ * ── 为什么分组导航是一排 chip 而不是左栏 ────────────────────
+ * 十六个分组，左栏会占掉 200px 宽，而每个分组最多十几个旋钮 —— 左栏比内容还宽。
+ * 横排 chip 可以换行、不占常驻宽度，切分组时正文原地换掉，视线不动。
  *
- * ── 为什么每个键单独提交而不是整表单提交 ────────────────────
- * 一次改一个键，出错能立刻定位到是哪个键；整表单提交时后端只回一个错误，
- * 用户得自己猜是哪一栏不合法。而且「改完即生效」比「填完点保存」更符合这类
- * 调参页的使用方式（改一下、回去看看效果、再改）。
+ * ── 哪些东西是「按当前配置推导」而不是「读回来的」────────────
+ * 路由表最右列的「将使用」是前端按 `llm::model_for` 的同一套规则算的（指定 →
+ * 标签 → 兜底 → 目录首个）。后端没有「解析给我看」的接口，前端复算一遍是唯一
+ * 不新增接口的做法，所以它在界面上明确标成「推导」—— 真实生效结果以调用台账
+ * 为准。改 `llm.rs` 的选模型规则时，这里的 `resolveModel` 要跟着改。
  */
 
-type Tier = 'basic' | 'advanced' | 'internal'
+/** 真正会调 LLM 的任务。`classify` / `dedup` 是纯本地规则，不在这张表里。 */
+/**
+ * 路由表里的任务行 —— 与 `schedule.rs` 的 `TASKS` 对齐，一个不漏。
+ *
+ * `llm: false` 的任务**确实存在、也确实在跑**，但走本地规则（0 token），
+ * 没有「指定模型 / 标签 / 思考强度」可配。这种行把三列合成一句说明，
+ * 而不是摆三个禁用下拉装作能配。
+ *
+ * `todo: true` 是后端还没有实现的任务，单独标出来，不留空壳控件。
+ */
+const ROUTE_TASKS: {
+  task: string
+  label: string
+  llm: boolean
+  note?: string
+  todo?: boolean
+}[] = [
+  { task: 'extract', label: '提取', llm: true },
+  { task: 'summarize', label: '摘要', llm: true },
+  { task: 'tag', label: '打标', llm: true },
+  {
+    task: 'classify',
+    label: '分类',
+    llm: false,
+    note: '本地规则：slug 模糊匹配 + Git 地址 / 目录名，0 token',
+  },
+  { task: 'supersede', label: '失效判定', llm: true },
+  { task: 'distill', label: '蒸馏', llm: true },
+  { task: 'consolidate', label: '合并', llm: true },
+  { task: 'profile', label: '画像', llm: true },
+  {
+    task: 'dedup',
+    label: '去重',
+    llm: false,
+    note: '本地规则：L1 哈希 + L2 文本近似（L3/L4 未实现）',
+  },
+  {
+    task: 'optimize',
+    label: '提示词优化',
+    llm: false,
+    todo: true,
+    note: '后端还没有这个任务',
+  },
+]
+
+const EFFORT_OPTIONS: { value: string; label: string }[] = [
+  { value: '', label: '用模型默认' },
+  { value: 'minimal', label: '最小（minimal）' },
+  { value: 'low', label: '低（low）' },
+  { value: 'medium', label: '中（medium）' },
+  { value: 'high', label: '高（high）' },
+]
+
+/** 分组 → 图标（`ui/icons.js` 里的键）。没列的用 info 兜底。 */
+const GROUP_ICONS: Record<string, string> = {
+  存储: 'database',
+  索引: 'sort',
+  检索: 'eye',
+  归类: 'route',
+  'Agent 接入': 'agent',
+  深层记忆: 'memory',
+  双时间轴: 'timer',
+  自动化: 'spark',
+  去重: 'traffic',
+  待确认: 'feedback',
+  清理: 'refresh',
+  模型与网关: 'gateway',
+  导入: 'download',
+  隐私: 'shield',
+  同步: 'refresh',
+  界面: 'display',
+}
+
+type RouteRow = { task: string; tags: string[]; model: string }
 
 function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement {
   const { data, loading, error, reload } = useLoad(() => m.loadConfig(), [])
-  const [open, setOpen] = React.useState<Record<Tier, boolean>>({
-    basic: true,
-    advanced: false,
-    internal: false,
-  })
+  const [draft, setDraft] = React.useState<Record<string, unknown>>({})
+  const [category, setCategory] = React.useState('')
+  const [advancedOpen, setAdvancedOpen] = React.useState<Record<string, boolean>>({})
   const [busy, setBusy] = React.useState('')
   const [actionError, setActionError] = React.useState('')
-  const [saved, setSaved] = React.useState('')
+  const [confirmReset, setConfirmReset] = React.useState(false)
+  const fileRef = React.useRef<HTMLInputElement | null>(null)
 
-  const save = async (key: string, value: unknown) => {
-    setBusy(key)
+  const groups = React.useMemo(() => {
+    const seen: string[] = []
+    for (const knob of data?.schema ?? []) {
+      if (!seen.includes(knob.group)) seen.push(knob.group)
+    }
+    return seen
+  }, [data])
+
+  /**
+   * 接住别的页签发来的「打开某个分组」请求（`mm:group`）。
+   *
+   * 同步页的「修改凭据」就是这么跳过来的 —— 它要去的不是配置页首页，而是
+   * 「同步」那一组旋钮。分组是组件内部状态，跨页签只能靠事件。
+   *
+   * 必须放在下面的提前 return **之前**：Hook 的调用顺序不能随数据加载状态变化，
+   * 放在 return 后面会在「先 loading 后 loaded」时触发 "rendered fewer hooks"。
+   */
+  React.useEffect(() => {
+    const onGroup = (event: Event) => {
+      const next = (event as CustomEvent<{ group?: string }>).detail?.group
+      if (next) setCategory(next)
+    }
+    window.addEventListener('mm:group', onGroup)
+    return () => window.removeEventListener('mm:group', onGroup)
+  }, [])
+
+  if (loading) return <Panel loading error=''>{null}</Panel>
+  if (error) return <Panel loading={false} error={error} onRetry={reload}>{null}</Panel>
+  if (!data) return <Empty>{t('读不到配置。')}</Empty>
+
+  const active = category && groups.includes(category) ? category : groups[0] ?? ''
+  const saved = data.values
+  const defaultOf = (key: string) => data.schema.find(item => item.key === key)?.default
+
+  /** 生效值：草稿 > 已保存 > 默认。 */
+  const value = (key: string): unknown => {
+    if (key in draft) return draft[key]
+    if (key in saved) return saved[key]
+    return defaultOf(key)
+  }
+
+  /**
+   * 基线值（用来判「有没有改过」）。
+   *
+   * `enabled` 不在 schema 里，也不在 `values` 里 —— 它是 `config.enabled` 这个
+   * 独立字段（后端 `patch` 单独处理它）。不特殊对待的话，把它拨回原位也算「未保存」，
+   * 页头的计数永远清不掉。
+   */
+  const baseOf = (key: string): unknown => {
+    if (key === 'enabled') return data.config.enabled
+    return key in saved ? saved[key] : defaultOf(key)
+  }
+
+  const isDirty = (key: string) => key in draft && JSON.stringify(draft[key]) !== JSON.stringify(baseOf(key))
+
+  const dirtyKeys = Object.keys(draft).filter(isDirty)
+
+  const put = (key: string, next: unknown) => {
     setActionError('')
-    setSaved('')
+    setDraft(current => ({ ...current, [key]: next }))
+  }
+
+  const commit = async () => {
+    const patch: Record<string, unknown> = {}
+    for (const key of dirtyKeys) patch[key] = draft[key]
+    if (Object.keys(patch).length === 0) return
+    setBusy('commit')
+    setActionError('')
     try {
-      await m.saveConfig({ [key]: value })
-      setSaved(key)
+      await m.saveConfig(patch)
+      setDraft({})
       reload()
       onChanged()
-      window.setTimeout(() => setSaved(current => current === key ? '' : current), 1600)
     } catch (caught) {
       setActionError(caught instanceof Error ? caught.message : String(caught))
     } finally {
@@ -57,183 +192,470 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
     }
   }
 
-  if (loading) return <Panel loading error=''>{null}</Panel>
-  if (error) return <Panel loading={false} error={error} onRetry={reload}>{null}</Panel>
-  if (!data) return <Empty>{t('读不到配置。')}</Empty>
-
-  const groups: string[] = []
-  for (const knob of data.schema) {
-    if (!groups.includes(knob.group)) groups.push(knob.group)
+  const resetAll = async () => {
+    setConfirmReset(false)
+    setBusy('reset')
+    setActionError('')
+    try {
+      await m.resetConfig()
+      setDraft({})
+      reload()
+      onChanged()
+    } catch (caught) {
+      setActionError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy('')
+    }
   }
 
+  const reloadOnly = () => {
+    setDraft({})
+    setActionError('')
+    reload()
+  }
+
+  /**
+   * 导出：把「生效值」整份写成 JSON 文件。
+   * 导的是值不是 schema —— 导入方拿到的就是可以直接 PUT 回去的形状。
+   */
+  const exportJson = () => {
+    const payload: Record<string, unknown> = { enabled: data.config.enabled }
+    for (const knob of data.schema) payload[knob.key] = value(knob.key)
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = 'memory.config.json'
+    anchor.click()
+    URL.revokeObjectURL(url)
+  }
+
+  /** 导入：只认 schema 里有的键，其余静默丢掉（老版本导出的文件里可能有已删的键）。 */
+  const importJson = async (file: File) => {
+    setActionError('')
+    try {
+      const text = await file.text()
+      const parsed = JSON.parse(text) as Record<string, unknown>
+      const known = new Set(data.schema.map(knob => knob.key))
+      const next: Record<string, unknown> = {}
+      for (const [key, item] of Object.entries(parsed)) {
+        if (key === 'enabled') continue
+        if (!known.has(key)) continue
+        next[key] = item
+      }
+      if (Object.keys(next).length === 0) {
+        setActionError(t('这份 JSON 里没有认识的配置键。'))
+        return
+      }
+      setDraft(current => ({ ...current, ...next }))
+    } catch (caught) {
+      setActionError(caught instanceof Error ? caught.message : t('JSON 解析失败'))
+    }
+  }
+
+  const items = data.schema.filter(knob => knob.group === active)
+  const basic = items.filter(knob => knob.tier === 'basic')
+  const advanced = items.filter(knob => knob.tier !== 'basic')
+  const advOpen = advancedOpen[active] ?? false
+  const enabledNow = 'enabled' in draft ? draft.enabled === true : data.config.enabled
+
   return (
-    <div className='mm-settings-page'>
-      {actionError ? <div className='mm-error'>{actionError}</div> : null}
-
-      <Section
-        title={t('记忆服务')}
-        hint={t('关掉总开关后，Agent 的读写类工具一律被拒绝，自检仍可用。用途是临时让 Agent 忘记，不必去每个客户端逐个卸载。')}
-      >
-        <div className='mm-field'>
-          <label>
-            {t('启用记忆中枢')}
-            <Switch
-              checked={data.config.enabled}
-              onCheckedChange={value => void save('enabled', value)}
-            />
-          </label>
-        </div>
-        <div className='mm-field'>
-          <label>{t('核心记忆默认预算（token）')}</label>
-          <Input
-            type='number'
-            min={200}
-            max={4000}
-            value={String(data.config.coreMaxTokens)}
-            onChange={event => {
-              const value = Number(event.target.value)
-              if (!Number.isFinite(value) || value < 200 || value > 4000) return
-              void save('agents.coreMaxTokens', Math.round(value))
-            }}
-          />
-          <p className='mm-hint'>
-            {t('200–4000。Agent 调 memory_core 时不传 maxTokens 就用这个值；超预算的条目整条丢掉，不截半句。')}
-          </p>
-        </div>
-      </Section>
-
-      <Section
-        title={t('全部旋钮（{n} 个）', { n: data.schema.length })}
-        hint={t('按分组列出。改一个键立刻生效，不用保存整张表。')}
-        action={(
-          <div className='mm-inline-actions'>
-            {(['basic', 'advanced', 'internal'] as Tier[]).map(tier => (
-              <Button
-                key={tier}
-                type='button'
-                size='sm'
-                variant={open[tier] ? 'default' : 'ghost'}
-                onClick={() => setOpen(current => ({ ...current, [tier]: !current[tier] }))}
-              >
-                {tierLabel(tier)}
-              </Button>
-            ))}
+    <div className='mm-cfg'>
+      {/* ── 页头 ── */}
+      <div className='mm-cfg-head'>
+        <div className='mm-cfg-head-text'>
+          <div className='mm-cfg-title'>{t('配置 · 记忆中枢')}</div>
+          <div className='mm-cfg-sub'>
+            {t('配置事实源：{path}（随 WebDAV 同步）', {
+              path: `${data.status.root.replace(/[\\/]+$/, '')}/config.json`,
+            })}
           </div>
-        )}
-      >
-        {(['basic', 'advanced', 'internal'] as Tier[]).map(tier => {
-          if (!open[tier]) return null
-          const knobs = data.schema.filter(knob => knob.tier === tier)
-          if (knobs.length === 0) return null
-          return (
-            <div key={tier} className='mm-tier'>
-              <div className='mm-tier-head'>
-                <StateBadge
-                  state={tier === 'basic' ? 'ok' : tier === 'advanced' ? 'warn' : 'idle'}
-                  label={tierLabel(tier)}
-                />
-                <span className='mm-muted'>{tierHint(tier)}</span>
-              </div>
-              {groups.map(group => {
-                const items = knobs.filter(knob => knob.group === group)
-                if (items.length === 0) return null
-                return (
-                  <div key={group} className='mm-group'>
-                    <div className='mm-group-title'>{group}</div>
-                    {items.map(knob => (
-                      <KnobField
-                        key={knob.key}
-                        knob={knob}
-                        value={data.values[knob.key]}
-                        busy={busy === knob.key}
-                        saved={saved === knob.key}
-                        onSave={value => void save(knob.key, value)}
-                      />
-                    ))}
-                  </div>
-                )
-              })}
-            </div>
-          )
-        })}
-      </Section>
-
-      <Section title={t('状态')} hint={t('这些是只读的运行时事实。')}>
-        <Grid
-          rows={[
-            [t('记忆根'), data.status.root],
-            [t('索引文件'), data.status.indexFile],
-            [t('设备 id'), data.status.device],
-            [t('条数'), `${data.status.live} 有效 / ${data.status.deleted} 回收站 / ${data.status.superseded} 已取代`],
-            [t('索引'), `${data.status.index.count} 条 · ${data.status.index.fts ? 'FTS5' : t('内存匹配')} · ${data.status.index.inSync ? t('一致') : t('待重建')}`],
-            [t('内容版本'), `r${data.status.revision}`],
-          ]}
-        />
-        <div className='mm-inline-actions'>
+        </div>
+        <div className='mm-cfg-head-actions'>
+          <Badge variant={dirtyKeys.length > 0 ? 'warning' : 'success'} shape='tag'>
+            {dirtyKeys.length > 0 ? t('{n} 项未保存', { n: dirtyKeys.length }) : t('已同步')}
+          </Badge>
+          <Button type='button' size='sm' variant='outline' disabled={busy !== ''} onClick={() => setConfirmReset(true)}>
+            {t('恢复默认')}
+          </Button>
           <Button
             type='button'
             size='sm'
-            variant='ghost'
-            onClick={() => void (async () => {
-              try {
-                await m.resetConfig()
-                reload()
-                onChanged()
-              } catch (caught) {
-                setActionError(caught instanceof Error ? caught.message : String(caught))
-              }
-            })()}
+            variant='default'
+            disabled={dirtyKeys.length === 0 || busy !== ''}
+            onClick={() => void commit()}
           >
-            {t('全部恢复默认')}
+            {busy === 'commit' ? t('保存中…') : t('保存配置')}
           </Button>
-          <span className='mm-muted'>{t('会把 config.json 里的自定义值全部清掉（不动记忆本身）。')}</span>
         </div>
-      </Section>
+      </div>
+
+      {actionError ? <div className='mm-error'>{actionError}</div> : null}
+
+      {confirmReset ? (
+        <div className='mm-cfg-confirm'>
+          <span>{t('会把 config.json 里的自定义值全部清掉（记忆本身不动）。确定恢复默认？')}</span>
+          <div className='mm-inline-actions'>
+            <Button type='button' size='sm' variant='destructive' onClick={() => void resetAll()}>
+              {t('确认恢复')}
+            </Button>
+            <Button type='button' size='sm' variant='ghost' onClick={() => setConfirmReset(false)}>
+              {t('取消')}
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
+      {/* ── 模块与存储 ── */}
+      <section className='mm-cfg-card'>
+        <div className='mm-cfg-card-head'>
+          <div className='mm-cfg-card-title'>{t('模块与存储')}</div>
+          <div className='mm-cfg-card-note'>{t('根目录改动需重启，旧目录里的文件不会自动搬')}</div>
+        </div>
+
+        <div className='mm-cfg-item'>
+          <div className='mm-cfg-item-label'>{t('启用状态')}</div>
+          <div className='mm-cfg-item-body'>
+            <div className='mm-cfg-item-control'>
+              <Switch checked={enabledNow} onCheckedChange={next => put('enabled', next)} />
+            </div>
+            <div className='mm-cfg-item-desc'>{enabledNow ? t('已启用') : t('已关闭')}</div>
+          </div>
+        </div>
+
+        <div className='mm-cfg-item'>
+          <div className='mm-cfg-item-label'>{t('当前根目录')}</div>
+          <div className='mm-cfg-item-body'>
+            <div className='mm-cfg-item-control mm-cfg-path'>
+              <code>{data.status.root}</code>
+              <Button
+                type='button'
+                size='sm'
+                variant='ghost'
+                onClick={() => void navigator.clipboard?.writeText(data.status.root)}
+              >
+                {t('复制路径')}
+              </Button>
+            </div>
+            <div className='mm-cfg-item-desc'>
+              {t('在下方「存储 → 记忆根目录」里改。改完需重启，旧目录的文件不会自动搬。')}
+            </div>
+          </div>
+        </div>
+
+        <div className='mm-cfg-item'>
+          <div className='mm-cfg-item-label'>{t('配置备份')}</div>
+          <div className='mm-cfg-item-body'>
+            <div className='mm-cfg-item-control'>
+              <Button type='button' size='sm' variant='outline' onClick={exportJson}>
+                {t('导出 JSON')}
+              </Button>
+              <Button type='button' size='sm' variant='outline' onClick={() => fileRef.current?.click()}>
+                {t('导入 JSON')}
+              </Button>
+              <input
+                ref={fileRef}
+                type='file'
+                accept='.json,application/json'
+                hidden
+                onChange={event => {
+                  const file = event.target.files?.[0]
+                  if (file) void importJson(file)
+                  event.target.value = ''
+                }}
+              />
+            </div>
+            <div className='mm-cfg-item-desc'>
+              {t('导出的是当前生效值。导入只认本页认识的键，其余丢掉；进草稿后仍需点「保存配置」。')}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* ── 供应商提示 ── */}
+      <div className='mm-cfg-banner'>
+        <span>{t('供应商与模型池在「模型管理」里维护；本页只保留记忆中枢自己的路由规则。')}</span>
+        <Button
+          type='button'
+          size='sm'
+          variant='outline'
+          onClick={() =>
+            (window as unknown as { wbApp?: { showPage?: (name: string) => void } })
+              .wbApp?.showPage?.('gateway')
+          }
+        >
+          {t('前往设置 →')}
+        </Button>
+      </div>
+
+      {/* ── 路由表 ── */}
+      <section className='mm-cfg-card'>
+        <div className='mm-cfg-card-head'>
+          <div className='mm-cfg-card-title'>{t('按标签的路由与降级链')}</div>
+          <div className='mm-cfg-card-actions'>
+            <Button type='button' size='sm' variant='ghost' onClick={reloadOnly}>
+              {t('刷新链路')}
+            </Button>
+          </div>
+        </div>
+        <div className='mm-cfg-card-sub'>
+          {t('每行可指定模型；不指定则按标签在模型池里挑。记忆任务固定走本机网关。')}
+        </div>
+
+        <RoutingTable
+          routing={toRouting(value('models.routing'))}
+          effort={toMap(value('models.taskEffort'))}
+          pool={toPool(value('models.models'))}
+          fallback={String(value('models.fallbackModel') ?? '')}
+          onChange={(task, patch) => {
+            const rows = toRouting(value('models.routing'))
+            const current = rows.find(row => row.task === task)
+            const next = rows.filter(row => row.task !== task)
+            const merged: RouteRow = {
+              task,
+              tags: patch.tags ?? current?.tags ?? [],
+              model: patch.model ?? current?.model ?? '',
+            }
+            // 既没指定模型也没标签的条目没有意义，落盘时不要留空壳
+            if (merged.model.trim() || merged.tags.length > 0) next.push(merged)
+            put('models.routing', next)
+          }}
+          onEffortChange={(task, level) => {
+            // 不能「删键」：后端对 Map 类型做深合并，删掉的键会被旧值留下。
+            // 写空串等价于「没配」—— `model_for` 与 `complete` 都把空串当未设置。
+            put('models.taskEffort', { ...toMap(value('models.taskEffort')), [task]: level })
+          }}
+        />
+
+        <div className='mm-cfg-note'>
+          <div>
+            {t('链路怎么看：先看是否指定了模型；没指定就按【思考强度】推出标签（高 → heavy、中 → light），在同标签的模型池里取第一个；都没有就用兜底模型；再没有就取模型目录里第一个对话模型。401/403 会立刻换下一个，429/5xx 由网关退避重试。')}
+          </div>
+          <div>
+            {t('分类与去重走本地规则、不消耗 token，所以那两行没有模型可配；提示词优化这个任务后端还没有实现。')}
+          </div>
+        </div>
+      </section>
+
+      {/* ── 分组导航 ── */}
+      <nav className='mm-cfg-nav'>
+        {groups.map(group => (
+          <button
+            key={group}
+            type='button'
+            className={`mm-cfg-nav-item${group === active ? ' on' : ''}`}
+            onClick={() => setCategory(group)}
+          >
+            <span
+              className='mm-cfg-nav-icon'
+              dangerouslySetInnerHTML={{ __html: iconHtml(GROUP_ICONS[group] ?? 'info') }}
+            />
+            {t(group)}
+          </button>
+        ))}
+      </nav>
+
+      {/* ── 当前分组的旋钮 ── */}
+      <section className='mm-cfg-card'>
+        <div className='mm-cfg-card-head'>
+          <div className='mm-cfg-card-title'>{t(active)}</div>
+          <div className='mm-cfg-card-actions'>
+            <span className='mm-cfg-card-note'>
+              {t('{n} 项（改完点「保存配置」生效，标「需重启」的还要重启或重建索引）', { n: items.length })}
+            </span>
+            {advanced.length > 0 ? (
+              <Button
+                type='button'
+                size='sm'
+                variant='ghost'
+                onClick={() => setAdvancedOpen(current => ({ ...current, [active]: !advOpen }))}
+              >
+                {advOpen
+                  ? t('高级项 {n} ▲ 收起', { n: advanced.length })
+                  : t('高级项 {n} ▼ 展开', { n: advanced.length })}
+              </Button>
+            ) : null}
+          </div>
+        </div>
+
+        {[...basic, ...(advOpen ? advanced : [])].map(knob => (
+          <KnobRow
+            key={knob.key}
+            knob={knob}
+            value={value(knob.key)}
+            dirty={isDirty(knob.key)}
+            onChange={next => put(knob.key, next)}
+            onDefault={() => put(knob.key, knob.default)}
+          />
+        ))}
+
+        {items.length === 0 ? <div className='mm-cfg-empty'>{t('这一组还没有旋钮。')}</div> : null}
+      </section>
     </div>
   )
 }
 
-function tierLabel(tier: Tier): string {
-  if (tier === 'basic') return t('常用')
-  if (tier === 'advanced') return t('进阶')
-  return t('内部')
+/* ─── 路由表 ─────────────────────────────────────────────── */
+
+function RoutingTable({
+  routing,
+  effort,
+  pool,
+  fallback,
+  onChange,
+  onEffortChange,
+}: {
+  routing: RouteRow[]
+  effort: Record<string, string>
+  pool: { model: string; tags: string[] }[]
+  fallback: string
+  onChange: (task: string, patch: { model?: string; tags?: string[] }) => void
+  onEffortChange: (task: string, level: string) => void
+}): React.ReactElement {
+  const unique = Array.from(new Set(pool.map(item => item.model).filter(Boolean)))
+
+  return (
+    <div className='mm-route'>
+      <div className='mm-route-row mm-route-head'>
+        <span>{t('任务')}</span>
+        <span>{t('绑定网关 / 供应商')}</span>
+        <span>{t('指定模型')}</span>
+        <span>{t('标签')}</span>
+        <span>{t('思考强度')}</span>
+        <span>{t('将使用（推导）')}</span>
+      </div>
+
+      {ROUTE_TASKS.map(({ task, label, llm, note, todo }) => {
+        /* 不调模型的任务：三列合并成一句说明。它们真的在跑，只是没有模型可配。 */
+        if (!llm) {
+          return (
+            <div key={task} className={`mm-route-row${todo ? ' todo' : ''}`}>
+              <span className='mm-route-task'>
+                {t(label)}
+                <code>{task}</code>
+              </span>
+              <span className='mm-route-fixed'>{todo ? '—' : t('不经过网关')}</span>
+              <span className='mm-route-inert'>
+                {todo ? <em className='mm-route-todo'>{t('未实现')}</em> : null}
+                {t(note ?? '')}
+              </span>
+            </div>
+          )
+        }
+
+        const row = routing.find(item => item.task === task)
+        const level = effort[task] ?? ''
+        const tag = level === 'high' ? 'heavy' : level === 'medium' ? 'light' : ''
+        const resolved = resolveModel(task, routing, effort, pool, fallback)
+        return (
+          <div key={task} className='mm-route-row'>
+            <span className='mm-route-task'>
+              {t(label)}
+              <code>{task}</code>
+            </span>
+            <span className='mm-route-fixed'>{t('本机网关')}</span>
+            <select
+              className='mm-select mm-select-sm'
+              value={row?.model ?? ''}
+              onChange={event => onChange(task, { model: event.target.value })}
+            >
+              <option value=''>{t('按标签 + 优先级')}</option>
+              {unique.map(model => (
+                <option key={model} value={model}>{model}</option>
+              ))}
+              {row?.model && !unique.includes(row.model) ? (
+                <option value={row.model}>{row.model}</option>
+              ) : null}
+            </select>
+            <span className='mm-route-tag'>
+              {tag ? t(tag === 'heavy' ? '重（heavy）' : '轻（light）') : '—'}
+            </span>
+            <select
+              className='mm-select mm-select-sm'
+              value={level}
+              onChange={event => onEffortChange(task, event.target.value)}
+            >
+              {EFFORT_OPTIONS.map(option => (
+                <option key={option.value} value={option.value}>{t(option.label)}</option>
+              ))}
+            </select>
+            <span className='mm-route-resolved'>
+              {resolved.model ? <code>{resolved.model}</code> : t('模型目录首个')}
+              <em>{t(resolved.via)}</em>
+            </span>
+          </div>
+        )
+      })}
+    </div>
+  )
 }
 
-function tierHint(tier: Tier): string {
-  if (tier === 'basic') return t('日常会改的：开关、预算、保留天数。')
-  if (tier === 'advanced') return t('调行为偏好：阈值、权重档、同步策略。改错了可以恢复默认。')
-  return t('具体权重数值、prompt 覆盖、正则。改之前先知道自己在改什么。')
+/**
+ * 按 `llm::model_for` 的同一套规则推导「将使用哪个模型」。
+ *
+ * **改后端选模型规则时这里要同步改** —— 它不读接口，是复算。界面上标了「推导」
+ * 就是为了不让它看起来像权威结果。
+ */
+function resolveModel(
+  task: string,
+  routing: RouteRow[],
+  effort: Record<string, string>,
+  pool: { model: string; tags: string[] }[],
+  fallback: string,
+): { model: string; via: string } {
+  const hit = routing.find(row => row.task === task && row.model.trim())
+  if (hit) return { model: hit.model.trim(), via: '指定' }
+
+  const level = effort[task]
+  if (level === 'high' || level === 'medium') {
+    const tag = level === 'high' ? 'heavy' : 'light'
+    const found = pool.find(item => item.tags.includes(tag) && item.model.trim())
+    if (found) return { model: found.model, via: `标签 ${tag}` }
+  }
+
+  if (fallback.trim()) return { model: fallback.trim(), via: '兜底' }
+  return { model: '', via: '目录首个' }
 }
 
-/** 一个旋钮 → 一个控件。按 `kind` 分发，这是「前端不需要知道有哪些旋钮」的落点。 */
-function KnobField({
+/* ─── 单个旋钮 ───────────────────────────────────────────── */
+
+function KnobRow({
   knob,
   value,
-  busy,
-  saved,
-  onSave,
+  dirty,
+  onChange,
+  onDefault,
 }: {
   knob: m.Knob
   value: unknown
-  busy: boolean
-  saved: boolean
-  onSave: (value: unknown) => void
+  dirty: boolean
+  onChange: (next: unknown) => void
+  onDefault: () => void
 }): React.ReactElement {
-  const current = value ?? knob.default
-
+  // 开关不挂「默认 开/关」：那一行右半边本来就空，再写一句等于噪音。
+  const hint = knob.kind === 'boolean' ? '' : defaultHint(knob)
   return (
-    <div className='mm-knob'>
-      <div className='mm-knob-label'>
-        <span>{knob.label}</span>
-        <code className='mm-knob-key'>{knob.key}</code>
-        {saved ? <Badge variant='success' shape='tag'>{t('已保存')}</Badge> : null}
-        {busy ? <Badge variant='outline' shape='tag'>{t('保存中')}</Badge> : null}
-        {knob.hot ? <Badge variant='warning' shape='tag'>{t('需重启')}</Badge> : null}
+    <div className={`mm-cfg-knob${dirty ? ' dirty' : ''}${knob.kind === 'list' || knob.kind === 'map' ? ' wide' : ''}`}>
+      <div className='mm-cfg-knob-main'>
+        <div className='mm-cfg-knob-label'>
+          <span>{t(knob.label)}</span>
+          {knob.hot === false ? <em className='mm-cfg-hot'>{t('需重启 / 重建索引')}</em> : null}
+          {dirty ? <em className='mm-cfg-dirty'>{t('未保存')}</em> : null}
+        </div>
+        <code className='mm-cfg-knob-key'>{knob.key}</code>
+        {knob.desc ? <div className='mm-cfg-knob-desc'>{t(knob.desc)}</div> : null}
       </div>
-      <div className='mm-knob-control'>
-        <KnobControl knob={knob} value={current} onSave={onSave} />
+
+      <div className='mm-cfg-knob-control'>
+        <KnobControl knob={knob} value={value} onChange={onChange} />
       </div>
-      {knob.desc ? <div className='mm-knob-desc'>{knob.desc}</div> : null}
+
+      <div className='mm-cfg-knob-default'>
+        {hint ? <span className='mm-cfg-default-hint'>{hint}</span> : null}
+        <Button type='button' size='sm' variant='ghost' onClick={onDefault}>
+          {t('默认')}
+        </Button>
+      </div>
     </div>
   )
 }
@@ -241,28 +663,28 @@ function KnobField({
 function KnobControl({
   knob,
   value,
-  onSave,
+  onChange,
 }: {
   knob: m.Knob
   value: unknown
-  onSave: (value: unknown) => void
+  onChange: (next: unknown) => void
 }): React.ReactElement {
   switch (knob.kind) {
     case 'boolean':
-      return <Switch checked={value === true} onCheckedChange={next => onSave(next)} />
+      return <Switch checked={value === true} onCheckedChange={next => onChange(next)} />
 
     case 'number':
       return (
         <Input
           type='number'
-          className='mm-knob-number'
+          className='mm-cfg-number'
           min={knob.min}
           max={knob.max}
           value={String(value ?? '')}
           onChange={event => {
             const next = Number(event.target.value)
             if (!Number.isFinite(next)) return
-            onSave(next)
+            onChange(next)
           }}
         />
       )
@@ -270,12 +692,12 @@ function KnobControl({
     case 'enum':
       return (
         <select
-          className='mm-select'
+          className='mm-select mm-select-sm'
           value={String(value ?? '')}
-          onChange={event => onSave(event.target.value)}
+          onChange={event => onChange(event.target.value)}
         >
           {(knob.options ?? []).map(option => (
-            <option key={option} value={option}>{option}</option>
+            <option key={option} value={option}>{t(option)}</option>
           ))}
         </select>
       )
@@ -283,7 +705,7 @@ function KnobControl({
     case 'multiselect': {
       const picked = Array.isArray(value) ? value.map(String) : []
       return (
-        <div className='mm-multi'>
+        <div className='mm-cfg-chips'>
           {(knob.options ?? []).map(option => {
             const on = picked.includes(option)
             return (
@@ -291,7 +713,7 @@ function KnobControl({
                 key={option}
                 type='button'
                 className={`mm-chip${on ? ' on' : ''}`}
-                onClick={() => onSave(on ? picked.filter(item => item !== option) : [...picked, option])}
+                onClick={() => onChange(on ? picked.filter(item => item !== option) : [...picked, option])}
               >
                 {option}
               </button>
@@ -303,30 +725,66 @@ function KnobControl({
 
     case 'list':
     case 'map':
-      return <JsonKnob value={value} onSave={onSave} />
+      return <JsonField value={value} onChange={onChange} />
 
     case 'path':
+      return (
+        <div className='mm-cfg-item-control'>
+          <Input
+            className='mm-cfg-text'
+            value={typeof value === 'string' ? value : ''}
+            placeholder={knob.default === null ? '' : String(knob.default ?? '')}
+            onChange={event => onChange(event.target.value)}
+          />
+          <Button
+            type='button'
+            size='sm'
+            variant='outline'
+            title={t('选择目录（仅桌面端）')}
+            onClick={() => {
+              void pickFolder(typeof value === 'string' ? value : '').then(picked => {
+                if (picked) onChange(picked)
+              })
+            }}
+          >
+            {t('浏览…')}
+          </Button>
+        </div>
+      )
+
     case 'string':
     default:
       return (
         <Input
+          className='mm-cfg-text'
           value={typeof value === 'string' ? value : ''}
-          placeholder={knob.default === null ? '' : String(knob.default)}
-          onChange={event => onSave(event.target.value)}
+          placeholder={knob.default === null ? '' : String(knob.default ?? '')}
+          onChange={event => onChange(event.target.value)}
         />
       )
   }
 }
 
 /**
- * 结构化值（数组 / 对象）用 JSON 文本框。
+ * 调壳的目录选择器。
  *
- * 为什么不做一个结构化编辑器：这些键的值形状千差万别（来源清单是字符串数组、
- * 模型池是对象数组、权重是对象），给每种形状写一个编辑器等于把 schema 的知识
- * 又抄一遍到前端。JSON 文本框加「解析失败就不提交」是这一层的正确粒度 ——
- * 这些本来就是内部/进阶旋钮。
+ * 走 `window.workbuddyDesktop.pickFolder`（`src-tauri/src/bridge.rs` 里已有的
+ * `pick_folder`）—— 网页端没有这个桥，返回 null，按钮就保持「点了没反应」的
+ * 保守行为，而不是报错。用户也可以直接在输入框里敲路径，这个按钮只是省事。
  */
-function JsonKnob({ value, onSave }: { value: unknown; onSave: (value: unknown) => void }): React.ReactElement {
+function pickFolder(defaultDir: string): Promise<string | null> {
+  const bridge = (window as unknown as {
+    workbuddyDesktop?: { pickFolder?: (dir?: string) => Promise<{ path?: string; canceled?: boolean }> }
+  }).workbuddyDesktop
+  if (!bridge?.pickFolder) return Promise.resolve(null)
+  return bridge
+    .pickFolder(defaultDir || undefined)
+    .then(result => (result && !result.canceled && result.path ? result.path : null))
+    .catch(() => null)
+}
+
+/** 结构化值（数组 / 对象）用 JSON 文本框：解析失败就不提交。 */
+function JsonField({ value, onChange }: { value: unknown; onChange: (next: unknown) => void }): React.ReactElement {
   const text = React.useMemo(() => {
     try {
       return JSON.stringify(value ?? null, null, 2)
@@ -343,9 +801,9 @@ function JsonKnob({ value, onSave }: { value: unknown; onSave: (value: unknown) 
   }, [text, dirty])
 
   return (
-    <div className='mm-json'>
+    <div className='mm-cfg-json'>
       <textarea
-        className={`mm-json-input${invalid ? ' invalid' : ''}`}
+        className={`mm-cfg-json-input${invalid ? ' invalid' : ''}`}
         rows={Math.min(10, Math.max(2, draft.split('\n').length))}
         value={draft}
         onChange={event => {
@@ -359,14 +817,15 @@ function JsonKnob({ value, onSave }: { value: unknown; onSave: (value: unknown) 
           }
         }}
       />
-      <div className='mm-json-actions'>
+      <div className='mm-inline-actions'>
         <Button
           type='button'
           size='sm'
+          variant='outline'
           disabled={invalid}
           onClick={() => {
             try {
-              onSave(JSON.parse(draft))
+              onChange(JSON.parse(draft))
               setDirty(false)
             } catch {
               setInvalid(true)
@@ -387,10 +846,72 @@ function JsonKnob({ value, onSave }: { value: unknown; onSave: (value: unknown) 
         >
           {t('还原')}
         </Button>
-        {invalid ? <span className='mm-warn'>{t('JSON 不合法，改对了才能应用')}</span> : null}
+        {invalid ? <span className='mm-warn'>{t('JSON 不合法')}</span> : null}
       </div>
     </div>
   )
+}
+
+/* ─── 小工具 ─────────────────────────────────────────────── */
+
+/** 「默认 5 · 范围 1~50」—— 让用户不用点开就知道默认值与合法区间。 */
+function defaultHint(knob: m.Knob): string {
+  const raw = knob.default
+  let text: string
+  if (raw === null || raw === undefined || raw === '') text = t('空')
+  else if (typeof raw === 'boolean') text = raw ? t('开') : t('关')
+  else if (typeof raw === 'number') text = String(raw)
+  else if (typeof raw === 'string') text = raw
+  else text = JSON.stringify(raw)
+
+  if (knob.kind === 'number' && knob.min !== undefined && knob.max !== undefined) {
+    return t('默认 {value} · 范围 {min}~{max}', { value: text, min: knob.min, max: knob.max })
+  }
+  return t('默认 {value}', { value: text })
+}
+
+function toRouting(raw: unknown): RouteRow[] {
+  if (!Array.isArray(raw)) return []
+  const rows: RouteRow[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const row = item as Record<string, unknown>
+    const task = typeof row.task === 'string' ? row.task : ''
+    if (!task) continue
+    rows.push({
+      task,
+      tags: Array.isArray(row.tags) ? row.tags.map(String) : [],
+      model: typeof row.model === 'string' ? row.model : '',
+    })
+  }
+  return rows
+}
+
+function toMap(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const out: Record<string, string> = {}
+  for (const [key, item] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof item === 'string') out[key] = item
+  }
+  return out
+}
+
+function toPool(raw: unknown): { model: string; tags: string[] }[] {
+  if (!Array.isArray(raw)) return []
+  const out: { model: string; tags: string[] }[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const row = item as Record<string, unknown>
+    const model = typeof row.model === 'string' ? row.model : ''
+    if (!model.trim()) continue
+    out.push({ model, tags: Array.isArray(row.tags) ? row.tags.map(String) : [] })
+  }
+  return out
+}
+
+function iconHtml(name: string, size = 14): string {
+  const api = (window as unknown as { wbIcons?: { icon?: (key: string, px?: number) => string } }).wbIcons
+  return api?.icon?.(name, size) ?? ''
 }
 
 export { Settings }

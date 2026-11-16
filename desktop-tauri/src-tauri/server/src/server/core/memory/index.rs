@@ -977,6 +977,16 @@ impl MemoryIndex {
         );
     }
 
+    /// 同步流水的总条数。
+    ///
+    /// 与 `sync_log_list` 分开：列表按 limit 取，界面上写「50 条」说的是**总量**，
+    /// 不是「这一页有几条」。表会一直长，所以 count 走索引扫，不拉行。
+    pub fn sync_log_count(&self) -> i64 {
+        let Ok(conn) = self.conn.lock() else { return 0 };
+        conn.query_row("SELECT COUNT(*) FROM sync_log", [], |row| row.get::<_, i64>(0))
+            .unwrap_or(0)
+    }
+
     pub fn sync_log_list(&self, limit: usize) -> Vec<Value> {
         let Ok(conn) = self.conn.lock() else { return Vec::new() };
         let Ok(mut statement) = conn.prepare(
