@@ -46,6 +46,64 @@ use super::model::{MemoryEntry, MemoryKind};
 /// 不属于任何项目的记忆，落到这个伪项目下（`general/` 在磁盘上的别名）
 pub const GLOBAL_SLUG: &str = "_global";
 
+/// 记忆事实源的**进程内写锁**。
+///
+/// ── 为什么必须有 ────────────────────────────────────────────
+/// [`save_section_locked`] 与 [`remove_section_locked`] 都是「读整份容器 → 摘/改一节 → 整份
+/// 写回」。两个写者落在**同一天、同一 agent** 的容器上时，后写的整份覆盖先写的，
+/// 先写那一节静默消失 —— 文件层不会报任何错。并发来源至少三路：
+///   · 多个客户端各自的 `tools/call`（`mcp.rs` 每调用一次丢一个 spawn_blocking）；
+///   · 面板 `/api/memory/write`（直接在 tokio worker 上跑，连 spawn_blocking 都没包）；
+///   · 调度器十二个任务（distill / tag / consolidate / cleanup …）。
+/// 这三路都写同一个 `l1/<agent>/<YYYY-MM-DD>.md`。
+///
+/// ── 为什么是进程内 Mutex 而不是文件锁 ───────────────────────
+/// 跨进程才需要 flock；事实源只由网关这一个进程写（用户手编 `.md` 属于「外力
+/// 改动」，模块头已写明「下次启动 / 下次重建生效」，不在本锁的承诺范围内）。
+/// 一把 `Mutex` 足够，也没有 Windows 上 flock 语义不一致的坑。
+///
+/// ── 附带修掉的一个更硬的坑：临时文件名只带 pid ──────────────
+/// [`write_atomic`] 的临时文件叫 `<目标>.tmp.<pid>`。同一进程里两个线程同时
+/// 写**同一份文件**时，它们拿到的是**同一个临时路径**：一个刚 create 完，另一
+/// 个就把它截断；随后先完成的一方把 tmp rename 走，后完成的一方 rename 时
+/// 文件已经不在了 —— 表现成随机的「落盘失败」或「内容串了」。锁把这条路径也
+/// 一并串行化，所以不必把 pid 换成「pid + 线程 id + 计数器」。
+///
+/// ── 为什么锁在外层入口，而不是里面的每一处 `write_atomic` ────
+/// `save` 内部会调 `detach_live` → `remove_section`，是天然嵌套的。std 的
+/// `Mutex` 不可重入，若让 `save_section` / `remove_section` 各自加锁就是自锁死。
+/// 所以这里采取「`*_locked` 内部版本不带锁 + 公开入口统一取锁」：
+///            `save` ──► `save_locked` ──► `detach_live_locked` ──► `remove_section_locked`
+///            `detach_live` ──► `detach_live_locked`
+///            `remove_section` / `remove_file` ──► 各自的 `_locked`
+///            `move_save` / `retire` / `revive` ──► 一次临界区里做两件事
+/// 一次事务（比如「摘旧节 + 写回收站」）在**同一把锁内**完成，中途不会被插队。
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 取写锁。panic 中毒只说明「当时那一节没写完」，文件因为原子写仍是一致的，
+/// 不该让全库永久写不进 —— 直接取回内部值。
+pub(crate) fn lock_writes() -> std::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// `projects.json` 的读改写锁（与 [`WRITE_LOCK`] 分开）。
+///
+/// 分类登记（`registry_upsert`）在**每一次写入**之前都会跑一遍：读整份登记表 →
+/// 补一条 → 整份写回。两个并发写者各补一个不同的项目时，后写的整份覆盖先写的，
+/// 先登记的那张项目卡凭空消失 —— 与容器丢节是同一类 bug，且触发的频率更高
+/// （不是「同一天同 agent」，而是「同一时刻的任意两次写入」）。
+///
+/// ── 为什么不用同一把锁 ──────────────────────────────────────
+/// `merge_project` 会「一边持锁遍历、一边逐条 `store::save`」，而 `store::save`
+/// 内部要 [`lock_writes`]。std 的 `Mutex` 不可重入，用同一把锁就是自锁死。
+/// 两把锁的**获取顺序固定为：先 PROJECTS 后 WRITE**（`merge_project` 之外的
+/// 路径都是先登记、后落盘，天然同序），不存在反向持有，因此不会死锁。
+static PROJECTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn lock_projects() -> std::sync::MutexGuard<'static, ()> {
+    PROJECTS_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
 fn now_ms() -> i64 {
     crate::server::logging::now_ms()
 }
@@ -377,7 +435,12 @@ fn strip_section(text: &str, id: &str) -> (String, bool) {
 }
 
 /// 把一条 l1 记忆写进（或更新到）它所属的当天容器。
-fn save_section(entry: &MemoryEntry) -> Result<(), String> {
+///
+/// **调用方必须已持有 [`lock_writes`]** —— 整段是「读容器 → 摘同 id 旧节 →
+/// 追加新节 → 整份写回」，中途被另一个写者插进来，先写那一节会被这一份整份
+/// 覆盖（静默丢数据）。加锁责任在公开入口，是为了让「摘 + 写」这类组合动作
+/// 能在一个临界区里做完（见 [`save`]）。
+fn save_section_locked(entry: &MemoryEntry) -> Result<(), String> {
     ensure_layout()?;
     let target = entry_path(entry, false);
     let relative = rel(&target);
@@ -428,16 +491,25 @@ fn live_is_container(entry: &MemoryEntry) -> bool {
 ///
 /// 只负责「写到它现在该在的位置」。**老位置**的清理是 [`detach_live`] 的事，
 /// 由调用方在改类型 / 改层 / 改日期这类会换路径的场景里先调一次 —— 这里没有
-/// 上一版对象，猜不出来。
+/// 上一版对象，猜不出来。要「摘旧 + 写新」在同一个临界区完成，用 [`move_save`]。
+///
+/// 本函数仍会把 `deleted_at` 非空的条目送进回收站（同步、导入这类手里只有
+/// 「最终形态」的路径要用），但**删除业务走 [`retire`]**：只有 `retire` 手里
+/// 才有改动前的对象，能按正确的活路径把旧那份摘干净。
 pub fn save(entry: &MemoryEntry) -> Result<(), String> {
     ensure_layout()?;
+    let _guard = lock_writes();
+    save_locked(entry)
+}
+
+fn save_locked(entry: &MemoryEntry) -> Result<(), String> {
     if entry.deleted_at.is_some() {
         // 进回收站前必须从原位置拿走，否则「同一个 id 两份文件」重建时会打架
-        detach_live(entry)?;
+        detach_live_locked(entry)?;
         return write_atomic(&trash_root().join(format!("{}.md", entry.id)), &entry.to_markdown());
     }
     if live_is_container(entry) {
-        return save_section(entry);
+        return save_section_locked(entry);
     }
     write_atomic(&entry_path(entry, false), &entry.to_markdown())
 }
@@ -447,10 +519,30 @@ pub fn save(entry: &MemoryEntry) -> Result<(), String> {
 /// 调用方负责之后的落盘。抽出来是因为三条路径（delete / 改类型换目录 / purge）
 /// 都要做同一件事，而少做一次的后果都是「同一条记忆出现两份」。
 pub fn detach_live(entry: &MemoryEntry) -> Result<(), String> {
-    if live_is_container(entry) {
-        return remove_section(entry);
-    }
+    let _guard = lock_writes();
+    detach_live_locked(entry)
+}
+
+fn detach_live_locked(entry: &MemoryEntry) -> Result<(), String> {
     let live = entry_path(&MemoryEntry { deleted_at: None, ..entry.clone() }, false);
+    // ── 判据只看「这个落点是什么形状的文件」
+    //
+    // 不能写成 `live_is_container(entry)`：它把 `layer`/`kind` 也纳入了判断，
+    // 于是结论取决于**调用方传进来的是哪一版对象**。当前所有调用方都传了与
+    // `live` 匹配的那一版（`move_save` 传 `previous`、`retire` 传改动前的
+    // 对象），所以没出问题；但这是个只靠调用纪律维持的隐式契约 —— 哪天有人
+    // 顺手把改完的 `entry` 传进来，daily → knowledge 会让判据返回 false，落到
+    // 下面「删单文件」分支，而 `live` 解析出来正是当天的容器：一次
+    // `remove_file` 就把同一天其它所有条目一起删了，且不报错。
+    // 收紧成「只看路径形状」之后，这个坑从根上没了。
+    //
+    // 这里用**绝对路径**判，不绕 `rel()`/`abs()` 一趟：那趟往返要求
+    // `storage.root` 与 `path` 的字面完全一致（`strip_prefix` 按组件逐字比），
+    // 用户把根目录写成不同大小写时 `rel()` 会回落成路径串、`abs()` 再拼一次
+    // 就得到一个不存在的路径，摘节被静默跳过 —— 旧容器里留下删不掉的孤儿节。
+    if looks_like_daily_container_path(&live) {
+        return strip_section_at(&live, &entry.id);
+    }
     if live.exists() {
         let _ = fs::remove_file(&live);
     }
@@ -462,12 +554,29 @@ pub fn detach_live(entry: &MemoryEntry) -> Result<(), String> {
 /// 只摘一节、不动同一天的其它条目。删一条 daily 记忆绝不能把同一天的其它
 /// 条目一起带走 —— 那是数据丢失，不是删除。
 pub fn remove_section(entry: &MemoryEntry) -> Result<(), String> {
+    let _guard = lock_writes();
+    remove_section_locked(entry)
+}
+
+/// 与 [`save_section_locked`] 同一种读改写：摘节也必须独占整份容器，
+/// 否则并发的 `save_section_locked` 会把刚摘掉的那一节又整份写回来（或者反过来）。
+fn remove_section_locked(entry: &MemoryEntry) -> Result<(), String> {
     let target = entry_path(&MemoryEntry { deleted_at: None, ..entry.clone() }, false);
-    if !target.exists() || !is_daily_container(&rel(&target)) {
+    strip_section_at(&target, &entry.id)
+}
+
+/// 按**绝对路径**从容器里摘掉某一节。不经过 `rel()`/`abs()` 往返。
+///
+/// 拆出来是因为两条路径算出来的「落点」可能不一样：`detach_live_locked` 要摘的是
+/// **改动之前**那一份容器，而它手里的 `entry.path` 已经指向改完之后的新位置。
+/// 让它复用 `remove_section_locked` 就只能靠临时改 `path` 再算一遍，既绕又容易
+/// 在 `storage.root` 大小写不一致时算出不存在的路径。这里直接收绝对路径。
+fn strip_section_at(target: &Path, id: &str) -> Result<(), String> {
+    if !target.exists() || !looks_like_daily_container_path(target) {
         return Ok(());
     }
-    let text = fs::read_to_string(&target).map_err(|error| error.to_string())?;
-    let (cleaned, removed) = strip_section(&text, &entry.id);
+    let text = fs::read_to_string(target).map_err(|error| error.to_string())?;
+    let (cleaned, removed) = strip_section(&text, id);
     if !removed {
         return Ok(());
     }
@@ -475,23 +584,108 @@ pub fn remove_section(entry: &MemoryEntry) -> Result<(), String> {
     // 攒一堆「只有 frontmatter 的日期文件」
     let has_section = cleaned.lines().any(|line| parse_marker(line).is_some());
     if !has_section {
-        let _ = fs::remove_file(&target);
+        let _ = fs::remove_file(target);
         return Ok(());
     }
-    write_atomic(&target, &cleaned)
+    write_atomic(target, &cleaned)
+}
+
+/// 绝对路径版的「是不是一天一文件的 l1 容器」。
+///
+/// 与 [`is_daily_container`] 同一套判据，只是不要求先算成相对路径 —— 这样
+/// 「按形状判容器」在 `storage.root` 大小写/分隔符与配置不一致时也不会失配。
+fn looks_like_daily_container_path(path: &Path) -> bool {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !looks_like_date(stem) {
+        return false;
+    }
+    // 形状固定是 `<base>/l1/<agent>/<YYYY-MM-DD>.md`：祖目录必须正好是 `l1`。
+    // 不能写成「路径里任意一段叫 l1」—— 记忆根恰好放在名叫 `l1` 的盘目录下时
+    // 会把根下所有日期命名的文件都当成容器。
+    path.parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(|name| name == "l1")
+        .unwrap_or(false)
 }
 
 /// 从事实源彻底移除一条记忆（purge 用；日常删除走回收站）。
 ///
-/// 活形态与回收站两份都要清掉。活形态一律走 [`detach_live`]，因为「活形态」
+/// 活形态与回收站两份都要清掉。活形态一律走 `detach_live_locked`，因为「活形态」
 /// 可能是容器里的一节，也可能是一个独立的 `.md` —— 只按 layer/kind 猜会漏掉
 /// 老 v1 单文件，或者在容器里留下孤儿节。
+///
+/// 整段一个临界区：分成「先摘活形态、再删回收站」两次加锁的话，中间插进来的
+/// 并发 `save` 会让刚 purge 的条目又被写出来。
 pub fn remove_file(entry: &MemoryEntry) -> Result<(), String> {
-    detach_live(entry)?;
+    let _guard = lock_writes();
+    detach_live_locked(entry)?;
     let trashed = entry_path(entry, true);
     if trashed.exists() {
         fs::remove_file(&trashed)
             .map_err(|error| format!("删除失败 {}：{error}", trashed.display()))?;
+    }
+    Ok(())
+}
+
+/// 换位保存：先把**旧位置**的那一份摘掉，再写到新位置，整段一个临界区。
+///
+/// ── 为什么两个动作必须在一起 ────────────────────────────────
+/// 改层 / 改类型 / 改日期 / 改项目都会换目录。调用方拿到的是旧 `MemoryEntry`，
+/// 先 `detach_live`、再 `save` 是两次加锁：中间被并发的 `save`（同一个 id，
+/// 同一个新路径）插进来，就会写出两份同 id 的文件 —— 下次重建索引时后者覆盖
+/// 前者、删除时只删掉一份，另一份变成删不掉的幽灵。
+///
+/// `previous` 是**改动前**的对象（按它算旧路径），`current` 是改完的。
+/// 两条路径算出来一样时只写不摘 —— 容器里的节原地更新由 `save` 自己处理。
+pub fn move_save(previous: &MemoryEntry, current: &MemoryEntry) -> Result<(), String> {
+    ensure_layout()?;
+    let _guard = lock_writes();
+    let old = entry_path(&MemoryEntry { deleted_at: None, ..previous.clone() }, false);
+    let new = entry_path(&MemoryEntry { deleted_at: None, ..current.clone() }, false);
+    if old != new {
+        detach_live_locked(previous)?;
+    }
+    save_locked(current)
+}
+
+/// 退休：把一条活着的记忆「摘离活形态 + 落进回收站」，整段一个临界区。
+///
+/// ── 为什么不能直接用 `save(current)` ────────────────────────
+/// [`save_locked`] 见到 `deleted_at` 非空时确实会走「摘活形态 + 写 trash/」，
+/// 但它摘活形态用的判据是**这一份对象自己**的路径。删除路径里 `entry.path` 已经
+/// 被改写成 `trash/<id>.md` 了：`entry_path` 见到 `trash/` 开头的相对路径会跳过
+/// 「按 `entry.path` 定落点」，转而按 layer/kind 重算 —— 对 v1 那种「独立单文件」
+/// 的 l1 记忆，重算出来是容器路径，原文件既没删掉、又写了一份进回收站。
+///
+/// 所以必须把**改动前**的对象（`previous`）一起传进来：摘活形态按它算，写回收站
+/// 按 `current` 算。两件事在同一个临界区，中间插不进来并发 `save`，否则会出现
+/// 「活的 + 回收站」两份同 id。
+pub fn retire(previous: &MemoryEntry, current: &MemoryEntry) -> Result<(), String> {
+    ensure_layout()?;
+    let _guard = lock_writes();
+    detach_live_locked(previous)?;
+    write_atomic(&trash_root().join(format!("{}.md", current.id)), &current.to_markdown())
+}
+
+/// 复活：把回收站里的一条写回活位置，再把回收站那份删掉，整段一个临界区。
+///
+/// 与 [`retire`] 对称。分成「save 一次 + remove_file 一次」两步的话，中间那一瞬
+/// 库里同时存在活的与回收站两份同 id：并发的 `restore` 会看到「已经活了」直接
+/// 返回、并发 `purge` 会把刚写出来的活文件一起删掉。收进一个临界区就没这问题。
+pub fn revive(trashed: &Path, current: &MemoryEntry) -> Result<(), String> {
+    ensure_layout()?;
+    let _guard = lock_writes();
+    save_locked(current)?;
+    if trashed.exists() {
+        fs::remove_file(trashed)
+            .map_err(|error| format!("清理回收站失败 {}：{error}", trashed.display()))?;
     }
     Ok(())
 }
@@ -671,6 +865,10 @@ pub fn save_projects(projects: &[Project]) -> Result<(), String> {
 /// 归档标记不该被一次自动归类覆盖。
 pub fn registry_upsert(slug: &str, name: &str, cwd: &str, remote: &str) -> Project {
     let slug = slugify(slug);
+    // 读整份登记表 → 补一条 → 整份写回。并发写不同项目时后者会让前者凭空消失，
+    // 所以整段持锁。注意这里**不能**再调 `store::save`（不会，只写 projects.json），
+    // 因此与 [`WRITE_LOCK`] 没有嵌套。
+    let _guard = lock_projects();
     let mut projects = load_projects();
     let now = now_ms();
     let name = if name.trim().is_empty() { slug.clone() } else { name.trim().to_string() };
@@ -779,6 +977,9 @@ fn random_u32() -> u32 {
 pub fn purge_expired_trash(days: usize) -> usize {
     let days = days.max(1) as i64;
     let cutoff = now_ms() - days * 24 * 3600 * 1000;
+    // 与 `save` 里「进回收站」那一步互斥：定时清理正删这一份时，
+    // 并发的 `save(deleted_at)` 可能刚把它写出来，两边都以为处理完了。
+    let _guard = lock_writes();
     let Ok(reader) = fs::read_dir(trash_root()) else { return 0 };
     let mut removed = 0usize;
     for item in reader.flatten() {
@@ -905,5 +1106,122 @@ mod tests {
         // 读一次配置（`stored()` 内部会去 stat 这个路径）必须能返回
         let verbose = crate::server::core::memory::config::bool_of("search.synonymsEnabled");
         let _ = verbose;
+    }
+
+    /// 并发写同一个当天容器时，每一节都必须留下来。
+    ///
+    /// 这是 [`lock_writes`] 的回归测试：没有锁时 `save_section_locked` 的
+    /// 「读整份 → 摘 → 追加 → 整份写回」会互相覆盖，最后容器里只剩一节的
+    /// 内容（而且**不会报任何错**）。二十个线程各写一条，断言条数正好二十。
+    ///
+    /// ── 为什么必须包在 `isolated` 里 ────────────────────────────
+    /// `cfg(test)` 下 `paths::config_dir()` 取的是 **thread_local** 临时目录
+    /// （`test_support::HOME`）。直接 `spawn` 二十个线程，每个线程拿到的是
+    /// **各自的**目录，二十条落到二十个文件里，测试永远「通过」——它测不到
+    /// 任何并发。`isolated` 让测试跑在一个子进程里、由 `AGENT2API_PROXY_HOME`
+    /// 指定目录，`config_dir()` 于是走进程级路径，二十个线程才真的抢同一份文件。
+    ///
+    /// 为什么用 20 而不是 2：两个线程撞上的概率不高，20 个足以让覆盖稳定复现
+    /// （无锁版本跑十次失败十次）。
+    #[test]
+    fn concurrent_writes_keep_every_section() {
+        crate::test_support::isolated(
+            concat!(
+                module_path!(),
+                "::concurrent_writes_keep_every_section"
+            ),
+            || {
+                // 固定 agent + 固定日期 → 所有条目落到同一个 `l1/<agent>/<date>.md`
+                let agent = "conc".to_string();
+                let stamp = 1_700_000_000_000_i64;
+                let mut handles = Vec::new();
+                for index in 0..20 {
+                    let agent = agent.clone();
+                    handles.push(std::thread::spawn(move || {
+                        let mut entry = MemoryEntry::draft(
+                            format!("{agent}-{index}"),
+                            format!("第 {index} 条"),
+                            MemoryKind::Daily,
+                            format!("并发正文 {index}"),
+                        );
+                        entry.agent = Some(agent);
+                        entry.created_at = stamp;
+                        entry.updated_at = stamp;
+                        save(&entry).expect("写入应当成功");
+                    }));
+                }
+                for handle in handles {
+                    handle.join().expect("线程不应 panic");
+                }
+
+                let mut probe = MemoryEntry::draft("probe", "探针", MemoryKind::Daily, "x");
+                probe.agent = Some(agent.clone());
+                probe.created_at = stamp;
+                let path = entry_path(&probe, false);
+                let text = fs::read_to_string(&path).expect("容器文件应当存在");
+                let sections = text.lines().filter(|line| parse_marker(line).is_some()).count();
+                assert_eq!(sections, 20, "并发写丢了节：实际 {sections} 节，文件 {}", path.display());
+            },
+        );
+    }
+
+    /// 把一条 daily 改成别的类型时，**同一天的其它条目必须还在**。
+    ///
+    /// 这是 [`detach_live_locked`] 判据的回归测试。旧实现用
+    /// `live_is_container(entry)` 判「要不要按容器摘节」，而它看的是**这一份对象
+    /// 自己的** `layer`/`kind`。改类型时调用方已经把 `kind` 换成新值（daily →
+    /// knowledge），判据返回 false，于是落到「删单文件」分支：`entry_path` 算出来
+    /// 正是当天的容器，`remove_file` 把整份容器删掉 —— 同一天其他条目一起没了，
+    /// 而且不报任何错。改成按**路径形状**判之后不会认错。
+    #[test]
+    fn type_change_keeps_siblings_in_the_container() {
+        crate::test_support::isolated(
+            concat!(module_path!(), "::type_change_keeps_siblings_in_the_container"),
+            || {
+                let agent = "mover".to_string();
+                let stamp = 1_700_000_000_000_i64;
+                let seed = |id: &str, title: &str| {
+                    let mut entry = MemoryEntry::draft(id, title, MemoryKind::Daily, "正文");
+                    entry.agent = Some(agent.clone());
+                    entry.created_at = stamp;
+                    entry.updated_at = stamp;
+                    save(&entry).expect("写入应当成功");
+                    entry
+                };
+                let staying = seed("stays", "留下的一条");
+                let mut moving = seed("moves", "要搬走的一条");
+
+                let container = entry_path(&staying, false);
+                let before = fs::read_to_string(&container).expect("容器应当存在");
+                assert_eq!(
+                    before.lines().filter(|line| parse_marker(line).is_some()).count(),
+                    2,
+                    "前置条件：容器里应当有两节"
+                );
+
+                // 模拟「改类型」：kind 换成 knowledge（会落到 L2 的独立文件），
+                // 但磁盘上那一份仍然是当天的容器
+                let previous = moving.clone();
+                moving.kind = MemoryKind::Knowledge;
+                moving.layer = Layer::L2;
+                moving.path.clear();
+                moving.path = rel(&entry_path(&moving, false));
+                move_save(&previous, &moving).expect("换位保存应当成功");
+
+                assert!(
+                    fs::read_to_string(&container).is_ok(),
+                    "容器被整份删掉了：{} —— 同一天的其它条目一起丢了",
+                    container.display()
+                );
+                let after = fs::read_to_string(&container).expect("容器应当还在");
+                let sections: Vec<String> = after
+                    .lines()
+                    .filter_map(parse_marker)
+                    .filter_map(|meta| meta.get("id").and_then(Value::as_str).map(str::to_string))
+                    .collect();
+                assert_eq!(sections, vec!["stays".to_string()], "留下的应当只有 stays：{sections:?}");
+                assert!(entry_path(&moving, false).is_file(), "新位置应当写出来了");
+            },
+        );
     }
 }

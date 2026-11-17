@@ -207,6 +207,35 @@ pub fn save_sources(items: &[Source]) -> Result<(), String> {
     Ok(())
 }
 
+/// 「启用 / 停用 / 改路径」这类要同时动 `import.sources` 与 `import.ignored`
+/// 的动作，统一走这一个事务。
+///
+/// ── 为什么必须是一个事务 ────────────────────────────────────
+/// 两个键是一份**两元状态**：一个来源要么「在清单里」，要么「在忽略名单里」。
+/// 拆成两次 `patch` 时，第二次失败（或另一路并发写入插进来）就会留下自相矛盾
+/// 的中间态 —— 页面显示「已启用」，扫描却把它当忽略跳过。而且「先读两个键、
+/// 判断、再写回」这段逻辑本身也不允许中途换版本，否则写回去的是过期快照。
+///
+/// 闭包拿到的是**刚从磁盘读上来的**两份原始清单（原串，不重新 parse 再拼，
+/// 免得顺手把人家写的 `1` 改成 `true`），返回改后的两份，由本函数一次落盘。
+pub fn update_sources(
+    edit: impl FnOnce(&[String], &[String]) -> Result<(Vec<String>, Vec<String>), String>,
+) -> Result<(), String> {
+    config::update(|next| {
+        let sources = next.strings("import.sources");
+        let ignored = next.strings("import.ignored");
+        let (sources, ignored) = edit(&sources, &ignored)?;
+        let payload = json!({
+            "import.sources": sources.iter().map(|item| json!(item)).collect::<Vec<_>>(),
+            "import.ignored": ignored.iter().map(|item| json!(item)).collect::<Vec<_>>(),
+        });
+        // 走 `apply_in` 而不是直接改 `values`：类型校验、未知键丢弃等规则与
+        // `patch` 完全同一条路，避免「事务版本」与「普通版本」两套校验口径。
+        config::apply_in(next, &payload)
+    })?;
+    Ok(())
+}
+
 // ── 候选文件 ─────────────────────────────────────────────────
 
 /// 一个待导入的文件（或一次会话）。

@@ -471,6 +471,8 @@ pub fn projects() -> Value {
 /// frontmatter 与路径，风险高一个量级。
 pub fn update_project(slug: &str, patch: &Value) -> Result<Value, String> {
     let slug = store::slugify(slug);
+    // 读整份登记表 → 改一张卡 → 整份写回（见 `store::lock_projects` 的说明）
+    let _guard = store::lock_projects();
     // 变量不能叫 `projects`：会和同模块的 `projects()` 函数互相遮蔽（E0618）
     let mut cards = store::load_projects();
     let Some(project) = cards.iter_mut().find(|item| item.slug == slug) else {
@@ -509,30 +511,30 @@ pub fn merge_project(from: &str, into: &str) -> Result<Value, String> {
     if from_slug == store::GLOBAL_SLUG {
         return Err("通用项目不能合并".into());
     }
+    // 登记表要「读 → 改写 → 整份写回」，与并发的 `registry_upsert` 互斥。
+    // 顺序固定：先登记表锁，后（`store::save` 内部的）容器锁 —— 见 `store`
+    // 里两把锁的说明，反向持有会自锁死。
+    let _guard = store::lock_projects();
     let mut cards = store::load_projects();
     if !cards.iter().any(|item| item.slug == into_slug) {
         return Err(format!("目标项目 {into_slug} 不存在"));
     }
     let mut moved = 0usize;
     for mut entry in store::load_all() {
-        let Some(project) = entry.project.as_deref() else { continue };
-        if store::slugify(project) != from_slug {
+        let Some(project) = entry.project.clone() else { continue };
+        if store::slugify(&project) != from_slug {
             continue;
         }
-        let old_path = entry.path.clone();
+        // 旧对象留一份：`move_save` 要按它算「活形态的旧位置」。原来这里是
+        // 「save 一次 + 手动 remove_file 一次」两个临界区，中间可能被并发写插队；
+        // 而且手动删除那步特意跳过了容器路径，于是旧容器里留下一条孤儿节。
+        let previous = entry.clone();
         entry.project = Some(into_slug.clone());
         // 清空 path 让 `entry_path` 按新项目重算 —— 否则它仍指向旧目录
         entry.path = String::new();
         entry.path = store::rel(&store::entry_path(&entry, false));
-        store::save(&entry)?;
+        store::move_save(&previous, &entry)?;
         let _ = index::global().upsert(&entry);
-        // 旧文件在新路径不同时删掉（同一天同一条可能算出同一路径）
-        if old_path != entry.path && !old_path.is_empty() {
-            let old = store::abs(&old_path);
-            if old.is_file() && !store::is_daily_container(&old_path) {
-                let _ = std::fs::remove_file(&old);
-            }
-        }
         moved += 1;
     }
     for project in cards.iter_mut() {
@@ -1134,18 +1136,14 @@ pub fn update(id: &str, patch: &Value) -> Result<Value, String> {
     }
     entry.updated_at = crate::server::logging::now_ms();
     // 换层 / 换类型 / 换项目 / 换日期都会换目录。旧形态可能是「容器里的一节」，
-    // 也可能是独立的 `.md`，只有 detach_live 两种都认。
+    // 也可能是独立的 `.md`，只有 move_save 两种都认。
+    //
+    // 为什么不是「先 detach_live、再 save」两次调用：那是两个临界区，中间插进来
+    // 的并发写入会让同一条记忆出现两份（见 `store::move_save` 的说明）。
     let previous = entry.clone();
-    let next_path = {
-        entry.path.clear();
-        store::entry_path(&entry, false)
-    };
-    let stays = store::entry_path(&previous, false) == next_path;
-    if !stays {
-        store::detach_live(&previous)?;
-    }
-    entry.path = store::rel(&next_path);
-    store::save(&entry)?;
+    entry.path.clear();
+    entry.path = store::rel(&store::entry_path(&entry, false));
+    store::move_save(&previous, &entry)?;
     index::global().upsert(&entry)?;
     bump_revision();
     Ok(json!({ "entry": entry.to_json(true) }))
@@ -1161,13 +1159,18 @@ pub fn remove(id: &str) -> Result<Value, String> {
     if entry.deleted_at.is_some() {
         return Ok(json!({ "id": id, "already": true }));
     }
-    // 摘活形态要在改 deleted_at 之前做：detach_live 按「活着的路径」找文件，
-    // 而进过回收站的 entry 路径已经变成 trash/<id>.md 了
-    store::detach_live(&entry)?;
+    // 「摘活形态」与「写回收站文件」必须是一个临界区：分两次做的话，中间插进来
+    // 的并发 `save` 会把这条记忆又写到活位置，删除于是留下「活的 + 回收站」两份。
+    //
+    // 为什么把**改动前**的对象一起传下去：`detach_live` 按「活着的路径」找文件，
+    // 而这里 `entry.path` 已经改成 `trash/<id>.md` 了；靠 layer/kind 重算会把
+    // v1 那种「独立单文件」的 l1 记忆算成容器路径，原文件既没删掉、又写了一份
+    // 进回收站 —— 那是数据损坏。
+    let previous = entry.clone();
     entry.deleted_at = Some(crate::server::logging::now_ms());
     entry.updated_at = entry.deleted_at.unwrap_or(entry.updated_at);
     entry.path = relative_path(&entry);
-    store::save(&entry)?;
+    store::retire(&previous, &entry)?;
     index::global().upsert(&entry)?;
     bump_revision();
     Ok(json!({ "id": id, "trashed": true }))
@@ -1187,10 +1190,10 @@ pub fn restore(id: &str) -> Result<Value, String> {
     entry.deleted_at = None;
     entry.updated_at = crate::server::logging::now_ms();
     entry.path = relative_path(&entry);
-    store::save(&entry)?;
-    if previous.exists() {
-        let _ = std::fs::remove_file(&previous);
-    }
+    // 「写回活位置」与「删掉回收站那份」必须是一个临界区：分两次做的话中间会有
+    // 一瞬间同 id 两份都在，并发的 restore 会当成「已经活了」直接返回、并发的
+    // purge 会把刚写出来的活文件一起删掉（见 `store::revive`）。
+    store::revive(&previous, &entry)?;
     index::global().upsert(&entry)?;
     bump_revision();
     Ok(json!({ "id": id, "restored": true }))
@@ -1449,12 +1452,11 @@ fn apply_classification(memory_id: &str, slug: &str) -> Result<(), String> {
     entry.updated_at = crate::server::logging::now_ms();
     entry.path.clear();
     let next_path = store::entry_path(&entry, false);
-    // 归档会把记忆从 general/ 搬进 projects/<slug>/，活形态可能是容器一节
-    if store::entry_path(&before, false) != next_path {
-        store::detach_live(&before)?;
-    }
     entry.path = store::rel(&next_path);
-    store::save(&entry)?;
+    // 归档会把记忆从 `general/` 搬进 `projects/<slug>/`。「摘旧 + 写新」必须在
+    // 一个临界区里（见 `store::move_save`）：分成两次调用的话，中间插进来一次
+    // 并发写入就会留下同 id 两份文件。
+    store::move_save(&before, &entry)?;
     index::global().upsert(&entry)?;
     Ok(())
 }

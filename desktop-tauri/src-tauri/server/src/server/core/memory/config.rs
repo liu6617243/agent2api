@@ -24,7 +24,9 @@
 //! `config.json` 两边都能读），实现是本仓自己写的。
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use serde_json::{json, Map, Value};
 
@@ -374,6 +376,55 @@ pub struct Stored {
 }
 
 impl Stored {
+    /// 取一个列表键的字符串项 —— **读的是这份内存状态**，不是磁盘、不补默认值。
+    ///
+    /// 为什么不用 [`strings_of`]：那个函数按 mtime 走缓存，在 [`update`] 的
+    /// 闭包里「刚改完再读」会拿到改之前的值。写入口要的是「我手上这一份现在
+    /// 是什么」，所以给它一个只认 `self` 的读取器。
+    pub fn strings(&self, key: &str) -> Vec<String> {
+        self.values
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    }
+
+    /// 取一个对象键 —— 同样只认这份内存状态（理由见 [`Stored::strings`]）。
+    pub fn map_of(&self, key: &str) -> Map<String, Value> {
+        self.values
+            .get(key)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 整份替换一个键（校验后写入，**不做深合并**）。
+    ///
+    /// 为什么需要它：`patch` 对 `Kind::Map` 走的是深合并，而深合并**删不掉键**。
+    /// 「改路径为空 = 删掉那条覆盖」这类动作用 `patch` 是无效的 —— 传进去的对象
+    /// 里少了那个键，合并时旧值还在，用户看到的是「删了但没删掉」。这里给一个
+    /// 明确的「整份替换」语义，校验规则仍走同一个 `coerce`。
+    pub fn set(&mut self, key: &str, value: Value) -> Result<(), String> {
+        if key == ENABLE_KEY {
+            self.enabled = value.as_bool().ok_or("enabled 必须是布尔值")?;
+            return Ok(());
+        }
+        let Some(knob) = find(key) else {
+            // 未知键静默丢弃，与 `apply_one` 同口径
+            return Ok(());
+        };
+        // 秘密字段拒绝走这条路：`coerce` 只校验类型、不加密，用它写进去就是
+        // 明文口令躺在 config.json 里。加密那段逻辑在 `apply_one`（它还要处理
+        // 「空串 = 沿用」），这里没有旧值可比，也就没法正确实现 —— 明确报错，
+        // 比悄悄落一份明文安全。
+        if knob.kind == Kind::Secret {
+            return Err(format!("「{}」是秘密字段，用 patch 写入（set 不做加密）", knob.label));
+        }
+        let fixed = coerce(knob, &value)?;
+        self.values.insert(key.to_string(), fixed);
+        Ok(())
+    }
+
     fn from_json(value: &Value) -> Self {
         let enabled = value.get(ENABLE_KEY).and_then(Value::as_bool).unwrap_or(true);
         let mut values = BTreeMap::new();
@@ -402,27 +453,95 @@ impl Stored {
     }
 }
 
+/// `config.json` 的**读改写锁**。
+///
+/// ── 为什么必须有 ────────────────────────────────────────────
+/// [`patch`] / [`reset`] / [`replace`] 三个写入口的形状完全一样：**读整份
+/// 配置 → 改几个键 → 整份写回**。并发时后写的那一份整份覆盖前一份，前一份
+/// 改的键静默消失 —— 文件层不报错、页面显示「已保存」、值就是没了。
+///
+/// 这不是理论风险：导入页的 `enable` 会连发两次 `patch`（`import.sources`
+/// 一次、`import.ignored` 一次），页面保存与 MCP 调用也在同一时刻发生；两个
+/// 用户在两个标签页里各改一个旋钮就是稳定的丢数据现场。
+///
+/// ── 为什么锁在这里而不是在 `write_atomic` ────────────────────
+/// `write_atomic` 只保证「一个文件不会写出半个」，它不知道这次写是「基于哪
+/// 一份读的」。原子写 + 丢失更新 = 一条完整但错误的新配置。锁必须包住
+/// 「读」和「写」两端。
+///
+/// ── 与其它锁的获取顺序 ──────────────────────────────────────
+/// 与 `store` 的两把锁（[`store::lock_writes`] / `store::lock_projects`）完全
+/// 独立，也没有任何路径会「持本锁去取 store 那两把」或反过来 —— 所以与它们
+/// 之间不存在环。
+///
+/// 唯一会嵌套的是缓存锁 [`slot`]：本锁 → `commit` → `write_atomic` →
+/// `storage.backupBeforeWrite` → [`stored`] → `slot()`。方向固定为「本锁 → slot」，
+/// 而 `slot()` 内部只读文件、从不反向取本锁，因此同样不成环。**但顺序不能反**：
+/// 先持 `slot()` 再落盘，`stored()` 里的 `slot().lock()` 就会自锁死（std 的
+/// `Mutex` 不可重入）。`commit` 因此是「先写盘、后刷缓存」。
+static CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_config() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// 配置缓存的唯一句柄（mtime + 内容）。
+fn slot() -> &'static Mutex<(Option<SystemTime>, Stored)> {
+    static CACHE: OnceLock<Mutex<(Option<SystemTime>, Stored)>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new((None, Stored { enabled: true, values: BTreeMap::new() })))
+}
+
 /// 读配置。按 mtime 缓存：这个函数在 MCP 工具调用与页面每次刷新都会走到，
 /// 每次都真读文件是纯浪费；改配置后下一次调用就能生效，不必重启进程。
 pub fn stored() -> Stored {
-    use std::sync::Mutex;
-    static CACHE: OnceLock<Mutex<(Option<std::time::SystemTime>, Stored)>> = OnceLock::new();
     let path = store::config_file();
     let stamp = std::fs::metadata(&path).ok().and_then(|meta| meta.modified().ok());
-    let cache = CACHE.get_or_init(|| Mutex::new((None, Stored { enabled: true, values: BTreeMap::new() })));
-    let Ok(mut slot) = cache.lock() else {
+    let Ok(mut guard) = slot().lock() else {
         return Stored { enabled: true, values: BTreeMap::new() };
     };
-    if slot.0 == stamp {
-        return slot.1.clone();
+    if guard.0 == stamp {
+        return guard.1.clone();
     }
-    let loaded = std::fs::read_to_string(&path)
+    let loaded = read_file(&path);
+    *guard = (stamp, loaded.clone());
+    loaded
+}
+
+/// 从磁盘真读一份，并把缓存同步成这一份（写入口专用）。
+///
+/// 为什么不直接用 [`stored`]：它按 mtime 判新鲜度，而 Windows 的 mtime 精度
+/// 与「同一秒内两次写」会撞在一起 —— 恰好在这一秒里做读改写，就会拿到上一版
+/// 内容再把这一版写回去。写入口不信缓存，直接读盘。
+fn read_disk() -> Stored {
+    let path = store::config_file();
+    let stamp = std::fs::metadata(&path).ok().and_then(|meta| meta.modified().ok());
+    let loaded = read_file(&path);
+    let mut guard = slot().lock().unwrap_or_else(|poison| poison.into_inner());
+    *guard = (stamp, loaded.clone());
+    loaded
+}
+
+fn read_file(path: &Path) -> Stored {
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .map(|value| Stored::from_json(&value))
-        .unwrap_or(Stored { enabled: true, values: BTreeMap::new() });
-    *slot = (stamp, loaded.clone());
-    loaded
+        .unwrap_or(Stored { enabled: true, values: BTreeMap::new() })
+}
+
+/// 落盘 + 把缓存刷成刚写的这一份。
+///
+/// 顺序不能反：`write_atomic` 内部要读 `storage.backupBeforeWrite`，那会走
+/// [`stored`] 取缓存锁 —— 若先持缓存锁再写盘就是自锁死（std 的 Mutex 不可重入）。
+fn commit(next: &Stored) -> Result<(), String> {
+    store::ensure_layout()?;
+    let text = serde_json::to_string_pretty(&next.to_json()).map_err(|error| error.to_string())?;
+    let path = store::config_file();
+    store::write_atomic(&path, &text)?;
+    let stamp = std::fs::metadata(&path).ok().and_then(|meta| meta.modified().ok());
+    let mut guard = slot().lock().unwrap_or_else(|poison| poison.into_inner());
+    *guard = (stamp, next.clone());
+    Ok(())
 }
 
 /// 取一个旋钮的生效值（显式值优先，否则表里的默认值）。
@@ -654,24 +773,58 @@ pub fn coerce(knob: &Knob, value: &Value) -> Result<Value, String> {
 /// * `{"agents.coreMaxTokens": 900}` —— 扁平点号键（页面与同步用）
 /// * `{"enabled": false}` —— 总开关
 /// * `{"coreMaxTokens": 900}` —— v1 的 camelCase 旧键（自动映射）
+///
+/// **整段持 [`CONFIG_LOCK`]**：这是「读整份 → 改几个键 → 整份写回」，两个
+/// 并发调用各改一个键时，后写的会把前一个键抹掉（见锁上的说明）。
 pub fn patch(incoming: &Value) -> Result<Value, String> {
+    // 直接把 `update` 的结果返回：它落盘后已经算过一次嵌套树，再调一次 `tree()`
+    // 等于多读一遍缓存 —— 而且那两棵树之间理论上还可能被别的写者插进来改一次，
+    // 返回给调用方的就不再是「我刚写进去的那一份」了。
+    update(|next| apply_all(next, incoming))
+}
+
+/// 在一个**写事务**里改配置：闭包拿到「刚从磁盘读上来的那一份」，改完由本
+/// 函数整份落盘。成功返回落盘后的嵌套树。
+///
+/// ── 为什么要有它，而不只有 [`patch`] ────────────────────────
+/// 有些业务动作要改两个键且必须**同生共死**：导入页「启用一个内置来源」是
+/// 「`import.sources` 加一条 + `import.ignored` 摘掉它」。拆成两次 `patch`，
+/// 中间任何一次失败（或另一路并发写入插进来）都会留下「清单里有、忽略名单里
+/// 也还有」的自相矛盾状态 —— 页面显示「已启用」，扫描却仍然跳过它。
+/// 闭包形态让「读到的这一份」在两次修改之间保持同一，中途不会被别人插队。
+///
+/// ── 闭包里必须用 [`Stored::strings`] 读 ──────────────────────
+/// 不能用模块级的 [`strings_of`]：那个按 mtime 走缓存，闭包里读到的是「改之前」
+/// 的值，于是第二次修改会把第一次的结果覆盖掉（正是要防的那类 bug）。
+pub fn update(edit: impl FnOnce(&mut Stored) -> Result<(), String>) -> Result<Value, String> {
+    let _guard = lock_config();
+    let mut next = read_disk();
+    edit(&mut next)?;
+    commit(&next)?;
+    Ok(tree())
+}
+
+/// 把一份 `patch` 形状的 JSON 全部应用到 `next` 上（[`patch`] 与 [`update`]
+/// 共用）。**调用方必须已持有 [`CONFIG_LOCK`]** —— 它只改内存，不落盘。
+fn apply_all(next: &mut Stored, incoming: &Value) -> Result<(), String> {
     let object = incoming.as_object().ok_or("配置必须是对象")?;
-    let mut next = stored();
     for (raw_key, value) in object {
         // 页面可能把整个嵌套树发回来（`{storage:{root:""}}`）：展开成扁平键再逐条校验。
         if find(raw_key).is_none() && value.is_object() {
             for (sub_key, sub_value) in value.as_object().expect("已确认 object") {
                 let dotted = format!("{raw_key}.{sub_key}");
-                apply_one(&mut next, &dotted, sub_value)?;
+                apply_one(next, &dotted, sub_value)?;
             }
             continue;
         }
-        apply_one(&mut next, raw_key, value)?;
+        apply_one(next, raw_key, value)?;
     }
-    store::ensure_layout()?;
-    let text = serde_json::to_string_pretty(&next.to_json()).map_err(|error| error.to_string())?;
-    store::write_atomic(&store::config_file(), &text)?;
-    Ok(tree())
+    Ok(())
+}
+
+/// 在 [`update`] 的事务里应用一份 `patch` 形状的 JSON（给「顺手再改一个键」用）。
+pub fn apply_in(next: &mut Stored, incoming: &Value) -> Result<(), String> {
+    apply_all(next, incoming)
 }
 
 fn apply_one(next: &mut Stored, key: &str, value: &Value) -> Result<(), String> {
@@ -706,8 +859,18 @@ fn apply_one(next: &mut Stored, key: &str, value: &Value) -> Result<(), String> 
     }
     if knob.kind == Kind::Map || knob.kind == Kind::List {
         // 对象/列表类做**深合并**：`auto.tasks` 只发改动的那一个任务时，
-        // 其余任务的配置必须保留（整体替换会把用户其他任务的开关抹掉）
-        let merged = merge(get(&mapped).unwrap_or(Value::Null), knob, value.clone())?;
+        // 其余任务的配置必须保留（整体替换会把用户其他任务的开关抹掉）。
+        //
+        // 基准取 `next` 里当前那一份，**不取 `get()`**：`get()` 走 mtime 缓存，
+        // 在事务里（同一把锁内连改两次同一个 Map）第二次会合并到改之前的旧值，
+        // 第一次改的键当场丢掉。`next` 就是本次事务正在编辑的那一份。
+        let current = next
+            .values
+            .get(&mapped)
+            .cloned()
+            .or_else(|| default_of(&mapped))
+            .unwrap_or(Value::Null);
+        let merged = merge(current, knob, value.clone())?;
         next.values.insert(mapped, merged);
         return Ok(());
     }
@@ -756,43 +919,38 @@ fn deep_merge(base: Value, over: Value) -> Value {
 
 /// 整份替换（导入配置用）。`enabled` 缺省为 true。
 pub fn replace(value: &Value) -> Result<Value, String> {
-    let mut next = Stored::from_json(value);
-    // 逐键过一遍校验，把非法值挡在落盘之前
-    let keys: Vec<String> = next.values.keys().cloned().collect();
-    for key in keys {
-        if find(&key).is_none() {
-            next.values.remove(&key);
-            continue;
+    update(|next| {
+        let parsed = Stored::from_json(value);
+        let mut clean: BTreeMap<String, Value> = BTreeMap::new();
+        // 逐键过一遍校验，把非法值挡在落盘之前；未知键直接丢（老配置兼容）
+        for (key, current) in parsed.values {
+            let Some(knob) = find(&key) else { continue };
+            clean.insert(key, coerce(knob, &current)?);
         }
-        if let Some(knob) = find(&key) {
-            let current = next.values.get(&key).cloned().unwrap_or(Value::Null);
-            let fixed = coerce(knob, &current)?;
-            next.values.insert(key, fixed);
-        }
-    }
-    store::ensure_layout()?;
-    let text = serde_json::to_string_pretty(&next.to_json()).map_err(|error| error.to_string())?;
-    store::write_atomic(&store::config_file(), &text)?;
-    Ok(tree())
+        // 整份替换 = 旧值全清再灌新的。不做这一步，「导入一份配置」就变成了
+        // 「把这份配置合并进来」—— 上一份里有、这一份里没有的键会静默残留。
+        next.values = clean;
+        next.enabled = parsed.enabled;
+        Ok(())
+    })
 }
 
 /// 恢复默认：`keys` 为空 = 全部恢复。
 pub fn reset(keys: &[String]) -> Result<Value, String> {
-    let mut next = stored();
-    if keys.is_empty() {
-        next.values.clear();
-    } else {
-        for key in keys {
-            next.values.remove(key);
-            if let Some(mapped) = (key.as_str() == "coreMaxTokens").then(|| "agents.coreMaxTokens".to_string()) {
-                next.values.remove(&mapped);
+    let keys = keys.to_vec();
+    update(|next| {
+        if keys.is_empty() {
+            next.values.clear();
+        } else {
+            for key in &keys {
+                next.values.remove(key);
+                if let Some(mapped) = (key.as_str() == "coreMaxTokens").then(|| "agents.coreMaxTokens".to_string()) {
+                    next.values.remove(&mapped);
+                }
             }
         }
-    }
-    store::ensure_layout()?;
-    let text = serde_json::to_string_pretty(&next.to_json()).map_err(|error| error.to_string())?;
-    store::write_atomic(&store::config_file(), &text)?;
-    Ok(tree())
+        Ok(())
+    })
 }
 
 /// 页面用的 schema 视图（不带 Rust 枚举，全是字符串/数字，前端直接用）。
@@ -984,5 +1142,48 @@ mod tests {
         ] {
             assert!(find(key).is_some(), "缺旋钮 {key}");
         }
+    }
+
+    /// 并发写配置时，每一处改动都必须留下来。
+    ///
+    /// 这是 [`CONFIG_LOCK`] 的回归测试。`patch` 是「读整份 → 改 → 整份写回」，
+    /// 没有锁时 20 个线程各改一个键，最后只剩最后写的那一个（**静默丢失**，
+    /// 页面还会显示「已保存」）。
+    ///
+    /// 为什么改 `import.overrides` 而不是二十个不同的旋钮：它是个 Map，`merge`
+    /// 会深合并兄弟键 —— 一把锁内 20 次写应当得到 20 个键；没有锁时后写的
+    /// 整份覆盖前写的，能稳定测出「只剩一两个」。
+    ///
+    /// 必须 `isolated`：`cfg(test)` 下配置目录是 thread_local 的，不隔离的话
+    /// 20 个线程各写各的临时目录，测试永远通过而测不到任何并发。
+    #[test]
+    fn concurrent_patches_keep_every_key() {
+        crate::test_support::isolated(
+            concat!(module_path!(), "::concurrent_patches_keep_every_key"),
+            || {
+                let mut handles = Vec::new();
+                for index in 0..20 {
+                    handles.push(std::thread::spawn(move || {
+                        // 键是算出来的，所以不能用 `json!` 的字面量键形态：显式建
+                        // 一个 `Map` 再包成 `Value::Object`，语义一样、没有歧义
+                        let mut overrides = Map::new();
+                        overrides.insert(format!("k{index}"), json!(format!("v{index}")));
+                        let payload = json!({ "import.overrides": Value::Object(overrides) });
+                        patch(&payload).expect("写入应当成功");
+                    }));
+                }
+                for handle in handles {
+                    handle.join().expect("线程不应 panic");
+                }
+                let saved = object_of("import.overrides");
+                assert_eq!(
+                    saved.len(),
+                    20,
+                    "并发写配置丢了键：实际只剩 {} 个 —— {}",
+                    saved.len(),
+                    serde_json::to_string(&saved).unwrap_or_default()
+                );
+            },
+        );
     }
 }

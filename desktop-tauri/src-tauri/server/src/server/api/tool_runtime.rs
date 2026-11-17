@@ -40,6 +40,23 @@ fn base_url(headers: &HeaderMap, state: &ServerState) -> String {
     format!("{scheme}://{host}")
 }
 
+/// 调用方客户端身份（`claude-code` / `codex` / `workbuddy` …），取不到时 `None`。
+///
+/// ── 来源只有一条：`X-Agent` 请求头 ──────────────────────────
+/// 由「本机接入」写客户端 MCP 配置时生成（见 `tool_services::install::mcp_entry`），
+/// 客户端每次请求都会带。为什么不从 `User-Agent` 猜：各家客户端的 UA 五花八门
+/// 且不稳定，猜错会把 A 客户端的记忆记到 B 名下，比「不知道是谁」更难查。
+/// 也不从 URL 上的 query 取：handler 签名里拿不到原始 URI，而要让 `X-Agent`
+/// 生效本来就得写头，两条通道并存只会让「到底哪条生效」变成新的疑问。
+fn request_agent(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-agent")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn with_port(host: &str, port: u16) -> String {
     if let Some(stripped) = host.strip_prefix('[') {
         if let Some(end) = stripped.find(']') {
@@ -279,8 +296,11 @@ async fn mcp_post(state: &ServerState, headers: HeaderMap, body: Bytes, kind: Mc
     let source = if kind == McpServerKind::ImageGeneration {
         crate::server::request_stats::RequestSource { client: "image-generation".into(), ..access.source }
     } else { access.source };
+    // 调用方客户端身份：记忆中枢用它决定 `l1/<agent>/` 落哪、心跳记给谁。
+    // 取不到就是 `None`，下游回落到历史值 `mcp`（不猜、不编造）。
+    let agent = request_agent(&headers);
     let context = McpRequestContext { base_url: base_url(&headers, state), store: state.store().clone(),
-        scope: access.scope, state: state.clone(), source, owner };
+        scope: access.scope, state: state.clone(), source, owner, agent };
     let response = match tool_services::mcp_dispatch(&payload, kind, &context).await {
         Some(response) => json_response(StatusCode::OK, response),
         None => StatusCode::ACCEPTED.into_response(),

@@ -41,6 +41,15 @@ pub struct McpRequestContext {
     pub state: crate::server::ServerState,
     pub source: crate::server::request_stats::RequestSource,
     pub owner: String,
+    /// 调用方客户端的 slug（`claude-code` / `codex` / …），取不到时为 `None`。
+    ///
+    /// ── 为什么需要它 ────────────────────────────────────────
+    /// MCP 的 HTTP 形态没有 stdio 那条「环境变量」通道（桥接形态可以用环境变量
+    /// 给每次调用打上客户端身份）。没有身份时记忆只能把所有客户端的 l1 落到同一
+    /// 个 `l1/mcp/` 目录、心跳表也只能空着 —— 用户看不出「这条是谁写的」，接入
+    /// 页的「最近活跃」永远是空的。所以由安装器把客户端名字写进 MCP 条目
+    /// （`X-Agent` 请求头），网关在这里读出来。
+    pub agent: Option<String>,
 }
 
 pub struct McpSpec {
@@ -191,8 +200,9 @@ async fn call_tool(
         McpServerKind::Memory => {
             let tool = name.to_string();
             let payload = args.clone();
+            let agent = ctx.agent.clone();
             let outcome = crate::server::core::blocking::run(move || {
-                super::memory_mcp::call(&tool, &payload)
+                super::memory_mcp::call(&tool, &payload, agent.as_deref())
             })
             .await;
             match outcome {

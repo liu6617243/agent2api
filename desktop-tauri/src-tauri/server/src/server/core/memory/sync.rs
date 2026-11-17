@@ -852,21 +852,21 @@ fn read_file(relative: &str) -> Option<String> {
 }
 
 fn write_file(relative: &str, text: &str) -> bool {
-    let path = store::abs(relative);
-    if let Some(parent) = path.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return false;
-        }
-    }
-    // 写入前先备份：同步进来的内容是远端写的，出了问题要能退回去
-    if config::bool_of("storage.backupBeforeWrite") && path.exists() {
-        let backup = path.with_extension("md.bak");
-        let _ = std::fs::copy(&path, backup);
-    }
-    std::fs::write(&path, text).is_ok()
+    // 与容器/单条的读改写互斥：同步落盘是「整份覆盖某个 .md」，若此刻另一个
+    // 线程正按「读容器 → 追加一节 → 整份写回」写同一份文件，两边各写一半版本，
+    // 最后活下来的是谁完全看时序 —— 拿锁把它变成确定的一件事。
+    //
+    // 顺带把 `fs::write` 换成 `store::write_atomic`：后者是「临时文件 → fsync →
+    // rename」，读者要么看到旧版、要么看到新版。裸 `fs::write` 是就地截断再写，
+    // 同步循环跑到一半时页面刷新恰好读到，就会看到半份文件（解析失败 → 那条
+    // 记忆从索引里消失，直到下次重建）。它自带的滚动备份也替代了这里的
+    // 手写 `.bak`，口径与其余写入路径一致。
+    let _guard = super::store::lock_writes();
+    store::write_atomic(&store::abs(relative), text).is_ok()
 }
 
 fn remove_file(relative: &str) -> bool {
+    let _guard = super::store::lock_writes();
     let path = store::abs(relative);
     if path.exists() {
         return std::fs::remove_file(&path).is_ok();

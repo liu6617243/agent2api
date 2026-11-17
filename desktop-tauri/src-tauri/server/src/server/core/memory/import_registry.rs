@@ -625,36 +625,58 @@ fn custom_path(id: &str) -> Option<&str> {
     id.strip_prefix(CUSTOM).map(str::trim).filter(|text| !text.is_empty())
 }
 
-/// 一条自定义来源「启用 / 停用」：改 `import.sources` 里那一条的开关。
+/// 一条自定义来源「启用 / 停用 / 改路径」：改 `import.sources` 里那一条。
 ///
 /// 停用即从清单移除 —— 自定义来源没有别的身份，离开清单就不存在了。
 /// （内置来源不能这么干，它还要留在清册里显示成「已忽略」。）
+///
+/// ── 为什么不再「`sources()` → 改 → `save_sources()`」 ─────────
+/// 那是两次独立读配置：中间插进来一次 `enable` 内置来源，这里写回的整份清单
+/// 会把它刚加的那条抹掉（页面显示已启用、扫描 0 个文件）。而且 `save_sources`
+/// 会把**清单里每一条**重新序列化，顺手把用户手写的 `1` 改成 `true`。
+/// 现在整段走 `update_sources` 事务，只重写真正被改的那一条，其余原样保留。
 fn set_custom(id: &str, path: Option<&str>, enabled: Option<bool>) -> Result<Value, String> {
     let target = custom_path(id).ok_or_else(|| format!("自定义来源 id 不合法：{id}"))?.to_string();
-    let mut items = super::import::sources();
     let key = canon(&target);
-    if let Some(enabled) = enabled {
-        let Some(item) = items.iter_mut().find(|item| canon(&item.path) == key) else {
-            return Err(format!("这条来源已经不在清单里了：{target}"));
-        };
-        item.enabled = enabled;
-    } else if let Some(path) = path {
-        let text = path.trim();
-        if text.is_empty() {
-            items.retain(|item| canon(&item.path) != key);
-        } else {
-            let Some(item) = items.iter_mut().find(|item| canon(&item.path) == key) else {
-                return Err(format!("这条来源已经不在清单里了：{target}"));
+    // 空串 = 删掉这条自定义来源。用 `Option<String>` 区分「没传路径」与「传了空」
+    let editing: Option<String> = path.map(|text| text.trim().to_string());
+    super::import::update_sources(move |sources, ignored| {
+        let mut next: Vec<String> = Vec::with_capacity(sources.len().max(1));
+        let mut hit = false;
+        for raw in sources {
+            let Some(mut item) = super::import::Source::parse(raw) else {
+                // 解析不了的条目原样留着 —— 不是我们要改的这一条，也不该被
+                // 一次「启用某来源」顺手清掉
+                next.push(raw.clone());
+                continue;
             };
-            // 格式按新路径重猜：用户把「笔记目录」改成「会话目录」时，
-            // 保留旧格式会让 `walk` 用错扩展名过滤，一条都读不到。
-            if item.format != super::import::guess_format(text) {
-                item.format = super::import::guess_format(text);
+            if canon(&item.path) != key {
+                next.push(raw.clone());
+                continue;
             }
-            item.path = text.to_string();
+            hit = true;
+            if let Some(flag) = enabled {
+                item.enabled = flag;
+            } else if let Some(text) = editing.as_deref() {
+                if text.is_empty() {
+                    // 不进 `next` 就是删掉
+                    continue;
+                }
+                // 格式按新路径重猜：用户把「笔记目录」改成「会话目录」时，
+                // 保留旧格式会让 `walk` 用错扩展名过滤，一条都读不到。
+                let guessed = super::import::guess_format(text);
+                if item.format != guessed {
+                    item.format = guessed;
+                }
+                item.path = text.to_string();
+            }
+            next.push(item.to_config());
         }
-    }
-    super::import::save_sources(&items)?;
+        if !hit {
+            return Err(format!("这条来源已经不在清单里了：{target}"));
+        }
+        Ok((next, ignored.to_vec()))
+    })?;
     Ok(view())
 }
 
@@ -669,10 +691,6 @@ pub fn add(path: &str, format: &str, priority: i64) -> Result<Value, String> {
     if text.is_empty() {
         return Err("路径不能为空".into());
     }
-    let mut items = super::import::sources();
-    if items.iter().any(|item| same_path(&item.path, text)) {
-        return Err(format!("这个路径已经在清单里了：{text}"));
-    }
     // 格式先看用户选的，选「自动」就按扩展名猜 —— 猜错的代价是一条都读不到，
     // 所以下拉里给了明确的「自动」。
     let format = match format.trim().to_ascii_lowercase().as_str() {
@@ -680,13 +698,31 @@ pub fn add(path: &str, format: &str, priority: i64) -> Result<Value, String> {
         "md" => "md".to_string(),
         _ => super::import::guess_format(text),
     };
-    items.push(super::import::Source {
+    let line = super::import::Source {
         path: text.to_string(),
         format,
         enabled: true,
         priority,
-    });
-    super::import::save_sources(&items)?;
+    }
+    .to_config();
+    // 「查重 + 追加」必须在一个事务里：分开做的话，两次并发「加一条」都能通过
+    // 查重，最后两条同路径都在清单里，同一批文件被导入两遍。
+    super::import::update_sources(move |sources, ignored| {
+        // 查重用 `Source::parse` 而不是裸切第一个 `|`：路径里合法地可以带 `|`
+        // （Windows 文件名不允许，但用户手写的配置什么都有），只按分隔符切会把
+        // 路径截断成前缀，两条不同目录被判成同一条。
+        let clash = sources.iter().any(|item| {
+            super::import::Source::parse(item)
+                .map(|parsed| same_path(&parsed.path, text))
+                .unwrap_or(false)
+        });
+        if clash {
+            return Err(format!("这个路径已经在清单里了：{text}"));
+        }
+        let mut next: Vec<String> = sources.to_vec();
+        next.push(line.clone());
+        Ok((next, ignored.to_vec()))
+    })?;
     Ok(view())
 }
 
@@ -706,17 +742,20 @@ pub fn enable(id: &str) -> Result<Value, String> {
     }
     // 存 `~` 形态：配置要能跟着仓库/同步走，绝对路径换台机器就废了
     let text = crate::server::core::system_info::mask_path(&probed.path).replace('\\', "/");
-    let mut paths: Vec<String> = config::strings_of("import.sources");
-    if !paths.iter().any(|item| entry_is_path(item, &text)) {
-        let format = if entry.kind == "md" { "md" } else { "jsonl" };
-        paths.push(format!("{text}|{format}|true|0"));
-        config::patch(&json!({ "import.sources": paths }))?;
-    }
-    let mut ignored: Vec<String> = config::strings_of("import.ignored");
-    if ignored.iter().any(|item| item == id) {
-        ignored.retain(|item| item != id);
-        config::patch(&json!({ "import.ignored": ignored }))?;
-    }
+    let format = if entry.kind == "md" { "md" } else { "jsonl" };
+    // 「读两个键 → 判断 → 写回」整段放在一个事务里：判断与写入之间不允许别人
+    // 插进来（否则那一瞬间的清单和我们要写的这一份不是同一个版本）。
+    let id = id.to_string();
+    let line = format!("{text}|{format}|true|0");
+    super::import::update_sources(move |sources, ignored| {
+        let mut next_sources: Vec<String> = sources.to_vec();
+        if !next_sources.iter().any(|item| entry_is_path(item, &text)) {
+            next_sources.push(line.clone());
+        }
+        let mut next_ignored: Vec<String> = ignored.to_vec();
+        next_ignored.retain(|item| item != &id);
+        Ok((next_sources, next_ignored))
+    })?;
     Ok(view())
 }
 
@@ -739,16 +778,17 @@ pub fn disable(id: &str) -> Result<Value, String> {
     if !probed.path.as_os_str().is_empty() {
         candidates.push(probed.path.to_string_lossy().to_string());
     }
-    let before: Vec<String> = config::strings_of("import.sources");
-    let after = drop_paths(&before, &candidates);
-    if after.len() != before.len() {
-        config::patch(&json!({ "import.sources": after }))?;
-    }
-    let mut ignored: Vec<String> = config::strings_of("import.ignored");
-    if !ignored.iter().any(|item| item == id) {
-        ignored.push(id.to_string());
-        config::patch(&json!({ "import.ignored": ignored }))?;
-    }
+    // 与 `enable` 同理：读两个键 → 改 → 写回整段在一个事务里，
+    // 不留「已从清单移除但还没进忽略名单」的中间态。
+    let id = id.to_string();
+    super::import::update_sources(move |sources, ignored| {
+        let after = drop_paths(sources, &candidates);
+        let mut next_ignored: Vec<String> = ignored.to_vec();
+        if !next_ignored.iter().any(|item| item == &id) {
+            next_ignored.push(id.clone());
+        }
+        Ok((after, next_ignored))
+    })?;
     Ok(view())
 }
 
@@ -762,25 +802,34 @@ pub fn set_path(id: &str, path: &str) -> Result<Value, String> {
         return Err(format!("没有这个内置来源：{id}"));
     };
     let text = path.trim().to_string();
-    let mut overrides = config::object_of("import.overrides");
-    if text.is_empty() {
-        overrides.remove(id);
-    } else {
-        overrides.insert(id.to_string(), json!(text));
-    }
-    config::patch(&json!({ "import.overrides": Value::Object(overrides) }))?;
-
-    // 改路径之后如果这个来源是启用的，`import.sources` 里那条旧路径要跟着换 ——
-    // 否则「页面显示新路径、导入还在读旧路径」这种不一致会静默地导错东西。
-    if !ignored(entry.id) && !text.is_empty() {
-        let old: Vec<String> = entry.paths.iter().map(|item| item.to_string()).collect();
-        let mut paths = drop_paths(&config::strings_of("import.sources"), &old);
-        if !paths.iter().any(|item| entry_is_path(item, &text)) {
-            let format = if entry.kind == "md" { "md" } else { "jsonl" };
-            paths.push(format!("{text}|{format}|true|0"));
+    // 覆盖表与清单必须一起改：只写覆盖表的话，来源已经是启用状态时清单里那条
+    // 旧路径还在，「页面显示新路径、导入仍然读旧路径」会静默地导错东西；
+    // 只改清单不写覆盖表的话，下次探测又会回到候选路径上。一次事务写完。
+    let old: Vec<String> = entry.paths.iter().map(|item| item.to_string()).collect();
+    let format = if entry.kind == "md" { "md" } else { "jsonl" };
+    let id = id.to_string();
+    config::update(|next| {
+        // 「是否处于启用状态」也要在事务里读：外面读一次、里面写一次，
+        // 中间别人改了忽略名单，这里就会按过期的判断改清单。
+        let enabled_now = !next.strings("import.ignored").iter().any(|item| item == &id) && !text.is_empty();
+        // 覆盖表用 `set` 整份替换而不是 `apply_in`：Map 类的 `patch` 走深合并，
+        // **删不掉键** ——「路径清空 = 删掉那条覆盖」用它写不进去（旧值还在）。
+        let mut overrides = next.map_of("import.overrides");
+        if text.is_empty() {
+            overrides.remove(&id);
+        } else {
+            overrides.insert(id.clone(), json!(text));
         }
-        config::patch(&json!({ "import.sources": paths }))?;
-    }
+        next.set("import.overrides", Value::Object(overrides))?;
+        if enabled_now {
+            let mut paths = drop_paths(&next.strings("import.sources"), &old);
+            if !paths.iter().any(|item| entry_is_path(item, &text)) {
+                paths.push(format!("{text}|{format}|true|0"));
+            }
+            next.set("import.sources", json!(paths))?;
+        }
+        Ok(())
+    })?;
     Ok(view())
 }
 
@@ -828,5 +877,75 @@ mod tests {
         assert_eq!(expand("~/.claude/projects"), home.join(".claude").join("projects"));
         // 中间的 `~` 不是前缀
         assert_eq!(expand("D:/a~b"), PathBuf::from("D:/a~b"));
+    }
+
+    /// 改一条自定义来源时，**别人的写法必须原样留着**。
+    ///
+    /// 旧实现是「`sources()` 读整份 → `save_sources()` 整份写回」，而
+    /// `save_sources` 会把每一条都 `to_config()` 重新序列化：用户手写的
+    /// `D:/notes|md|1|5`（`1` 而不是 `true`）、`D:/x|MD|on|5` 这类等价写法，
+    /// 会在「改另一条来源的路径」这个动作里被顺手改写。功能上无害，但它让
+    /// 配置文件出现大片与用户操作无关的 diff，也让「我只改了一条」这句话变成假的。
+    /// 现在 `update_sources` 只重写真正命中的那一条。
+    #[test]
+    fn set_custom_keeps_other_rows_verbatim() {
+        crate::test_support::isolated(
+            concat!(module_path!(), "::set_custom_keeps_other_rows_verbatim"),
+            || {
+                // 两条「写法不标准」的旁证 + 一条待改的自定义来源
+                let untouched = [
+                    "D:/notes|md|1|5".to_string(),
+                    "D:/chats|jsonl|on|9".to_string(),
+                ];
+                let editing = "D:/old|md|true|0".to_string();
+                let mut rows = untouched.to_vec();
+                rows.push(editing.clone());
+                // 测试模块里的 `super` 是 `import_registry`，要再上一层才是 `memory`
+                super::super::import::update_sources(move |_, ignored| Ok((rows.clone(), ignored.to_vec())))
+                    .expect("写入初始清单应当成功");
+
+                set_custom("custom:D:/old", Some("D:/new"), None).expect("改路径应当成功");
+
+                let saved = super::config::strings_of("import.sources");
+                for row in &untouched {
+                    assert!(
+                        saved.iter().any(|item| item == row),
+                        "旁证行被改写了：`{row}` 不见了，实际 {saved:?}"
+                    );
+                }
+                assert!(
+                    saved.iter().any(|item| item.starts_with("D:/new|")),
+                    "新路径没有写进清单：{saved:?}"
+                );
+                assert!(
+                    !saved.iter().any(|item| item == &editing),
+                    "旧路径应当被替换而不是并存：{saved:?}"
+                );
+            },
+        );
+    }
+
+    /// 加一条已经被停用的自定义来源：应当**重新启用**，而不是加出第二条。
+    ///
+    /// `set_custom` 停用是「从清单移除」；用户再点一次「加」时走的却是
+    /// `add()`。两条路径处理的是同一份清单，`add` 的查重必须把「已停用的那条」
+    /// 也认成重复 —— 否则清单里会出现两条同路径（一条 `false` 一条 `true`），
+    /// 同一批文件被扫两遍。
+    #[test]
+    fn add_does_not_duplicate_an_existing_path() {
+        crate::test_support::isolated(
+            concat!(module_path!(), "::add_does_not_duplicate_an_existing_path"),
+            || {
+                let rows = vec!["D:/notes|md|false|0".to_string()];
+                super::super::import::update_sources(move |_, ignored| Ok((rows.clone(), ignored.to_vec())))
+                    .expect("写入初始清单应当成功");
+
+                let outcome = add("D:/notes", "md", 0);
+                assert!(outcome.is_err(), "同路径重复添加应当报错，实际：{outcome:?}");
+
+                let saved = super::config::strings_of("import.sources");
+                assert_eq!(saved.len(), 1, "清单里出现了重复条目：{saved:?}");
+            },
+        );
     }
 }

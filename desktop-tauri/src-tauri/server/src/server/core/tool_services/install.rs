@@ -268,6 +268,16 @@ fn mcp_entry(
 ) -> Value {
     let authorization = format!("Bearer {api_key}");
     let extra = timeout_entry(def, timeout);
+    // 记忆中枢按 `X-Agent` 认「这条记忆是哪个客户端写的」（决定 `l1/<agent>/`
+    // 落在哪个目录、心跳记给谁）。只有记忆服务需要它 —— 搜索/视觉不关心调用方，
+    // 给它们也加一个头只会让别的服务的配置看起来被污染。
+    let with_agent = |headers: Value| -> Value {
+        let mut headers = headers;
+        if service == super::MEMORY_SERVICE_ID {
+            headers["X-Agent"] = json!(def.id);
+        }
+        headers
+    };
     let base = match bridge {
         Some(path) => {
             let bridge_path = path.display().to_string();
@@ -287,24 +297,23 @@ fn mcp_entry(
             "opencode" => json!({
                 "type": "remote",
                 "url": url,
-                "headers": { "Authorization": authorization },
+                "headers": with_agent(json!({ "Authorization": authorization })),
             }),
             "gemini-cli" => json!({
                 "httpUrl": url,
-                "headers": { "Authorization": authorization },
+                "headers": with_agent(json!({ "Authorization": authorization })),
             }),
             "codex" => json!({
                 "url": url,
-                "http_headers": { "Authorization": authorization },
+                "http_headers": with_agent(json!({ "Authorization": authorization })),
             }),
             _ => json!({
                 "type": "http",
                 "url": url,
-                "headers": { "Authorization": authorization },
+                "headers": with_agent(json!({ "Authorization": authorization })),
             }),
         },
     };
-    let _ = service;
     merge_entry(base, extra)
 }
 
@@ -434,4 +443,71 @@ pub fn uninstall_mcp(service: &str, client_ids: &[String]) -> Vec<InstallOutcome
         }
     }
     outcomes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_of(entry: &Value, key: &str) -> Option<Value> {
+        entry.get(key).cloned().filter(|value| value.is_object())
+    }
+
+    /// 记忆服务的每一条 MCP 配置都要带上调用方身份。
+    ///
+    /// 这是「记忆按客户端分目录」的**起点**：网关只认请求头 `X-Agent`，头是安装
+    /// 器写进去的。写错一处（比如只给 `headers` 写、漏了 codex 用的
+    /// `http_headers`），那个客户端的所有记忆就会静默落进 `l1/mcp/`，事后分不清
+    /// 是谁写的。所以逐种形态都断言一遍。
+    #[test]
+    fn memory_entry_carries_the_client_identity() {
+        for id in ["claude-code", "codex", "opencode", "gemini-cli"] {
+            let def = agents::find(id).expect("内置客户端必须存在");
+            let entry = mcp_entry(
+                def,
+                crate::server::core::tool_services::MEMORY_SERVICE_ID,
+                "http://127.0.0.1:3065/mcp/memory",
+                "sk-test",
+                None,
+                0,
+            );
+            // codex 用 `http_headers`，其余用 `headers`
+            let key = if entry.get("http_headers").is_some() { "http_headers" } else { "headers" };
+            let headers = headers_of(&entry, key).unwrap_or_else(|| panic!("{id} 缺少 {key}：{entry}"));
+            assert_eq!(
+                headers.get("X-Agent").and_then(Value::as_str),
+                Some(def.id),
+                "{id} 的记忆配置没有写 X-Agent：{entry}"
+            );
+            assert_eq!(
+                headers.get("Authorization").and_then(Value::as_str),
+                Some("Bearer sk-test"),
+                "{id} 的鉴权头被弄丢了：{entry}"
+            );
+            // 这条身份最终会成为目录名，安装器写出来的值必须能原样通过网关清洗
+            let allowed = def.id.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'));
+            assert!(allowed, "客户端 id `{}` 不是路径安全的，网关会把它改名", def.id);
+        }
+    }
+
+    /// 搜索/视觉这类服务不该被写上调用方身份。
+    ///
+    /// 它们不按客户端分目录，多一个头只会让配置文件看起来被污染，也让「记忆
+    /// 服务的身份头」这条约束在别处被误读成通用的。
+    #[test]
+    fn other_services_do_not_carry_the_identity() {
+        let def = agents::find("claude-code").expect("内置客户端必须存在");
+        for service in [
+            crate::server::core::tool_services::WEB_SEARCH_SERVICE_ID,
+            crate::server::core::tool_services::VISION_SERVICE_ID,
+        ] {
+            let entry = mcp_entry(def, service, "http://127.0.0.1:3065/mcp", "sk-test", None, 0);
+            let key = if entry.get("http_headers").is_some() { "http_headers" } else { "headers" };
+            let headers = headers_of(&entry, key).unwrap_or_default();
+            assert!(
+                headers.get("X-Agent").is_none(),
+                "{service} 不该带 X-Agent：{entry}"
+            );
+        }
+    }
 }

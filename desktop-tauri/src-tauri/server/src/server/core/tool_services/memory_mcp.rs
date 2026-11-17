@@ -330,7 +330,60 @@ fn list_arg(args: &Value, key: &str) -> Vec<String> {
 }
 
 /// 执行一个记忆工具，返回给模型的 payload。
-pub fn call(name: &str, args: &Value) -> Result<Value, CallError> {
+///
+/// `agent` 是「这次调用来自哪个客户端」（网关从安装时写入的 `X-Agent` 头读出来，
+/// 见 `McpRequestContext::agent`）。它做两件事：
+///   1. 决定 `memory_write` 落到 `l1/<agent>/…` 的哪个目录 —— 没有它时所有
+///      客户端共用 `l1/mcp/`，事后分不清哪条是哪个客户端写的；
+///   2. 落一条 `agent_beat` 心跳，接入页的「最近活跃」才有内容。
+pub fn call(name: &str, args: &Value, agent: Option<&str>) -> Result<Value, CallError> {
+    let outcome = dispatch(name, args, agent);
+    // 心跳只在**协议层认识这个工具**时记：`UnknownTool` 说明客户端在用旧工具名，
+    // 把它记成「活跃」会掩盖版本不匹配。
+    //
+    // 只读工具不心跳吗？—— 也记。接入页要回答的是「这个客户端最近有没有在
+    // 用记忆」，只读调用（开局 `memory_core`）正是最可靠的活跃证据。
+    //
+    // 两个 `matches!` 都按**引用**匹配：`matches!(x, …)` 展开成 `match x`，
+    // 按值匹配会把 `outcome` move 走，后面那次判断与最后 `outcome` 的返回
+    // 就都拿不到它了（E0382）。
+    if !matches!(&outcome, Err(CallError::UnknownTool)) {
+        let identity = agent_slug(agent);
+        crate::server::core::memory::index::global().beat(
+            &identity,
+            name,
+            matches!(&outcome, Ok(_)),
+        );
+    }
+    outcome
+}
+
+/// 客户端身份的归一化：只留 ASCII 字母数字与 `-` `_`，压到 64 字节以内。
+///
+/// 这个词会直接成为目录名（`l1/<agent>/`），所以必须是路径安全的。两条硬规则：
+///   · **`/` `\` 必须挡掉** —— 否则一次写入能在记忆根下造出两级目录；
+///   · **`.` 也挡掉** —— 唯一危险值是 `".."`：`l1/../<date>.md` 会跳出记忆根，
+///     而 `".."` 恰好是「只由允许字符组成」的合法串，光靠白名单拦不住。
+///     各家客户端 id（`claude-code` / `gemini-cli` / `kimi-code` …）都不带点，
+///     去掉它不损失任何真实身份。
+///
+/// 清洗后若一个字母数字都不剩（全空白 / 全符号），回落到历史值 `mcp` ——
+/// 宁可不分类，也不要造出一个 `_` 或 `-` 的目录。
+fn agent_slug(agent: Option<&str>) -> String {
+    let raw = agent.map(str::trim).unwrap_or("");
+    let cleaned: String = raw
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') { ch } else { '_' })
+        .take(64)
+        .collect();
+    if !cleaned.chars().any(|ch| ch.is_ascii_alphanumeric()) {
+        "mcp".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn dispatch(name: &str, args: &Value, agent: Option<&str>) -> Result<Value, CallError> {
     // 总开关只管"业务工具"：`memory_status` / `memory_health` / `memory_sync_status`
     // 必须始终可用 —— 否则关掉之后用户连"为什么 Agent 一点记忆都没有"都查不了
     // （这正是最需要自检的时刻）。
@@ -429,7 +482,9 @@ pub fn call(name: &str, args: &Value) -> Result<Value, CallError> {
                 kind: Some(kind),
                 layer: text_arg(args, "layer"),
                 project: text_arg(args, "project"),
-                agent: Some("mcp".to_string()),
+                // 身份优先取调用方带来的客户端 slug（决定 `l1/<agent>/` 目录与
+                // 心跳归因）；取不到时才退回 `mcp` 这个历史值。
+                agent: Some(agent_slug(agent)),
                 tags: list_arg(args, "tags"),
                 importance: args.get("importance").and_then(Value::as_f64),
                 files: list_arg(args, "files"),
@@ -511,24 +566,24 @@ mod tests {
 
     #[test]
     fn unknown_tool_is_protocol_error() {
-        assert!(matches!(call("memory_nope", &json!({})), Err(CallError::UnknownTool)));
+        assert!(matches!(call("memory_nope", &json!({}), None), Err(CallError::UnknownTool)));
     }
 
     #[test]
     fn search_requires_query() {
-        assert!(matches!(call("memory_search", &json!({})), Err(CallError::Failed(_))));
+        assert!(matches!(call("memory_search", &json!({}), None), Err(CallError::Failed(_))));
     }
 
     #[test]
     fn write_rejects_unknown_type() {
         let args = json!({ "content": "x", "type": "nonsense" });
-        assert!(matches!(call("memory_write", &args), Err(CallError::Failed(_))));
+        assert!(matches!(call("memory_write", &args, None), Err(CallError::Failed(_))));
     }
 
     #[test]
     fn write_rejects_unknown_layer() {
         let args = json!({ "content": "x", "layer": "l3" });
-        assert!(matches!(call("memory_write", &args), Err(CallError::Failed(_))));
+        assert!(matches!(call("memory_write", &args, None), Err(CallError::Failed(_))));
     }
 
     #[test]
@@ -544,5 +599,33 @@ mod tests {
         // 模型不该自己批准「这条记忆作废」
         let text = spec().instructions.to_lowercase();
         assert!(text.contains("never approve review items yourself"));
+    }
+
+    #[test]
+    fn agent_slug_is_path_safe_and_falls_back_to_mcp() {
+        // 这个词会直接成为 `l1/<agent>/` 的目录名：斜杠、空格、中文必须被挡掉，
+        // 否则一次写入能在记忆根下造出两级目录
+        assert_eq!(agent_slug(Some("claude-code")), "claude-code");
+        assert_eq!(agent_slug(Some("a/b c")), "a_b_c");
+        assert_eq!(agent_slug(Some("trae/ide")), "trae_ide");
+        assert_eq!(agent_slug(Some("   ")), "mcp");
+        assert_eq!(agent_slug(None), "mcp");
+        // 上限 64：与 AgentHub 桥的 `slice(0, 64)` 同口径
+        let long = "a".repeat(200);
+        assert_eq!(agent_slug(Some(long.as_str())).len(), 64);
+    }
+
+    /// `..` 是唯一能跳出 `l1/` 的目录名，而且它只由「合法字符」组成 ——
+    /// 白名单里留一个 `.` 就等于把 `l1/../<date>.md` 这个入口留开着。
+    #[test]
+    fn agent_slug_cannot_escape_the_l1_directory() {
+        assert_eq!(agent_slug(Some("..")), "mcp");
+        assert_eq!(agent_slug(Some(".")), "mcp");
+        assert_eq!(agent_slug(Some("../..")), "mcp");
+        // 中间带点的真实 id 也要落成安全名（不允许出现 `.` 段）
+        assert_eq!(agent_slug(Some("a.b")), "a_b");
+        // 纯符号同样不给造目录的机会
+        assert_eq!(agent_slug(Some("---")), "mcp");
+        assert_eq!(agent_slug(Some("___")), "mcp");
     }
 }

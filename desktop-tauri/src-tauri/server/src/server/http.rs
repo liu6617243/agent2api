@@ -67,8 +67,13 @@ const CORS_METHODS: &str = "GET, POST, PUT, PATCH, OPTIONS, DELETE";
 /// 补这三项不放松任何准入：预检只声明「允许跨源发这些头」，能不能用仍由
 /// `require_api_key` 判；且 `Allow-Origin: *` 下浏览器不会替跨源请求带 cookie，
 /// 凭证只能显式放进请求头 —— 这正是手机端要的形态。
+///
+/// `x-agent` 是记忆 MCP 的**客户端身份**头（安装器写进各客户端配置，网关在
+/// `api::tool_runtime` 读取后按它把记忆分到 `l1/<agent>/`）。命令行客户端不
+/// 走预检，但这个端点也可能被浏览器里的 MCP 客户端直连，漏了这一项时预检
+/// 会被拦下、身份静默退化成 `mcp`。
 const CORS_HEADERS: &str =
-    "Content-Type, Authorization, x-api-key, x-panel-token, x-panel-refresh, x-panel-auth-mode, x-agent2api-client, x-title, x-client-type, x-cerebras-3rd-party-integration";
+    "Content-Type, Authorization, x-api-key, x-panel-token, x-panel-refresh, x-panel-auth-mode, x-agent, x-agent2api-client, x-title, x-client-type, x-cerebras-3rd-party-integration";
 
 /// 组装完整路由（面板 + 网关**同端口**：默认形态与桌面壳）。
 ///
@@ -1655,5 +1660,26 @@ mod cors_tests {
             headers.get(header::ACCESS_CONTROL_ALLOW_HEADERS).unwrap(),
             CORS_HEADERS
         );
+    }
+
+    /// 记忆 MCP 的客户端身份头必须在 CORS 白名单里。
+    ///
+    /// 上一条用例拿 `CORS_HEADERS` 跟自己比，是恒真断言 —— 从白名单里删掉某项
+    /// 它照样通过。这里按项检查：`X-Agent` 是安装器写进各客户端 MCP 配置、
+    /// 网关据此把记忆分到 `l1/<agent>/` 的身份头。命令行客户端不走预检，但
+    /// 浏览器里的 MCP 客户端跨源直连这个端点时，缺了这一项预检会被拦下，
+    /// 身份静默退化成 `mcp`（表现成「所有客户端共用一份 l1」）。
+    #[test]
+    fn cors_allows_the_memory_agent_header() {
+        let allowed: Vec<String> = CORS_HEADERS
+            .split(',')
+            .map(|item| item.trim().to_ascii_lowercase())
+            .collect();
+        for required in ["x-agent", "authorization", "x-api-key", "content-type"] {
+            assert!(
+                allowed.iter().any(|item| item == required),
+                "CORS 白名单缺 `{required}`：{CORS_HEADERS}"
+            );
+        }
     }
 }

@@ -516,15 +516,15 @@ fn cleanup(manual: bool) -> Outcome {
             if entry.pinned || entry.kind == super::MemoryKind::Profile {
                 continue;
             }
-            let mut entry = entry;
-            if store::detach_live(&entry).is_err() {
-                continue;
-            }
-            entry.deleted_at = Some(now);
-            entry.updated_at = now;
-            entry.path = store::rel(&store::entry_path(&entry, true));
-            if store::save(&entry).is_ok() {
-                let _ = index::global().upsert(&entry);
+            // 「摘活形态 + 写回收站」一个临界区（见 `store::retire`）：
+            // `entry` 是改动前的对象（摘活形态按它算路径），`trashed_entry` 是
+            // 改动后的（写进 `trash/`）。分成两次调用会露出「同 id 两份」的窗口。
+            let mut trashed_entry = entry.clone();
+            trashed_entry.deleted_at = Some(now);
+            trashed_entry.updated_at = now;
+            trashed_entry.path = store::rel(&store::entry_path(&trashed_entry, true));
+            if store::retire(&entry, &trashed_entry).is_ok() {
+                let _ = index::global().upsert(&trashed_entry);
                 trashed += 1;
             }
             if trashed >= 200 {

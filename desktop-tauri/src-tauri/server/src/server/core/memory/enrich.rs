@@ -490,14 +490,12 @@ pub fn build_profile(force: bool) -> Outcome {
     let mut replaced = 0usize;
     for stale in &existing {
         let mut entry = (*stale).clone();
-        if let Err(error) = store::detach_live(&entry) {
-            crate::server::logging::log("[Memory]", &format!("⚠️ 旧画像移出失败：{error}"));
-            continue;
-        }
         entry.deleted_at = Some(crate::server::logging::now_ms());
         entry.updated_at = entry.deleted_at.unwrap_or(entry.updated_at);
         entry.path = store::rel(&store::entry_path(&entry, true));
-        if store::save(&entry).is_ok() {
+        // 「摘活形态 + 写回收站」一个临界区：`stale` 是改动前的对象，摘活形态
+        // 必须按它算路径；分成 detach + save 两次的话，中间那一段里同 id 两份都在。
+        if store::retire(stale, &entry).is_ok() {
             let _ = index::global().upsert(&entry);
             replaced += 1;
         }
