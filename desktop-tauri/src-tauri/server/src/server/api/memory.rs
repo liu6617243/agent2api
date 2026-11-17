@@ -305,7 +305,11 @@ pub async fn post_agents_uninstall(State(_state): State<ServerState>, body: Byte
     }
 }
 
-/// 校验：逐个客户端读一遍配置，确认条目还在、提示词块还完整。
+/// 校验：读配置 + 真发一次 MCP 握手。
+///
+/// 不再走 `blocking::run`：探活本身是异步 HTTP，塞进 `spawn_blocking` 里要么
+/// 得开 `reqwest::blocking`（多一条 feature），要么得自己搭 runtime。直接在
+/// handler 里 `await` 更直接 —— 探活是 I/O 等待，本来就不该占线程。
 pub async fn post_agents_verify(State(_state): State<ServerState>, body: Bytes) -> Response {
     let payload = parse_body(&body).unwrap_or(Value::Null);
     let clients: Vec<String> = payload
@@ -313,11 +317,7 @@ pub async fn post_agents_verify(State(_state): State<ServerState>, body: Bytes) 
         .and_then(Value::as_array)
         .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
         .unwrap_or_default();
-    let outcome = crate::server::core::blocking::run(move || memory::agents::verify(&clients)).await;
-    match outcome {
-        Ok(value) => ok_json(value),
-        Err(error) => errors::management_error(500, error.message),
-    }
+    ok_json(memory::agents::verify(&clients).await)
 }
 
 /// 配置片段：给自定义客户端 / 手动粘贴用。

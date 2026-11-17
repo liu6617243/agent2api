@@ -90,15 +90,16 @@ pub fn list() -> Value {
         let mcp = resources::snapshot(def, "mcp");
         let mcp_error = mcp.as_ref().err().cloned();
         let supported = mcp.is_ok();
-        let installed = mcp
-            .as_ref()
-            .ok()
-            .and_then(|snapshot| snapshot.get("servers").and_then(Value::as_array))
-            .is_some_and(|servers| {
-                servers
-                    .iter()
-                    .any(|server| server.get("name").and_then(Value::as_str) == Some(server_name()))
-            });
+        // 取到那一条的完整配置，而不只是「在不在」：卡片还要回答「它带没带身份头」。
+        let entry = mcp_entry_of(mcp.as_ref().ok());
+        let installed = entry.is_some();
+        // `X-Agent` 是记忆分目录（`l1/<agent>/`）与心跳归属的唯一来源。老版本安装器
+        // 不写它，条目照样「存在」，于是卡片显示「已接入」而记忆全部静默落进
+        // `l1/mcp/` —— 事后分不清是谁写的。这里把事实摆到卡片上，让用户能看见。
+        //
+        // 变量不能叫 `agent_header`：本模块有同名函数，局部绑定会把它遮住，
+        // 后面再想调用就变成「调用一个 Option」（与 E0618 同一个坑）。
+        let identity = entry.as_ref().and_then(agent_header);
         let prompt = prompt_path.as_deref().map(block_state);
         // `block_state` 里已有 path 之外的字段，卡片直接展开：
         // 前端不需要再自己拼路径，也就不用猜提示词文件叫什么。
@@ -132,6 +133,9 @@ pub fn list() -> Value {
             "note": mcp_error.clone().or(detection.note.clone()),
             "mcp": {
                 "installed": installed,
+                // 写进配置的 `X-Agent` 值（没有就是 null）。它既是「要不要提醒用户
+                // 重写一次」的判据，也让用户能看出这条是不是别的客户端共用来的。
+                "agentHeader": identity,
                 "serverName": server_name(),
             },
             "instruction": instruction,
@@ -177,6 +181,45 @@ pub fn list() -> Value {
         "injectAgentsMd": config::bool_of("agents.injectAgentsMd"),
         "tools": tool_services::capability_count(tool_services::MEMORY_SERVICE_ID),
     })
+}
+
+// ── 配置读取的小工具 ──────────────────────────────────────────
+
+/// 从 MCP 快照里取出本服务那一条的 `config`。
+///
+/// 快照的 `servers` 是 `[{name, endpoint, config}]`；不同客户端的 `config` 形态
+/// 各不相同（json 用 `headers`、codex 用 `http_headers`、dsh 用 `serverName`），
+/// 所以这里只负责「按名字找到那一条」，不解释内容。
+fn mcp_entry_of(snapshot: Option<&Value>) -> Option<Value> {
+    snapshot
+        .and_then(|snapshot| snapshot.get("servers").and_then(Value::as_array))
+        .and_then(|servers| {
+            servers
+                .iter()
+                .find(|server| server.get("name").and_then(Value::as_str) == Some(server_name()))
+        })
+        .map(|server| server.get("config").cloned().unwrap_or(Value::Null))
+}
+
+/// 这一条配置里的 `X-Agent`（大小写不敏感地找头名）。
+///
+/// 三种头容器都要看：普通客户端写 `headers`、Codex 写 `http_headers`、DSH 的
+/// 条目直接是 `config.headers`。头名按小写比对 —— JSON 里 `X-Agent` / `x-agent`
+/// 都合法，客户端自己不区分大小写，我们也不该因为大小写把它判成「没写」。
+fn agent_header(config: &Value) -> Option<String> {
+    for key in ["headers", "http_headers", "httpHeaders"] {
+        let Some(headers) = config.get(key).and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case("x-agent") {
+                if let Some(text) = value.as_str().map(str::trim).filter(|text| !text.is_empty()) {
+                    return Some(text.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 // ── 自定义 Agent（用户手填的扩展位）────────────────────────────
@@ -562,43 +605,74 @@ pub fn uninstall(clients: &[String]) -> Value {
     })
 }
 
-/// 校验：逐个客户端读一遍配置，确认条目还在、提示词块还完整。
+/// 待探活的一个客户端：配置侧的事实 + 探活要用的原始条目。
 ///
-/// 单独做一个「校验」而不是只在接入时检查一次：用户可能事后手改配置文件，
-/// 也可能换了客户端版本导致配置搬家。接入页要能回答「现在还通不通」。
-pub fn verify(clients: &[String]) -> Value {
+/// 用具名结构体而不是六元组：`zip` 之后要同时解出 `installed` / `entry` /
+/// `instruction` 三样，元组下标写错（`entry` 与 `mcp_error` 都是 `Option`）编译器
+/// 也不会拦 —— 那种错误的表现是「卡片显示的身份来自另一个字段」，很难查。
+struct Target {
+    id: String,
+    name: String,
+    installed: bool,
+    entry: Option<Value>,
+    mcp_error: Option<String>,
+    instruction: Option<BlockState>,
+}
+
+/// 校验：逐个客户端读一遍配置，确认条目还在，**再真的发一次 `initialize`**。
+///
+/// ── 为什么必须真发请求 ──────────────────────────────────────
+/// 早先这里只读盘（条目在不在、标记块全不全），于是「测试连接」这个名字是假的：
+/// 配置文件写对了但密钥失效、端口改了、服务没起，它照样报「检测通过」。用户拿
+/// 这个绿色结论去排查「为什么 Agent 不写记忆」，方向会被彻底带偏。
+///
+/// ── 为什么用**配置里那把** url / headers ────────────────────
+/// 要回答的是「这个客户端照它现在的配置，能不能连上」。用网关自己算一遍地址去
+/// 探活，测的是「网关能不能连自己」—— 永远为真，一点信息量都没有。所以 url 和
+/// 鉴权头都从快照里取，探的就是客户端将来会走的那条路。
+///
+/// ── 为什么探 `initialize` 而不是 `tools/list` ────────────────
+/// `initialize` 是任何 MCP 客户端握手的第一步，也是最便宜的一次往返：它不碰
+/// 记忆数据、不写心跳、不需要任何参数。`tools/list` 要多传一次协议版本，且
+/// 万一服务端按会话记账，会把「探活」记成「客户端真的在用了」。
+pub async fn verify(clients: &[String]) -> Value {
     let targets: Vec<String> = if clients.is_empty() {
         config::strings_of("agents.enabled")
     } else {
         clients.to_vec()
     };
+    // 读配置是同步文件 IO：放到 `blocking::in_place` 里，免得在 async 上下文里
+    // 阻塞 tokio 的 worker 线程（项目里读盘一律走这条，见 `core::blocking`）。
+    let prepared = crate::server::core::blocking::in_place(|| read_targets(&targets));
+
+    // 只探「配置里确实有我们这一条」的客户端；没有条目的不用发请求 —— 结论是
+    // 「没接入」，不是「连不上」，两者给用户的下一步完全不同。
+    let probes = futures::future::join_all(prepared.iter().map(|target| async move {
+        if target.installed {
+            probe(target.entry.as_ref()).await
+        } else {
+            Probe::skipped("配置里没有这条 MCP 条目")
+        }
+    }))
+    .await;
+
     let mut rows = Vec::new();
-    for id in targets {
-        let Some(def) = hub::find(&id) else {
-            rows.push(json!({ "id": id, "ok": false, "message": "未知客户端" }));
-            continue;
-        };
-        let mcp = resources::snapshot(def, "mcp");
-        let installed = mcp
-            .as_ref()
-            .ok()
-            .and_then(|snapshot| snapshot.get("servers").and_then(Value::as_array))
-            .is_some_and(|servers| {
-                servers
-                    .iter()
-                    .any(|server| server.get("name").and_then(Value::as_str) == Some(server_name()))
-            });
-        let instruction = resources::snapshot(def, "prompt")
-            .ok()
-            .and_then(|snapshot| snapshot.get("path").and_then(Value::as_str).map(str::to_string))
-            .map(|path| block_state(&path));
+    // 循环变量不叫 `probe`：本模块有同名 async fn，遮住之后若将来在循环体内再
+    // 想探一次，会得到「调用一个 struct」（E0618 同款）。
+    for (target, outcome) in prepared.into_iter().zip(probes) {
+        // `ok` 的含义收窄成「配置在 **且** 探活成功」：徽标上的绿必须对应一个
+        // 真实往返，否则又回到「读盘报通过」的老问题。
+        let ok = target.installed && outcome.reachable;
         rows.push(json!({
-            "id": id,
-            "name": def.name,
-            "ok": installed,
-            "mcp": installed,
-            "mcpError": mcp.err(),
-            "instruction": instruction.map(|state| json!({
+            "id": target.id,
+            "name": target.name,
+            "ok": ok,
+            "mcp": target.installed,
+            "mcpError": target.mcp_error,
+            "agentHeader": target.entry.as_ref().and_then(agent_header),
+            "reachable": outcome.reachable,
+            "detail": outcome.detail,
+            "instruction": target.instruction.map(|state| json!({
                 "injected": state.injected,
                 "broken": state.broken,
             })),
@@ -609,6 +683,178 @@ pub fn verify(clients: &[String]) -> Value {
         .filter(|row| row.get("ok").and_then(Value::as_bool) == Some(true))
         .count();
     json!({ "rows": rows, "ok": ok, "total": rows.len() })
+}
+
+/// 逐个客户端把配置侧的事实读出来（同步 IO，调用方负责切到 blocking 上下文）。
+fn read_targets(ids: &[String]) -> Vec<Target> {
+    let mut prepared: Vec<Target> = Vec::new();
+    for id in ids {
+        let Some(def) = hub::find(id) else {
+            prepared.push(Target {
+                id: id.clone(),
+                name: String::new(),
+                installed: false,
+                entry: None,
+                mcp_error: Some("未知客户端".into()),
+                instruction: None,
+            });
+            continue;
+        };
+        let mcp = resources::snapshot(def, "mcp");
+        let mcp_error = mcp.as_ref().err().cloned();
+        let entry = mcp_entry_of(mcp.as_ref().ok());
+        let instruction = resources::snapshot(def, "prompt")
+            .ok()
+            .and_then(|snapshot| snapshot.get("path").and_then(Value::as_str).map(str::to_string))
+            .map(|path| block_state(&path));
+        prepared.push(Target {
+            id: id.clone(),
+            name: def.name.to_string(),
+            installed: entry.is_some(),
+            entry,
+            mcp_error,
+            instruction,
+        });
+    }
+    prepared
+}
+
+/// 一次探活的结果。
+struct Probe {
+    reachable: bool,
+    detail: String,
+}
+
+impl Probe {
+    fn skipped(detail: &str) -> Self {
+        Self { reachable: false, detail: detail.to_string() }
+    }
+    fn failed(detail: String) -> Self {
+        Self { reachable: false, detail }
+    }
+}
+
+/// 按客户端配置里的 url / headers 发一次 MCP `initialize`。
+///
+/// 客户端配置里可能根本没有 url（本地桥接形态是 `command` + `args`），那种情况
+/// 我们探不了 —— 桥接进程是客户端自己 spawn 的，网关这边看不到。明确说「探不了」
+/// 比编一个「通过」诚实。
+async fn probe(entry: Option<&Value>) -> Probe {
+    let Some(config) = entry else {
+        return Probe::skipped("配置里没有这条 MCP 条目");
+    };
+    let Some(url) = config
+        .get("url")
+        .or_else(|| config.get("httpUrl"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    else {
+        return Probe::skipped("这条配置走本地桥接（command），网关无法代探");
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        // 探的是本机/局域网端点，绝不能被系统代理截走 —— 一个配了全局代理的
+        // 机器上，请求会跑到代理那边去，得到的 502 会被误读成「服务挂了」。
+        .no_proxy()
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return Probe::failed(format!("构造探活请求失败：{error}")),
+    };
+
+    let mut request = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "agent2api-verify", "version": env!("CARGO_PKG_VERSION") },
+            },
+        }));
+    for (name, value) in config_headers(config) {
+        request = request.header(name, value);
+    }
+
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            // 连不上是接入页最需要区分的一类失败：服务没起 / 端口不对 / 被防火墙
+            // 挡了。`reqwest` 的错误文本已经分得够细（connection refused / timeout），
+            // 原样带上比我们自己归纳成一句「失败」有用得多。
+            return Probe::failed(format!("连不上 {url}：{error}"));
+        }
+    };
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Probe::failed(format!("{url} 返回 {status} —— 配置里的 API Key 无效或已停用"));
+    }
+    if !status.is_success() {
+        return Probe::failed(format!("{url} 返回 {status}"));
+    }
+
+    // 握手成功的判据是「回了带 serverInfo 的 result」，不是「HTTP 200」：
+    // 反代 / 登录页也可能给 200，那种 200 会让客户端拿不到任何工具。
+    let body: Value = match response.json().await {
+        Ok(body) => body,
+        Err(error) => return Probe::failed(format!("响应不是 JSON：{error}")),
+    };
+    match handshake(&body) {
+        Some(name) => Probe { reachable: true, detail: format!("{url} 握手成功（{name}）") },
+        None => Probe::failed(format!("{url} 有响应但不是 MCP 握手：{}", brief(&body))),
+    }
+}
+
+/// 响应体是不是一次成功的 MCP 握手？是则返回服务端自报的名字。
+///
+/// 只看 `result.serverInfo.name`：JSON-RPC 的错误响应长成 `{"error": {...}}`，
+/// 没有 `result`，天然被排除；而「200 + 登录页 HTML」在解析 JSON 那一步就失败了。
+/// 单独抽成函数是为了能测 —— `probe` 本身要发网络请求，测试里不该起服务。
+fn handshake(body: &Value) -> Option<&str> {
+    body.get("result")
+        .and_then(|result| result.get("serverInfo"))
+        .and_then(|info| info.get("name"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+}
+
+/// 配置里的请求头，转成可以塞进 reqwest 的键值对。
+///
+/// `Authorization` 与 `X-Agent` 都要带上：少了前者会被判 401（探活变成误报失败），
+/// 少了后者虽然能握手，但探的不是「客户端真实会发的那一份」。
+fn config_headers(config: &Value) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for key in ["headers", "http_headers", "httpHeaders"] {
+        let Some(headers) = config.get(key).and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, value) in headers {
+            if let Some(text) = value.as_str() {
+                pairs.push((name.clone(), text.to_string()));
+            }
+        }
+    }
+    pairs
+}
+
+/// 把响应体截短到可读长度。
+///
+/// 不叫 `snippet`：本模块有 `pub fn snippet(base_url)`（配置片段），同名会让
+/// 编译直接失败 —— 而且这种失败发生在「加了个小工具函数」之后，第一眼很难联想到
+/// 是重名。
+fn brief(body: &Value) -> String {
+    let text = body.to_string();
+    if text.chars().count() > 160 {
+        format!("{}…", text.chars().take(160).collect::<String>())
+    } else {
+        text
+    }
 }
 
 /// 配置片段：给自定义客户端 / 手贴用。
@@ -679,5 +925,86 @@ mod tests {
         let result = inject_block("", INSTRUCTION_BLOCK).unwrap();
         assert!(result.starts_with(BLOCK_BEGIN));
         assert_eq!(result.matches(BLOCK_BEGIN).count(), 1);
+    }
+
+    /// 身份头三种容器都要认得。
+    ///
+    /// 漏掉 `http_headers`（Codex）或大小写写歪，卡片会误报「缺身份」，
+    /// 用户于是去点一键注入，把本来正确的配置重写一遍 —— 白折腾还多一次备份。
+    #[test]
+    fn agent_header_reads_every_container() {
+        let plain = json!({ "headers": { "X-Agent": "workbuddy" } });
+        assert_eq!(agent_header(&plain).as_deref(), Some("workbuddy"));
+
+        let codex = json!({ "http_headers": { "x-agent": "codex" } });
+        assert_eq!(agent_header(&codex).as_deref(), Some("codex"));
+
+        // 真实世界里 `X-AGENT` / `x-Agent` 都出现过，客户端自己不区分大小写。
+        let shouted = json!({ "headers": { "X-AGENT": "claude-code" } });
+        assert_eq!(agent_header(&shouted).as_deref(), Some("claude-code"));
+    }
+
+    /// 老版本写的那一条（只有 Authorization）必须判成「缺身份」。
+    ///
+    /// 这是本次修复的起因：条目存在 → 卡片显示「已接入」→ 用户以为一切正常，
+    /// 而记忆其实全落进 `l1/mcp/`。判定必须为 None，界面才有机会提示重写。
+    #[test]
+    fn legacy_entry_without_identity_is_detected() {
+        let legacy = json!({ "type": "http", "url": "http://127.0.0.1:3065/mcp/memory",
+            "headers": { "Authorization": "Bearer sk-a2a-x" } });
+        assert_eq!(agent_header(&legacy), None);
+    }
+
+    /// 空值不算写了：`"X-Agent": ""` 与没有这一条对下游等价（都会回落 `mcp`），
+    /// 所以卡片也不该显示一个空的身份。
+    #[test]
+    fn blank_identity_counts_as_missing() {
+        let blank = json!({ "headers": { "X-Agent": "   " } });
+        assert_eq!(agent_header(&blank), None);
+    }
+
+    /// 探活要带的就是配置里那几个头，一个不能少。
+    ///
+    /// 少了 `Authorization` → 401，探活变成误报失败；少了 `X-Agent` → 探的不是
+    /// 客户端真实会发的那一份。
+    #[test]
+    fn config_headers_collects_auth_and_identity() {
+        let entry = json!({ "headers": { "Authorization": "Bearer sk-a2a-x", "X-Agent": "workbuddy" } });
+        let pairs = config_headers(&entry);
+        let get = |key: &str| pairs.iter().find(|(name, _)| name == key).map(|(_, value)| value.as_str());
+        assert_eq!(get("Authorization"), Some("Bearer sk-a2a-x"));
+        assert_eq!(get("X-Agent"), Some("workbuddy"));
+    }
+
+    /// 真握手成功的响应长什么样（取自本机网关的实际返回）。
+    #[test]
+    fn handshake_accepts_the_real_initialize_response() {
+        let body = json!({
+            "id": 1, "jsonrpc": "2.0",
+            "result": {
+                "capabilities": { "tools": {} },
+                "instructions": "…",
+                "protocolVersion": "2024-11-05",
+                "serverInfo": { "name": "agent2api-memory", "version": "1.0.0" },
+            },
+        });
+        assert_eq!(handshake(&body), Some("agent2api-memory"));
+    }
+
+    /// 401 / 反代页 / JSON-RPC 错误都不是握手成功。
+    ///
+    /// 这条断言守的是「测试连接」的可信度：只要有一类非握手的 200 被当成通过，
+    /// 用户就会拿着假绿去排查真问题。
+    #[test]
+    fn handshake_rejects_non_mcp_payloads() {
+        // JSON-RPC 错误：有 jsonrpc 有 id，但没有 result
+        let error = json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32600, "message": "bad" } });
+        assert_eq!(handshake(&error), None);
+        // 反代 / 登录页包装过的响应
+        let proxy = json!({ "code": 200, "data": { "ok": true } });
+        assert_eq!(handshake(&proxy), None);
+        // serverInfo 里名字为空 —— 客户端会拿不到可用服务名
+        let blank = json!({ "result": { "serverInfo": { "name": "" } } });
+        assert_eq!(handshake(&blank), None);
     }
 }

@@ -32,13 +32,24 @@ import { Empty, Panel, Section, StateBadge, num, useLoad } from './memory-shared
  * 卡片右上角的两枚徽标：装了没、接上了没。
  *
  * 两枚都只判真假，不掺程度（不写「检测通过 N 次」）—— 次数在「真实调用」
- * 那一行有，挤进徽标只会让人以为它是另一个维度。
+ * 那一行有，挤进徽标只会让人以为它是另一个维度。词汇固定四个：
+ * 已安装 / 未检出、已接入 / 未接入，不因为细分状态再长出新词。
+ *
+ * ── 为什么「已接入」有时是黄的 ──────────────────────────────
+ * 条目在 = 客户端会去连；但老版本安装器写的条目**没有 `X-Agent`**，连上之后
+ * 记忆会全部落进共用的 `l1/mcp/`，事后分不清是哪个客户端写的。这时候状态还是
+ * 「已接入」（事实没变），颜色降成 warn，具体原因写在卡片内的提示行 ——
+ * 徽标负责扫视，解释归正文，两件事不混。
  */
 function DetectState({ card }: { card: m.AgentCard }): React.ReactElement {
+  const missingIdentity = card.mcp.installed && !card.mcp.agentHeader
   return (
     <>
       <StateBadge state={card.detected ? 'ok' : 'idle'} label={card.detected ? t('已安装') : t('未检出')} />
-      <StateBadge state={card.mcp.installed ? 'ok' : 'idle'} label={card.mcp.installed ? t('已接入') : t('未接入')} />
+      <StateBadge
+        state={card.mcp.installed ? (missingIdentity ? 'warn' : 'ok') : 'idle'}
+        label={card.mcp.installed ? t('已接入') : t('未接入')}
+      />
     </>
   )
 }
@@ -87,19 +98,33 @@ function Agents(): React.ReactElement {
     }
   }
 
+  /**
+   * 测试连接：现在真的发一次 MCP `initialize`，不是读盘。
+   *
+   * 失败时把后端给的 `detail` 原样显示 —— 它带着具体地址与错误（连不上 / 401 /
+   * 不是 MCP 握手），比「检测没通过」有用得多，用户照着就能定位是端口、密钥
+   * 还是服务没起。
+   */
   const testOne = (card: m.AgentCard) => run(card.id, async () => {
     const result = await m.verifyAgents([card.id])
-    const row = result.rows[0] ?? {}
-    const detailText = String(row.detail ?? row.message ?? '')
-    if (!result.ok) throw new Error(detailText || t('检测没通过'))
+    const row = result.rows[0]
+    const detailText = row?.detail || ''
+    if (!row?.ok) throw new Error(detailText || t('检测没通过'))
     return detailText || t('检测通过')
   })
 
+  /**
+   * 一键注入：写 MCP 条目（带 `X-Agent` 身份）+ 按配置写指令文件受控块。
+   *
+   * 提示里带上「重启客户端」这一步 —— 配置只在启动时读一次，写完不重启等于没写，
+   * 用户会盯着「尚未观察到真实调用」以为功能坏了。
+   */
   const injectOne = (card: m.AgentCard) => run(card.id, async () => {
     const result = await m.installAgents([card.id], apiKeyId)
     const row = result.results.find(item => item.id === card.id)
     if (row && !row.ok) throw new Error(row.error ?? t('写入失败'))
-    return [row?.mcp, row?.instruction].filter(Boolean).join(' · ') || t('已写入')
+    const wrote = [row?.mcp, row?.instruction].filter(Boolean).join(' · ')
+    return `${wrote || t('已写入')}${t('。重启 {name} 后生效 —— 配置只在启动时读一次。', { name: card.name })}`
   })
 
   const dropOne = (card: m.AgentCard) => run(card.id, async () => {
@@ -147,8 +172,20 @@ function Agents(): React.ReactElement {
               disabled={busyId !== ''}
               onClick={() => void run('__all__', async () => {
                 const result = await m.verifyAgents([])
-                if (result.ok < result.total) throw new Error(t('{ok} / {total} 个正常，其余有问题', { ok: result.ok, total: result.total }))
-                return t('{n} 个全部正常', { n: result.total })
+                // 分母只算「配置里真有我们这一条」的客户端：把没接入的算成失败，
+                // 用户会看到「0 / 7 个正常」这种毫无信息量的结论 —— 那 6 个从来
+                // 就没接过，谈不上好坏。
+                const wired = result.rows.filter(row => row.mcp)
+                if (!wired.length) throw new Error(t('没有任何客户端写入过记忆配置'))
+                const dead = wired.filter(row => !row.ok)
+                if (dead.length) {
+                  throw new Error(t('{ok} / {total} 个握手成功；{names} 连不上', {
+                    ok: wired.length - dead.length,
+                    total: wired.length,
+                    names: dead.map(row => row.name ?? row.id).join('、'),
+                  }))
+                }
+                return t('{n} 个已接入的客户端全部握手成功', { n: wired.length })
               })}
             >
               {busyId === '__all__' ? t('校验中…') : t('全部校验')}
@@ -235,6 +272,11 @@ function Agents(): React.ReactElement {
                   </div>
                 </div>
 
+                {card.mcp.installed && !card.mcp.agentHeader ? (
+                  <p className='mm-agent-note'>
+                    {t('这条配置是旧版本写的，缺客户端身份 —— 记忆会记到共用的 mcp 名下。点「一键注入」重写一次即可补齐。')}
+                  </p>
+                ) : null}
                 {card.heartbeat && card.heartbeat.calls > 0 && !card.heartbeat.ok ? (
                   <p className='mm-agent-note'>{t('最近一次调用失败了 —— 看服务端日志里的 memory 工具报错。')}</p>
                 ) : null}

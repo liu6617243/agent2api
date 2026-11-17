@@ -321,7 +321,9 @@ export type AgentCard = {
   format?: string
   supported: boolean
   note?: string | null
-  mcp: { installed: boolean; serverName: string }
+  /** 这一条配置里的 `X-Agent`（决定 `l1/<agent>/` 与心跳归属）。
+   *  `null` = 老版本安装器写的条目，能连但记忆会落进共用的 `mcp` 目录。 */
+  mcp: { installed: boolean; agentHeader?: string | null; serverName: string }
   instruction: { path?: string | null; exists: boolean; injected: boolean; broken: boolean } | null
   heartbeat: {
     agent: string
@@ -805,7 +807,19 @@ export function uninstallAgents(clients: string[]): Promise<{ results: InstallRe
   return api('POST', '/api/memory/agents/uninstall', { clients })
 }
 
-export function verifyAgents(clients: string[]): Promise<{ rows: Record<string, unknown>[]; ok: number; total: number }> {
+/** 一次探活的结果。`ok` = 配置在**且**握手成功，不再是「读盘看见条目」。 */
+export type AgentVerifyRow = {
+  id: string
+  name?: string
+  ok: boolean
+  mcp: boolean
+  reachable?: boolean
+  detail?: string
+  agentHeader?: string | null
+  mcpError?: string | null
+}
+
+export function verifyAgents(clients: string[]): Promise<{ rows: AgentVerifyRow[]; ok: number; total: number }> {
   return api('POST', '/api/memory/agents/verify', { clients })
 }
 
