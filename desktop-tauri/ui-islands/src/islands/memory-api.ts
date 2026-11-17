@@ -316,6 +316,9 @@ export type AgentCard = {
   enabled: boolean
   configPath?: string | null
   configExists: boolean
+  /** 该客户端配置文件的形态：`json` / `jsonc` / `json+env` / `toml` / `yaml`。
+   *  「手动接入片段」按它决定给 JSON 还是 TOML。 */
+  format?: string
   supported: boolean
   note?: string | null
   mcp: { installed: boolean; serverName: string }
@@ -329,16 +332,43 @@ export type AgentCard = {
     version?: string | null
     ok: boolean
     alive: boolean
+    /** 写类工具次数（升级后才开始分类，可能小于 `calls`） */
+    writes?: number
+    /** 读 / 检索类工具次数 */
+    reads?: number
+    /** 失败次数（失败优先计数，不重复计入 reads） */
+    errors?: number
   } | null
 }
 
 export type AgentList = {
   cards: AgentCard[]
-  custom: { id: string; name: string; custom: boolean }[]
+  custom: AgentCustom[]
   serverName: string
   endpoint: string
   injectAgentsMd: boolean
   tools: number
+}
+
+/**
+ * 自定义 Agent（用户手填的扩展位）。
+ *
+ * 没有资源写入器 —— 我们不知道它家配置的合并语义，所以它不参与「一键注入」，
+ * 只提供片段让用户自己贴。`installed` 是「配置文件里出现过我们的服务名」，
+ * 文本级判断，够回答「我到底贴进去了没有」。
+ */
+export type AgentCustom = {
+  id: string
+  name: string
+  custom: true
+  configPath: string
+  configExists: boolean
+  /** `json` | `toml`：条目写在 `mcpServers` 还是 `[mcp_servers]` */
+  format: string
+  instructionPath: string
+  instructionExists: boolean
+  installed: boolean
+  detected: boolean
 }
 
 export type InstallResult = {
@@ -355,6 +385,9 @@ export type AgentSnippet = {
   url: string
   json: unknown
   toml: string
+  /** Claude Code 的 `claude mcp add` 命令。其它客户端 CLI 语法各家不同，不猜。 */
+  commandLine?: string
+  commandLineFor?: string
   instruction: string
 }
 
@@ -774,6 +807,20 @@ export function uninstallAgents(clients: string[]): Promise<{ results: InstallRe
 
 export function verifyAgents(clients: string[]): Promise<{ rows: Record<string, unknown>[]; ok: number; total: number }> {
   return api('POST', '/api/memory/agents/verify', { clients })
+}
+
+/** 加一条自定义 Agent（同名覆盖）。返回整份 custom 列表。 */
+export function addCustomAgent(
+  name: string,
+  configPath: string,
+  format: string,
+  instructionPath = '',
+): Promise<AgentCustom[]> {
+  return api('POST', '/api/memory/agents/custom/add', { name, configPath, format, instructionPath })
+}
+
+export function removeCustomAgent(name: string): Promise<AgentCustom[]> {
+  return api('POST', '/api/memory/agents/custom/remove', { name })
 }
 
 /**

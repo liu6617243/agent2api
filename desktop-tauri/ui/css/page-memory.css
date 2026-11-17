@@ -537,36 +537,169 @@
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--surface-inset);
-  cursor: pointer;
+  /* 卡片不再是 <label>，没有「点整卡 = 勾选」这回事，光标保持默认箭头：
+     整卡可点却什么也不发生的观感比不可点更糟。 */
+  min-width: 0;
 }
-.mm-agent-card.disabled { opacity: 0.6; cursor: default; }
+.mm-agent-card.disabled { opacity: 0.72; }
 .mm-agent-head { display: flex; align-items: center; gap: 9px; }
+/* 品牌色小圆点：三列网格里每像素都紧，它比字母方块更快被认出来又不占宽。 */
+.mm-agent-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  margin-top: 1px;
+}
 .mm-agent-id { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
-.mm-agent-id strong { font-size: 13px; }
+/* 名称允许省略：三列/四列网格里，两枚状态徽标会吃掉 150px，
+   宁可把「Claude Code」截成「Claude Co…」，也别让徽标换行到第二排。 */
+.mm-agent-id strong {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .mm-agent-id .mm-muted { font-size: 11px; }
-.mm-agent-badges { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+/* 两枚徽标之间留 6px：4px 时两个浅底 pill 会粘成一条，看起来像一个控件。 */
+.mm-agent-badges { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 .mm-agent-rows { display: flex; flex-direction: column; gap: 3px; }
 .mm-agent-note {
   font-size: 11.5px;
   color: var(--warn);
   line-height: 1.55;
+  margin: 0;
+}
+.mm-agent-hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.5;
+}
+/* 逐卡动作的结果条。绿/红只染左边框与文字，不铺底色 ——
+   卡片已经很密，一整块色底会把四行字段压下去。 */
+.mm-agent-result {
+  margin: 0;
+  padding: 3px 0 3px 8px;
+  border-left: 2px solid var(--border);
+  font-size: 11px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+.mm-agent-result.ok { border-left-color: var(--ok); color: var(--text-2); }
+.mm-agent-result.bad { border-left-color: var(--danger); color: var(--danger); }
+/* 按钮组：四个动作。允许换行 —— 320px 的列宽放不下四个小按钮，
+   强行 nowrap 会把「手动接入片段」压成两行文字。 */
+.mm-agent-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: auto;
+  padding-top: 2px;
 }
 .mm-custom-agents { display: flex; flex-direction: column; gap: 6px; }
 
+/* ── 手动接入 ─────────────────────────────────────────────────
+   一条控件行：目标下拉 / 形态分段 / 三个复制按钮。
+   窄屏各自换行 —— 这三组控件是不同的维度，宁可分行也不要把下拉压成 80px。 */
+.mm-manual-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.mm-manual-target { min-width: 168px; max-width: 260px; }
+.mm-seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+}
+.mm-seg-item {
+  padding: 0 10px;
+  height: 28px;
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 11.5px;
+  cursor: pointer;
+  /* 分段之间画一条竖线；最后一段不画（用它压住相邻段的分隔） */
+  border-left: 1px solid var(--border);
+}
+.mm-seg-item:first-child { border-left: 0; }
+.mm-seg-item:hover { background: var(--row-hover); color: var(--text-2); }
+.mm-seg-item.on { background: var(--surface-raised); color: var(--text); font-weight: 600; }
+
+/* 片段本体：限高 + 双向滚动。给 260px 是因为再高会把「手动步骤」那句
+   推到屏幕外，而那句话才是这块的用法说明。 */
+.mm-manual-code {
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+  background: var(--surface-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 9px 11px;
+  margin: 0;
+}
+.mm-manual-toggle {
+  align-self: flex-start;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 11.5px;
+  padding: 2px 0;
+  cursor: pointer;
+  text-align: left;
+}
+.mm-manual-toggle:hover { color: var(--text); }
+
+/* 自定义 Agent 表单：一行排开，窄屏逐项换行。 */
+.mm-custom-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.mm-custom-form > input:first-child { flex: 0 0 150px; }
+.mm-custom-form > input:nth-child(2) { flex: 1 1 300px; min-width: 200px; }
+.mm-custom-form > input:nth-child(4) { flex: 1 1 240px; min-width: 180px; }
+
 .mm-row-line {
   display: grid;
-  grid-template-columns: 74px 1fr;
+  /* 第二列写 `minmax(0, 1fr)` 而不是 `1fr`：`1fr` 的最小尺寸是 min-content，
+     而值列里是 `white-space: nowrap` 的路径 —— 它会把列撑到路径的完整宽度，
+     整个卡片跟着横向溢出（实测 57px）。`minmax(0, 1fr)` 才允许它收缩到省略号。 */
+  grid-template-columns: 64px minmax(0, 1fr);
   gap: 8px;
   font-size: 11.5px;
   align-items: baseline;
 }
 .mm-row-label { color: var(--text-3); }
 .mm-row-value { color: var(--text-2); display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+/* 带路径的两行不换行：路径 + 状态徽标必须同一行。
+   换行会让「存在 / 不存在」掉到路径下面一行，而它恰恰是这一行最该被看见的字。 */
+.mm-row-value.tight { flex-wrap: nowrap; }
+.mm-row-value.tight .badge { flex: 0 0 auto; }
 .mm-row-value code {
   font-family: var(--font-mono);
   font-size: 11px;
-  word-break: break-all;
+  /* 路径单行省略，不折行。
+     卡片只有 336px 宽，一条 Windows 绝对路径折成三行之后，一张卡会从 170px
+     涨到 420px —— 而涨出来的高度全是「C:\Users\yiyiyoyo\.config\opencode\」
+     这种前缀，信息量为零。完整路径在 title 里，鼠标停一下就看得见。 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1 1 auto;
+  min-width: 0;
 }
+/* 但「真实调用」那行是句子，必须能换行 —— 它没有 code 元素包着。
+   `.mm-row-value` 自己保留 wrap，只有 code 走省略。 */
 
 .mm-result-list { display: flex; flex-direction: column; gap: 5px; }
 .mm-result-row {

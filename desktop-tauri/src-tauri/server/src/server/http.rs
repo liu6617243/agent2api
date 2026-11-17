@@ -382,6 +382,8 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/memory/agents/uninstall", post(api::memory::post_agents_uninstall))
         .route("/api/memory/agents/verify", post(api::memory::post_agents_verify))
         .route("/api/memory/agents/snippet", get(api::memory::get_agents_snippet))
+        .route("/api/memory/agents/custom/add", post(api::memory::post_agents_custom_add))
+        .route("/api/memory/agents/custom/remove", post(api::memory::post_agents_custom_remove))
         .route("/api/memory/write", post(api::memory::post_write))
         .route("/api/memory/update", post(api::memory::post_update))
         .route("/api/memory/delete", post(api::memory::post_delete))

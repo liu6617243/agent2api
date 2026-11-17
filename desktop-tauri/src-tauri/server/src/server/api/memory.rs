@@ -325,6 +325,42 @@ pub async fn get_agents_snippet(State(state): State<ServerState>, headers: axum:
     ok_json(memory::agents::snippet(&gateway_base(&headers, &state)))
 }
 
+/// 加一条自定义 Agent（扩展位）。同名覆盖。
+pub async fn post_agents_custom_add(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(error) => return errors::management_error(400, error.message),
+    };
+    let text = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+    let (name, config_path, format, instruction_path) = (
+        text("name"),
+        text("configPath"),
+        text("format"),
+        text("instructionPath"),
+    );
+    let outcome = crate::server::core::blocking::run(move || {
+        memory::agents::add_custom(&name, &config_path, &format, &instruction_path)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(value)) => ok_json(value),
+        Ok(Err(message)) => errors::management_error(400, message),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+/// 删一条自定义 Agent。
+pub async fn post_agents_custom_remove(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let name = payload.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let outcome = crate::server::core::blocking::run(move || memory::agents::remove_custom(&name)).await;
+    match outcome {
+        Ok(Ok(value)) => ok_json(value),
+        Ok(Err(message)) => errors::management_error(400, message),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
 /// 「客户端要访问的网关地址」。
 ///
 /// 面板端口与网关端口可能不同：客户端连的是网关端口，所以有面板端口时要把

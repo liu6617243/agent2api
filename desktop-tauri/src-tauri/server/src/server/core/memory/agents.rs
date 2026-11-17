@@ -125,6 +125,9 @@ pub fn list() -> Value {
             "enabled": enabled.iter().any(|item| item.as_str() == def.id),
             "configPath": mcp_path.as_ref().map(|path| path.display().to_string()),
             "configExists": mcp_path.as_ref().is_some_and(|path| path.is_file()),
+            // 配置文件形态（json / jsonc / json+env / toml / yaml）。页面「手动接入
+            // 片段」要按它选 JSON 还是 TOML —— 给 Codex 贴一段 JSON 是纯浪费用户时间。
+            "format": def.format.as_str(),
             "supported": supported,
             "note": mcp_error.clone().or(detection.note.clone()),
             "mcp": {
@@ -140,11 +143,30 @@ pub fn list() -> Value {
         }));
     }
 
-    // 自定义客户端：用户手填路径的兜底通道。不参与一键接入（格式未知），
-    // 只把配置片段给他自己贴。
-    let custom: Vec<Value> = config::strings_of("agents.custom")
-        .into_iter()
-        .map(|entry| json!({ "id": entry, "name": entry, "custom": true }))
+    // 自定义客户端：用户手填路径的兜底通道。不参与一键接入（没有资源写入器，
+    // 不知道它家配置的合并语义），只把配置片段给他自己贴。
+    let custom: Vec<Value> = custom_agents()
+        .iter()
+        .map(|item| {
+            let config_exists = !item.config_path.is_empty() && std::path::Path::new(&item.config_path).is_file();
+            let instruction_exists = !item.instruction_path.is_empty()
+                && std::path::Path::new(&item.instruction_path).is_file();
+            json!({
+                "id": item.name,
+                "name": item.name,
+                "custom": true,
+                "configPath": item.config_path,
+                "configExists": config_exists,
+                "format": item.format,
+                "instructionPath": item.instruction_path,
+                "instructionExists": instruction_exists,
+                // 「写过没有」只看配置文件里有没有这个名字。自定义 Agent 的格式
+                // 我们没解析，做不了 keys 级判断 —— 但「这一行有没有出现」足够
+                // 回答用户此刻的问题（我到底贴进去了没有）。
+                "installed": config_exists && item.mentions_server(),
+                "detected": config_exists,
+            })
+        })
         .collect();
 
     json!({
@@ -155,6 +177,128 @@ pub fn list() -> Value {
         "injectAgentsMd": config::bool_of("agents.injectAgentsMd"),
         "tools": tool_services::capability_count(tool_services::MEMORY_SERVICE_ID),
     })
+}
+
+// ── 自定义 Agent（用户手填的扩展位）────────────────────────────
+
+/// 一条自定义 Agent。
+///
+/// ── 为什么存成 `名称|配置路径|格式|指令路径` 而不是 JSON 对象 ──
+/// `agents.custom` 是 `Kind::List`（字符串数组），改成对象数组要动配置校验那一层；
+/// 而这四个字段都是短字符串，竖线分隔与 `import.sources` 是同一套写法。
+/// 兼容旧数据：老版本只存了名称（裸字符串），解析时按「只有名字」处理。
+#[derive(Debug, Clone)]
+pub struct CustomAgent {
+    pub name: String,
+    pub config_path: String,
+    /// `json`（条目写在 `mcpServers`）或 `toml`（写在 `[mcp_servers]` 表）
+    pub format: String,
+    pub instruction_path: String,
+}
+
+impl CustomAgent {
+    fn parse(raw: &str) -> Option<Self> {
+        let text = raw.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let mut parts = text.split('|').map(str::trim);
+        let name = parts.next().unwrap_or_default().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        let config_path = parts.next().unwrap_or_default().to_string();
+        let format = parts
+            .next()
+            .map(|value| value.to_ascii_lowercase())
+            .filter(|value| value == "json" || value == "toml")
+            .unwrap_or_else(|| "json".to_string());
+        let instruction_path = parts.next().unwrap_or_default().to_string();
+        Some(Self { name, config_path, format, instruction_path })
+    }
+
+    fn to_config(&self) -> String {
+        format!("{}|{}|{}|{}", self.name, self.config_path, self.format, self.instruction_path)
+    }
+
+    /// 配置文件里出现过我们的 server 名吗。
+    ///
+    /// 用文本包含而不是解析：JSON / TOML 两种格式各写一套解析只为回答一个是非题，
+    /// 反而多两处会漂移的地方。代价是别人在注释里写到这个名字时会误报 ——
+    /// 这个代价比「解析器跟客户端格式一起演进」小得多。
+    fn mentions_server(&self) -> bool {
+        if self.config_path.is_empty() {
+            return false;
+        }
+        std::fs::read_to_string(&self.config_path)
+            .map(|text| text.contains(server_name()))
+            .unwrap_or(false)
+    }
+}
+
+/// 当前配置里的自定义 Agent 列表。
+pub fn custom_agents() -> Vec<CustomAgent> {
+    config::strings_of("agents.custom")
+        .iter()
+        .filter_map(|raw| CustomAgent::parse(raw))
+        .collect()
+}
+
+/// 加一条自定义 Agent（同名覆盖）。
+///
+/// ── 为什么要跟扩展名对一下格式 ──────────────────────────────
+/// 格式选错的表现是「保存成功了，但那条 MCP 条目写在错误的键下，客户端永远读不到」
+/// —— 用户会以为是客户端不支持。这里在保存时就拦：`.toml` 配 `json` 直接报错。
+pub fn add_custom(name: &str, config_path: &str, format: &str, instruction_path: &str) -> Result<Value, String> {
+    let name = name.trim();
+    let config_path = config_path.trim();
+    if name.is_empty() {
+        return Err("名称不能为空".into());
+    }
+    if config_path.is_empty() {
+        return Err("配置文件路径不能为空".into());
+    }
+    let format = format.trim().to_ascii_lowercase();
+    let format = match format.as_str() {
+        "json" | "toml" => format,
+        _ => return Err(format!("不认识的格式：{format}（只支持 json / toml）")),
+    };
+    let lowered = config_path.to_ascii_lowercase();
+    if lowered.ends_with(".toml") && format == "json" {
+        return Err("配置文件是 .toml，格式要选 TOML —— 用 JSON 写进去客户端读不到".into());
+    }
+    if (lowered.ends_with(".json") || lowered.ends_with(".jsonc")) && format == "toml" {
+        return Err("配置文件是 JSON，格式要选 JSON —— 用 TOML 写进去客户端读不到".into());
+    }
+
+    let mut items = custom_agents();
+    let entry = CustomAgent {
+        name: name.to_string(),
+        config_path: config_path.to_string(),
+        format,
+        instruction_path: instruction_path.trim().to_string(),
+    };
+    match items.iter_mut().find(|item| item.name == entry.name) {
+        Some(slot) => *slot = entry,
+        None => items.push(entry),
+    }
+    let list: Vec<Value> = items.iter().map(|item| json!(item.to_config())).collect();
+    config::update(|next| next.set("agents.custom", json!(list)))?;
+    Ok(list())
+}
+
+/// 删一条自定义 Agent。
+pub fn remove_custom(name: &str) -> Result<Value, String> {
+    let name = name.trim();
+    let mut items = custom_agents();
+    let before = items.len();
+    items.retain(|item| item.name != name);
+    if items.len() == before {
+        return Err(format!("没有这个自定义 Agent：{name}"));
+    }
+    let list: Vec<Value> = items.iter().map(|item| json!(item.to_config())).collect();
+    config::update(|next| next.set("agents.custom", json!(list)))?;
+    Ok(list())
 }
 
 struct BlockState {
@@ -489,6 +633,13 @@ pub fn snippet(base_url: &str) -> Value {
         "toml": format!(
             "[mcp_servers.{name}]\nurl = \"{url}\"\nhttp_headers = {{ Authorization = \"Bearer <你的 Agent2API Key>\" }}\n"
         ),
+        // 命令行形态只给 Claude Code：它的 CLI 语法是公开且稳定的。
+        // 其它客户端的 CLI 参数各家不同、还会随版本改 —— 猜一条错的命令，
+        // 用户会照着执行然后得到「未知参数」，比不给他更糟。页面上要写清这点。
+        "commandLine": format!(
+            "claude mcp add --transport http {name} {url} --header \"Authorization: Bearer <你的 Agent2API Key>\""
+        ),
+        "commandLineFor": "claude-code",
         "instruction": INSTRUCTION_BLOCK,
     })
 }

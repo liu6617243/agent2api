@@ -185,6 +185,24 @@ fn same_run(
     last_task == task && last_status == status && last_detail == detail
 }
 
+/// 这个工具是不是「写」。
+///
+/// ── 为什么用白名单而不是按名字猜 ────────────────────────────
+/// 「写 / 读」这两个字用户是当**后果**看的：说「写了 17 次」意味着记忆库被改了
+/// 17 次。猜错的代价是让人误判自己的数据被动过。所以只有明确落盘的几个算写，
+/// 其余（含 `memory_status` 这种纯查询、`memory_review_list` 这种读队列）都算读。
+fn is_write_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "memory_write"
+            | "memory_update"
+            | "memory_forget"
+            | "memory_digest"
+            | "memory_core"
+            | "memory_review_resolve"
+    )
+}
+
 impl MemoryIndex {
     fn open() -> Self {
         let path = super::store::index_file();
@@ -276,7 +294,10 @@ impl MemoryIndex {
                calls INTEGER DEFAULT 0,
                last_tool TEXT,
                version TEXT,
-               ok INTEGER DEFAULT 1
+               ok INTEGER DEFAULT 1,
+               writes INTEGER DEFAULT 0,
+               reads INTEGER DEFAULT 0,
+               errors INTEGER DEFAULT 0
              );
 
              CREATE TABLE IF NOT EXISTS mem_link (
@@ -362,6 +383,28 @@ impl MemoryIndex {
             .unwrap_or(false);
         if !has_repeat {
             let _ = conn.execute_batch("ALTER TABLE task_run ADD COLUMN repeat INTEGER DEFAULT 1;");
+        }
+
+        // 老库补列：`agent_beat` 的 writes / reads / errors 是后加的。
+        //
+        // 「共 30 次」这一句在页面上不够用 —— 用户真正想知道的是「它在写、在读，
+        // 还是在报错」。三列都从 0 起算：老库里历史调用的分类补不回来（当时没记
+        // 工具名的那部分只能算总数），所以这三列是「从这次升级之后的分布」，
+        // 页面文案要说清，不能让人以为它等于 calls。
+        let beat_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(agent_beat)")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .map(|rows| rows.flatten().collect())
+            })
+            .unwrap_or_default();
+        for column in ["writes", "reads", "errors"] {
+            if !beat_columns.iter().any(|name| name == column) {
+                let _ = conn.execute_batch(&format!(
+                    "ALTER TABLE agent_beat ADD COLUMN {column} INTEGER DEFAULT 0;"
+                ));
+            }
         }
 
         // FTS5 探测：建不起来就退化（编译期选项，不是运行期错误）
@@ -1046,21 +1089,40 @@ impl MemoryIndex {
     pub fn beat(&self, agent: &str, tool: &str, ok: bool) {
         let Ok(conn) = self.conn.lock() else { return };
         let now = crate::server::logging::now_ms();
+        // 归类在 Rust 侧做，不写进 SQL：`IN (...)` 拼字符串既难读又容易被工具名
+        // 里的引号咬到。失败优先计入 errors —— 一次失败的写不该同时算「写成功」，
+        // 否则「写 N / 错误 M」两个数字会互相矛盾。
+        let write = ok && is_write_tool(tool);
+        let read = ok && !write;
         let _ = conn.execute(
-            "INSERT INTO agent_beat (agent, last_seen, calls, last_tool, ok) VALUES (?1, ?2, 1, ?3, ?4)
+            "INSERT INTO agent_beat
+               (agent, last_seen, calls, last_tool, ok, writes, reads, errors)
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(agent) DO UPDATE SET
                last_seen = excluded.last_seen,
                calls = calls + 1,
                last_tool = excluded.last_tool,
-               ok = excluded.ok",
-            params![agent, now, tool, if ok { 1_i64 } else { 0 }],
+               ok = excluded.ok,
+               writes = writes + excluded.writes,
+               reads = reads + excluded.reads,
+               errors = errors + excluded.errors",
+            params![
+                agent,
+                now,
+                tool,
+                if ok { 1_i64 } else { 0 },
+                i64::from(write),
+                i64::from(read),
+                i64::from(!ok)
+            ],
         );
     }
 
     pub fn beats(&self) -> Vec<Value> {
         let Ok(conn) = self.conn.lock() else { return Vec::new() };
         let mut statement = match conn.prepare(
-            "SELECT agent, last_seen, calls, last_tool, version, ok FROM agent_beat ORDER BY last_seen DESC",
+            "SELECT agent, last_seen, calls, last_tool, version, ok, writes, reads, errors
+               FROM agent_beat ORDER BY last_seen DESC",
         ) {
             Ok(statement) => statement,
             Err(_) => return Vec::new(),
@@ -1077,6 +1139,10 @@ impl MemoryIndex {
                     "lastTool": row.get::<_, Option<String>>(3)?,
                     "version": row.get::<_, Option<String>>(4)?,
                     "ok": row.get::<_, i64>(5).unwrap_or(1) != 0,
+                    // 分类计数从升级之后起算，可能小于 calls（历史行没分类）
+                    "writes": row.get::<_, i64>(6).unwrap_or(0),
+                    "reads": row.get::<_, i64>(7).unwrap_or(0),
+                    "errors": row.get::<_, i64>(8).unwrap_or(0),
                     "alive": now - last_seen < 3_600_000,
                 }))
             })
