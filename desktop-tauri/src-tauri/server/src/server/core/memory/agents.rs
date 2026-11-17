@@ -282,8 +282,10 @@ pub fn add_custom(name: &str, config_path: &str, format: &str, instruction_path:
         Some(slot) => *slot = entry,
         None => items.push(entry),
     }
-    let list: Vec<Value> = items.iter().map(|item| json!(item.to_config())).collect();
-    config::update(|next| next.set("agents.custom", json!(list)))?;
+    // 变量不能叫 `list`：本模块有一个同名的 `fn list()`，局部绑定会把它遮住，
+    // 于是 `Ok(list())` 变成「调用一个 Vec」（E0618）。改完顺手记住这个坑。
+    let entries: Vec<Value> = items.iter().map(|item| json!(item.to_config())).collect();
+    config::update(|next| next.set("agents.custom", json!(entries)))?;
     Ok(list())
 }
 
@@ -296,8 +298,8 @@ pub fn remove_custom(name: &str) -> Result<Value, String> {
     if items.len() == before {
         return Err(format!("没有这个自定义 Agent：{name}"));
     }
-    let list: Vec<Value> = items.iter().map(|item| json!(item.to_config())).collect();
-    config::update(|next| next.set("agents.custom", json!(list)))?;
+    let entries: Vec<Value> = items.iter().map(|item| json!(item.to_config())).collect();
+    config::update(|next| next.set("agents.custom", json!(entries)))?;
     Ok(list())
 }
 
