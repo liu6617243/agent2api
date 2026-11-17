@@ -114,7 +114,7 @@ impl Source {
         Some(Source { path, format, enabled, priority })
     }
 
-    fn to_config(&self) -> String {
+    pub fn to_config(&self) -> String {
         format!("{}|{}|{}|{}", self.path, self.format, self.enabled, self.priority)
     }
 
@@ -123,28 +123,11 @@ impl Source {
     /// 页面上的示例写的是 `~/.claude/projects`，而 `PathBuf::from` 不认 `~` ——
     /// 不展开的话用户照着提示填完只会看到「路径不存在」，还会以为是自己填错。
     /// 只认开头的 `~/` 与 `~\`：中间出现的 `~` 在真实文件名里是合法字符。
-    fn root(&self) -> PathBuf {
-        let raw = self.path.trim();
-        let rest = raw
-            .strip_prefix("~/")
-            .or_else(|| raw.strip_prefix("~\\"))
-            .or_else(|| if raw == "~" { Some("") } else { None });
-        match rest {
-            Some(rest) => {
-                let home = crate::server::core::system_info::home_dir();
-                if home.as_os_str().is_empty() {
-                    PathBuf::from(raw)
-                } else if rest.is_empty() {
-                    home
-                } else {
-                    home.join(rest)
-                }
-            }
-            None => PathBuf::from(raw),
-        }
+    pub fn root(&self) -> PathBuf {
+        home_expand(&self.path)
     }
 
-    fn label(&self) -> String {
+    pub fn label(&self) -> String {
         self.root()
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
@@ -153,13 +136,58 @@ impl Source {
 }
 
 /// 没写格式时按路径猜：`.jsonl` / `.json` 是会话记录，其余按 Markdown 目录。
-fn guess_format(path: &str) -> String {
+pub(super) fn guess_format(path: &str) -> String {
     let lowered = path.to_ascii_lowercase();
     if lowered.ends_with(".jsonl") || lowered.ends_with(".json") {
         "jsonl".to_string()
     } else {
         "md".to_string()
     }
+}
+
+/// 展开路径开头的 `~`。`Source::root` 与清册的 `expand` 共用这一份 ——
+/// 两处各写一遍的话，「配置文件里写的 `~/x`」和「卡片上探测的 `~/x`」迟早
+/// 有一边忘了改。
+pub(super) fn home_expand(path: &str) -> PathBuf {
+    let raw = path.trim();
+    let rest = raw
+        .strip_prefix("~/")
+        .or_else(|| raw.strip_prefix("~\\"))
+        .or_else(|| if raw == "~" { Some("") } else { None });
+    match rest {
+        Some(rest) => {
+            let home = crate::server::core::system_info::home_dir();
+            if home.as_os_str().is_empty() {
+                PathBuf::from(raw)
+            } else if rest.is_empty() {
+                home
+            } else {
+                home.join(rest)
+            }
+        }
+        None => PathBuf::from(raw),
+    }
+}
+
+/// 路径的规范形态，只用于**比较**。
+///
+/// 四种写法指同一个位置：`~/.claude/projects`（用户照提示填的）、
+/// `C:\Users\me\.claude\projects`（目录选择器给的）、
+/// `C:/Users/me/.claude/projects`（清册把它转成了正斜杠），以及
+/// Windows 上的大小写差异。不归一就没法判断「这个来源已经在清单里了」。
+pub(super) fn canon(path: &str) -> String {
+    let text = home_expand(path).to_string_lossy().replace('\\', "/");
+    let text = text.trim_end_matches('/').to_string();
+    if cfg!(windows) {
+        text.to_ascii_lowercase()
+    } else {
+        text
+    }
+}
+
+/// 两条路径是不是同一个目录（比较用）。
+pub(super) fn same_path(left: &str, right: &str) -> bool {
+    canon(left) == canon(right)
 }
 
 /// 生效的来源清单（按优先级降序，关掉的也返回 —— 页面要显示它们为什么没跑）。
@@ -509,9 +537,13 @@ struct Scanned {
 /// 打开页面就做了一次全量干跑 —— 几百个会话记录能让页面卡上十几秒。
 fn scan(only: Option<&str>) -> Vec<Scanned> {
     let mut out: Vec<Scanned> = Vec::new();
+    // `only` 来自页面回传的路径，与配置里存的那条可能只差分隔符或大小写
+    // （`C:\Users\me\.claude\projects` vs `C:/Users/me/.claude/projects`）。
+    // 裸字符串比较会让「点某张卡片的导入」静默变成「一条都不读」——
+    // 用户看到的是「扫描 0 个文件」而不是报错，最难查。
     for source in sources() {
         if let Some(filter) = only {
-            if source.path != filter {
+            if !same_path(&source.path, filter) {
                 continue;
             }
         }

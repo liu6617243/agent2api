@@ -28,6 +28,7 @@ pub mod agents;
 pub mod config;
 pub mod enrich;
 pub mod import;
+pub mod import_registry;
 pub mod index;
 pub mod layout;
 pub mod llm;
@@ -1214,6 +1215,132 @@ pub fn purge_trash() -> Value {
     let removed = store::purge_expired_trash(days);
     bump_revision();
     json!({ "removed": removed, "keepDays": days })
+}
+
+/// 全库去重巡检：扫一遍存量记忆，找出**已经重复但没被处理**的那些。
+///
+/// ── 与写入时的去重差在哪 ────────────────────────────────────
+/// 写入时 `find_hash_duplicate`（l1 精确哈希）与 `near_duplicate`（l2 词面近似）
+/// 只在**新条目落盘那一刻**看一眼当下库里的东西。历史数据是分批导进来的、
+/// 中间可能关过去重、也可能换过归一化强度 —— 所以「当时没判成重复」的那些
+/// 会一直留在库里，越导越多。这个巡检就是补那一步。
+///
+/// ── 为什么只产建议不自动合并 ────────────────────────────────
+/// 判重判错的代价是**静默丢掉一条不同的结论**，而且用户不会知道。所以这里只
+/// 往 `review_queue` 塞 `dedup` 建议，由人在浏览页逐条点头。`dedup.l2.autoMergeThreshold`
+/// 这条自动通道仍然保留给写入路径 —— 那里两边都是「刚写下来的」，语境更近。
+///
+/// ── 为什么先按 hash 分组再进近似判定 ────────────────────────
+/// 精确重复（同一段话导了两遍）占绝大多数，且 O(n) 就能抓干净。先分组把这一
+/// 大批一次性解决掉，剩下的才进 O(n²) 的词面比较 —— 否则每次巡检都要对所有
+/// 活条目两两算 Dice + Levenshtein，库上千条就会卡住整个进程。
+pub fn dedup_scan() -> Value {
+    if !config::bool_of("dedup.enabled") {
+        return json!({
+            "skipped": true,
+            "reason": "去重总开关关着（dedup.enabled），巡检不跑。",
+            "scanned": 0, "exact": 0, "near": 0, "queued": 0,
+        });
+    }
+    let live: Vec<MemoryEntry> = store::load_all()
+        .into_iter()
+        .filter(|entry| entry.is_live())
+        .collect();
+    let scanned = live.len();
+
+    // ── 第一轮：精确 hash 分组 ────────────────────────────────
+    // 每组保留**最新**的那条（它是用户最可能还在引用的一条），其余作为候选。
+    let mut by_hash: std::collections::HashMap<String, Vec<&MemoryEntry>> =
+        std::collections::HashMap::new();
+    for entry in &live {
+        if entry.hash.is_empty() || entry.layer != Layer::L1 {
+            continue;
+        }
+        by_hash.entry(entry.hash.clone()).or_default().push(entry);
+    }
+
+    let mut queued = 0usize;
+    let mut exact = 0usize;
+    for (_hash, group) in &by_hash {
+        if group.len() < 2 {
+            continue;
+        }
+        let mut sorted = group.clone();
+        sorted.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
+        let keep = sorted[0];
+        for other in sorted.iter().skip(1) {
+            exact += 1;
+            // 载荷形状与写入路径一致（`candidate` + `score`），
+            // 这样 `review_resolve` 的 `dedup` 分支不用为巡检再加一条路径。
+            index::global().enqueue(
+                "dedup",
+                &other.id,
+                &json!({ "candidate": keep.id, "score": 1.0, "foundBy": "scan" }),
+                1.0,
+            );
+            queued += 1;
+        }
+    }
+
+    // ── 第二轮：l2 词面近似 ───────────────────────────────────
+    // 只对 l2 跑：l1 流水里「同一个决定说过两遍」很常见，合并它会丢掉时间线。
+    let mut near = 0usize;
+    if config::bool_of("dedup.l2.enabled") {
+        // 权重与阈值都走配置：巡检与写入路径必须用**同一条判据**，否则
+        // 「写入时没判成重复、巡检却判成」这种不一致会让用户怀疑两边都在乱来。
+        let w_dice = config::number("dedup.l2.wDice");
+        let w_edit = config::number("dedup.l2.wEdit");
+        let w_title = config::number("dedup.l2.wTitle");
+        let weight_sum = (w_dice + w_edit + w_title).max(0.001);
+        let threshold = config::number("dedup.l2.candidateThreshold");
+        let l2: Vec<&MemoryEntry> = live.iter().filter(|entry| entry.layer == Layer::L2).collect();
+        // 上限 400 条：两两比较是 O(n²)，400 条 = 8 万次比较，几秒钟的量级；
+        // 再多就该让用户分批跑，而不是让请求挂十分钟。
+        let take = l2.len().min(400);
+        for i in 0..take {
+            for j in (i + 1)..take {
+                if l2[i].kind != l2[j].kind {
+                    continue;
+                }
+                let dice = dice_coefficient(&l2[i].body, &l2[j].body);
+                let chars = l2[i].body.chars().count().max(l2[j].body.chars().count()).max(1);
+                let edit = 1.0 - (levenshtein(&l2[i].body, &l2[j].body) as f64) / chars as f64;
+                let title = similarity(&l2[i].title, &l2[j].title);
+                let score = (dice * w_dice + edit * w_edit + title * w_title) / weight_sum;
+                if score < threshold {
+                    continue;
+                }
+                // 保留更早的那条（沉淀结论通常越早越是被引用的那次），新的去候选
+                let (keep, other) = if l2[i].created_at <= l2[j].created_at {
+                    (l2[i], l2[j])
+                } else {
+                    (l2[j], l2[i])
+                };
+                index::global().enqueue(
+                    "dedup",
+                    &other.id,
+                    &json!({ "candidate": keep.id, "score": score, "foundBy": "scan" }),
+                    score,
+                );
+                near += 1;
+                queued += 1;
+            }
+        }
+    }
+
+    bump_revision();
+    crate::server::logging::log(
+        "[Memory]",
+        &format!("全库去重巡检：扫 {scanned} 条，精确重复 {exact}，近似 {near}"),
+    );
+    json!({
+        "skipped": false,
+        "scanned": scanned,
+        "exact": exact,
+        "near": near,
+        "queued": queued,
+        "pending": index::global().review_count(),
+    })
 }
 
 // ── 待确认队列 ───────────────────────────────────────────────

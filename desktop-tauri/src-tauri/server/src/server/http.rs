@@ -400,6 +400,16 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/memory/import/sources", post(api::memory::post_import_sources))
         .route("/api/memory/import/preview", post(api::memory::post_import_preview))
         .route("/api/memory/import/run", post(api::memory::post_import_run))
+        // 来源清册：12 个内置来源的探测结果（路径 / 体量 / 水位 / 是否已找到）。
+        // 与 `/import` 的区别是「有没有真的去读盘」—— view 只数文件，
+        // registry 还会去开 sqlite 列表、数 dsh 的 session 目录。
+        .route("/api/memory/import/registry", get(api::memory::get_import_registry))
+        .route("/api/memory/import/registry/enable", post(api::memory::post_import_registry_enable))
+        .route("/api/memory/import/registry/disable", post(api::memory::post_import_registry_disable))
+        .route("/api/memory/import/registry/path", post(api::memory::post_import_registry_path))
+        .route("/api/memory/import/registry/add", post(api::memory::post_import_registry_add))
+        // 全库去重巡检：存量数据里已经重复、但写入时没被判成重复的那些
+        .route("/api/memory/dedup/scan", post(api::memory::post_dedup_scan))
         // WebDAV 同步：状态 / 测连接 / 立即同步 / 冲突 / 流水 / 预览。
         // 全部挂 protected —— 响应里含 WebDAV 地址与远端包名。
         .route("/api/memory/sync", get(api::memory::get_sync))

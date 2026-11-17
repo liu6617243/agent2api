@@ -274,6 +274,10 @@ static SCHEMA: &[Knob] = &[
     knob_d("import.sensitiveSkip", Kind::Bool, Tier::Advanced, "导入", "疑似敏感内容默认跳过", "", "true"),
     knob_d("import.sources", Kind::List, Tier::Advanced, "导入", "导入来源清单",
         "路径/格式/启用/优先级；Markdown 笔记目录默认关，选好路径再开", "[]"),
+    knob_d("import.overrides", Kind::Map, Tier::Internal, "导入", "来源路径覆盖",
+        "内置来源 id → 用户手填的路径；有值时优先于候选路径", "{}"),
+    knob_d("import.ignored", Kind::List, Tier::Internal, "导入", "已忽略的来源 id",
+        "用户主动关掉的内置来源；不在清单里 = 未被忽略", "[]"),
 
     // ===== 隐私 =====
     knob_d("privacy.redact", Kind::Bool, Tier::Advanced, "隐私", "写入前脱敏", "", "false"),

@@ -623,6 +623,91 @@ pub async fn post_import_sources(State(_state): State<ServerState>, body: Bytes)
     }
 }
 
+// ── 导入来源清册 ─────────────────────────────────────────────
+
+/// 12 个内置来源的探测结果。
+///
+/// 这个端点会**真的去读盘**（开 sqlite、递归数文件），所以它比 `/import` 贵。
+/// 页面在两个时机拉它：进页签时、以及任何一个来源被启停/改路径之后。
+pub async fn get_import_registry(State(_state): State<ServerState>) -> Response {
+    let result = crate::server::core::blocking::run(memory::import_registry::view).await;
+    match result {
+        Ok(value) => ok_json(value),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+/// 启用一个内置来源（写进 `import.sources`，现有导入链路就会读它）。
+pub async fn post_import_registry_enable(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let Some(id) = payload.get("id").and_then(Value::as_str).map(str::to_string) else {
+        return errors::management_error(400, "缺少 id".to_string());
+    };
+    let result = crate::server::core::blocking::run(move || memory::import_registry::enable(&id)).await;
+    match result {
+        Ok(Ok(value)) => ok_json(value),
+        Ok(Err(message)) => errors::management_error(400, message),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+/// 停用一个内置来源（从 `import.sources` 移除 + 记进忽略名单）。
+pub async fn post_import_registry_disable(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let Some(id) = payload.get("id").and_then(Value::as_str).map(str::to_string) else {
+        return errors::management_error(400, "缺少 id".to_string());
+    };
+    let result = crate::server::core::blocking::run(move || memory::import_registry::disable(&id)).await;
+    match result {
+        Ok(Ok(value)) => ok_json(value),
+        Ok(Err(message)) => errors::management_error(400, message),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+/// 改一个内置来源的路径（写 `import.overrides`，并把新路径同步进 `import.sources`）。
+pub async fn post_import_registry_path(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let Some(id) = payload.get("id").and_then(Value::as_str).map(str::to_string) else {
+        return errors::management_error(400, "缺少 id".to_string());
+    };
+    let path = payload.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+    let result = crate::server::core::blocking::run(move || memory::import_registry::set_path(&id, &path)).await;
+    match result {
+        Ok(Ok(value)) => ok_json(value),
+        Ok(Err(message)) => errors::management_error(400, message),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+/// 加一条自定义来源。走「追加」而不是整体替换，页面就不必知道全部行。
+pub async fn post_import_registry_add(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let path = payload.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+    let format = payload.get("format").and_then(Value::as_str).unwrap_or("").to_string();
+    let priority = payload.get("priority").and_then(Value::as_i64).unwrap_or(0);
+    let result = crate::server::core::blocking::run(move || {
+        memory::import_registry::add(&path, &format, priority)
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => ok_json(value),
+        Ok(Err(message)) => errors::management_error(400, message),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+// ── 去重巡检 ─────────────────────────────────────────────────
+
+/// 全库去重巡检。同步等结果 —— 它只产建议不写记忆，但会读全库。
+pub async fn post_dedup_scan(State(_state): State<ServerState>) -> Response {
+    let result = crate::server::core::blocking::run(memory::dedup_scan).await;
+    match result {
+        Ok(value) => ok_json(value),
+        Err(error) => errors::management_error(500, error.message),
+    }
+}
+
 // ── WebDAV 同步 ──────────────────────────────────────────────
 
 /// 同步页顶部：配置摘要 + 设备 + 冲突计数 + 上次结果。

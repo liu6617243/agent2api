@@ -720,6 +720,8 @@
   border-radius: var(--r-sm);
 }
 .mm-add-source > input:first-child { flex: 1; min-width: 220px; }
+/* 表单里的错误条要跨整行：它出现时输入框那一行已经排满了。 */
+.mm-add-source-error { flex: 1 1 100%; }
 
 .mm-source-list { display: flex; flex-direction: column; gap: 6px; }
 .mm-source-row {
@@ -777,6 +779,180 @@
   gap: 8px;
   font-size: 12px;
   padding: 3px 0;
+}
+
+/* ── 导入页：来源探测卡片 ──────────────────────────────────────
+   12 个内置来源铺成 3 列 × 4 行。为什么是卡片而不是表格：
+   每张卡里有 4 个不同性质的值（路径是长字符串、格式是枚举、体量是两个数、
+   已导入是一句话），表格列宽只能取一个折中值 —— 路径列要么截断要么挤掉
+   后面的列。卡片让每张卡自己决定行内怎么分宽，12 张卡之间又靠网格对齐，
+   扫视时仍然是整齐的矩阵。
+
+   卡片内部的四行用 `42px + 1fr` 的网格而不是 flex：label 宽度在所有卡里
+   必须一致，否则「体量 / 已导入」两列的值会左右跳动，看起来像没对齐。 */
+.mm-import-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 14px;
+  flex-wrap: wrap;
+}
+.mm-import-sub {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-2);
+  /* 说明句最多占 76ch：再宽的话右侧两个按钮会被挤到下一行，而它们是这页
+     最常点的两个动作，不该为了给一句说明腾地方而掉行。 */
+  max-width: 76ch;
+  min-width: 220px;
+  flex: 1 1 auto;
+}
+
+.mm-src-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.mm-src-card {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  min-width: 0;
+}
+.mm-src-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  /* 标题行固定 16px：它是这张卡的锚点，12 张卡的标题必须在同一条水平线上，
+     否则扫视时第一列字高会在卡片之间跳。 */
+  min-height: 16px;
+}
+.mm-src-name {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 三态徽标。ok / bad / idle 不是「好看一点的灰绿红」：
+   「已找到」是绿（可以去导）、「路径不存在」是红（要去改路径）、
+   「已忽略」是灰（用户自己关的，没事别管它）。 */
+.mm-src-state {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+.mm-src-state.ok { color: var(--ok); background: var(--ok-soft); border-color: var(--ok-bd); }
+.mm-src-state.bad { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-bd); }
+.mm-src-state.idle { color: var(--text-3); background: var(--surface-raised); border-color: var(--border); }
+/* 「未启用」用 warn 而不是 idle：它是**能一键修好的**状态（盘上有、
+   只是没进清单），灰色会让它看起来和「已忽略」一样无关紧要。 */
+.mm-src-state.off { color: var(--warn); background: var(--warn-soft); border-color: var(--warn-bd); }
+
+.mm-src-rows {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  gap: 0 8px;
+  align-items: baseline;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--text-3);
+}
+.mm-src-rows > span:nth-child(odd) { white-space: nowrap; }
+.mm-src-value {
+  color: var(--text-2);
+  text-align: right;
+  /* 路径可能是一整条 Windows 绝对路径，`anywhere` 而不是 `break-all`：
+     前者优先在分隔符处断，后者会把 `.zcode` 劈成 `.zco / de`。 */
+  overflow-wrap: anywhere;
+}
+.mm-src-path {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 16px;
+  color: var(--text-3);
+  text-align: right;
+  /* 单行省略，不折行。折行会让「格式 / 体量 / 已导入」三行的 label 被推下去
+     —— 一张卡里路径折成两行后，四行字段的表就断了，与其视觉上错位，不如
+     让路径截断：完整值在 title 里，点「改路径」也能看到全文。 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mm-src-estimate { color: var(--text-3); }
+
+.mm-src-note {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+.mm-src-edit {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.mm-src-edit > input {
+  flex: 1 1 150px;
+  min-width: 0;
+}
+
+.mm-src-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  /* 卡片内容行数不一（有的带 note 有的不带），把按钮压到底部，
+     4 张一行时底边才是齐的。 */
+  margin-top: auto;
+}
+.mm-src-more {
+  width: 26px;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1;
+}
+.mm-src-menu { display: flex; flex-direction: column; gap: 2px; }
+.mm-src-menu > button { justify-content: flex-start; }
+
+/* 巡检结果条：虚线框而不是实线卡 —— 它是一句**结果**，不是一块新内容区。 */
+.mm-scan-note {
+  padding: 8px 11px;
+  border: 1px dashed var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-2);
+}
+
+@media (max-width: 1180px) {
+  .mm-src-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 780px) {
+  .mm-src-grid { grid-template-columns: minmax(0, 1fr); }
+  /* 单列时卡片占满整行，路径那一行有足够宽度，不必再右对齐 —— 右对齐在长行上
+     会让读者要横跨整行去找值的起点。 */
+  .mm-src-value, .mm-src-path { text-align: left; }
+  /* 说明句与按钮换行后各自独占一行：按钮要贴右，与宽屏时「动作在右」的位置
+     保持一致，不然它换到第二行还挂在左边缘，看起来像另一段说明。 */
+  .mm-import-head > .mm-actions { width: 100%; justify-content: flex-end; }
 }
 
 /* ── 同步 ── */

@@ -528,6 +528,75 @@ export type ImportSummary = {
   atText: string
 }
 
+/* ─── 导入来源清册（import_registry::view）─────────────────── */
+
+/**
+ * 一个来源的探测结果。
+ *
+ * `kind` 决定「怎么读」，页面据此决定「格式」那一行显示什么：
+ *   · `jsonl`       —— 会话日志，准实时
+ *   · `md`          —— Markdown 笔记目录
+ *   · `sqlite`      —— 明文会话库，权威源
+ *   · `trae`        —— SQLCipher 加密库（需要运行时才能读）
+ *   · `antigravity` —— 加密 bin 日志
+ *   · `dsh`         —— zstd 压缩的 JSONL
+ */
+export type ImportSourceKind = 'jsonl' | 'md' | 'sqlite' | 'trae' | 'antigravity' | 'dsh'
+
+export type ImportRegistryRow = {
+  id: string
+  name: string
+  kind: ImportSourceKind | string
+  /** 已脱敏（主目录换成 `~`）、正斜杠形态；空串表示「未指定」 */
+  path: string
+  /** 有没有指定过路径。`notes-md` 这类来源天生没有候选路径，状态要画成「未指定」 */
+  hasPath: boolean
+  exists: boolean
+  /** 用户主动关掉的（`import.ignored`） */
+  ignored: boolean
+  /**
+   * 找到、没被忽略、且已写进 `import.sources` —— 也就是「点了导入真的会读」。
+   *
+   * 这三个条件是叠加的，不是同义的：路径在盘上但没进清单时 `exists` 为真、
+   * `enabled` 为假，此时卡片要显示「未启用」而不是「已找到」，否则用户点
+   * 「导入该来源」只会看到「扫描 0 个文件」。
+   */
+  enabled: boolean
+  /** 路径是用户手填的（`import.overrides`） */
+  custom: boolean
+  priority: number
+  /** 条目数（文件数 / sqlite 会话数 / dsh 的 session 目录数）；加密源恒为 0 */
+  items: number
+  bytes: number
+  bytesText: string
+  /** 「已读到 id=2890，本次按增量续读」/「首次导入，将全量扫描」 */
+  estimate: string
+  /** 读法补充（加密库、zstd 这类要提前说） */
+  note: string
+  about: string
+  candidates: string[]
+}
+
+export type ImportRegistry = {
+  sources: ImportRegistryRow[]
+  /** 已找到的来源数 */
+  found: number
+  total: number
+  bytes: number
+  bytesText: string
+}
+
+/** 全库去重巡检的结果。 */
+export type DedupScan = {
+  skipped: boolean
+  reason?: string
+  scanned: number
+  exact: number
+  near: number
+  queued: number
+  pending?: number
+}
+
 /* ─── 请求 ────────────────────────────────────────────────── */
 
 function query(params: Record<string, string | number | boolean | undefined>): string {
@@ -746,6 +815,37 @@ export function runImport(path?: string): Promise<{ summary: ImportSummary; view
 
 export function saveImportSources(sources: { path: string; format: string; enabled: boolean; priority: number }[]): Promise<{ view: ImportView }> {
   return api('POST', '/api/memory/import/sources', { sources })
+}
+
+/** 来源清册：会真的读盘（开 sqlite、递归数文件），比 `/import` 贵。 */
+export function loadImportRegistry(): Promise<ImportRegistry> {
+  return api('GET', '/api/memory/import/registry')
+}
+
+export function enableImportSource(id: string): Promise<ImportRegistry> {
+  return api('POST', '/api/memory/import/registry/enable', { id })
+}
+
+export function disableImportSource(id: string): Promise<ImportRegistry> {
+  return api('POST', '/api/memory/import/registry/disable', { id })
+}
+
+export function setImportSourcePath(id: string, path: string): Promise<ImportRegistry> {
+  return api('POST', '/api/memory/import/registry/path', { id, path })
+}
+
+/**
+ * 加一条自定义来源。走「追加」接口而不是整体替换 `import.sources` ——
+ * 整体替换要求页面知道全部行，而内置来源启用后也住在同一份清单里，
+ * 页面某次少算一行就会把它静默删掉。
+ */
+export function addImportSource(path: string, format = '', priority = 0): Promise<ImportRegistry> {
+  return api('POST', '/api/memory/import/registry/add', { path, format, priority })
+}
+
+/** 全库去重巡检：只往待确认队列塞建议，不合并任何东西。 */
+export function dedupScan(): Promise<DedupScan> {
+  return api('POST', '/api/memory/dedup/scan')
 }
 
 /* ─── 项目卡操作 ──────────────────────────────────────────── */
