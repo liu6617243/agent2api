@@ -164,6 +164,27 @@ pub struct MemoryIndex {
     fts: bool,
 }
 
+/// 两次执行是否可以合并成一行：任务、状态、明细三项全等。
+///
+/// ── 为什么是模块级自由函数，不是 `impl MemoryIndex` 的方法 ────────
+/// 它不碰连接、不碰 `self`，只是三个字段的比较。放进 `impl` 里会带来两个
+/// 后果：一是调用点必须写 `Self::`（写成 `same_run(..)` 直接 `E0425`），
+/// 二是 `mod tests` 的 `use super::*` 看不到关联函数，必须再写一遍
+/// `MemoryIndex::same_run` —— 一条纯判据没必要让两处都记着它挂在哪。
+///
+/// 抽成独立函数是为了能单测：这条判据写错的后果是「不同任务的记录互相覆盖」，
+/// 而它埋在一条 SQL 里时只能靠读代码发现。
+fn same_run(
+    last_task: &str,
+    last_status: &str,
+    last_detail: Option<&str>,
+    task: &str,
+    status: &str,
+    detail: Option<&str>,
+) -> bool {
+    last_task == task && last_status == status && last_detail == detail
+}
+
 impl MemoryIndex {
     fn open() -> Self {
         let path = super::store::index_file();
@@ -669,21 +690,6 @@ impl MemoryIndex {
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![now, task, model, provider, prompt, completion, latency, if ok { 1_i64 } else { 0 }, error, note],
         );
-    }
-
-    /// 两次执行是否可以合并成一行：任务、状态、明细三项全等。
-    ///
-    /// 抽成独立函数是为了能单测 —— 这条判据写错的后果是「不同任务的记录
-    /// 互相覆盖」，而它埋在一条 SQL 里时只能靠读代码发现。
-    fn same_run(
-        last_task: &str,
-        last_status: &str,
-        last_detail: Option<&str>,
-        task: &str,
-        status: &str,
-        detail: Option<&str>,
-    ) -> bool {
-        last_task == task && last_status == status && last_detail == detail
     }
 
     /// 记一次任务执行（`task_run`）。

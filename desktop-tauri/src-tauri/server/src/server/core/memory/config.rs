@@ -506,9 +506,13 @@ pub fn flat() -> BTreeMap<String, Value> {
 
 /// 秘密字段是否已在磁盘上配置过（给页面显示「已保存口令」）。
 pub fn secret_set(key: &str) -> bool {
+    // `stored()` 每次返回的是**克隆**（`Stored` 里有 `BTreeMap`），绑到局部变量
+    // 才能借用里面的字符串。写成 `.and_then(|_| stored().values.get(key))` 会
+    // 得到 `E0515`：临时值在语句结束就被丢弃，返回的引用悬空。
+    let cache = stored();
     find(key)
         .filter(|item| item.kind == Kind::Secret)
-        .and_then(|_| stored().values.get(key))
+        .and_then(|_| cache.values.get(key))
         .and_then(Value::as_str)
         .map(|text| !text.trim().is_empty())
         .unwrap_or(false)
@@ -522,7 +526,9 @@ pub fn secret_set(key: &str) -> bool {
 ///   · 密文解开失败（密钥文件被换过）—— 此时当作没配，让用户重填一次，
 ///     比抛一个「解密失败」把整条同步流程卡死要好。
 pub fn secret_of(key: &str) -> String {
-    let Some(value) = stored().values.get(key).and_then(Value::as_str) else {
+    // 同上：先把克隆落到局部变量，`value` 借用的是它，不是临时值。
+    let cache = stored();
+    let Some(value) = cache.values.get(key).and_then(Value::as_str) else {
         return String::new();
     };
     let value = value.trim();

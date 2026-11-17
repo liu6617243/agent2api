@@ -1092,7 +1092,7 @@ mod tests {
 
     #[test]
     fn first_daily_after_rolls_to_tomorrow_once_the_clock_passes() {
-        use chrono::{Local, TimeZone};
+        use chrono::Local;
         // 取「今天 00:00 本地时刻」，那样「今天 23:59」一定还没到、
         // 「今天 00:00」一定已过 —— 不依赖跑测试的钟点。
         let today = Local::now().date_naive();

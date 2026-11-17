@@ -658,9 +658,6 @@ pub fn run(manual: bool) -> super::enrich::Outcome {
     let mut deleted = 0usize;
     let mut conflicted = 0usize;
     let mut skipped = 0usize;
-    // 本次上行的包体大小（字节）。界面上的「上传 5.3 MB」说的是这个，
-    // 不是「记忆正文总量」—— 包里还有 frontmatter 与 manifest。
-    let mut pushed_bytes = 0usize;
 
     ensure_remote_dir();
 
@@ -755,20 +752,27 @@ pub fn run(manual: bool) -> super::enrich::Outcome {
         index::global().sync_log_add(&device, "error", &message, false);
         return Outcome::Skipped(message);
     }
-    let packed_files = match pack(&manifest, &contents) {
+    // 上行的两个结果一起带出来：`packed_files` 是真正进包的文件数，
+    // `pushed_bytes` 是包体大小（界面上的「上传 5.3 MB」说的就是这个，不是
+    // 「记忆正文总量」—— 包里还有 frontmatter 与 manifest）。
+    //
+    // 用元组一次性接住，而不是先在循环外 `let mut pushed_bytes = 0` 再赋值：
+    // 那个初值必然被这里覆盖，编译器会报 `unused_assignments`（且真的有一次
+    // 读不到初值的赋值）。上行失败的两个分支都是 `return`，不会走到解构。
+    let (packed_files, pushed_bytes) = match pack(&manifest, &contents) {
         Ok(bytes) => {
             let packed = contents.len();
+            let size = bytes.len();
             match push_package(&own_package_name(&device), &bytes) {
                 Ok(()) => {
                     pushed += 1;
-                    pushed_bytes = bytes.len();
                     index::global().sync_log_add(
                         &device,
                         "push",
-                        &format!("上行 {} 个文件 / {}", packed, size_mb(bytes.len())),
+                        &format!("上行 {} 个文件 / {}", packed, size_mb(size)),
                         true,
                     );
-                    packed
+                    (packed, size)
                 }
                 Err(error) => {
                     index::global().sync_log_add(&device, "error", &error, false);
