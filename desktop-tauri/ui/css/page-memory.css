@@ -791,39 +791,221 @@
 }
 .mm-verdict-arrow { margin-left: 6px; font-size: 12px; opacity: .8; }
 
-.mm-task-table, .mm-run-table, .mm-preview-table { display: flex; flex-direction: column; }
-.mm-task-row {
+.mm-run-table, .mm-preview-table { display: flex; flex-direction: column; }
+
+/* ── 自动化 · 任务卡片网格 ──
+   三列：卡片再窄（四列）时节奏面板里的「上次运行 / 下次计划」就要换行，
+   再宽（两列）则在 1440 的屏上一行两张、每张 660px —— 大片空白反而看不出
+   12 个任务之间的对比。列宽用 minmax(0, 1fr) 而不是固定 px：卡片要能随窗口
+   收窄，收窄时由下面两档媒体查询降列。 */
+.mm-auto-grid {
   display: grid;
-  grid-template-columns: minmax(160px, 1.5fr) 52px 92px minmax(76px, 0.8fr) minmax(86px, 0.9fr) minmax(96px, 0.9fr) 96px;
-  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  /* 同一排拉齐：卡片内部的统计行数不同（1 行 vs 3 行），不拉齐的话同一排
+     三张卡的下沿参差，第二排的起始位置也随之错位，看起来像渲染中途的帧。
+     拉齐不会留空底色 —— `.mm-auto-card-foot` 用 `margin-top:auto` 把统计行
+     与「立即执行」推到卡片底部，多出来的高度落在节奏面板与统计行之间那段
+     留白里，视觉上仍是完整的一张卡。 */
+  align-items: stretch;
+}
+@media (max-width: 1280px) {
+  .mm-auto-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 860px) {
+  .mm-auto-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* 一张任务卡。
+   左侧 3px 竖条是「开了几个」的余光指标：12 个开关本身只有 24px 宽，
+   逐个数很累，沿卡片外缘的绿条一列扫下来就能看出分布。
+   竖条用 ::before 而不是 border-left：border 会吃掉 3px 内容宽度，且跟随
+   圆角裁切时边缘会发毛；伪元素贴住圆角内缘更干净。 */
+.mm-auto-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 12px 14px 11px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  min-width: 0;
+  transition: border-color 160ms ease-out;
+}
+.mm-auto-card::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 7px;
+  bottom: 7px;
+  width: 3px;
+  border-radius: var(--r-pill);
+  /* 关着的卡不画条：`transparent` 而不是 `display:none` —— 保留占位，
+     开关的竖条出现/消失时卡片不会被 3px 的位移推一下。 */
+  background: transparent;
+}
+.mm-auto-card.is-on::before { background: var(--ok); }
+.mm-auto-card.is-on { border-color: var(--ok-bd); }
+
+.mm-auto-card-head {
+  display: flex;
   align-items: center;
-  padding: 6px 0;
-  border-bottom: 1px solid var(--hairline);
-  font-size: 12.5px;
+  gap: 8px;
+  min-width: 0;
 }
-.mm-task-row:last-child { border-bottom: none; }
-.mm-task-head {
-  font-size: 11.5px;
-  color: var(--text-3);
+/* 标题行：名字 + 徽标。徽标可能有两个（WebDAV / 调用模型），要能换行 ——
+   名字本身较长（「人格 / 偏好画像」），不给换行的后果是把开关挤出卡片。 */
+.mm-auto-card-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.mm-auto-card-name {
+  font-size: 13.5px;
   font-weight: 600;
-  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  letter-spacing: .005em;
 }
-/* 任务列是两行：名字 + 徽标一行，说明一行。名字行要能换行不挤 ——
-   三个徽标（WebDAV / 调用模型 / 零成本）同时出现时是最宽的情形。 */
-.mm-task-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.mm-task-name { display: flex; align-items: center; gap: 6px; font-weight: 500; flex-wrap: wrap; }
-.mm-task-desc {
+/* 开关永远靠右，不被标题挤走 */
+.mm-auto-card-head > [data-slot='switch'] { flex: 0 0 auto; margin-left: auto; }
+
+/* 说明行。固定两行高：三列网格里说明有一行的也有两行的，不固定会让下面
+   节奏面板的起始位置逐卡不同，扫读时视线要重新找锚点。 */
+.mm-auto-card-desc {
   font-size: 11.5px;
+  line-height: 1.5;
   color: var(--text-3);
-  line-height: 1.35;
+  min-height: 34px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* 空说明只有一个 `—`：保留两行高的占位，否则同一排里这张卡的节奏面板会
+   比邻卡高一行，三张卡的「调度节奏」行就不在同一条水平线上 —— 拉齐网格
+   只对齐卡片外框，对齐不了卡内的行。 */
+.mm-auto-card-desc.is-empty { color: var(--text-3); }
+
+/* 节奏面板：凹槽底 + 细描边，与卡片底色差一档。
+   四行信息（节奏 / 上次 / 下次 / 改节奏）都在这一块里，框起来才读得出
+   「这是同一台机器的节拍」，摊成普通文字会和上面的说明混成一段。 */
+.mm-auto-card-cadence {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  padding: 0 10px;
+}
+.mm-auto-card-cadence-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 0;
+  min-width: 0;
+}
+/* 两行之间那条分隔线画在第二行顶部：只在需要时出现一次，比给每行加
+   border-bottom 再抹掉最后一条少一条规则。 */
+.mm-auto-card-cadence-times { border-top: 1px solid var(--hairline); }
+
+.mm-auto-card-cadence-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.mm-auto-card-cadence-icon { flex: 0 0 auto; color: var(--text-3); }
+.mm-auto-card-cadence-label { font-size: 11.5px; color: var(--text-3); white-space: nowrap; }
+.mm-auto-card-cadence-value {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
-/* 累计列同样两行：「N 次 · 成功 M」与 token 合计。两行是因为这两个数字
-   回答不同问题（可靠吗 / 贵不贵），挤成一行加分隔符会读到一起。 */
-.mm-task-stats { display: flex; flex-direction: column; gap: 1px; font-size: 11.5px; }
-.mm-task-spend { color: var(--text-3); font-family: var(--font-mono); font-size: 11px; }
+/* 「改节奏」是一枚真按钮（键盘能 Tab 到），但视觉上要像行内链接 ——
+   它在节奏面板里，做成填充按钮会把这一行的文字挤散。 */
+.mm-auto-card-cadence-edit {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ok);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  border-radius: var(--r-xs);
+}
+.mm-auto-card-cadence-edit:hover { color: var(--text); }
+.mm-auto-card-cadence-edit:focus-visible { outline: 2px solid var(--ok-bd); outline-offset: 2px; }
+
+/* 「上次运行」与「下次计划」在窄卡里各占一半，靠两端对齐分开 ——
+   中间用 margin-left:auto 而不是 justify-content: space-between：
+   后者在只有一项时会把那一项推到右边，读起来像是「下次」的值。 */
+.mm-auto-card-time {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+  flex: 1 1 0;
+}
+.mm-auto-card-time + .mm-auto-card-time {
+  justify-content: flex-end;
+  margin-left: auto;
+  text-align: right;
+}
+.mm-auto-card-time-label { font-size: 11px; color: var(--text-3); white-space: nowrap; }
+.mm-auto-card-time-value {
+  font-size: 11.5px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 「下次计划」用绿色：它是这一页唯一「未来会发生的事」，与节奏条同色，
+   让「什么时候再跑」在扫读时先被看到。 */
+.mm-auto-card-time-value.is-next { color: var(--ok); font-weight: 500; }
+
+.mm-auto-card-foot {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  min-height: 44px;
+  padding-top: 1px;
+  /* 卡片被网格拉齐后，多出来的高度全部落在这里（节奏面板与统计行之间），
+     于是「统计 + 立即执行」永远贴着卡片底部 —— 同一排三张卡的按钮在一条
+     线上，而不是各按内容高度浮在半空。 */
+  margin-top: auto;
+}
+/* 统计列三行：次数 / 成功率 / token。**不并成一行**：这三个数回答三个不同
+   的问题（跑得多不多 / 稳不稳 / 贵不贵），挤成一行加分隔符会读到一起。 */
+.mm-auto-card-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1 1 auto;
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.45;
+}
+.mm-auto-card-runs { color: var(--text-2); }
+.mm-auto-card-rate { color: var(--ok); }
+.mm-auto-card-tokens { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-3); }
+.mm-auto-card-run { flex: 0 0 auto; gap: 3px; }
+
+/* 「N / 12 已开启」：页签标题右侧的一枚概览，替代原先被删掉的「已开启」状态行。 */
+.mm-auto-count { font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
 
 /* 执行记录：时间 / 任务 / 结果 / 明细 / token / 耗时。
    明细列吃满剩余宽度 —— 它是这张表唯一的自由文本，也是用户真正要看的一列。 */
@@ -1953,12 +2135,10 @@
   .mm-route-inert { grid-column: 2 / -1; }
   .mm-route-head { display: none; }
   .mm-cfg-item { grid-template-columns: minmax(0, 1fr); }
-  /* 窄屏保留「任务 / 开关 / 节奏 / 下次 / 立即执行」五列，砍掉「上次」与「累计」。
-   这两列在窄屏下可以进 title，而「立即执行」砍掉就等于这一页没法手动跑任务了。 */
-  .mm-task-row { grid-template-columns: minmax(120px, 1fr) 46px 78px 76px 84px; }
-  .mm-task-row > :nth-child(4), .mm-task-row > :nth-child(6) { display: none; }
   /* 执行记录：窄屏砍掉 token 与耗时，留下「时间 / 任务 / 结果 / 明细」——
-     明细是被砍列之外唯一有解释力的列，不能丢。 */
+     明细是被砍列之外唯一有解释力的列，不能丢。
+     任务卡的降列在 .mm-auto-grid 自己身上做（640px 起单列），这里不再
+     重复一套 .mm-task-row 的列覆盖 —— 那张表已经不存在了。 */
   .mm-run-row { grid-template-columns: 78px minmax(70px, 0.9fr) 52px minmax(0, 1.6fr); }
   .mm-run-row > :nth-child(5), .mm-run-row > :nth-child(6) { display: none; }
   .mm-preview-row { grid-template-columns: 1fr 84px 54px; }

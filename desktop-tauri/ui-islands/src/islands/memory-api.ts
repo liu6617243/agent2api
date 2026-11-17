@@ -201,6 +201,12 @@ export type ReviewItem = {
 
 /* ─── 自动化（schedule::status）────────────────────────────── */
 
+/** 任务当前生效的节奏。三种模式互斥，字段由后端按配置填。 */
+export type AutoCadence =
+  | { mode: 'interval'; intervalMin: number; text: string }
+  | { mode: 'daily'; daily: string; text: string }
+  | { mode: 'weekly'; weekly: number; weeklyTime: string; text: string }
+
 export type AutoTask = {
   task: string
   enabled: boolean
@@ -218,8 +224,10 @@ export type AutoTask = {
   tokens: number
   /** 这个任务会不会调模型 —— 界面据此标「零成本 / 调用模型」。 */
   usesModel: boolean
-  /** 一句「它在干什么」，静态文案，还没跑过时也显示。 */
+  /** 一句「它在干什么」，静态文案。空串 = 没有可说的（界面画 —）。 */
   summary: string
+  /** 节奏：间隔 / 每天 / 每周。界面那句「调度节奏：…」直接用它。 */
+  cadence: AutoCadence
 }
 
 /** 一次任务执行（`task_run` 一行）。 */
@@ -793,6 +801,30 @@ export function rejectAllReview(): Promise<{ rejected: number }> {
 
 export function runAutoTask(task: string, project?: string): Promise<{ task: string; outcome: Outcome }> {
   return api('POST', '/api/memory/auto/run', { task, project })
+}
+
+/** 改节奏 / 开关要发的东西。`cadence` 三种形状与 `AutoCadence` 的 mode 对齐。 */
+export type AutoTaskPatch = {
+  /** 开关。不传 = 不改。 */
+  enabled?: boolean
+  /** 节奏。不传 = 不改；传了就整份替换（旧模式的字段由后端清掉）。 */
+  cadence?:
+    | { mode: 'interval'; intervalMin: number }
+    | { mode: 'daily'; daily: string }
+    | { mode: 'weekly'; weekly: number; weeklyTime: string }
+}
+
+/**
+ * 改一个任务的开关 / 节奏，返回刷新后的**整份**自动化状态。
+ *
+ * 为什么不走 `saveConfig`：那样页面得自己拼 `auto.tasks` 的三层嵌套。
+ * 拼成扁平子键（`auto.tasks.extract`）会被后端当成未知键静默丢弃 ——
+ * 开关点了、刷新又弹回去，且没有任何报错；拼成深合并形状则删不掉旧节奏
+ * 字段（改成「每隔 30 分钟」后 `daily` 残留，调度器仍然每天只跑一次）。
+ * 两类坏状态都不会在页面上报警，所以语义交给后端收口。
+ */
+export function setAutoTask(task: string, patch: AutoTaskPatch): Promise<AutoStatus> {
+  return api('POST', '/api/memory/auto/task', { task, ...patch })
 }
 
 export function buildProfile(): Promise<{ outcome: Outcome; profile: ProfileView }> {

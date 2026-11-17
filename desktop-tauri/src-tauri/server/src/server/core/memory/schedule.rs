@@ -33,7 +33,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use super::enrich::{self, Outcome};
 use super::{config, index, store};
@@ -121,6 +121,240 @@ fn task_batch(task: &str) -> usize {
         .and_then(Value::as_i64)
         .map(|value| value.clamp(1, 200) as usize)
         .unwrap_or(20)
+}
+
+/// 一个任务**当前生效的**节奏，给界面画「调度节奏：每隔 30 分钟」那一行。
+///
+/// ── 为什么要把「模式」发下去，而不是只发一个 `intervalMin` ─────
+/// 三种节奏（每隔 N 分钟 / 每天 HH:MM / 每周第 N 天 HH:MM）在配置里是三组
+/// 不同的字段，但界面上是同一句话。只发 `intervalMin` 的话，前端只能拿到
+/// 「1440 分钟」这种等价但读起来不像人话的数字，于是页面会写「每 1 天」——
+/// 而用户配的是「每天 11:00」。把模式和原始字段一起发下去，前端拼的句子
+/// 与 `next_due` 用的是同一份事实，不需要自己从分钟数反推。
+///
+/// `weekly` 按 1 = 周一 … 7 = 周日（ISO），与 `first_weekly_after` 同口径。
+fn task_cadence(task: &str) -> Value {
+    let entry = config::object_of("auto.tasks");
+    let item = entry.get(task);
+    let daily = item.and_then(|value| value.get("daily")).and_then(Value::as_str).map(str::trim);
+    let weekly_time = item
+        .and_then(|value| value.get("weeklyTime"))
+        .and_then(Value::as_str)
+        .map(str::trim);
+    let weekly = item.and_then(|value| value.get("weekly")).and_then(Value::as_i64);
+    // 与 `next_due` 同一个优先级：按周优先，其次按天，最后按间隔。
+    // 顺序反过来会出现「页面说每天 11:00、调度器其实按周跑」这种谎。
+    if let (Some(day), Some(time)) = (weekly, weekly_time) {
+        if parse_clock(time).is_some() {
+            return json!({
+                "mode": "weekly",
+                "weekly": day.clamp(1, 7),
+                "weeklyTime": time,
+                "text": weekly_cadence_text(day.clamp(1, 7), time),
+            });
+        }
+    }
+    if let Some(time) = daily {
+        if parse_clock(time).is_some() {
+            return json!({
+                "mode": "daily",
+                "daily": time,
+                "text": daily_cadence_text(time),
+            });
+        }
+    }
+    let minutes = task_interval(task);
+    json!({
+        "mode": "interval",
+        "intervalMin": minutes,
+        "text": interval_cadence_text(minutes),
+    })
+}
+
+/// 「每隔 30 分钟 / 每隔 6 小时」。到天就退化成「每天」——「每隔 1 天」不像人话。
+fn interval_cadence_text(minutes: i64) -> String {
+    if minutes >= 1440 {
+        let days = minutes / 1440;
+        return if days == 1 { "每天".to_string() } else { format!("每隔 {days} 天") };
+    }
+    if minutes >= 60 && minutes % 60 == 0 {
+        return format!("每隔 {} 小时", minutes / 60);
+    }
+    format!("每隔 {minutes} 分钟")
+}
+
+fn daily_cadence_text(time: &str) -> String {
+    format!("每天 {time}")
+}
+
+fn weekly_cadence_text(day: i64, time: &str) -> String {
+    let name = match day {
+        1 => "周一",
+        2 => "周二",
+        3 => "周三",
+        4 => "周四",
+        5 => "周五",
+        6 => "周六",
+        _ => "周日",
+    };
+    format!("每{name} {time}")
+}
+
+/// 一次「任务改设置」请求：开关 + 节奏，两项都可缺省。
+///
+/// ── 为什么要有这个入口，而不是让页面自己拼 `auto.tasks` ──────
+/// `auto.tasks` 是个三层嵌套的 Map（任务名 → 字段）。页面直接发
+/// `{"auto.tasks": {"extract": {"enabled": true}}}` 能work（`patch` 对 Map
+/// 做深合并），但发 `{"auto.tasks.extract": true}` 会被 `find()` 判成未知键
+/// **静默丢掉** —— 开关看着点了、刷新又弹回去，且没有任何错误可看。
+///
+/// 节奏则更难拼对：改「每天 11:00」必须**同时删掉**旧的 `intervalMin`，
+/// 否则 `next_due` 会因为按周/按天分支先命中而行为正确、但页面上的
+/// 「每隔 N 分钟」残留下来变成谎言。这类「互斥字段要一起改」的规则属于
+/// 调度器的语义，不该让前端抄一份。所以写入口收在这里：**页面只说
+/// 「改成每天 11:00」，怎么落到那几个字段由调度器决定**。
+struct TaskPatch {
+    enabled: Option<bool>,
+    cadence: Option<Cadence>,
+}
+
+enum Cadence {
+    Interval(i64),
+    Daily(String),
+    Weekly(i64, String),
+}
+
+/// 解析一次任务的改动请求。形状：
+/// `{"task":"extract","enabled":true,"cadence":{"mode":"daily","daily":"11:00"}}`
+fn parse_task_patch(payload: &Value) -> Result<(String, TaskPatch), String> {
+    let task = payload
+        .get("task")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .ok_or("缺少 task")?
+        .to_string();
+    if !TASKS.contains(&task.as_str()) {
+        return Err(format!("未知任务：{task}（可选 {}）", TASKS.join(" / ")));
+    }
+    let enabled = match payload.get("enabled") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(flag)) => Some(*flag),
+        Some(_) => return Err("enabled 必须是布尔值".into()),
+    };
+    let cadence = match payload.get("cadence") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(parse_cadence(value)?),
+    };
+    if enabled.is_none() && cadence.is_none() {
+        return Err("没有要改的字段".into());
+    }
+    Ok((task, TaskPatch { enabled, cadence }))
+}
+
+fn parse_cadence(value: &Value) -> Result<Cadence, String> {
+    let mode = value
+        .get("mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .ok_or("cadence.mode 必须是 interval / daily / weekly")?;
+    match mode {
+        "interval" => {
+            let minutes = value
+                .get("intervalMin")
+                .and_then(Value::as_i64)
+                .ok_or("cadence.intervalMin 必须是整数分钟")?;
+            if !(1..=43_200).contains(&minutes) {
+                return Err("间隔必须在 1 分钟到 30 天之间".into());
+            }
+            Ok(Cadence::Interval(minutes))
+        }
+        "daily" => {
+            let time = value.get("daily").and_then(Value::as_str).map(str::trim).ok_or("缺少 cadence.daily")?;
+            let (hour, minute) = parse_clock(time).ok_or("cadence.daily 必须是 HH:MM（24 小时制）")?;
+            Ok(Cadence::Daily(format!("{hour:02}:{minute:02}")))
+        }
+        "weekly" => {
+            let day = value
+                .get("weekly")
+                .and_then(Value::as_i64)
+                .ok_or("缺少 cadence.weekly（1 = 周一 … 7 = 周日）")?;
+            if !(1..=7).contains(&day) {
+                return Err("cadence.weekly 必须在 1（周一）到 7（周日）之间".into());
+            }
+            let time = value
+                .get("weeklyTime")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .ok_or("缺少 cadence.weeklyTime")?;
+            let (hour, minute) = parse_clock(time).ok_or("cadence.weeklyTime 必须是 HH:MM（24 小时制）")?;
+            Ok(Cadence::Weekly(day, format!("{hour:02}:{minute:02}")))
+        }
+        other => Err(format!("未知节奏模式：{other}（可选 interval / daily / weekly）")),
+    }
+}
+
+/// 把一次任务改动写进配置，返回改动后的任务状态。
+///
+/// ── 为什么节奏用「整份替换这个任务条」而不是深合并 ──────────
+/// 深合并删不掉键。从「每天 11:00」改成「每隔 30 分钟」时，旧的 `daily`
+/// 会一直留在那一层里；`next_due` 先看 `daily`，于是用户明明改成了每 30
+/// 分钟，调度器仍然每天只跑一次。`Stored::set` 的语义正是「整份替换」——
+/// 它和 `patch` 走同一个 `coerce`，所以非法的值照样进不来。
+///
+/// ── 基准必须取「含默认值的完整表」，不能只取显式值 ────────────
+/// `next.map_of("auto.tasks")` 只读**显式设置过**的那一份。首次写入时它是
+/// 空对象，若拿它当基准，写完之后 `auto.tasks` 就变成「只有这一次改的那个
+/// 任务」——其余十一个任务的默认字段（`supersede.daily = 11:00`、
+/// `consolidate.weekly = 1` …）全部从生效值里消失，`next_due` 退回
+/// 「上次 + 间隔」。表现是「我改了一下抽取的开关，其余按天的任务时间全乱了」，
+/// 而且没有任何报错。所以基准按 `apply_one` 的同一口径取：
+/// 显式值 → 否则 schema 默认值。
+pub fn apply_task(payload: &Value) -> Result<Value, String> {
+    let (task, patch) = parse_task_patch(payload)?;
+    config::update(|next| {
+        // 基准只在内存里取（显式值 → 默认值），不用 `config::object_of`：
+        // 那个按 mtime 走缓存，在事务闭包内读到的是「改之前」的副本。
+        let base = next
+            .values
+            .get("auto.tasks")
+            .cloned()
+            .or_else(|| config::default_of("auto.tasks"))
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        let mut tasks = base.as_object().cloned().unwrap_or_default();
+        let mut entry = tasks
+            .get(&task)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(flag) = patch.enabled {
+            entry.insert("enabled".into(), json!(flag));
+        }
+        if let Some(cadence) = &patch.cadence {
+            // 三种节奏的字段互斥：先全部清掉，再按新模式写回。
+            // 留着旧的等于让 `next_due` 的优先级分支替用户做决定。
+            entry.remove("intervalMin");
+            entry.remove("daily");
+            entry.remove("weekly");
+            entry.remove("weeklyTime");
+            match cadence {
+                Cadence::Interval(minutes) => {
+                    entry.insert("intervalMin".into(), json!(minutes));
+                }
+                Cadence::Daily(time) => {
+                    entry.insert("daily".into(), json!(time));
+                }
+                Cadence::Weekly(day, time) => {
+                    entry.insert("weekly".into(), json!(day));
+                    entry.insert("weeklyTime".into(), json!(time));
+                }
+            }
+        }
+        tasks.insert(task.clone(), Value::Object(entry));
+        next.set("auto.tasks", Value::Object(tasks))?;
+        Ok(())
+    })
+    .map(|_| status())
 }
 
 /// 上次执行时间（epoch ms）。
@@ -810,10 +1044,15 @@ pub fn status() -> Value {
                 // 这个任务要不要花 token。零 token 的标「零成本」，
                 // 花 token 的标「调用模型」——用户扫一眼就知道开它会烧钱。
                 "usesModel": task_uses_model(task),
-                // 一句「它在干什么」，进表格的副标题。文案与 `detail_of`
+                // 一句「它在干什么」，进卡片副标题。文案与 `detail_of`
                 // 的分支同名同义，但这里是**静态说明**（还没跑时也要显示），
-                // 那边是**运行结果**（跑完才有）。
+                // 那边是**运行结果**（跑完才有）。空串 = 这个任务没有可说的
+                // （`health` 就是），前端画一个 `—`，不编一句废话。
                 "summary": task_summary(task),
+                // 节奏（三选一：间隔 / 每天 / 每周）。界面那句「调度节奏：…」
+                // 直接用它，不自己从 `intervalMin` 反推 —— 反推会把
+                // 「每天 11:00」显示成「每 1 天」。
+                "cadence": task_cadence(task),
             })
         })
         .collect();
@@ -877,22 +1116,22 @@ pub fn runs(limit: usize) -> Value {
 }
 
 /// 任务的一句静态说明（「它在干什么」）。
-/// 与 `TASK_LABELS` 分开：那个是**名字**（「抽取要点」，用于标题与下拉），
-/// 这里是**解释**（「给新记忆抽一句摘要，写入摘要字段」）。目标界面的表格
-/// 每行都带这么一句，没有它用户只能从名字猜这个任务会动什么数据。
+/// 与 `TASK_LABELS` 分开：那个是**名字**（「抽取结构化信息」，用于标题与下拉），
+/// 这里是**解释**（「给新记忆补一句语义摘要与重要度评级」）。卡片式界面里
+/// 每张卡标题下面都是这一句，没有它用户只能从名字猜这个任务会动什么数据。
 fn task_summary(task: &str) -> &'static str {
     match task {
-        "extract" => "把最近的流水压成结论候选，写进记忆",
-        "summarize" => "为长文本记忆生成一句摘要，供检索行显示",
-        "tag" => "按内容推断 2-5 个标签，优先复用已有标签",
-        "classify" => "按 cwd 的 git 身份给未归类记忆补项目建议",
-        "supersede" => "拿新记忆比同主题旧记忆，输出失效建议",
-        "distill" => "把同项目的原始碎片蒸馏成 L2 结论与决策",
-        "consolidate" => "把同类 L2 结论合并成一条更完整的",
-        "profile" => "跨项目提炼用户画像：习惯、偏好、工作方式",
-        "index-scan" => "全量重建索引与检索缓存（零成本）",
-        "cleanup" => "清回收站与失效记忆（零成本）",
-        "health" => "记忆体检：陈旧条目、待确认积压（零成本）",
+        "extract" => "给新记忆补一句语义摘要与重要度评级",
+        "summarize" => "为长时间会话或日常工作流提炼高密度摘要",
+        "tag" => "按内容更新 2-5 个标签，优先与已有概念复用",
+        "classify" => "未归属项目的碎片自动匹配相似归档（零成本）",
+        "supersede" => "识别「新事实推翻旧事实」，输出失效建议",
+        "distill" => "将项目原始碎片深度蒸馏为架构决策与取舍手册",
+        "consolidate" => "全库记忆查重：自动合并雷同、存储换入队列",
+        "profile" => "跨项目深度归纳人格、沟通、技术栈与工作习惯",
+        "index-scan" => "全库文件与索引一致性自检及修复（零成本）",
+        "cleanup" => "清理回收站与异常无用记录（零成本）",
+        "health" => "",
         "sync" => "把记忆文件夹打包同步到 WebDAV 远端",
         _ => "",
     }
@@ -1156,6 +1395,12 @@ mod tests {
     #[test]
     fn every_task_has_a_summary_and_zero_cost_tasks_are_marked() {
         for task in TASKS {
+            // `health` 是唯一允许空说明的：它的名字（记忆体检）已经把「干什么」
+            // 说尽了，卡片上画一个 `—`，不要为凑满而编一句同义反复。
+            if task == "health" {
+                assert!(task_summary(task).is_empty(), "health 应当留空，由界面画 —");
+                continue;
+            }
             assert!(!task_summary(task).is_empty(), "{task} 没有说明文案");
         }
         // 零 token 的四个 + sync（它走 WebDAV，不调模型）必须标成零成本：
@@ -1165,6 +1410,56 @@ mod tests {
         }
         for task in ["extract", "summarize", "tag", "distill", "consolidate", "profile", "supersede"] {
             assert!(task_uses_model(task), "{task} 会调模型，必须标出来");
+        }
+    }
+
+    #[test]
+    fn interval_cadence_text_degrades_to_human_units() {
+        assert_eq!(interval_cadence_text(30), "每隔 30 分钟");
+        assert_eq!(interval_cadence_text(360), "每隔 6 小时");
+        // 1440 分钟写「每隔 1 天」读起来像机器；说「每天」才是人的说法。
+        assert_eq!(interval_cadence_text(1440), "每天");
+        assert_eq!(interval_cadence_text(10_080), "每隔 7 天");
+        // 90 分钟不能被 60 整除，退回分钟：写「每隔 1.5 小时」比分钟更难读。
+        assert_eq!(interval_cadence_text(90), "每隔 90 分钟");
+    }
+
+    #[test]
+    fn weekly_cadence_text_names_the_weekday() {
+        assert_eq!(weekly_cadence_text(1, "11:00"), "每周一 11:00");
+        assert_eq!(weekly_cadence_text(7, "09:30"), "每周日 09:30");
+        // 越界的星期号被 `task_cadence` clamp 过；这里断言兜底落在周日，
+        // 而不是 panic 或产出「每周 0」。
+        assert_eq!(weekly_cadence_text(0, "11:00"), "每周日 11:00");
+    }
+
+    #[test]
+    fn task_patch_rejects_unknown_task_and_bad_fields() {
+        assert!(parse_task_patch(&json!({ "task": "nope", "enabled": true })).is_err());
+        assert!(parse_task_patch(&json!({ "task": "extract" })).is_err(), "一个字段都没有应当报错");
+        assert!(parse_task_patch(&json!({ "task": "extract", "enabled": "yes" })).is_err());
+        // 节奏必须落在允许区间：0 分钟会让 tick 每一轮都跑，30 天以外没有意义。
+        assert!(parse_task_patch(&json!({ "task": "extract", "cadence": { "mode": "interval", "intervalMin": 0 } })).is_err());
+        assert!(parse_task_patch(&json!({ "task": "extract", "cadence": { "mode": "interval", "intervalMin": 60 } })).is_ok());
+        // 时刻必须能被 `parse_clock` 认（24:00 / 25:00 都不行）—— 认不了的值
+        // 写进去会让 `next_due` 静默退回「上次 + 间隔」，页面却还显示那个时刻。
+        assert!(parse_task_patch(&json!({ "task": "extract", "cadence": { "mode": "daily", "daily": "24:00" } })).is_err());
+        assert!(parse_task_patch(&json!({ "task": "extract", "cadence": { "mode": "daily", "daily": "9:05" } })).is_ok());
+        assert!(parse_task_patch(&json!({ "task": "extract", "cadence": { "mode": "weekly", "weekly": 8, "weeklyTime": "11:00" } })).is_err());
+    }
+
+    #[test]
+    fn task_patch_normalises_clock_text() {
+        // 用户可能填 `9:5`：写进配置前统一补零，否则页面与 `next_due` 的
+        // 显示会一个写 9:5、一个写 09:05。
+        let (_, patch) = parse_task_patch(&json!({
+            "task": "extract",
+            "cadence": { "mode": "daily", "daily": "9:5" }
+        }))
+        .expect("9:5 应当被接受");
+        match patch.cadence {
+            Some(Cadence::Daily(time)) => assert_eq!(time, "09:05"),
+            _ => panic!("应当解析成 daily"),
         }
     }
 }

@@ -393,6 +393,9 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/memory/rebuild", post(api::memory::post_rebuild))
         // 自动化：状态 + 立即执行（同步等结果 —— 点了就要看到跑成什么样）
         .route("/api/memory/auto", get(api::memory::get_auto))
+        // 改单个任务的开关 / 节奏。语义在调度器里（三种节奏的字段互斥），
+        // 不让页面自己拼 `auto.tasks` 的嵌套形状 —— 见 handler 的注释。
+        .route("/api/memory/auto/task", post(api::memory::post_auto_task))
         .route("/api/memory/auto/run", post(api::memory::post_auto_run))
         // 任务执行审计（?limit=）。`/auto` 里已带 30 条预览，这条只为翻页。
         .route("/api/memory/auto/runs", get(api::memory::get_auto_runs))

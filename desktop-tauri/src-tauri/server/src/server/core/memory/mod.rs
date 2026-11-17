@@ -60,16 +60,16 @@ pub use search::Query as MemoryQuery;
 
 /// 自动化任务的中文名（状态页与服务清单共用一份，避免两处漂移）。
 pub const TASK_LABELS: [(&str, &str); 12] = [
-    ("extract", "抽取要点"),
+    ("extract", "抽取结构化信息"),
     ("summarize", "生成摘要"),
     ("tag", "自动打标签"),
-    ("classify", "项目归类"),
-    ("supersede", "事实失效判定"),
-    ("distill", "蒸馏结论"),
-    ("consolidate", "合并重复结论"),
-    ("profile", "画像生成"),
-    ("index-scan", "索引对账"),
-    ("cleanup", "清理回收站"),
+    ("classify", "项目归类建议"),
+    ("supersede", "失效判定"),
+    ("distill", "L2 蒸馏"),
+    ("consolidate", "去重合并"),
+    ("profile", "人格 / 偏好画像"),
+    ("index-scan", "索引自愈扫描"),
+    ("cleanup", "异常记忆清理"),
     ("health", "记忆体检"),
     ("sync", "WebDAV 同步"),
 ];
@@ -138,7 +138,12 @@ pub fn revision() -> u64 {
     REVISION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn bump_revision() {
+/// 内容版本号 +1。页面与 MCP 据此判断「手里这份是不是过期了」。
+///
+/// 公开是因为自动化页的「改开关 / 改节奏」走 `schedule::apply_task`（它改的是
+/// 配置，但入口不在 `save_config` 上）：那条路不改版本号的话，另一个页签
+/// 打开着配置页时会一直显示旧值。
+pub fn bump_revision() {
     REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 

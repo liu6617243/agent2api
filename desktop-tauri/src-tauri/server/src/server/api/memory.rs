@@ -15,6 +15,7 @@
 //! POST /api/memory/review      裁决（{id, approve} 或 {rejectAll: true}）
 //! GET  /api/memory/calls       内部 LLM 调用台账（?limit=100）
 //! GET  /api/memory/auto        自动化：调度器状态 + 12 个任务的节奏与累计统计
+//! POST /api/memory/auto/task   改一个任务的开关 / 节奏（返回刷新后的整份状态）
 //! POST /api/memory/auto/run    立即执行一个任务（同步等结果）
 //! GET  /api/memory/auto/runs   任务执行审计（?limit=100）
 //! GET  /api/memory/agents      Agent 心跳（接入页的「最近活跃」）
@@ -555,6 +556,33 @@ pub async fn post_rebuild(State(_state): State<ServerState>) -> Response {
 /// 自动化页顶部：调度线程状态 + 12 个任务的节奏与上次执行。
 pub async fn get_auto(State(_state): State<ServerState>) -> Response {
     ok_json(memory::schedule::status())
+}
+
+/// 改一个任务的开关 / 节奏，返回刷新后的整份自动化状态。
+///
+/// ── 为什么单独一个端点，而不是让页面 PUT `auto.tasks` ─────────
+/// 页面自己拼嵌套 Map 有两条已知的错法：发扁平子键（`auto.tasks.extract`）
+/// 会被 `find()` 判成未知键**静默丢掉**（开关点了刷新又弹回去，且没有报错）；
+/// 发深合并形状则删不掉旧节奏字段（从「每天 11:00」改成「每隔 30 分钟」后，
+/// `daily` 残留，`next_due` 仍然按天跑）。两条都是「页面看不见的坏状态」，
+/// 交给调度器自己收口最省事。
+///
+/// 返回整份 `status()`：页面拿到就能直接替换，不用再发一次 GET（两次请求
+/// 之间调度器可能刚好跑了一轮，先 G 后 G 会看到跳变）。
+pub async fn post_auto_task(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(error) => return errors::management_error(400, error.message),
+    };
+    match memory::schedule::apply_task(&payload) {
+        Ok(next) => {
+            // 与 `save_config` 同口径：改了配置就 +1 版本号，别的页面据此知道
+            // 手里那份过期了。绕过去会出现「改了开关，配置页还显示旧值」。
+            memory::bump_revision();
+            ok_json(next)
+        }
+        Err(message) => errors::management_error(400, message),
+    }
 }
 
 /// 手动执行一个任务。**同步等待结果**：用户点了「立即执行」就想看它跑成什么样，
