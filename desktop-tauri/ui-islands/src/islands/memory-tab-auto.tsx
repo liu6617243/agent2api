@@ -96,7 +96,6 @@ function VerdictCard({ pending, onGo }: { pending: number; onGo: () => void }): 
 
 function Auto({ onGo }: { onGo: (tab: 'browse') => void }): React.ReactElement {
   const { data, loading, error, reload } = useLoad(() => m.loadAuto(), [])
-  const calls = useLoad(() => m.loadCalls(60), [])
   const [busy, setBusy] = React.useState('')
   const [actionError, setActionError] = React.useState('')
   const [outcome, setOutcome] = React.useState<{ task: string; outcome: m.Outcome } | null>(null)
@@ -111,7 +110,6 @@ function Auto({ onGo }: { onGo: (tab: 'browse') => void }): React.ReactElement {
       const result = await m.runAutoTask(task)
       setOutcome(result)
       reload()
-      calls.reload()
       if (showAllRuns) allRuns.reload()
     } catch (caught) {
       setActionError(caught instanceof Error ? caught.message : String(caught))
@@ -275,43 +273,6 @@ function Auto({ onGo }: { onGo: (tab: 'browse') => void }): React.ReactElement {
             ))}
           </div>
         )}
-      </Section>
-
-      <Section
-        title={t('调用台账')}
-        hint={t('每次内部模型调用都落一行。排查「为什么今天烧了这么多」看这里。')}
-        action={<Button type='button' size='sm' variant='ghost' onClick={calls.reload}>{t('刷新')}</Button>}
-      >
-        {calls.loading ? <Panel loading error=''>{null}</Panel> : null}
-        {calls.data && calls.data.items.length === 0 ? (
-          <Empty>{t('还没有调用记录。开了花 token 的任务之后这里才会有行。')}</Empty>
-        ) : null}
-        {calls.data && calls.data.items.length > 0 ? (
-          <div className='mm-call-table'>
-            <div className='mm-call-row mm-call-head'>
-              <span>{t('时间')}</span>
-              <span>{t('任务')}</span>
-              <span>{t('模型')}</span>
-              <span>{t('token')}</span>
-              <span>{t('耗时')}</span>
-              <span>{t('结果')}</span>
-            </div>
-            {calls.data.items.map((row, index) => (
-              <div key={index} className='mm-call-row'>
-                <span className='mm-muted'>{row.atText}</span>
-                <span>{labelOf(row.task)}</span>
-                <span className='mm-mono'>{row.model || '—'}</span>
-                <span className='mm-mono'>{num(row.promptTokens)} + {num(row.completionTokens)}</span>
-                <span className='mm-mono'>{row.latencyMs} ms</span>
-                <span>
-                  {row.ok
-                    ? <Badge variant='success' shape='tag'>{t('成功')}</Badge>
-                    : <Badge variant='destructive' shape='tag' title={row.error ?? ''}>{t('失败')}</Badge>}
-                </span>
-              </div>
-            ))}
-          </div>
-        ) : null}
       </Section>
     </div>
   )
