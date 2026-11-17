@@ -2,7 +2,7 @@ import * as React from 'react'
 import { Badge, Button, Switch } from '@ui'
 import { t } from '../i18n'
 import * as m from './memory-api'
-import { Empty, Panel, Section, StateBadge, num, timeText, useLoad } from './memory-shared'
+import { Empty, Panel, Section, StateBadge, num, useLoad } from './memory-shared'
 import { OutcomeLine } from './memory-tab-profile'
 
 /**
@@ -48,7 +48,53 @@ function cadenceText(minutes: number): string {
     : t('每 {n} 分钟', { n: minutes })
 }
 
-function Auto(): React.ReactElement {
+/**
+ * 待确认裁决积压卡。
+ *
+ * ── 为什么把「待确认」从调度器状态里提出来单独一张卡 ─────────
+ * 待确认积压**不是**调度器指标：调度器开得好好的、任务照常跑，积压也会涨。
+ * 早先它只是状态行里一枚黄色小徽标，和「已开启 / 线程在跑」挤在同一排，
+ * 读起来像又一次健康检查 —— 而它其实是这页唯一需要**人去干活**的东西。
+ *
+ * 提到独立卡片之后，卡片里只有两件事：有多少条等你裁决、去哪儿裁决。
+ *
+ * 超预算行为（`auto.overBudgetAction`）不在这张卡上：它属于「配置」，
+ * 一年改一次，摆在日常页面上只会把这张卡的两个数字挤散。
+ */
+function VerdictCard({ pending, onGo }: { pending: number; onGo: () => void }): React.ReactElement {
+  return (
+    <div className='mm-verdict'>
+      <div className='mm-verdict-head'>
+        <span className='mm-verdict-icon' aria-hidden>
+          {/* 方框里一个勾：与页面里「待确认」的语义一致（裁决 = 逐条过一遍）。
+              用内联 SVG 而不是 wbIcons：图标字体在岛里要等 window.wbIcons 就位，
+              这一枚是页面的主视觉，不能有「先空一下再出现」的时序。 */}
+          <svg width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='1.8' strokeLinecap='round' strokeLinejoin='round'>
+            <rect x='3.5' y='3.5' width='17' height='17' rx='4' />
+            <path d='M8 13.2l2.6 2.6L16 9.4' />
+          </svg>
+        </span>
+        <div className='mm-verdict-title'>
+          <div className='mm-verdict-name'>{t('待确认裁决建议')}</div>
+          <div className='mm-verdict-sub'>{t('需人工判定的失效 / 归类 / 查重建议')}</div>
+        </div>
+      </div>
+
+      <div className='mm-verdict-body'>
+        <span className='mm-verdict-count'>
+          <strong>{num(pending)}</strong>
+          <span>{t('项待办')}</span>
+        </span>
+        <Button type='button' size='sm' variant='outline' onClick={onGo}>
+          {t('进入裁决收件箱')}
+          <span aria-hidden className='mm-verdict-arrow'>→</span>
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function Auto({ onGo }: { onGo: (tab: 'browse') => void }): React.ReactElement {
   const { data, loading, error, reload } = useLoad(() => m.loadAuto(), [])
   const calls = useLoad(() => m.loadCalls(60), [])
   const [busy, setBusy] = React.useState('')
@@ -79,7 +125,6 @@ function Auto(): React.ReactElement {
   if (!data) return <Empty>{t('读不到调度器状态。')}</Empty>
 
   const labelOf = (task: string) => data.labels.find(item => item.task === task)?.label ?? task
-  const used = data.dailyTokenLimit > 0 ? Math.min(100, Math.round((data.tokensToday / data.dailyTokenLimit) * 100)) : 0
   // 累计 token 只在会调模型的任务上显示：零成本任务的 0 是恒定的，
   // 每行都写一遍「0 token」只会让人以为那台机器没记上账。
   const spend = (task: m.AutoTask) => (task.usesModel ? `${num(task.tokens)} token` : t('零成本'))
@@ -91,39 +136,21 @@ function Auto(): React.ReactElement {
     <div className='mm-auto'>
       {actionError ? <div className='mm-error'>{actionError}</div> : null}
 
-      <Section title={t('调度器')} hint={t('扫描式：每 60 秒醒一次，检查每个任务「距上次跑够不够间隔」。错过一次不会漏，只是晚一点。')}>
-        <div className='mm-inline-meta'>
-          <StateBadge state={data.globalEnabled ? 'ok' : 'idle'} label={data.globalEnabled ? t('已开启') : t('已关闭')} />
-          <StateBadge state={data.running ? 'ok' : 'idle'} label={data.running ? t('线程在跑') : t('线程未启动')} />
-          {data.privacyPaused ? <Badge variant='warning' shape='tag'>{t('隐私暂停：全部任务停跑')}</Badge> : null}
-          {data.budgetExhausted ? <Badge variant='destructive' shape='tag'>{t('今日预算已用完')}</Badge> : null}
-          {data.pendingReview > 0 ? (
-            <Badge
-              variant='warning'
-              shape='tag'
-              title={t('待确认的裁决建议（去重 / 失效 / 合并）。积压到 50 条会挡住新的归类任务。')}
-            >
-              {t('待确认 {n} 条', { n: num(data.pendingReview) })}
-            </Badge>
-          ) : null}
-          <span className='mm-muted'>{t('上次 tick：{when}', { when: timeText(data.lastTick) })}</span>
-        </div>
+      {/* 调度器状态 + 预算进度已按截图并入裁决卡；这里不再重复一遍「已开启 /
+          线程在跑 / 上次 tick」—— 那三项在仪表盘有，两处都摆在页面最上面
+          只会让真正要动手的事（裁决积压）被挤到第二眼。 */}
+      <VerdictCard pending={data.pendingReview} onGo={() => onGo('browse')} />
 
-        <div className='mm-budget'>
-          <div className='mm-budget-head'>
-            <span>{t('今日模型消耗')}</span>
-            <span className='mm-muted'>{num(data.tokensToday)} / {num(data.dailyTokenLimit)} token（{used}%）</span>
-          </div>
-          <div className='mm-budget-track'>
-            <div className={`mm-budget-fill${used >= 100 ? ' full' : used >= 80 ? ' high' : ''}`} style={{ width: `${used}%` }} />
-          </div>
-          <p className='mm-hint'>
-            {t('预算在「配置 → 自动化」里改（auto.dailyTokenLimit）。超预算后按 auto.overBudgetAction 处理：现在是「{mode}」。', {
-              mode: data.overBudgetAction === 'ignore' ? t('照跑') : t('暂停'),
-            })}
-          </p>
+      {data.privacyPaused ? (
+        <div className='mm-scan-note'>{t('隐私暂停：全部自动化任务停跑。去「配置 → 自动化」解除。')}</div>
+      ) : null}
+      {data.budgetExhausted ? (
+        <div className='mm-scan-note'>
+          {t('今日预算已用完，任务按「{mode}」处理（auto.overBudgetAction，在「配置 → 自动化」里改）。', {
+            mode: data.overBudgetAction === 'ignore' ? t('不限额继续') : t('暂停任务'),
+          })}
         </div>
-      </Section>
+      ) : null}
 
       <Section title={t('任务')} hint={t('零 token 的默认开，花 token 的默认关 —— 它们会在后台消耗你的额度。')}>
         <div className='mm-task-table'>

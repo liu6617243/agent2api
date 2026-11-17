@@ -244,7 +244,11 @@ function MemoryPage(): React.ReactElement {
 
           {tab === 'profile' ? <TabBoundary name='画像'><Profile /></TabBoundary> : null}
           {tab === 'agents' ? <TabBoundary name='接入'><Agents /></TabBoundary> : null}
-          {tab === 'auto' ? <TabBoundary name='自动化'><Auto /></TabBoundary> : null}
+          {tab === 'auto' ? (
+            <TabBoundary name='自动化'>
+              <Auto onGo={next => switchTab(next as Tab)} />
+            </TabBoundary>
+          ) : null}
           {tab === 'import' ? <TabBoundary name='导入'><Import /></TabBoundary> : null}
           {tab === 'sync' ? <TabBoundary name='同步'><Sync /></TabBoundary> : null}
           {tab === 'settings' ? (

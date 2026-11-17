@@ -593,28 +593,68 @@
   min-height: 0;
   padding-bottom: 4px;
 }
-.mm-budget { display: flex; flex-direction: column; gap: 5px; }
-.mm-budget-head {
+/* 待确认裁决卡。
+   两段式：标题区（图标 + 名称 + 说明）/ 计数行（数字 + 收件箱按钮）。
+   不放超预算行为之类的配置项 —— 那张卡只回答「有多少条等裁决、去哪儿裁决」，
+   混进配置项会让两个数字被挤散。 */
+.mm-verdict {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
+  flex-direction: column;
   gap: 10px;
-  font-size: 12.5px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  /* 与 .mm-section 同理：固定高度的滚动列里，卡片不能被压矮 */
+  flex: 0 0 auto;
 }
-.mm-budget-track {
-  height: 6px;
-  border-radius: 999px;
-  background: var(--surface-inset);
-  overflow: hidden;
+.mm-verdict-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
 }
-.mm-budget-fill {
-  height: 100%;
-  border-radius: 999px;
-  background: var(--primary);
-  transition: width 200ms ease-out;
+.mm-verdict-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--r-sm);
+  /* 琥珀底 + 琥珀描边：与「待确认」在别处用的 warn 同族，但压成深底，
+     因为它是一块图标底，不是一条提示条。 */
+  background: var(--warn-soft);
+  border: 1px solid var(--warn-bd);
+  color: var(--warn);
 }
-.mm-budget-fill.high { background: var(--warn); }
-.mm-budget-fill.full { background: var(--danger); }
+.mm-verdict-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.mm-verdict-name { font-size: 14px; font-weight: 600; color: var(--text); letter-spacing: .01em; }
+.mm-verdict-sub { font-size: 11.5px; color: var(--text-3); line-height: 1.5; }
+
+.mm-verdict-body {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 2px;
+}
+.mm-verdict-count {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.mm-verdict-count strong {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--warn);
+  /* 等宽数字：0 与 12 之间切换时数字宽度不跳，右侧按钮不会左右晃 */
+  font-variant-numeric: tabular-nums;
+}
+.mm-verdict-arrow { margin-left: 6px; font-size: 12px; opacity: .8; }
 
 .mm-task-table, .mm-call-table, .mm-run-table, .mm-preview-table { display: flex; flex-direction: column; }
 .mm-task-row {
