@@ -28,6 +28,13 @@ import { Empty, Panel, Section, StateBadge, num, useLoad } from './memory-shared
  * （分类是从这次升级之后开始记的，所以三项之和可能小于总次数。）
  */
 
+/** 清单还没到手时的空数组。
+ *
+ * 必须是**模块级常量**而不是每次渲染的 `?? []`：下面的 `useMemo` 依赖里有它，
+ * 每次渲染都造一个新数组会让记忆化每轮都失效（依赖比较是 `Object.is`）。
+ * 结果一样、也不会死循环，但「派生值」本来是为了省钱，别先自己花了。 */
+const EMPTY_KEYS: m.GatewayKey[] = []
+
 /**
  * 卡片右上角的两枚徽标：装了没、接上了没。
  *
@@ -72,7 +79,22 @@ function callText(card: m.AgentCard): React.ReactNode {
 
 function Agents(): React.ReactElement {
   const { data, loading, error, reload } = useLoad(() => m.loadAgents(), [])
+  /**
+   * 用哪把 key 写进客户端。
+   *
+   * ── 为什么是下拉而不是输入框 ────────────────────────────────
+   * 输入框要求用户自己记住 key 的 id（`legacy` / 一串 uuid），而他要表达的只是
+   * 「用哪一把」。这个值唯一的来源就是网关的 key 清单，没有自由输入的空间 ——
+   * 敲错一个字符会得到「所选 API Key 不存在」，而用户没有任何线索判断错在哪。
+   * 下拉把「可能的取值」直接摆在眼前，选不出来就是没有，一目了然。
+   *
+   * ── 为什么默认就选中第一把 ──────────────────────────────────
+   * 空值必须有个明确归宿。旧文案写「留空 = 默认」但后端会直接 400，等于让用户
+   * 照着一句谎话操作。现在后端会把空值落到第一把可用 key，前端也就默认选中它，
+   * 并在注入成功后回执「Key：某某」—— 隐式决策要变成可见事实。
+   */
   const [apiKeyId, setApiKeyId] = React.useState('')
+  const keys = useLoad(() => m.loadGatewayKeys(), [])
   /** 正在忙的那张卡（空串 = 都没忙）。逐卡而不是全局：同一时刻只允许一个写动作，
    *  但别的卡要照常可读、可展开，不能整页变灰。 */
   const [busyId, setBusyId] = React.useState('')
@@ -81,6 +103,24 @@ function Agents(): React.ReactElement {
   const [notes, setNotes] = React.useState<Record<string, { ok: boolean; text: string }>>({})
   const [snippet, setSnippet] = React.useState<m.AgentSnippet | null>(null)
   const [snippetFor, setSnippetFor] = React.useState('')
+
+  /**
+   * 真正要提交的那把 key = 「state 里的选择」∩「清单里真实存在的」。
+   *
+   * ── 为什么在渲染期派生，而不是用 effect 回写 state ──────────
+   * 两件事必须同时成立：下拉**显示**的是 A，提交上去的**也是** A。用 effect 回写
+   * 的话中间有一帧 state 还是旧值 —— 而 `<select value>` 指向不存在的 option 时
+   * 浏览器会把显示落到第一项，于是「看着 A、提交 B」。派生值没有这一帧：显示的
+   * 和提交的就是同一个变量，不必再验一次。
+   *
+   * 两种失效都要管：还没选过（空串）、选过的那把后来被删了或停用了。后者很常见 ——
+   * 用户去「账号与密钥」删掉旧 key，回来接着点「一键注入」，不该 400。
+   */
+  const keyList = keys.data?.keys ?? EMPTY_KEYS
+  const pickedKeyId = React.useMemo(() => {
+    if (keyList.some(key => key.id === apiKeyId)) return apiKeyId
+    return keyList[0]?.id ?? ''
+  }, [apiKeyId, keyList])
 
   /** 跑一个逐卡动作：结果写进 `notes[id]`，不弹全局提示条。 */
   const run = async (id: string, task: () => Promise<string>) => {
@@ -120,11 +160,16 @@ function Agents(): React.ReactElement {
    * 用户会盯着「尚未观察到真实调用」以为功能坏了。
    */
   const injectOne = (card: m.AgentCard) => run(card.id, async () => {
-    const result = await m.installAgents([card.id], apiKeyId)
+    const result = await m.installAgents([card.id], pickedKeyId)
     const row = result.results.find(item => item.id === card.id)
     if (row && !row.ok) throw new Error(row.error ?? t('写入失败'))
     const wrote = [row?.mcp, row?.instruction].filter(Boolean).join(' · ')
-    return `${wrote || t('已写入')}${t('。重启 {name} 后生效 —— 配置只在启动时读一次。', { name: card.name })}`
+    // 带上「用了哪把 key」：用户可能在别处把它停用了，回来点注入仍会成功（后端
+    // 会挑第一把），这条回执是事后唯一能查到「客户端拿的是哪把凭证」的线索。
+    const usedKey = result.apiKey
+      ? t('（Key：{name}）', { name: result.apiKey.name })
+      : ''
+    return `${wrote || t('已写入')}${usedKey}${t('。重启 {name} 后生效 —— 配置只在启动时读一次。', { name: card.name })}`
   })
 
   const dropOne = (card: m.AgentCard) => run(card.id, async () => {
@@ -159,12 +204,33 @@ function Agents(): React.ReactElement {
         hint={t('记忆只走 MCP：客户端自己决定什么时候读，网关不改任何请求体。')}
         action={(
           <div className='mm-inline-actions'>
-            <Input
-              className='mm-key-input'
-              value={apiKeyId}
-              placeholder={t('用哪个 Key（留空 = 默认）')}
-              onChange={event => setApiKeyId(event.target.value)}
-            />
+            {/* key 选择器：清单为空时给出「去哪建」，而不是一个点不动的空下拉。
+                用原生 `select` + `.mm-select`：本页其余 9 处下拉（归类 / 层级 /
+                项目 / 格式…）全是这个形态，混进一个 @ui Select 会让同一页出现两套
+                下拉外观（高度、箭头、阴影都不一样）。 */}
+            {keyList.length ? (
+              <select
+                className='mm-select mm-key-select'
+                aria-label={t('写进客户端用的 API Key')}
+                value={pickedKeyId}
+                onChange={event => setApiKeyId(event.target.value)}
+              >
+                {keyList.map(key => (
+                  <option key={key.id} value={key.id}>{key.name}（{key.masked}）</option>
+                ))}
+              </select>
+            ) : (
+              <span className={keys.error ? 'mm-warn mm-key-empty' : 'mm-muted mm-key-empty'}>
+                {keys.error
+                  // 「读不到清单」和「一把都没有」是两件事，处理方式也不同：
+                  // 前者要重试，后者要新建。合并成一句「没有可用的 Key」会让读失败
+                  // 的用户跑去建第二把 key —— 而问题根本不在那里。
+                  ? t('读不到 Key 清单：{error}', { error: keys.error })
+                  : keys.loading
+                    ? t('正在读取 Key…')
+                    : t('还没有可用的 API Key —— 先到「账号与密钥 → API Key」建一把')}
+              </span>
+            )}
             <Button
               type='button'
               size='sm'

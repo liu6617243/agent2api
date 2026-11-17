@@ -799,8 +799,27 @@ export function buildProfile(): Promise<{ outcome: Outcome; profile: ProfileView
   return api('POST', '/api/memory/profile/build')
 }
 
-export function installAgents(clients: string[], apiKeyId: string): Promise<{ results: InstallResult[]; cards: AgentList }> {
+/** 写进客户端的 key 身份（不含明文）。`picked=true` 表示前端没选、由后端挑的第一把。 */
+export type AgentInstalledKey = { id: string; name: string; picked: boolean }
+
+export function installAgents(
+  clients: string[],
+  apiKeyId: string,
+): Promise<{ results: InstallResult[]; cards: AgentList; apiKey?: AgentInstalledKey }> {
   return api('POST', '/api/memory/agents/install', { clients, api_key_id: apiKeyId })
+}
+
+/** 网关里可用的 API Key（id / 名字 / 掩码），复用工具服务页那个端点。
+ *
+ *  ── 为什么复用而不是再开一个 ──────────────────────────────────
+ * 「写进客户端哪把 key」这件事没有记忆中枢特有的语义 —— 工具服务页早就有一份
+ * 完全相同的清单（连过滤条件都一样：只要 `is_usable` 的）。再开一个端点，两边
+ * 的可用性判定迟早会分叉（比如一边算上了降级态的 key，另一边没算）。
+ */
+export type GatewayKey = { id: string; name: string; masked: string }
+
+export function loadGatewayKeys(): Promise<{ keys: GatewayKey[] }> {
+  return api('GET', '/api/tools/api-keys')
 }
 
 export function uninstallAgents(clients: string[]): Promise<{ results: InstallResult[]; cards: AgentList }> {

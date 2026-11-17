@@ -231,7 +231,9 @@
 }
 .mm-project-select { max-width: 190px; }
 .mm-priority-input { max-width: 92px; }
-.mm-key-input { max-width: 210px; }
+/* key 选择器：宽度够放「名称（sk-abc...1234）」但不抢走「全部校验」的位置。 */
+.mm-key-select { min-width: 200px; max-width: 260px; }
+.mm-key-empty { font-size: 12px; }
 
 .mm-split {
   display: grid;

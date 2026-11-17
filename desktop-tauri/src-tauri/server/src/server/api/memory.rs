@@ -273,14 +273,29 @@ pub async fn post_agents_install(State(state): State<ServerState>, headers: axum
     let base = gateway_base(&headers, &state);
     let key = match plain_key(object.get("api_key_id").and_then(Value::as_str).unwrap_or("")) {
         Ok(key) => key,
-        Err(response) => return response,
+        // 前端要能就地显示「最后用了哪把 key」—— 留空时是我们替他挑的，不讲清楚
+        // 就等于把一次隐式决策藏起来了。
+        Err(message) => return errors::management_error(400, message),
     };
+    // 明文只进闭包（写进客户端配置），名字与 id 留在外面回给前端 —— 明文不出网关。
+    // 用解构而不是逐个 `.clone()`：`text` 是明文，多克隆一份就多一份它可能被
+    // 顺手带进日志 / 响应的机会；这里直接把它交给闭包，作用域里不留第二份。
+    let PickedKey { id: key_id, name: key_name, text: key_text, picked: key_picked } = key;
     let outcome = crate::server::core::blocking::run(move || {
-        memory::agents::install(&clients, &base, &key)
+        memory::agents::install(&clients, &base, &key_text)
     })
     .await;
     match outcome {
-        Ok(value) => ok_json(value),
+        Ok(mut value) => {
+            // 把「这次写进客户端的是哪把 key」带回前端：只有 id / 名字 / 是否代选，
+            // **没有明文也没有掩码** —— 掩码只对「还没选过、需要辨认」的场景有用，
+            // 这里前端刚从上拉框里选过，再把指纹回显一遍只会多一处可泄漏的字段。
+            if let Some(object) = value.as_object_mut() {
+                let used = json!({ "id": key_id, "name": key_name, "picked": key_picked });
+                object.insert("apiKey".into(), used);
+            }
+            ok_json(value)
+        }
         Err(error) => errors::management_error(500, error.message),
     }
 }
@@ -399,12 +414,64 @@ fn replace_port(host: &str, port: u16) -> String {
     }
 }
 
-fn plain_key(key_id: &str) -> Result<String, Response> {
-    crate::server::core::api_keys::list()
+/// 这次写进客户端的 key。
+///
+/// `text` 是明文，只该往「写进客户端配置」这条路上走；回给前端的那份 JSON 里
+/// 绝不能带上它 —— 接口响应会被 UI 缓存、日志、错误上报一路抄下去。
+struct PickedKey {
+    id: String,
+    name: String,
+    text: String,
+    /// true = 前端没指定，是我们按清单顺序替他挑的第一把
+    picked: bool,
+}
+
+/// 「用哪一把」的纯决策：给定可用 key 的 id 清单，选出下标。
+///
+/// 抽成纯函数是为了能测 —— `ApiKeyEntry` 的降级标记是私有字段，测试里造不出来；
+/// 而这条规则（空 = 第一把、非空 = 精确匹配）恰恰是最容易写错、又最影响用户的那部分。
+fn pick_index(available: &[String], key_id: &str) -> Result<(usize, bool), String> {
+    let key_id = key_id.trim();
+    if key_id.is_empty() {
+        if available.is_empty() {
+            // 一把都没有时说的必须是「怎么建」，不是「key 不存在」：用户此刻在
+            // 接入页，最需要知道的是下一步点哪里。
+            return Err("还没有可用的 API Key —— 先到「账号与密钥 → API Key」建一把，再回来接入".into());
+        }
+        return Ok((0, true));
+    }
+    available
+        .iter()
+        .position(|id| id == key_id)
+        .map(|index| (index, false))
+        .ok_or_else(|| "所选 API Key 不存在、已停用或不可用".to_string())
+}
+
+/// 取要写进客户端的那把 key。
+///
+/// ── 为什么空值要落到「第一把可用 key」而不是报错 ─────────────
+/// 界面上的占位文案一直写着「留空 = 默认」，但旧实现把空串直接拿去按 id 查，
+/// 必然查不到（id 只可能是 `legacy` 或 uuid）→ 一律 400。用户照着文案留空，
+/// 得到「所选 API Key 不存在」—— 文案在骗人，功能也走不通。
+///
+/// 「默认」的合理含义就是清单里第一把能用的：用户没表达偏好时，用哪把都一样
+/// 能连通，挑第一把是唯一不需要额外决策的选择。把挑中的名字一起返回，前端才能
+/// 把这次隐式决策变成一个可见的事实。
+fn plain_key(key_id: &str) -> Result<PickedKey, String> {
+    let usable: Vec<_> = crate::server::core::api_keys::list()
         .into_iter()
-        .find(|entry| entry.id == key_id && entry.is_usable())
-        .map(|entry| entry.key)
-        .ok_or_else(|| errors::management_error(400, "所选 API Key 不存在、已停用或不可用"))
+        .filter(crate::server::core::api_keys::ApiKeyEntry::is_usable)
+        .collect();
+    let ids: Vec<String> = usable.iter().map(|entry| entry.id.clone()).collect();
+    let (index, picked) = pick_index(&ids, key_id)?;
+    // 用 `get` 而不是 `remove` / `nth`：`pick_index` 已经保证了下标合法，但
+    // release 构建是 `panic=abort` —— 任何一处越界 panic 都会让整个网关退出。
+    // 为一个「理论上不可能」的分支押上整个进程不划算，宁可多一次 clone。
+    let entry = usable
+        .get(index)
+        .cloned()
+        .ok_or_else(|| "读取 API Key 清单时顺序发生变化，请重试".to_string())?;
+    Ok(PickedKey { id: entry.id, name: entry.name, text: entry.key, picked })
 }
 
 pub async fn post_write(State(_state): State<ServerState>, body: Bytes) -> Response {
@@ -940,4 +1007,54 @@ fn strings(value: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_index;
+
+    fn ids(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    /// 留空 = 第一把可用 key，并且标为「替用户挑的」。
+    ///
+    /// 这条守的是界面那句文案：旧实现把空串当 id 查，必然 400，用户照着
+    /// 「留空 = 默认」操作只会得到「所选 API Key 不存在」。
+    #[test]
+    fn blank_falls_back_to_the_first_key() {
+        let available = ids(&["legacy", "k-2"]);
+        assert_eq!(pick_index(&available, "").unwrap(), (0, true));
+        // 前后空白也算留空 —— 输入框里粘进来的值经常带空格
+        assert_eq!(pick_index(&available, "   ").unwrap(), (0, true));
+    }
+
+    /// 一把都没有时必须告诉他去哪建，而不是「不存在」。
+    #[test]
+    fn blank_with_no_keys_says_how_to_create_one() {
+        let error = pick_index(&[], "").unwrap_err();
+        assert!(error.contains("API Key"), "{error}");
+        assert!(error.contains("建"), "错误里要给出下一步动作：{error}");
+    }
+
+    /// 指定了 id 就是精确匹配，不做前缀 / 模糊匹配。
+    ///
+    /// 模糊匹配在这里是危险的：`k-1` 和 `k-11` 都会命中前者，用户选了 B 却写进
+    /// 客户端 A 的 key —— 界面上完全看不出来（两者都能连通）。
+    #[test]
+    fn explicit_id_matches_exactly() {
+        let available = ids(&["k-1", "k-11"]);
+        assert_eq!(pick_index(&available, "k-11").unwrap(), (1, false));
+        assert_eq!(pick_index(&available, "k-1").unwrap(), (0, false));
+    }
+
+    /// 指定的 id 不在可用清单里（停用 / 已删 / 手改配置）→ 报错，不静默换成别的。
+    ///
+    /// 静默回落会让「我明明选了 B，怎么客户端用的是 A」变成无法排查的问题。
+    #[test]
+    fn unknown_id_is_rejected() {
+        let available = ids(&["k-1"]);
+        assert!(pick_index(&available, "k-2").is_err());
+        assert!(pick_index(&[], "k-1").is_err());
+    }
 }
