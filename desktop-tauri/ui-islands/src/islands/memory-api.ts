@@ -208,6 +208,32 @@ export type AutoTask = {
   lastRun: number | null
   lastRunText: string | null
   nextRun: number
+  /** 「下次」的人话：按配置的 daily / weeklyTime 推，与 `lastRun + interval` 不同。 */
+  nextRunText: string
+  /** 累计执行次数（含跳过 / 失败）。 */
+  runs: number
+  /** 成功次数（status = done）。 */
+  success: number
+  /** 累计消耗的 token（零成本任务恒为 0）。 */
+  tokens: number
+  /** 这个任务会不会调模型 —— 界面据此标「零成本 / 调用模型」。 */
+  usesModel: boolean
+  /** 一句「它在干什么」，静态文案，还没跑过时也显示。 */
+  summary: string
+}
+
+/** 一次任务执行（`task_run` 一行）。 */
+export type TaskRun = {
+  at: number
+  atText: string
+  task: string
+  status: 'done' | 'skipped' | 'failed'
+  detail: string
+  tokens: number
+  latencyMs: number
+  manual: boolean
+  /** 这一行代表「连续 N 次同样的结果」。1 = 普通一行。 */
+  repeat: number
 }
 
 export type AutoStatus = {
@@ -218,8 +244,18 @@ export type AutoStatus = {
   dailyTokenLimit: number
   tokensToday: number
   budgetExhausted: boolean
+  /** `pause` = 超预算挂起，`ignore` = 照跑。 */
+  overBudgetAction: string
+  /** 待裁决建议条数（`review_queue` 里 pending 的行）。 */
+  pendingReview: number
   labels: { task: string; label: string }[]
   tasks: AutoTask[]
+  /** 最近 30 条执行记录（预览；翻页走 loadAutoRuns）。 */
+  recentRuns: TaskRun[]
+  /** 记录**行数**（「查看全部 N 条」的 N）。 */
+  runRows: number
+  /** 执行**次数**（合并后一行可代表多次，与任务行「累计」同口径）。 */
+  runCount: number
 }
 
 export type LlmCall = {
@@ -552,6 +588,11 @@ export function loadReview(status = 'pending', type?: string, limit = 50): Promi
 
 export function loadAuto(): Promise<AutoStatus> {
   return api('GET', '/api/memory/auto')
+}
+
+/** 任务执行审计翻页（`/auto` 里已带 30 条预览）。 */
+export function loadAutoRuns(limit = 100): Promise<{ items: TaskRun[]; total: number; runs: number }> {
+  return api('GET', `/api/memory/auto/runs${query({ limit })}`)
 }
 
 export function loadCalls(limit = 100): Promise<{ items: LlmCall[]; tokensToday: number; dailyLimit: number }> {

@@ -298,8 +298,50 @@ impl MemoryIndex {
                detail TEXT,
                ok INTEGER DEFAULT 1
              );
-             CREATE INDEX IF NOT EXISTS sync_log_at ON sync_log(at DESC);",
+             CREATE INDEX IF NOT EXISTS sync_log_at ON sync_log(at DESC);
+
+             -- 任务执行审计：每次自动化任务跑完（含跳过 / 失败）落一行。
+             --
+             -- ── 为什么不复用 llm_call ────────────────────────────
+             -- 两者是一对多的关系，不是同一件事：`llm_call` 记「这一批里调了几次
+             -- 模型、各花了多少 token」，`task_run` 记「这一轮任务整体跑了多久、
+             -- 处理了几条、结没成功」。零 token 的任务（索引对账、清理回收站、
+             -- 记忆体检）根本不产生 llm_call，但用户同样要知道它们跑过没有 ——
+             -- 只看 llm_call 会得到一张「这些任务从没运行过」的假报表。
+             --
+             -- `tokens` 是这一轮该任务所有模型调用的合计（零 token 任务为 0），
+             -- 冗余存一份是为了让「任务执行记录」那张表不用 join 两张表、也不用
+             -- 在时间窗口上做近似匹配（两次调用的时间戳与任务开始时间必然不同）。
+             CREATE TABLE IF NOT EXISTS task_run (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               at INTEGER NOT NULL,
+               task TEXT NOT NULL,
+               status TEXT NOT NULL,          -- done / skipped / failed
+               detail TEXT,                   -- 一句人能读的结果摘要
+               tokens INTEGER DEFAULT 0,
+               latency_ms INTEGER DEFAULT 0,
+               manual INTEGER DEFAULT 0       -- 1 = 用户点「立即执行」
+             );
+             CREATE INDEX IF NOT EXISTS task_run_at ON task_run(at DESC);
+             CREATE INDEX IF NOT EXISTS task_run_task ON task_run(task, at DESC);",
         );
+        // 老库补列：`repeat` 是后加的（见 `log_task_run` 的「连续相同结果合并」）。
+        // SQLite 的 `ALTER TABLE ADD COLUMN` 不支持 `IF NOT EXISTS`，所以先问
+        // `PRAGMA table_info`。放在 `execute_batch` 外面：批次里有一条失败，
+        // 后面全不执行。
+        let has_repeat: bool = conn
+            .prepare("PRAGMA table_info(task_run)")
+            .and_then(|mut statement| {
+                let names: Vec<String> = statement
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .map(|rows| rows.flatten().collect())
+                    .unwrap_or_default();
+                Ok(names.iter().any(|name| name == "repeat"))
+            })
+            .unwrap_or(false);
+        if !has_repeat {
+            let _ = conn.execute_batch("ALTER TABLE task_run ADD COLUMN repeat INTEGER DEFAULT 1;");
+        }
 
         // FTS5 探测：建不起来就退化（编译期选项，不是运行期错误）
         let fts = conn
@@ -627,6 +669,199 @@ impl MemoryIndex {
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![now, task, model, provider, prompt, completion, latency, if ok { 1_i64 } else { 0 }, error, note],
         );
+    }
+
+    /// 两次执行是否可以合并成一行：任务、状态、明细三项全等。
+    ///
+    /// 抽成独立函数是为了能单测 —— 这条判据写错的后果是「不同任务的记录
+    /// 互相覆盖」，而它埋在一条 SQL 里时只能靠读代码发现。
+    fn same_run(
+        last_task: &str,
+        last_status: &str,
+        last_detail: Option<&str>,
+        task: &str,
+        status: &str,
+        detail: Option<&str>,
+    ) -> bool {
+        last_task == task && last_status == status && last_detail == detail
+    }
+
+    /// 记一次任务执行（`task_run`）。
+    ///
+    /// 与 [`Self::log_llm`] 分开落表：一次任务可能调 0 次或 N 次模型，而
+    /// 「跑没跑、跑成什么样」是任务级的结论。表在 `index.rs` 里建，
+    /// 写入点是 `schedule::run_once` 的出口 —— 那里是唯一知道「这一轮整体
+    /// 耗时多少、产出了什么」的地方。
+    ///
+    /// ── 连续相同结果的合并 ──────────────────────────────────
+    /// `classify` 每小时跑一次，没东西可归的时候每次都跳过、理由一字不差。
+    /// 每跳过一次就落一行的话，一天 24 行全是「没有未归类的记忆」，把真正
+    /// 有信息量的那几行挤出「最近 30 条」。所以：**当最后一行是同任务、
+    /// 同状态、同明细**时，不新增行，只把最后一行的 `at` 推到本次、`repeat +1`。
+    /// 只比最后一行（不是全表），这样「跳过 → 成功 → 跳过」不会被合并成
+    /// 一条，顺序与次数都还在。
+    pub fn log_task_run(&self, task: &str, status: &str, detail: Option<&str>, tokens: i64, latency: i64, manual: bool) {
+        let Ok(conn) = self.conn.lock() else { return };
+        let now = crate::server::logging::now_ms();
+        // 最后一行（同任务、同状态、同明细）→ 合并到它上面。
+        let previous: Option<(i64, String, String, Option<String>)> = conn
+            .query_row(
+                "SELECT id, task, status, detail FROM task_run ORDER BY id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .ok();
+        if let Some((id, last_task, last_status, last_detail)) = previous {
+            // 三项全等才合并。任务名也要比 —— 两个任务的「跳过」理由可能
+            // 一字不差（都是「没有未归类的记忆」那种通用句），只比状态与
+            // 明细会把甲任务的记录挂到乙任务名下。
+            if same_run(&last_task, &last_status, last_detail.as_deref(), task, status, detail) {
+                let _ = conn.execute(
+                    // `at` 推到本次（这行的意思是「最近一次是什么时候」），
+                    // `repeat` 记次数，`tokens` 累加（跳过恒 0，成功则每次都
+                    // 真花了），耗时取本次。
+                    "UPDATE task_run
+                        SET at = ?1, repeat = repeat + 1, tokens = tokens + ?2, latency_ms = ?3, manual = ?4
+                      WHERE id = ?5",
+                    params![now, tokens.max(0), latency.max(0), if manual { 1_i64 } else { 0 }, id],
+                );
+                return;
+            }
+        }
+        let _ = conn.execute(
+            "INSERT INTO task_run (at, task, status, detail, tokens, latency_ms, manual, repeat)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,1)",
+            params![now, task, status, detail, tokens.max(0), latency.max(0), if manual { 1_i64 } else { 0 }],
+        );
+        // 滚动删除：与 `recall_log` 同一口径，靠 `auto.logKeepCount` 一档配置
+        // 收两条表的上限。任务日志比检索日志稀（一轮 tick 最多 12 行），
+        // 用同一个上限不会把用户真正想看的历史挤掉。
+        let keep = super::config::usize_of("auto.logKeepCount").max(20) as i64;
+        let _ = conn.execute(
+            "DELETE FROM task_run WHERE id NOT IN (SELECT id FROM task_run ORDER BY id DESC LIMIT ?1)",
+            params![keep],
+        );
+    }
+
+    /// 最近的执行记录（「任务执行审计」那张表）。
+    pub fn recent_task_runs(&self, limit: usize) -> Vec<Value> {
+        let Ok(conn) = self.conn.lock() else { return Vec::new() };
+        let mut statement = match conn.prepare(
+            "SELECT at, task, status, detail, tokens, latency_ms, manual, repeat
+               FROM task_run ORDER BY id DESC LIMIT ?1",
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return Vec::new(),
+        };
+        let now = crate::server::logging::now_ms();
+        statement
+            .query_map(params![limit.min(500) as i64], |row| {
+                let at: i64 = row.get(0)?;
+                Ok(json!({
+                    "at": at,
+                    "atText": super::search::relative_time(at, now),
+                    "task": row.get::<_, String>(1)?,
+                    "status": row.get::<_, String>(2)?,
+                    "detail": row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    "tokens": row.get::<_, i64>(4).unwrap_or(0),
+                    "latencyMs": row.get::<_, i64>(5).unwrap_or(0),
+                    "manual": row.get::<_, i64>(6).unwrap_or(0) != 0,
+                    // 这一行代表「连续 N 次同样的结果」。1 = 普通的一行。
+                    "repeat": row.get::<_, i64>(7).unwrap_or(1),
+                }))
+            })
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    /// 执行记录**行数**（「查看全部 N 条」里的 N —— 翻页翻的是行）。
+    pub fn task_run_count(&self) -> i64 {
+        let Ok(conn) = self.conn.lock() else { return 0 };
+        conn.query_row("SELECT COUNT(*) FROM task_run", [], |row| row.get::<_, i64>(0))
+            .unwrap_or(0)
+    }
+
+    /// 执行**次数**（`repeat` 求和）。合并过以后不等于行数：一行可能代表
+    /// 24 次「同样的结果」。与任务行「累计 N 次」同一口径。
+    pub fn task_run_executions(&self) -> i64 {
+        let Ok(conn) = self.conn.lock() else { return 0 };
+        conn.query_row("SELECT COALESCE(SUM(COALESCE(repeat, 1)), 0) FROM task_run", [], |row| row.get::<_, i64>(0))
+            .unwrap_or(0)
+    }
+
+    /// 每个任务**上次执行**的时刻（epoch ms）。
+    ///
+    /// ── 为什么「上次」要从库里读，而不是只存内存 ────────────────
+    /// 调度器原先只把 `last` 放在内存里，进程重启即归零。后果有两个：
+    /// · 页面重启后整列显示「还没跑过」—— 明明昨天 11:00 跑过；
+    /// · 按天配时刻的任务在「启动即补跑」之后，到点又跑一次（一天两遍）。
+    /// `task_run` 本来就有 `at`，直接取 `MAX(at)` 即可，不必另建一张状态表。
+    ///
+    /// 一次 `GROUP BY` 取全量：调度线程启动时调一次，不在每轮 tick 里查。
+    pub fn task_last_runs(&self) -> std::collections::HashMap<String, i64> {
+        let mut out = std::collections::HashMap::new();
+        let Ok(conn) = self.conn.lock() else { return out };
+        let mut statement = match conn.prepare("SELECT task, MAX(at) FROM task_run GROUP BY task") {
+            Ok(statement) => statement,
+            Err(_) => return out,
+        };
+        if let Ok(rows) = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1).unwrap_or(0)))
+        }) {
+            for (task, at) in rows.flatten() {
+                out.insert(task, at);
+            }
+        }
+        out
+    }
+
+    /// 每个任务的累计统计：跑了几次、成功几次、一共烧了多少 token。
+    ///
+    /// ── 口径 ────────────────────────────────────────────────
+    /// `runs` 数的是**所有状态**（done / skipped / failed）的行 —— 用户问
+    /// 「这个任务跑过几次」时，跳过的那几次同样是跑过的；把它们剔掉会让
+    /// 「从没跑过」与「跑了但一直跳过」看起来一样。
+    ///
+    /// `ok` 只数 `done`，成功率的分母是 `runs`。零成本任务永远 `done`，
+    /// 于是显示 100% —— 这在语义上是对的（它没有失败的可能）。
+    ///
+    /// ── 为什么要乘 `repeat` ─────────────────────────────────
+    /// 连续相同结果会合并成一行（见 [`Self::log_task_run`]），表里一行可能
+    /// 代表 24 次执行。按行数统计会把「每小时跑一次、整天都在跳过」报成
+    /// 「跑了 1 次」，用户据此判断「这个任务是不是没在跑」就会判错。
+    pub fn task_stats(&self) -> std::collections::HashMap<String, (i64, i64, i64)> {
+        let mut out = std::collections::HashMap::new();
+        let Ok(conn) = self.conn.lock() else { return out };
+        let mut statement = match conn.prepare(
+            "SELECT task, COALESCE(SUM(COALESCE(repeat, 1)), 0),
+                    COALESCE(SUM(CASE WHEN status = 'done' THEN COALESCE(repeat, 1) ELSE 0 END), 0),
+                    COALESCE(SUM(tokens), 0)
+               FROM task_run GROUP BY task",
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return out,
+        };
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1).unwrap_or(0),
+                row.get::<_, i64>(2).unwrap_or(0),
+                row.get::<_, i64>(3).unwrap_or(0),
+            ))
+        });
+        if let Ok(rows) = rows {
+            for (task, runs, ok, tokens) in rows.flatten() {
+                out.insert(task, (runs, ok, tokens));
+            }
+        }
+        out
     }
 
     /// 当日已消耗的 token（`auto.dailyTokenLimit` 的判据）。
@@ -1024,6 +1259,7 @@ impl MemoryIndex {
             "sync_state",
             "sync_conflict",
             "sync_log",
+            "task_run",
         ] {
             let count: i64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
@@ -1267,6 +1503,21 @@ mod tests {
     #[test]
     fn normalize_lowercases_ascii() {
         assert_eq!(normalize("Routing-Table"), "routing-table");
+    }
+
+    #[test]
+    fn same_run_requires_all_three_fields_to_match() {
+        // 合并成一行会让「最近 30 条」少掉一半噪声，但判错就会把两个任务
+        // 的记录搅在一起。三个字段缺一不可。
+        assert!(same_run("classify", "skipped", Some("没有未归类的记忆"), "classify", "skipped", Some("没有未归类的记忆")));
+        // 同任务同状态、明细不同 → 不合并（「跳过」的理由不同就是不同的事）
+        assert!(!same_run("classify", "skipped", Some("没有未归类的记忆"), "classify", "skipped", Some("待确认已积压 12 条")));
+        // 同状态同明细、任务不同 → 不合并。两个任务的跳过理由可能一字不差。
+        assert!(!same_run("classify", "skipped", Some("没有未归类的记忆"), "health", "skipped", Some("没有未归类的记忆")));
+        // 同任务同明细、状态不同 → 不合并（跳过变成功是转折，必须留痕）
+        assert!(!same_run("extract", "skipped", Some("最近流水太少"), "extract", "done", Some("最近流水太少")));
+        // 明细从 None 到 Some → 不合并
+        assert!(!same_run("health", "done", None, "health", "done", Some("陈旧 0 条")));
     }
 
     /// 列自愈：老库里缺的列必须能补上，否则升级后整页空白。

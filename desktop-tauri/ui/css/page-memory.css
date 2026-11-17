@@ -616,10 +616,10 @@
 .mm-budget-fill.high { background: var(--warn); }
 .mm-budget-fill.full { background: var(--danger); }
 
-.mm-task-table, .mm-call-table, .mm-preview-table { display: flex; flex-direction: column; }
+.mm-task-table, .mm-call-table, .mm-run-table, .mm-preview-table { display: flex; flex-direction: column; }
 .mm-task-row {
   display: grid;
-  grid-template-columns: minmax(140px, 1.4fr) 52px 100px minmax(90px, 1fr) minmax(90px, 1fr) 100px;
+  grid-template-columns: minmax(160px, 1.5fr) 52px 92px minmax(76px, 0.8fr) minmax(86px, 0.9fr) minmax(96px, 0.9fr) 96px;
   gap: 8px;
   align-items: center;
   padding: 6px 0;
@@ -633,7 +633,55 @@
   font-weight: 600;
   border-bottom: 1px solid var(--border);
 }
-.mm-task-name { display: flex; align-items: center; gap: 6px; font-weight: 500; }
+/* 任务列是两行：名字 + 徽标一行，说明一行。名字行要能换行不挤 ——
+   三个徽标（WebDAV / 调用模型 / 零成本）同时出现时是最宽的情形。 */
+.mm-task-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.mm-task-name { display: flex; align-items: center; gap: 6px; font-weight: 500; flex-wrap: wrap; }
+.mm-task-desc {
+  font-size: 11.5px;
+  color: var(--text-3);
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 累计列同样两行：「N 次 · 成功 M」与 token 合计。两行是因为这两个数字
+   回答不同问题（可靠吗 / 贵不贵），挤成一行加分隔符会读到一起。 */
+.mm-task-stats { display: flex; flex-direction: column; gap: 1px; font-size: 11.5px; }
+.mm-task-spend { color: var(--text-3); font-family: var(--font-mono); font-size: 11px; }
+
+/* 执行记录：时间 / 任务 / 结果 / 明细 / token / 耗时。
+   明细列吃满剩余宽度 —— 它是这张表唯一的自由文本，也是用户真正要看的一列。 */
+.mm-run-row {
+  display: grid;
+  grid-template-columns: 92px minmax(86px, 0.8fr) 58px minmax(160px, 2.2fr) 74px 66px;
+  gap: 8px;
+  align-items: center;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 12px;
+}
+.mm-run-row:last-child { border-bottom: none; }
+.mm-run-head {
+  font-size: 11.5px;
+  color: var(--text-3);
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+}
+.mm-run-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+.mm-run-manual {
+  margin-left: 5px;
+  padding: 0 4px;
+  border-radius: var(--r-xs);
+  background: var(--surface-inset);
+  color: var(--text-3);
+  font-size: 10px;
+}
 
 .mm-call-row {
   display: grid;
@@ -1569,10 +1617,16 @@
   .mm-route-inert { grid-column: 2 / -1; }
   .mm-route-head { display: none; }
   .mm-cfg-item { grid-template-columns: minmax(0, 1fr); }
-  .mm-task-row { grid-template-columns: minmax(110px, 1fr) 46px 84px 80px; }
-  .mm-task-row > :nth-child(5), .mm-task-row > :nth-child(6) { display: none; }
+  /* 窄屏保留「任务 / 开关 / 节奏 / 下次 / 立即执行」五列，砍掉「上次」与「累计」。
+   这两列在窄屏下可以进 title，而「立即执行」砍掉就等于这一页没法手动跑任务了。 */
+  .mm-task-row { grid-template-columns: minmax(120px, 1fr) 46px 78px 76px 84px; }
+  .mm-task-row > :nth-child(4), .mm-task-row > :nth-child(6) { display: none; }
   .mm-call-row { grid-template-columns: 74px 1fr 1fr 62px; }
   .mm-call-row > :nth-child(5), .mm-call-row > :nth-child(6) { display: none; }
+  /* 执行记录：窄屏砍掉 token 与耗时，留下「时间 / 任务 / 结果 / 明细」——
+     明细是被砍列之外唯一有解释力的列，不能丢。 */
+  .mm-run-row { grid-template-columns: 78px minmax(70px, 0.9fr) 52px minmax(0, 1.6fr); }
+  .mm-run-row > :nth-child(5), .mm-run-row > :nth-child(6) { display: none; }
   .mm-preview-row { grid-template-columns: 1fr 84px 54px; }
   .mm-preview-row > :nth-child(4) { display: none; }
   .mm-dialog-row { grid-template-columns: 1fr; }

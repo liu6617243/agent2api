@@ -932,15 +932,26 @@ pub fn status() -> Value {
         .sync_get(LAST_RESULT_KEY)
         .and_then(|(raw, _)| serde_json::from_str::<Value>(&raw).ok())
         .unwrap_or(Value::Null);
+    // 协议里写什么就是什么；界面据此把「S3 兼容对象存储」那一档画成未实现。
+    //
+    // 这两个值先在 `json!` **外面**算好：宏里的 `{}` 只会被解析成嵌套对象，
+    // 写成 `"provider": { let x = ..; }` 会得到 `missing tokens in macro
+    // arguments` 的编译错（宏把 `let` 当成了键名）。
+    let provider = {
+        let value = config::text_of("sync.provider");
+        if value.trim().is_empty() { "webdav".to_string() } else { value.trim().to_string() }
+    };
+    // 预设只影响「填默认值」，不改变行为；这里照实回给界面好让它把下拉
+    // 停在用户上次选的那一项（而不是每次都跳回「自定义」）。
+    let preset = {
+        let value = config::text_of("sync.preset");
+        if value.trim().is_empty() { "custom".to_string() } else { value.trim().to_string() }
+    };
     json!({
         "configured": configured,
         "url": base_url(),
         "remoteDir": remote_dir(),
-        // 协议里写什么就是什么；界面据此把「S3 兼容对象存储」那一档画成未实现。
-        "provider": {
-            let provider = config::text_of("sync.provider");
-            if provider.trim().is_empty() { "webdav".to_string() } else { provider.trim().to_string() }
-        },
+        "provider": provider,
         // 远端完整地址（地址 + 目录）。地址为空时给空串而不是「/目录」——
         // 后者在界面上看起来像「配置了一半」，实际上就是没配。
         "remoteUrl": if configured { remote_url() } else { String::new() },
@@ -952,12 +963,7 @@ pub fn status() -> Value {
         // 号池包口令：留空 = 沿用 WebDAV 密码，所以「有没有」要单独说清，
         // 不然界面分不出「没配」和「沿用」。
         "hasConfirmPhrase": config::secret_set("sync.confirmPhrase"),
-        // 预设只影响「填默认值」，不改变行为；这里照实回给界面好让它把下拉
-        // 停在用户上次选的那一项（而不是每次都跳回「自定义」）。
-        "preset": {
-            let preset = config::text_of("sync.preset");
-            if preset.trim().is_empty() { "custom".to_string() } else { preset.trim().to_string() }
-        },
+        "preset": preset,
         "device": device,
         "deviceName": config::text_of("sync.deviceName"),
         "enabled": config::bool_of("sync.enabled"),

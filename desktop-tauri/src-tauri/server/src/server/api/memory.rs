@@ -14,6 +14,9 @@
 //! GET  /api/memory/review      待确认队列（?status=pending&type=dedup）
 //! POST /api/memory/review      裁决（{id, approve} 或 {rejectAll: true}）
 //! GET  /api/memory/calls       内部 LLM 调用台账（?limit=100）
+//! GET  /api/memory/auto        自动化：调度器状态 + 12 个任务的节奏与累计统计
+//! POST /api/memory/auto/run    立即执行一个任务（同步等结果）
+//! GET  /api/memory/auto/runs   任务执行审计（?limit=100）
 //! GET  /api/memory/agents      Agent 心跳（接入页的「最近活跃」）
 //! GET  /api/memory/health      体检（孤儿索引、断链、过期条目）
 //! GET  /api/memory/sync        WebDAV 同步状态（含设备、跳过名单、上次结果）
@@ -234,6 +237,13 @@ pub async fn get_calls(State(_state): State<ServerState>, Query(params): Query<H
         "tokensToday": crate::server::core::memory::index::global().tokens_today(),
         "dailyLimit": memory_config::usize_of("auto.dailyTokenLimit"),
     }))
+}
+
+/// 任务执行审计（自动化页「查看全部」）。`status()` 已带 30 条预览，
+/// 这个接口只为翻页。
+pub async fn get_auto_runs(State(_state): State<ServerState>, Query(params): Query<HashMap<String, String>>) -> Response {
+    let limit = number(&params, "limit").unwrap_or(100);
+    ok_json(memory::schedule::runs(limit))
 }
 
 pub async fn get_agents(State(_state): State<ServerState>) -> Response {
