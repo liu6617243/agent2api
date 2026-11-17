@@ -615,39 +615,52 @@ function Sync(): React.ReactElement {
           </label>
         </div>
 
-        <div className='mm-sync-inline mm-sync-inline-end'>
-          <label className='mm-sync-field mm-sync-field-grow'>
-            <span className='mm-sync-field-label'>{t('电脑名（用量统计在多设备列表中显示）')}</span>
+        {/* 「电脑名」这一格：标签独占一行，输入框和「保存预设与电脑名」按钮并排一行。
+            为什么不是原来那种「label 里塞标签+输入框，按钮当 label 的兄弟」：
+            那样按钮的参照系是「标签+输入框」整块（52px 高），而 align-items 又被
+            .mm-sync-inline 的 center 盖成了居中 —— 按钮既没跟输入框对齐，
+            中间隔着一整片空白，「这一格和这个按钮是同一件事」的关联也被切断了。
+            现在输入框和按钮是同一行的兄弟节点（都是 30px 高），天然平齐，
+            按钮也紧跟在输入框右边。 */}
+        <div className='mm-sync-device'>
+          <label className='mm-sync-field-label' htmlFor='mm-sync-device-name'>
+            {t('电脑名（用量统计在多设备列表中显示）')}
+          </label>
+          <div className='mm-sync-inline'>
             <Input
+              id='mm-sync-device-name'
+              className='mm-sync-device-input'
               value={current.deviceName}
               spellCheck={false}
               placeholder={data.device}
               onChange={event => put({ deviceName: event.target.value })}
             />
-          </label>
-          <Button
-            type='button'
-            size='sm'
-            variant='outline'
-            disabled={busy === 'dirs'}
-            onClick={() =>
-              void act('dirs', async () => {
-                await m.saveSyncSetup({
-                  'sync.deviceName': current.deviceName,
-                  'sync.preset': current.preset,
-                  ...Object.fromEntries(
-                    modules
-                      .filter(item => item.id !== 'memory')
-                      .map(item => [item.key, current.modules[item.id] ?? ''])
-                  ),
+            <Button
+              type='button'
+              /* default 档 = h-[30px]，跟 Input 的 h-[30px] 一致。
+                 原来用 sm（26px），就算对齐了也会比输入框矮 4px。 */
+              size='default'
+              variant='outline'
+              disabled={busy === 'dirs'}
+              onClick={() =>
+                void act('dirs', async () => {
+                  await m.saveSyncSetup({
+                    'sync.deviceName': current.deviceName,
+                    'sync.preset': current.preset,
+                    ...Object.fromEntries(
+                      modules
+                        .filter(item => item.id !== 'memory')
+                        .map(item => [item.key, current.modules[item.id] ?? ''])
+                    ),
+                  })
+                  drafted.current = false
+                  setForm(null)
                 })
-                drafted.current = false
-                setForm(null)
-              })
-            }
-          >
-            {busy === 'dirs' ? t('保存中…') : t('保存预设与电脑名')}
-          </Button>
+              }
+            >
+              {busy === 'dirs' ? t('保存中…') : t('保存预设与电脑名')}
+            </Button>
+          </div>
         </div>
 
         <div className='mm-sync-note'>

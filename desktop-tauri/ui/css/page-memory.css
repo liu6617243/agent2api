@@ -964,9 +964,37 @@
 /* 存储预设的下拉：跟旁边的输入框同高同宽，免得这一格比周围矮一截 */
 .mm-sync-select { width: 100%; height: 30px; }
 
-/* 「电脑名 + 保存按钮」那一行：按钮贴底对齐（它跟输入框同高，不跟标签同高） */
-.mm-sync-inline-end { align-items: flex-end; }
-.mm-sync-field-grow { flex: 1 1 auto; }
+/* 「电脑名 + 保存预设与电脑名」这一格。
+   为什么单独一格而不是复用 .mm-sync-field（那是「标签在上、控件在下」的竖排）：
+   这一格的控件要**并排且同高**（输入框 30px + 按钮 30px），标签独占上面一行。
+   早先的结构是「label 里塞标签+输入框，按钮当 label 的兄弟」+ align-items 底对齐，
+   结果两条规则互相打脸：
+     · .mm-sync-inline-end { align-items: flex-end } 与 .mm-sync-inline { align-items: center }
+       同为单类选择器（0,1,0），后者声明在后面 → 赢的是 center，按钮相对
+       「标签+输入框」整块居中，跟输入框底边差了十几像素；
+     · Button size='sm' 是 26px，Input 是 30px —— 就算对齐了也差 4px。
+   现在按钮跟输入框是同一行的兄弟节点（都用 30px），align-items: center 天然平齐，
+   按钮也紧跟在输入框右边，中间不再隔一整片空白。 */
+.mm-sync-device { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+/* 输入框不撑满：设备名是 16 位 hex 那种短串（如 `2513bce19754ff14`），
+   拉满整行会把「保存预设与电脑名」推到卡片最右，中间那片空白把
+   「这一格和那个按钮是同一件事」的视觉关联切断了。
+   flex: 1 1 240px + max-width: 240px —— 两头都要：
+     · flex-grow:1 → 宽屏时它想吃掉剩余空间，max-width 把这个欲望掐在 240px；
+     · flex-shrink:1 → 窄屏时放不下「240px + 按钮」，由输入框让出空间，
+       两个控件仍然同一行（Input 自带 min-w-0，所以能一路缩下去）。
+   注意这里不能用 flex-wrap: wrap 兜底 —— 换行是在「按 flex 基准尺寸算
+   hypothetical size」之后才判定的，那一步不做收缩，所以一旦允许换行，
+   输入框就会以 240px 的基准宽度去断行、按钮被推到下一行，而不是收缩。
+   Input 自带 w-full（width:100%），但 flex-basis 非 auto 时 width 不参与
+   主轴尺寸计算，所以这里限宽不靠它。 */
+.mm-sync-device-input { flex: 1 1 240px; max-width: 240px; }
+/* 窄屏（≤767px）Input 会长到 40px（max-[767px]:h-10），按钮还是 30px 就又不齐了。
+   这条不是手机专属：Tauri 桌面窗口最小宽度正好 720px，也落在这个区间。
+   用未分层的普通 CSS 压 Tailwind 的 @layer utilities —— 未分层样式永远赢。 */
+@media (max-width: 767px) {
+  .mm-sync-device .mm-sync-inline > button { height: 40px; }
+}
 
 /* 卡片底部的按钮组：左对齐、等间距。放右对齐会跟上面的输入框脱开 ——
    这几个按钮作用于整张卡，贴着左边界读起来才是「对上面这些字段的操作」。 */
@@ -977,7 +1005,11 @@
   flex-wrap: wrap;
   margin-top: 2px;
 }
-/* 一行里「输入框 + 一个按钮」：按钮不参与拉伸，输入框吃掉剩余宽度 */
+/* 一行里「输入框 + 一个按钮」：按钮不参与拉伸，输入框按自己的宽度收着。
+   刻意不开 flex-wrap —— 换行的判定发生在收缩之前（断行用的是 flex 基准尺寸，
+   那一步不 shrink），一开 wrap，输入框就会以 240px 的基准宽度去断行、
+   把按钮推到下一行，而不是自己让出空间。保持不换行、由输入框收缩，
+   两个控件才始终在同一行、始终平齐。 */
 .mm-sync-inline { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .mm-sync-inline > button { flex: none; }
 
