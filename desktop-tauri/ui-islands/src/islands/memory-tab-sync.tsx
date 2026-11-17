@@ -306,6 +306,26 @@ function Sync(): React.ReactElement {
     }
   }
 
+  // ── 快速同步的行序（必须在提前返回之前算）──
+  //
+  // `QUICK_ORDER` 里的五个先按那个顺序，后端将来新增的模块（不在表里）按原顺序
+  // 接在后面。
+  //
+  // 为什么这个 `useMemo` 抬到三个 `if (...) return` 上面：hooks 的调用顺序必须
+  // 逐帧一致。它原来在返回语句之后，首帧 `loading === true` 提前返回、这一句根本
+  // 没跑；数据回来那帧才第一次执行 —— React 数出「这一帧比上一帧多了个 hook」，
+  // 抛 `Rendered more hooks than during the previous render` 并把整棵树卸载。
+  // 表现就是点「同步」页签后整页空白（连页签栏一起没了，因为崩的是 `MemoryPage`
+  // 的子树而不是这张卡）。所以它只能待在所有条件返回之前。
+  const modules = data?.modules ?? []
+  const quick = React.useMemo(() => {
+    const rank = (id: string) => {
+      const at = QUICK_ORDER.indexOf(id)
+      return at < 0 ? QUICK_ORDER.length : at
+    }
+    return [...modules].sort((a, b) => rank(a.id) - rank(b.id))
+  }, [modules])
+
   if (loading) return <Panel loading error=''>{null}</Panel>
   if (error) return <Panel loading={false} error={error} onRetry={reload}>{null}</Panel>
   if (!data) return <Empty>{t('读不到同步状态。')}</Empty>
@@ -315,16 +335,6 @@ function Sync(): React.ReactElement {
   const summary = (lastRun?.result ?? data.lastResult ?? null) as LastSummary | null
   const running = busy === 'run'
   const badge = runBadge(data.configured, running, lastRun, data.lastSyncAt)
-  const modules = data.modules ?? []
-  // 快速同步的行序见 `QUICK_ORDER`：固定的五个先按那个顺序，后端将来新增的
-  // 模块（不在表里）按原顺序接在后面。
-  const quick = React.useMemo(() => {
-    const rank = (id: string) => {
-      const at = QUICK_ORDER.indexOf(id)
-      return at < 0 ? QUICK_ORDER.length : at
-    }
-    return [...modules].sort((a, b) => rank(a.id) - rank(b.id))
-  }, [modules])
   const current = form ?? formOf(data)
 
   return (

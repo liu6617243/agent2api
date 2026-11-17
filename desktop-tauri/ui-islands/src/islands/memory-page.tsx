@@ -14,6 +14,7 @@ import { Import } from './memory-tab-import'
 import { Sync } from './memory-tab-sync'
 import { Index } from './memory-tab-index'
 import { Settings } from './memory-tab-settings'
+import { TabBoundary } from './memory-shared'
 
 /**
  * Agent2API · 记忆中枢（页面岛）。
@@ -208,37 +209,47 @@ function MemoryPage(): React.ReactElement {
       ) : (
         <div className='mm-body-area'>
           {tab === 'dashboard' ? (
-            <Dashboard status={status} onGo={next => switchTab(next as Tab)} />
+            <TabBoundary name='仪表盘'>
+              <Dashboard status={status} onGo={next => switchTab(next as Tab)} />
+            </TabBoundary>
           ) : null}
 
           {tab === 'browse' ? (
-            <Browse
-              kinds={kinds}
-              projects={projects}
-              onChanged={afterChange}
-              focusId={focusId}
-              onFocusConsumed={() => setFocusId(null)}
-            />
+            <TabBoundary name='浏览'>
+              <Browse
+                kinds={kinds}
+                projects={projects}
+                onChanged={afterChange}
+                focusId={focusId}
+                onFocusConsumed={() => setFocusId(null)}
+              />
+            </TabBoundary>
           ) : null}
 
           {tab === 'projects' ? (
-            <Projects
-              projects={projects}
-              loading={projectsLoading}
-              error={projectsError}
-              onReload={() => void refreshProjects()}
-              onOpenEntry={openEntryFromProject}
-              onChanged={afterChange}
-            />
+            <TabBoundary name='项目'>
+              <Projects
+                projects={projects}
+                loading={projectsLoading}
+                error={projectsError}
+                onReload={() => void refreshProjects()}
+                onOpenEntry={openEntryFromProject}
+                onChanged={afterChange}
+              />
+            </TabBoundary>
           ) : null}
 
-          {tab === 'profile' ? <Profile /> : null}
-          {tab === 'agents' ? <Agents /> : null}
-          {tab === 'auto' ? <Auto /> : null}
-          {tab === 'import' ? <Import /> : null}
-          {tab === 'sync' ? <Sync /> : null}
-          {tab === 'index' ? <Index /> : null}
-          {tab === 'settings' ? <Settings onChanged={afterChange} /> : null}
+          {tab === 'profile' ? <TabBoundary name='画像'><Profile /></TabBoundary> : null}
+          {tab === 'agents' ? <TabBoundary name='接入'><Agents /></TabBoundary> : null}
+          {tab === 'auto' ? <TabBoundary name='自动化'><Auto /></TabBoundary> : null}
+          {tab === 'import' ? <TabBoundary name='导入'><Import /></TabBoundary> : null}
+          {tab === 'sync' ? <TabBoundary name='同步'><Sync /></TabBoundary> : null}
+          {tab === 'index' ? <TabBoundary name='索引'><Index /></TabBoundary> : null}
+          {tab === 'settings' ? (
+            <TabBoundary name='配置'>
+              <Settings onChanged={afterChange} />
+            </TabBoundary>
+          ) : null}
         </div>
       )}
     </div>

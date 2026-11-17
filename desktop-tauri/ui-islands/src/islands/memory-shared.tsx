@@ -175,3 +175,54 @@ export function useLoad<T>(
 
   return { data, loading, error, reload: () => setTick(value => value + 1) }
 }
+
+/* ─── 页签容错边界 ───────────────────────────── */
+
+type BoundaryState = { error: Error | null }
+
+/**
+ * 单个页签的渲染错误边界。
+ *
+ * ── 为什么必须有它 ────────────────────────────────────────
+ * React 18 里渲染期抛出的异常（hooks 顺序变了、读到了 undefined 的字段、
+ * 某个 `.map` 的返回值不是节点……）如果没有边界接住，React 会**卸载整棵
+ * 子树**。记忆中枢是十页签共用一个根，一页崩掉的表现是「整页空白，连页签栏
+ * 都没了」—— 用户既看不出是哪一页的问题，也没法切走。这不是理论风险：同步页
+ * 就因为 `useMemo` 写在条件返回之后真的白过一次。
+ *
+ * 边界放在**每个页签外面**、不在页面根上：崩掉的只有那一页，页签栏和其它九页
+ * 照常可用，用户还能换个页签继续干活，也还留着一条「重试」的路。
+ *
+ * ── 为什么用 class ───────────────────────────────────────
+ * `componentDidCatch` / `getDerivedStateFromError` 至今只有 class 组件能实现，
+ * 没有函数式等价物。这是 React 官方唯一强制 class 的场景。
+ */
+export class TabBoundary extends React.Component<
+  { name: string; children: React.ReactNode },
+  BoundaryState
+> {
+  state: BoundaryState = { error: null }
+
+  static getDerivedStateFromError(error: Error): BoundaryState {
+    return { error }
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo): void {
+    // 控制台留全量堆栈：页面上的那句话只够让用户知道「哪一页坏了」，
+    // 定位还是要看 `componentStack`（它指出崩在哪个组件的哪一次渲染）。
+    console.error(`[memory:${this.props.name}] 渲染失败`, error, info.componentStack)
+  }
+
+  render(): React.ReactNode {
+    const { error } = this.state
+    if (!error) return this.props.children
+    return (
+      <div className='mm-panel-error'>
+        <span>{t('「{name}」这一页渲染失败了：{message}', { name: t(this.props.name), message: error.message })}</span>
+        <Button type='button' size='sm' variant='ghost' onClick={() => this.setState({ error: null })}>
+          {t('重试')}
+        </Button>
+      </div>
+    )
+  }
+}
