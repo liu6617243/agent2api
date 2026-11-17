@@ -25,13 +25,37 @@ import { Empty, Panel, Section, StateBadge, num, timeText, useLoad } from './mem
 
 type DashboardProps = {
   status: m.MemoryStatus | null
-  onGo: (tab: 'browse' | 'profile' | 'auto' | 'sync' | 'index' | 'agents') => void
+  onGo: (tab: 'browse' | 'profile' | 'auto' | 'sync' | 'agents') => void
+  /** 重建索引会改条数，重建完让外层刷新一次 status。 */
+  onChanged?: () => void
 }
 
-function Dashboard({ status, onGo }: DashboardProps): React.ReactElement {
+function Dashboard({ status, onGo, onChanged }: DashboardProps): React.ReactElement {
   const auto = useLoad(() => m.loadAuto(), [])
   const health = useLoad(() => m.loadHealth(20), [])
   const sync = useLoad(() => m.loadSync(), [])
+  const [rebuilding, setRebuilding] = React.useState(false)
+  const [showStale, setShowStale] = React.useState(false)
+  const [actionError, setActionError] = React.useState('')
+
+  /**
+   * 重建索引：原本在「索引」页的主按钮。那一页删掉之后它是唯一没有别处替代的
+   * 动作（体检清单、检索、回收站都各有归宿），所以挪到这里，并且只在
+   * 「索引漂移」时出现 —— 平时摆着一个「重建」按钮只会让人想去点它。
+   */
+  const rebuild = async () => {
+    setRebuilding(true)
+    setActionError('')
+    try {
+      await m.rebuildIndex()
+      health.reload()
+      onChanged?.()
+    } catch (caught) {
+      setActionError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setRebuilding(false)
+    }
+  }
 
   if (!status) {
     return <Panel loading error=''>{null}</Panel>
@@ -93,6 +117,7 @@ function Dashboard({ status, onGo }: DashboardProps): React.ReactElement {
         title={t('需要处理')}
         hint={t('这四类问题都不会自己消失，也不会阻塞 Agent —— 但放着会越来越难查。')}
       >
+        {actionError ? <div className='mm-error'>{actionError}</div> : null}
         <div className='mm-todo-list'>
           <TodoRow
             state={backlogged ? 'warn' : 'ok'}
@@ -106,7 +131,9 @@ function Dashboard({ status, onGo }: DashboardProps): React.ReactElement {
             detail={stale
               ? t('{n} 条记忆锚定的文件在写下之后被改过', { n: stale })
               : t('没有发现')}
-            action={stale > 0 ? { label: t('看清单'), run: () => onGo('index') } : undefined}
+            action={stale > 0
+              ? { label: showStale ? t('收起清单') : t('看清单'), run: () => setShowStale(value => !value) }
+              : undefined}
           />
           <TodoRow
             state={conflicts > 0 ? 'bad' : 'ok'}
@@ -120,9 +147,36 @@ function Dashboard({ status, onGo }: DashboardProps): React.ReactElement {
             detail={drift
               ? t('索引条数与事实源不一致（可重建，不影响数据）')
               : t('索引与事实源一致')}
-            action={drift ? { label: t('去重建'), run: () => onGo('index') } : undefined}
+            action={drift
+              ? { label: rebuilding ? t('重建中…') : t('重建索引'), run: () => void rebuild() }
+              : undefined}
           />
         </div>
+
+        {/* 过时清单就地展开在「需要处理」卡里。
+            原来它在「索引」页，那一页删掉之后清单无处可去 —— 但它正是这一行
+            「N 条可能过时」的证据，展开在原地比跳到另一页更短。 */}
+        {showStale && stale > 0 && health.data ? (
+          <div className='mm-stale-list'>
+            {health.data.stale.map(row => (
+              <div key={row.id} className='mm-stale'>
+                <div className='mm-stale-head'>
+                  <strong>{row.title}</strong>
+                  <Badge variant='secondary' shape='tag'>{row.type}</Badge>
+                  <Badge variant='outline' shape='tag'>{row.layer}</Badge>
+                  <span className='mm-muted'>{t('写下于 {when}', { when: row.updatedText })}</span>
+                </div>
+                <div className='mm-stale-files'>
+                  {row.files.map(file => (
+                    <span key={file.file} className='mm-warn'>
+                      <code>{file.file}</code> {t('改于 {when}', { when: file.changedText })}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : null}
       </Section>
 
       <div className='mm-two-col'>

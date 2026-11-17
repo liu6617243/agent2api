@@ -12,7 +12,6 @@ import { Agents } from './memory-tab-agents'
 import { Auto } from './memory-tab-auto'
 import { Import } from './memory-tab-import'
 import { Sync } from './memory-tab-sync'
-import { Index } from './memory-tab-index'
 import { Settings } from './memory-tab-settings'
 import { TabBoundary } from './memory-shared'
 
@@ -25,7 +24,7 @@ import { TabBoundary } from './memory-shared'
  * 而「记忆」的后端（存储 + 检索 + MCP 工具）本来就只能由网关提供 —— 插件连
  * 端点都加不了。所以页面归网关，插件不参与本功能。
  *
- * ── 为什么是十个页签 ────────────────────────────────────────
+ * ── 为什么是九个页签 ────────────────────────────────────────
  * 对齐 AgentHub 的记忆中枢之后，这一页承载的不再只是「看记忆」：
  *
  *   dashboard 仪表盘  —— 现在什么状态、有什么要处理
@@ -36,10 +35,15 @@ import { TabBoundary } from './memory-shared'
  *   auto      自动化  —— 12 个后台任务的节奏与消耗
  *   import    导入    —— 把别处的历史会话搬进来
  *   sync      同步    —— WebDAV 多设备，冲突裁决
- *   index     索引    —— 派生数据的自检与重建
  *   settings  配置    —— 一百多个旋钮，schema 驱动
  *
- * 十项平铺在一条页签栏里而不是收进二级菜单：记忆的日常动作横跨这十项（看一条 →
+ * ── 原来的第十个「索引」页去哪了 ────────────────────────────
+ * 那一页原本放四样排障工具：重建索引、体检清单、检索调试、清理回收站。
+ * 前两样在仪表盘「需要处理」里本来就有对等入口（可能过时 / 索引一致性），
+ * 检索与回收站浏览页都有，剩下「重建索引」一个动作撑不起一整页 ——
+ * 于是把它挪到仪表盘「索引一致性」那一行的按钮上，页签删掉。
+ *
+ * 九项平铺在一条页签栏里而不是收进二级菜单：记忆的日常动作横跨这九项（看一条 →
  * 发现过时 → 去改配置 → 回来验证），藏进二级菜单会让人忘了它的存在。
  *
  * ── 为什么没有「核心记忆」这个独立页签了 ────────────────────
@@ -62,7 +66,6 @@ const TABS = [
   { key: 'auto', label: '自动化' },
   { key: 'import', label: '导入' },
   { key: 'sync', label: '同步' },
-  { key: 'index', label: '索引' },
   { key: 'settings', label: '配置' },
 ] as const
 
@@ -210,7 +213,7 @@ function MemoryPage(): React.ReactElement {
         <div className='mm-body-area'>
           {tab === 'dashboard' ? (
             <TabBoundary name='仪表盘'>
-              <Dashboard status={status} onGo={next => switchTab(next as Tab)} />
+              <Dashboard status={status} onGo={next => switchTab(next as Tab)} onChanged={afterChange} />
             </TabBoundary>
           ) : null}
 
@@ -244,7 +247,6 @@ function MemoryPage(): React.ReactElement {
           {tab === 'auto' ? <TabBoundary name='自动化'><Auto /></TabBoundary> : null}
           {tab === 'import' ? <TabBoundary name='导入'><Import /></TabBoundary> : null}
           {tab === 'sync' ? <TabBoundary name='同步'><Sync /></TabBoundary> : null}
-          {tab === 'index' ? <TabBoundary name='索引'><Index /></TabBoundary> : null}
           {tab === 'settings' ? (
             <TabBoundary name='配置'>
               <Settings onChanged={afterChange} />

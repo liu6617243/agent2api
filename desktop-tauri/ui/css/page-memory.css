@@ -1203,15 +1203,10 @@
 .mm-log-when { font-family: var(--font-mono); }
 .mm-log-action { font-family: var(--font-mono); color: var(--text-2); }
 
-/* ── 索引 / 体检 ── */
-.mm-index {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  overflow: auto;
-  min-height: 0;
-  padding-bottom: 4px;
-}
+/* ── 体检（可能过时清单） ──
+   `.mm-index`（整页滚动容器）/ `.mm-table-stats` / `.mm-table-stat` / `.mm-probe-*`
+   已随「索引」页签一起删除。清单现在展开在仪表盘的「需要处理」卡里，
+   所以这一组只剩 `mm-stale-*` 与 `.mm-status-grid`（后者仍被仪表盘用）。 */
 .mm-status-grid {
   display: grid;
   grid-template-columns: 108px 1fr;
@@ -1227,22 +1222,6 @@
   word-break: break-all;
 }
 .mm-status-compact { grid-template-columns: 92px 1fr; font-size: 12px; }
-
-.mm-table-stats {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-  gap: 5px;
-}
-.mm-table-stat {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 4px 8px;
-  border-radius: var(--r-xs);
-  background: var(--surface-inset);
-  font-size: 11.5px;
-}
-.mm-table-stat code { font-family: var(--font-mono); color: var(--text-2); }
 
 .mm-stale-list { display: flex; flex-direction: column; gap: 7px; }
 .mm-stale {
@@ -1264,16 +1243,6 @@
   font-size: 11.5px;
 }
 .mm-stale-files code { font-family: var(--font-mono); font-size: 11px; }
-
-.mm-probe-list { display: flex; flex-direction: column; gap: 3px; }
-.mm-probe-row {
-  display: grid;
-  grid-template-columns: 26px 1fr;
-  gap: 8px;
-  font-size: 12px;
-  padding: 3px 0;
-  border-bottom: 1px solid var(--hairline);
-}
 
 /* ── 通用小字（多页签共用：说明、次要信息、警告） ── */
 .mm-hint {
