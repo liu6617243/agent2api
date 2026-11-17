@@ -1157,6 +1157,12 @@ mod tests {
                 let mut probe = MemoryEntry::draft("probe", "探针", MemoryKind::Daily, "x");
                 probe.agent = Some(agent.clone());
                 probe.created_at = stamp;
+                // `updated_at` 必须一起钉住：`entry_path` 用的是
+                // `created_at.max(updated_at)`，而 `draft` 会把 updated_at 设成
+                // 「现在」。只钉 created_at 的话，20 条写入落在 stamp 那天（2023），
+                // 探针却指向今天 —— 断言「容器文件存在」永远失败，且看上去像
+                // 并发写把文件写没了。
+                probe.updated_at = stamp;
                 let path = entry_path(&probe, false);
                 let text = fs::read_to_string(&path).expect("容器文件应当存在");
                 let sections = text.lines().filter(|line| parse_marker(line).is_some()).count();
