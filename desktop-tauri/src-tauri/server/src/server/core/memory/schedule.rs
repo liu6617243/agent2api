@@ -65,6 +65,25 @@ pub const TASKS: [&str; 11] = [
     "health",
 ];
 
+/// 默认折叠时展示的执行记录行数。
+///
+/// ── 为什么是 10 而不是 30 ────────────────────────────────────
+/// 这张表是「刚才发生了什么」的速览，不是列表页。30 行会把整页撑到两三屏：
+/// 一轮 tick 会同时写 3~6 行（抽取 / 归类 / 画像各一条），30 行只覆盖最近
+/// 五六轮，信息密度并不比 10 行高，但滚动距离翻了倍，而且把下面真正要动手
+/// 的东西（裁决积压、任务卡）推到首屏之外。
+///
+/// 想翻全量走「展开」（`GET /api/memory/auto/runs?limit=50`）。
+pub const PREVIEW_RUNS: usize = 10;
+
+/// 「展开」一次最多给多少行。
+///
+/// ── 为什么是 50 ─────────────────────────────────────────────
+/// 与目标界面对齐：展开态给「最新的 50 条」，够看清最近一两天的节奏，又不至于
+/// 把 DOM 撑爆（每行 6 个格子，500 行会让滚动明显发涩）。再往前翻的需求属于
+/// 「导出报告」，不该在页面上实现一遍分页。
+pub const EXPANDED_RUNS: usize = 50;
+
 /// 每个任务的默认节奏（分钟），与 `config.rs` 里 `auto.tasks` 的默认值保持一致。
 fn default_interval(task: &str) -> i64 {
     match task {
@@ -1108,11 +1127,13 @@ pub fn status() -> Value {
         // 与状态页 `review.pending` 同一个计数（`review_queue` 里 pending 的行），
         // 这里再给一次是因为自动化页不该为了一个数字去拉整个 status。
         "pendingReview": index::global().review_count(),
-        // 最近几次执行（「任务执行记录」那张表）。取 30 条：一页表格看得完，
-        // 又不至于把一轮 11 个任务的整轮吞掉一半。
+        // 最近几次执行（「任务执行记录」那张表）。**预览只取 10 条** ——
+        // 与目标界面同口径：这张表是「刚才发生了什么」的速览，不是全量列表。
+        // 早先取 30 条，结果页面被一张表撑到两三屏，下面「待确认裁决」之类
+        // 真正要动手的东西全被挤到看不见。想看更多走「展开」。
         // `runRows` 是可翻的**行数**，`runCount` 是**执行次数**（合并后的
-        // 一行代表多次）—— 前者给「查看全部 N 条」，后者给页面顶部的概览。
-        "recentRuns": index::global().recent_task_runs(30),
+        // 一行代表多次）—— 前者给展开按钮上的数字，后者给页面顶部概览。
+        "recentRuns": index::global().recent_task_runs(PREVIEW_RUNS),
         "runRows": index::global().task_run_count(),
         "runCount": index::global().task_run_executions(),
         "labels": labels,
@@ -1120,15 +1141,16 @@ pub fn status() -> Value {
     })
 }
 
-/// 任务执行审计（「查看全部」那一页）。
+/// 任务执行审计的「展开」数据。
 ///
-/// `status()` 里已带 30 条预览，这个接口只为翻页：`limit` 上限 500 由
-/// `recent_task_runs` 兜底（一次拉太多没有意义 —— `auto.logKeepCount`
-/// 默认只留几百行）。
+/// `status()` 里已带 `PREVIEW_RUNS`（10 条）预览，这个接口只服务「展开」：
+/// 默认给 `EXPANDED_RUNS`（50 条）。`limit` 仍可由调用方覆盖（`?limit=N`），
+/// 上限 500 由 `recent_task_runs` 兜底 —— 一次拉太多没有意义，
+/// `auto.logKeepCount` 默认只留几百行，翻到尽头也就是那个数。
 ///
-/// 返回两个数：`total` 是**行数**（还能翻出多少行），`runs` 是**执行次数**
+/// 返回两个数：`total` 是**行数**（库里一共多少行），`runs` 是**执行次数**
 /// （`repeat` 求和，与任务行「累计 N 次」同一口径）。合并过以后两者不再相等，
-/// 页面上的「查看全部 N 条」要用行数，任务行的「累计」要用次数。
+/// 页面上的「展开」按钮旁边的数字要用行数，任务行的「累计」要用次数。
 pub fn runs(limit: usize) -> Value {
     json!({
         "items": index::global().recent_task_runs(limit.clamp(1, 500)),

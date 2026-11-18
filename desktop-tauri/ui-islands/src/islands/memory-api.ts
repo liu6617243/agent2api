@@ -230,6 +230,16 @@ export type AutoTask = {
   cadence: AutoCadence
 }
 
+/**
+ * 执行记录表的两个档位：默认折叠 10 条、展开 50 条。
+ *
+ * ── 为什么这两个数要写在这里 ────────────────────────────────
+ * 折叠档由后端 `schedule::PREVIEW_RUNS` 决定（`/auto` 的 `recentRuns` 就只有
+ * 10 条），前端不需要知道；但**展开档**是前端主动请求的 `limit`，写死在调用处
+ * 容易和后端 `EXPANDED_RUNS` 漂移 —— 于是这里留一份，改后端时两处一起改。
+ */
+export const RUNS_EXPANDED = 50
+
 /** 一次任务执行（`task_run` 一行）。 */
 export type TaskRun = {
   at: number
@@ -258,9 +268,9 @@ export type AutoStatus = {
   pendingReview: number
   labels: { task: string; label: string }[]
   tasks: AutoTask[]
-  /** 最近 30 条执行记录（预览；翻页走 loadAutoRuns）。 */
+  /** 最近 10 条执行记录（预览；展开走 loadAutoRuns）。 */
   recentRuns: TaskRun[]
-  /** 记录**行数**（「查看全部 N 条」的 N）。 */
+  /** 记录**行数**（展开按钮上的 N 与脚注里的「共 N 行」）。 */
   runRows: number
   /** 执行**次数**（合并后一行可代表多次，与任务行「累计」同口径）。 */
   runCount: number
@@ -727,8 +737,13 @@ export function loadAuto(): Promise<AutoStatus> {
   return api('GET', '/api/memory/auto')
 }
 
-/** 任务执行审计翻页（`/auto` 里已带 30 条预览）。 */
-export function loadAutoRuns(limit = 100): Promise<{ items: TaskRun[]; total: number; runs: number }> {
+/**
+ * 任务执行审计的「展开」数据。
+ *
+ * `/auto` 里只带 10 条预览；展开时按 50 条取（与目标界面同口径）。这个上限
+ * 不是分页，是「展开态一次显示多少行」—— 再往前翻的需求属于导出报告。
+ */
+export function loadAutoRuns(limit = RUNS_EXPANDED): Promise<{ items: TaskRun[]; total: number; runs: number }> {
   return api('GET', `/api/memory/auto/runs${query({ limit })}`)
 }
 

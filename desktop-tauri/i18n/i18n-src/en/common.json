@@ -839,5 +839,7 @@
   "（未指定）": "(not specified)",
   "（请下载与该平台对应的插件包）": "(download the pack built for this platform)",
   "（默认问候）": "(default greeting)",
-  "记忆中枢": "Memory Hub"
+  "记忆中枢": "Memory Hub",
+  "展开 {n} 条": "Show {n} rows",
+  "已展开到最新 {n} 行（共 {m} 行）。更早的记录请用「导出报告」。": "Showing the latest {n} of {m} rows. Use \"Export report\" for older entries."
 }

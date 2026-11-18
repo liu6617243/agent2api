@@ -240,10 +240,10 @@ pub async fn get_calls(State(_state): State<ServerState>, Query(params): Query<H
     }))
 }
 
-/// 任务执行审计（自动化页「查看全部」）。`status()` 已带 30 条预览，
-/// 这个接口只为翻页。
+/// 任务执行审计的「展开」数据。`status()` 已带 10 条预览，这个接口只服务展开，
+/// 默认给 50 条（`schedule::EXPANDED_RUNS`）；`?limit=N` 可覆盖，上限 500。
 pub async fn get_auto_runs(State(_state): State<ServerState>, Query(params): Query<HashMap<String, String>>) -> Response {
-    let limit = number(&params, "limit").unwrap_or(100);
+    let limit = number(&params, "limit").unwrap_or(memory::schedule::EXPANDED_RUNS);
     ok_json(memory::schedule::runs(limit))
 }
 

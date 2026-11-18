@@ -1312,6 +1312,28 @@
 /* 「N / 12 已开启」：页签标题右侧的一枚概览，替代原先被删掉的「已开启」状态行。 */
 .mm-auto-count { font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
 
+/* ── 执行记录表：折叠 10 行 / 展开 50 行 ────────────────────────
+   折叠态**不裁剪**（10 行本来就短，加滚动条反而多一层容器）；
+   展开态限高并给一条竖滚动条 —— 50 行摊开是 1400px 左右，没有限高的话
+   下面「待确认裁决」与任务卡会被顶出两三屏，而那才是这页要人动手的地方。
+   限高用 vh 而不是 px：窗口小的时候按比例缩，栏宽变化不会让表格忽高忽低。 */
+.mm-run-scroll { display: block; min-width: 0; }
+.mm-run-scroll-open {
+  max-height: 52vh;
+  overflow-y: auto;
+  /* 右侧留 2px：滚动条出现时不压住末列文字的右边缘 */
+  padding-right: 2px;
+  /* 表头吸顶：滚到第 30 行时还知道每一列是什么 */
+  scrollbar-gutter: stable;
+}
+.mm-run-scroll-open .mm-run-head {
+  position: sticky;
+  top: 0;
+  /* 必须盖住下面的行，否则半透明的行会从表头文字背面透出来 */
+  background: var(--surface);
+  z-index: 1;
+}
+
 /* 执行记录：执行时间 / 任务名称 / 状态 / 耗时 / 消耗 Token / 执行详情。
    前五列定宽（都是短值，定宽才能对成竖线），末列吃满剩余宽度 ——
    它唯一的自由文本，也是用户真正要看的那一列。 */
@@ -1377,11 +1399,11 @@
   color: var(--text-3);
   font-size: 10px;
 }
-/* 「导出报告」与「查看全部」并排：两个都是描边小按钮，
+/* 「导出报告」与「展开 / 收起」并排：两个都是描边小按钮，
    间距 6px 让它们读成一组动作而不是两个孤立控件。 */
 .mm-run-export {
   gap: 4px;
-  /* 只给这一个按钮上绿色描边：旁边「查看全部 N 条」是中性翻页，
+  /* 只给这一个按钮上绿色描边：旁边「展开 / 收起」是中性翻页，
      两个按钮同色会让「把数据拿出去」这件事失去强调。色值取主题里的
      `--ui-success`（与状态列那枚「● 成功」同源），没有主题时回落到同一支绿。 */
   border-color: color-mix(in srgb, var(--ui-success, #2e9e5b) 42%, transparent);
@@ -1392,6 +1414,19 @@
   border-color: var(--ui-success, #2e9e5b);
   background: color-mix(in srgb, var(--ui-success, #2e9e5b) 10%, transparent);
   color: var(--ui-success, #2e9e5b);
+}
+
+/* 展开态脚注：说清「看到的是最新 N 行、库里一共 M 行」。
+   右对齐 + 等宽数字：它是一句说明，不该抢标题行的注意力；
+   但两个数字必须一眼能读，所以数字走 tabular-nums。 */
+.mm-run-more {
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px solid var(--hairline);
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
 .mm-mono { font-family: var(--font-mono); font-size: 11.5px; }

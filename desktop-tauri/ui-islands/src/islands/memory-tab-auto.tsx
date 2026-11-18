@@ -606,7 +606,7 @@ function Auto({ onGo }: { onGo: (tab: 'browse') => void }): React.ReactElement {
   const [draftError, setDraftError] = React.useState('')
   /** 开关乐观更新的本地覆盖：点下去立刻变，请求回来再以后端为准。 */
   const [toggles, setToggles] = React.useState<Record<string, boolean>>({})
-  const allRuns = useLoad(() => (showAllRuns ? m.loadAutoRuns(200) : Promise.resolve(null)), [showAllRuns])
+  const allRuns = useLoad(() => (showAllRuns ? m.loadAutoRuns(m.RUNS_EXPANDED) : Promise.resolve(null)), [showAllRuns])
 
   const data = latest ?? loaded
 
@@ -700,9 +700,17 @@ function Auto({ onGo }: { onGo: (tab: 'browse') => void }): React.ReactElement {
   if (!data) return <Empty>{t('读不到调度器状态。')}</Empty>
 
   const labelOf = (task: string) => data.labels.find(item => item.task === task)?.label ?? task
+  /**
+   * 折叠态用 `/auto` 自带的 10 条预览；展开态用「展开」接口的 50 条。
+   *
+   * `allRuns.data` 为 null 的那一小段（点下去到响应回来）**回落预览**而不是
+   * 空表：用空数组会让表格瞬间消失又长出来，看起来像加载失败。
+   */
   const runs = showAllRuns ? allRuns.data?.items ?? data.recentRuns : data.recentRuns
-  // 「查看全部 N 条」用**行数**（翻的是行）；执行次数在任务卡的统计里。
+  // 展开按钮上的数字用**行数**（展开的是行）；执行次数在任务卡的统计里。
   const runRows = data.runRows
+  /** 展开态能显示多少行：取「库里有的」与「一次请求的」两者较小值。 */
+  const expandable = Math.min(runRows, m.RUNS_EXPANDED)
   const enabledCount = data.tasks.filter(task => toggles[task.task] ?? task.enabled).length
 
   return (
@@ -761,7 +769,7 @@ function Auto({ onGo }: { onGo: (tab: 'browse') => void }): React.ReactElement {
           <div className='mm-inline-actions'>
             {runRows > data.recentRuns.length ? (
               <Button type='button' size='sm' variant='outline' onClick={() => setShowAllRuns(value => !value)}>
-                {showAllRuns ? t('只看最近 {n} 条', { n: data.recentRuns.length }) : t('查看全部 {n} 条', { n: num(runRows) })}
+                {showAllRuns ? t('收起') : t('展开 {n} 条', { n: num(expandable) })}
               </Button>
             ) : null}
             <Button type='button' size='sm' variant='outline' className='mm-run-export' onClick={() => exportRuns(runs, labelOf)}>
@@ -774,35 +782,46 @@ function Auto({ onGo }: { onGo: (tab: 'browse') => void }): React.ReactElement {
         {runs.length === 0 ? (
           <Empty>{t('还没有执行记录。任务跑过一次之后这里就会有行 —— 自动轮次与「立即执行」都算。')}</Empty>
         ) : (
-          <div className='mm-run-table'>
-            <div className='mm-run-row mm-run-head'>
-              <span>{t('执行时间')}</span>
-              <span>{t('任务名称')}</span>
-              <span>{t('状态')}</span>
-              <span>{t('耗时')}</span>
-              <span>{t('消耗 Token')}</span>
-              <span>{t('执行详情')}</span>
-            </div>
-            {runs.map((row, index) => (
-              <div key={`${row.at}-${row.task}-${index}`} className='mm-run-row'>
-                <span className='mm-run-at' title={new Date(row.at).toLocaleString()}>
-                  {runStamp(row.at)}
-                  {row.repeat > 1 ? <span className='mm-run-manual' title={t('连续 {n} 次相同结果，合并成一行', { n: row.repeat })}>{t('×{n}', { n: row.repeat })}</span> : null}
-                  {row.manual ? <span className='mm-run-manual'>{t('手动')}</span> : null}
-                </span>
-                <span className='mm-run-task'>{labelOf(row.task)}</span>
-                <span><StatusBadge status={row.status} /></span>
-                <span className='mm-run-latency'>{latencyText(row.latencyMs)}</span>
-                {/* 「消耗 Token」列：跳过与零成本任务是真正的 0，不是没记账 ——
-                    写 0 而不是 `—`，与目标界面一致（0 在这列是有意义的事实）。 */}
-                <span className='mm-mono mm-run-tokens'>{num(row.tokens)}</span>
-                {/* 详情是后端 `detail_of` 生成的一句人话，原样显示：
-                    失败/跳过的原因已经在里面，不再拼前缀。 */}
-                <span className='mm-run-detail' title={row.detail || ''}>{row.detail || '—'}</span>
+          <div className={`mm-run-scroll${showAllRuns ? ' mm-run-scroll-open' : ''}`}>
+            <div className='mm-run-table'>
+              <div className='mm-run-row mm-run-head'>
+                <span>{t('执行时间')}</span>
+                <span>{t('任务名称')}</span>
+                <span>{t('状态')}</span>
+                <span>{t('耗时')}</span>
+                <span>{t('消耗 Token')}</span>
+                <span>{t('执行详情')}</span>
               </div>
-            ))}
+              {runs.map((row, index) => (
+                <div key={`${row.at}-${row.task}-${index}`} className='mm-run-row'>
+                  <span className='mm-run-at' title={new Date(row.at).toLocaleString()}>
+                    {runStamp(row.at)}
+                    {row.repeat > 1 ? <span className='mm-run-manual' title={t('连续 {n} 次相同结果，合并成一行', { n: row.repeat })}>{t('×{n}', { n: row.repeat })}</span> : null}
+                    {row.manual ? <span className='mm-run-manual'>{t('手动')}</span> : null}
+                  </span>
+                  <span className='mm-run-task'>{labelOf(row.task)}</span>
+                  <span><StatusBadge status={row.status} /></span>
+                  <span className='mm-run-latency'>{latencyText(row.latencyMs)}</span>
+                  {/* 「消耗 Token」列：跳过与零成本任务是真正的 0，不是没记账 ——
+                      写 0 而不是 `—`，与目标界面一致（0 在这列是有意义的事实）。 */}
+                  <span className='mm-mono mm-run-tokens'>{num(row.tokens)}</span>
+                  {/* 详情是后端 `detail_of` 生成的一句人话，原样显示：
+                      失败/跳过的原因已经在里面，不再拼前缀。 */}
+                  <span className='mm-run-detail' title={row.detail || ''}>{row.detail || '—'}</span>
+                </div>
+              ))}
+            </div>
           </div>
         )}
+        {/* 展开态的脚注：把「看到的是最新 50 行、库里一共多少行」说清楚。
+            不写的话用户会以为这张表就是全部，然后去质疑「怎么 12 天前的没了」。
+            `runs.length < runRows` 才写：库里只有 30 行时展开就已经是全部，
+            这时再说「更早的记录请用导出报告」是虚指 —— 根本没有更早的。 */}
+        {showAllRuns && runs.length > 0 && runs.length < runRows ? (
+          <div className='mm-run-more'>
+            {t('已展开到最新 {n} 行（共 {m} 行）。更早的记录请用「导出报告」。', { n: num(runs.length), m: num(runRows) })}
+          </div>
+        ) : null}
       </Section>
 
       {draft ? (

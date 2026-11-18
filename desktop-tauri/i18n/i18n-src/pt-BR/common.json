@@ -828,5 +828,7 @@
   "（未指定）": "(não especificado)",
   "（请下载与该平台对应的插件包）": "(baixe o pacote desta plataforma)",
   "（默认问候）": "(saudação padrão)",
-  "记忆中枢": "Central de memória"
+  "记忆中枢": "Central de memória",
+  "展开 {n} 条": "Mostrar {n} linhas",
+  "已展开到最新 {n} 行（共 {m} 行）。更早的记录请用「导出报告」。": "Mostrando as {n} linhas mais recentes de {m}. Use \"Exportar relatório\" para registros anteriores."
 }
