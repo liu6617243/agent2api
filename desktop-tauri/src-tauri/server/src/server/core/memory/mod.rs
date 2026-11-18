@@ -58,6 +58,86 @@ use search::Query;
 pub use model::{DedupStatus as MemoryDedupStatus, Layer as MemoryLayer, MemoryKind};
 pub use search::Query as MemoryQuery;
 
+// ── 画像四类 ─────────────────────────────────────────────────
+//
+// 四类的 key 进了 frontmatter（`type=profile` 条目的 `tags[0]`），所以它同时是
+// **磁盘格式的一部分**：改 key 等于让存量画像从 `profile_view` 里消失。因此这里
+// 只增不减 —— 旧 key 留在 `legacy` 一侧，按新 key 归类时回落，不会丢条目。
+//
+// `identity` / `communication` / `technical` / `workstyle` 是「关于这个人」的四个
+// 正交视角：他是谁（人格特质）、他怎么跟人说话（沟通偏好）、他擅长什么（技术偏好）、
+// 他怎么干活（工作习惯）。原来的 `preference / habit / expertise / context` 混了
+// 两个维度（「偏好」既可能是沟通也可能是技术），一个结论同时属于两类的后果是
+// 分类全靠模型措辞，同一份画像重生成一次就可能整批换组。
+pub const PROFILE_SUBS: [(&str, &str, &str); 4] = [
+    // (key, 中文名, 一句话说明：界面上那行小字)
+    ("identity", "人格特质", "思维倾向、决策模式与协作个性，帮助 Agent 理解你的深层思考习惯"),
+    ("communication", "沟通偏好", "说话方式、信息密度与反馈节奏：Agent 该怎样向你汇报与求证"),
+    ("technical", "技术偏好", "技术选型倾向、工具链习惯与代码审美：Agent 该按什么标准写代码"),
+    ("workstyle", "工作习惯", "排查路径、验证方式与时间安排：Agent 该在什么时候做什么、怎么自证"),
+];
+
+/// 旧 key → 新 key。存量画像文件里写的是这四个，读的时候按它归位。
+///
+/// `preference` 归到 `communication` 而不是 `technical`：旧 prompt 对 preference 的
+/// 定义是「工具、写法、沟通方式」，其中沟通方式与说话风格是最常被总结出来的一类，
+/// 而技术细节在旧数据里本来就稀疏（它要求「反复出现的深度证据」）。归错一类的
+/// 代价是用户看到一条「技术偏好：喜欢简短回复」，归到沟通类至少读得通。
+pub const PROFILE_LEGACY_SUBS: [(&str, &str); 4] = [
+    ("preference", "communication"),
+    ("habit", "workstyle"),
+    ("expertise", "technical"),
+    ("context", "identity"),
+];
+
+/// 把任意一个 `sub`（新 key / 旧 key / 模型自由发挥的字符串）归到四类之一。
+///
+/// 为什么必须兜底而不是 `Option`：画像条目的分类只用于**分组展示**，漏一类的
+/// 后果是一条结论在界面上彻底不可见（用户以为它被删了）。所以宁可归错也不能归丢。
+pub fn profile_sub(raw: &str) -> &'static str {
+    let key = raw.trim().to_ascii_lowercase();
+    // 用 `for` + `copied()` 而不是 `iter().find(...)`：`iter()` 的元素是
+    // `&(&str, &str, &str)`，闭包与解构里会多出一层引用（`&&str`），返回时
+    // 还得再解一次 —— 那种写法编译能过但读起来全是 `*`。`copied()` 把元素变成
+    // `(&str, &str, &str)`，解构出来就是 `&'static str`，直接可返回。
+    for (name, _, _) in PROFILE_SUBS.iter().copied() {
+        if name == key.as_str() {
+            return name;
+        }
+    }
+    for (old, mapped) in PROFILE_LEGACY_SUBS.iter().copied() {
+        if old == key.as_str() {
+            return mapped;
+        }
+    }
+    // 模型自造的类别（"personality" / "style" …）：按关键词猜，最后落 identity。
+    if key.contains("commun") || key.contains("talk") || key.contains("feedback") {
+        return "communication";
+    }
+    if key.contains("tech") || key.contains("skill") || key.contains("code") || key.contains("tool") {
+        return "technical";
+    }
+    if key.contains("work") || key.contains("habit") || key.contains("routine") {
+        return "workstyle";
+    }
+    "identity"
+}
+
+/// 「这条是用户自己钉的」标记（写进 `tags`，与四类 key 并列）。
+///
+/// ── 为什么需要一个标记，不能只看 `pinned` ────────────────────
+/// 上一版给每一条生成的画像都设了 `pinned = true`（当时的理由是「画像必须进
+/// `memory_core`」）。于是升级之后，库里所有画像条目都有 `pinned`，光看这个布尔
+/// 分不出「用户钉的」与「上一版批量钉的」—— 把前者当真会保护住全部旧结论、让
+/// 重生成什么也换不掉；把后者当真会让用户钉的那条一起被冲掉。
+///
+/// 标记之后口径变成一句可执行的话：**`pinned && tags 含本标记` 才是用户的钉子**。
+/// 生成器只写 `starred`，用户点置顶时由 `update()` 顺手打上这个标记。
+///
+/// key 用 ASCII：它同时是磁盘上 frontmatter 的一部分，非 ASCII 标签在别的
+/// 记忆工具里过滤时容易出现编码差异。
+pub const PROFILE_PIN_TAG: &str = "pin";
+
 /// 自动化任务的中文名（状态页与服务清单共用一份，避免两处漂移）。
 ///
 /// 条目数必须与 `schedule::TASKS` 一致 —— `status()` 是按 `TASKS` 遍历、
@@ -559,10 +639,22 @@ pub fn merge_project(from: &str, into: &str) -> Result<Value, String> {
     Ok(json!({ "moved": moved, "items": projects()["items"] }))
 }
 
-/// 画像页视图：四类画像 + 生成门槛是否已达 + 上一版生成时间。
+/// 画像页视图：四类画像 + 生成门槛是否已达 + 上一版生成时间 + 存储与同步状态。
 ///
 /// 为什么按 `sub`（`tags[0]`）分类而不是按标题关键词：模型写出来的标题措辞每次
 /// 都不一样，而 `sub` 是我们在 prompt 里固定要求输出的四个枚举值之一，稳定。
+///
+/// ── 为什么这里连「持久缓存 / WebDAV 同步」一起回 ──────────────
+/// 画像页顶部的三枚状态徽标里有两枚讲的是**这份画像存得靠不靠得住**：内容落在
+/// 本地 `.md`（重启、断网、换模型都不丢）、而且开了同步（换机器还在）。它们与
+/// 「上次处理 N 天前」「素材 M 条」同属「你现在看到的这四类结论是可不可信」的
+/// 判据，放在同一份响应里才不会出现「徽标说同步保护中、同步页说没配」。
+///
+/// ── `material` 与 `total` 的区别 ────────────────────────────
+/// `total` = 库里活着的记忆条数（门槛判据）；`material` = **真正会喂给模型**的
+/// 素材条数（重要度排序后截到 `deep.batchSize`）。界面上写「记忆素材 N 条」时
+/// 用户以为那是「模型看过的东西」，所以给 material —— 给 total 会在素材被截断时
+/// 撒一个无害但会让人误判「为什么结论没覆盖到某条记忆」的谎。
 pub fn profile_view() -> Value {
     ensure_index_once();
     let all = store::load_all();
@@ -576,34 +668,76 @@ pub fn profile_view() -> Value {
     let min = config::usize_of("deep.personaMinMemories").max(5);
     let newest = profiles.iter().map(|entry| entry.updated_at).max().unwrap_or(0);
     let fresh = live.iter().filter(|entry| entry.updated_at > newest).count();
-    let groups: Vec<Value> = ["preference", "habit", "expertise", "context"]
+    let material = live
         .iter()
-        .map(|sub| {
-            let items: Vec<Value> = profiles
+        .filter(|entry| entry.kind != MemoryKind::Profile)
+        .count()
+        .min(config::usize_of("deep.batchSize").max(20).min(200));
+    // 只数**用户钉的**：上一版给每条画像都设了 `pinned = true`，直接数 `pinned`
+    // 会让升级后的老库显示「24 条已置顶」——那个数字既不是用户钉的，也保护不了
+    // 任何东西（真正被保护的是带 `PROFILE_PIN_TAG` 的那些）。
+    let pinned = profiles
+        .iter()
+        .filter(|entry| entry.pinned && entry.tags.iter().any(|tag| tag == PROFILE_PIN_TAG))
+        .count();
+
+    let groups: Vec<Value> = PROFILE_SUBS
+        .iter()
+        .copied()
+        .map(|(sub, label, hint)| {
+            // 旧 key 的条目也要出现在新分组里（见 `profile_sub` 的说明）。
+            let mut items: Vec<Value> = profiles
                 .iter()
-                .filter(|entry| entry.tags.first().map(String::as_str) == Some(*sub))
+                .filter(|entry| {
+                    profile_sub(entry.tags.first().map(String::as_str).unwrap_or("")) == sub
+                })
                 .map(|entry| {
                     let mut value = entry.to_json(true);
                     value["evidenceCount"] = json!(entry.evidence.len());
+                    // `sub` 回填成**归一之后的 key**：前端用它做「单独生成」的参数，
+                    // 直接拿 `tags[0]` 会把旧 key 再发回来，后端又得猜一遍。
+                    value["sub"] = json!(sub);
+                    // `pinned` 也归一成「用户钉的」：老库里每条画像都带 `pinned=true`，
+                    // 原样下发会让整页挂满「置顶」签，而那个签按下去又什么都不会发生
+                    // （它本来就已经是 true 了）。归一后界面上的签 = 真正会被保护的条目。
+                    value["pinned"] = json!(entry.pinned && entry.tags.iter().any(|tag| tag == PROFILE_PIN_TAG));
                     value
                 })
                 .collect();
+            // 置顶的先排，其余按更新时间倒序 —— 与 `projects()` 的排序口径一致。
+            items.sort_by(|left, right| {
+                let pin = |value: &Value| value.get("pinned").and_then(Value::as_bool).unwrap_or(false);
+                pin(right)
+                    .cmp(&pin(left))
+                    .then_with(|| {
+                        let at = |value: &Value| value.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+                        at(right).cmp(&at(left))
+                    })
+            });
             json!({
                 "sub": sub,
-                "label": match *sub {
-                    "preference" => "偏好",
-                    "habit" => "习惯",
-                    "expertise" => "擅长",
-                    _ => "背景",
-                },
+                "label": label,
+                "hint": hint,
                 "items": items,
             })
         })
         .collect();
+
+    // 持久缓存：事实源是本地 `.md`，只要根目录可写就算「存得住」。这里不探写权限
+    // （一次探针会在用户的记忆目录里留下垃圾文件），改为回根目录让界面显示位置。
+    let storage_root = store::root().to_string_lossy().to_string();
+    // 用 `summary()` 而不是 `status()`：后者会跑 `local_manifest()` 扫全目录，
+    // 而这份视图每次刷新画像页都会被请求一次（见 `sync::summary` 的说明）。
+    //
+    // 变量不叫 `sync`：局部绑定会遮住同名的 `sync` 模块，之后任何 `sync::xxx`
+    // 都会变成 `E0618` 之类的怪错（这条坑在 `agents.rs` 踩过两次）。
+    let sync_state = sync::summary();
     json!({
         "groups": groups,
         "count": profiles.len(),
         "total": live.len(),
+        "material": material,
+        "pinned": pinned,
         "minMemories": min,
         "ready": live.len() >= min,
         "freshSinceProfile": fresh,
@@ -611,6 +745,14 @@ pub fn profile_view() -> Value {
         "generatedText": if newest > 0 { json!(search::relative_time(newest, now)) } else { Value::Null },
         "enabled": config::bool_of("deep.enabled") && config::bool_of("deep.personaEnabled"),
         "evidenceRequired": config::bool_of("deep.evidenceRequired"),
+        // 顶部两枚徽标的判据：存在哪、同步开没开。
+        "storage": {
+            "root": storage_root,
+            "persistent": true,
+        },
+        // `summary()` 已经是这四个键了，直接嵌进去：再逐键 `get` 一遍只是把
+        // 同一份结构抄第二次，且多一处「新加字段忘了转发」的机会。
+        "sync": sync_state,
     })
 }
 
@@ -1124,6 +1266,19 @@ pub fn update(id: &str, patch: &Value) -> Result<Value, String> {
     }
     if let Some(pinned) = patch.get("pinned").and_then(Value::as_bool) {
         entry.pinned = pinned;
+        // 画像是「编译产物」，重生成会整批替换 —— 用户钉住一条时说的事实是
+        // 「这句别被模型洗掉」。所以置顶要在 `tags` 里留一个可判定的标记，
+        // 否则下一次 `build_profile` 分不出「用户钉的」与「上一版批量钉的」。
+        // 见 `PROFILE_PIN_TAG` 的说明。
+        if entry.kind == MemoryKind::Profile {
+            if pinned {
+                if !entry.tags.iter().any(|tag| tag == PROFILE_PIN_TAG) {
+                    entry.tags.push(PROFILE_PIN_TAG.to_string());
+                }
+            } else {
+                entry.tags.retain(|tag| tag != PROFILE_PIN_TAG);
+            }
+        }
     }
     if let Some(project) = patch.get("project").and_then(Value::as_str) {
         let slug = store::slugify(project);

@@ -567,8 +567,40 @@ pub fn run_once(task: &str, project: Option<&str>, manual: bool) -> Outcome {
     let before = index::global().tokens_today();
     let started = crate::server::logging::now_ms();
     let outcome = run_inner(task, project, manual);
+    record(task, started, before, outcome, manual)
+}
+
+/// 立即重生成画像（可只重算一类）。`sub` 为空 = 四类全量。
+///
+/// ── 为什么不复用 `run_now("profile")` ────────────────────────
+/// `run_now` 的任务名是 `TASKS` 里的枚举，审计表按它归类；「只重算技术偏好」
+/// 与「全量重算」在审计里都该记成 `profile` 一行（否则任务列表会多出四个
+/// 只在手动时才有的假任务）。所以这里走 `run_once` 的同一套记账，只是把
+/// `sub` 透给 `build_profile`。
+///
+/// ── 为什么不等调度线程 ──────────────────────────────────────
+/// 用户的「单独生成」点完就要看到结果（这一页的结论会整块换掉）。走频道会让
+/// 它排在下一轮 tick 后面，用户以为按钮没反应。代价是可能与自动轮次重叠 ——
+/// 但 `store` 的写锁 + 「替换 → 写入」的顺序保证了最坏情况是白算一次，不会
+/// 产生两份同 id 的活画像。
+pub fn run_profile_now(sub: Option<&str>) -> Outcome {
+    let before = index::global().tokens_today();
+    let started = crate::server::logging::now_ms();
+    let outcome = if !config::bool_of(config::ENABLE_KEY) {
+        Outcome::Skipped("记忆中枢已关闭".into())
+    } else if config::bool_of("privacy.pause") {
+        Outcome::Skipped("隐私模式已开启（privacy.pause），自动化暂停".into())
+    } else {
+        enrich::build_profile(sub, true)
+    };
+    record("profile", started, before, outcome, true)
+}
+
+/// 执行 + 记账（手动与自动共用）。抽成函数是为了让「只重算一类」也走同一套
+/// token 口径与审计行 —— 抄两份记账代码的下一步必然是两份口径。
+fn record(task: &str, started: i64, tokens_before: i64, outcome: Outcome, manual: bool) -> Outcome {
     let latency = crate::server::logging::now_ms() - started;
-    let tokens = (index::global().tokens_today() - before).max(0);
+    let tokens = (index::global().tokens_today() - tokens_before).max(0);
     // 手动执行同样算「跑过一次」：不然点了「立即执行」之后，下一轮 tick
     // 会因为「距上次（自动那次）够久了」立刻再跑一遍 —— 用户看到的是
     // 「我手动跑了一次，它自己又跑了一次」。自动轮次在 `tick` 里已先
@@ -606,7 +638,7 @@ fn run_inner(task: &str, project: Option<&str>, manual: bool) -> Outcome {
         "summarize" => enrich::summarize(&[], task_batch("summarize")),
         "tag" => enrich::tag(&[], false, task_batch("tag")),
         "distill" => enrich::distill(project, 0),
-        "profile" => enrich::build_profile(manual),
+        "profile" => enrich::build_profile(None, manual),
         "supersede" => supersede_recent(project),
         "consolidate" => consolidate(project, manual),
         other => Outcome::Skipped(format!("未知任务：{other}")),
@@ -658,7 +690,16 @@ fn detail_of(task: &str, outcome: &Outcome) -> String {
                 "classify" => format!("扫描 {} 条未归类（建议在写入时产生）", n("unclassified")),
                 "supersede" => format!("检查 {} 条，产出 {} 条失效建议", n("checked"), n("suggestions")),
                 "consolidate" => format!("检查 {} 条，产出 {} 条合并建议", n("checked"), n("queued")),
-                "profile" => format!("写入 {} 段画像，覆盖 {} 段", n("written"), n("replaced")),
+                // 「保留 N 条置顶」只在真的有钉子时出现：大多数轮次没有用户钉的
+                // 结论，恒显示「保留 0 条」会让审计行看起来像是漏了什么。
+                "profile" => {
+                    let kept = n("kept");
+                    if kept > 0 {
+                        format!("写入 {} 段画像，覆盖 {} 段，保留 {kept} 条置顶", n("written"), n("replaced"))
+                    } else {
+                        format!("写入 {} 段画像，覆盖 {} 段", n("written"), n("replaced"))
+                    }
+                }
                 "index-scan" => format!("重建索引 {} 条", n("indexed")),
                 "cleanup" => format!("清回收站 {} 条，失效入回收站 {} 条", n("trashPurged"), n("supersededTrashed")),
                 "health" => format!("陈旧 {} 条，待确认 {} 条", n("stale"), n("pending")),

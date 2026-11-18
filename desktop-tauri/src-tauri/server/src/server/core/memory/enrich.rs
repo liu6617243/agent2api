@@ -72,7 +72,10 @@ Output strict JSON, no prose around it.";
 
 const SYSTEM_PROFILE: &str = "You build a long-term profile of one engineer from their own memory entries. \
 Every statement must be supported by the entries you were given, and you must cite the entry ids. \
-Never speculate about personality from a single event. Output strict JSON, no prose around it.";
+Never speculate about personality from a single event. \
+The four sections are orthogonal: identity = who they are, communication = how they talk and want to be told, \
+technical = what they build and with what, workstyle = how they investigate and verify. \
+A statement belongs to exactly one section. Output strict JSON, no prose around it.";
 
 const SYSTEM_SUPERSEDE: &str = "You compare a new memory entry against older entries on the same topic. \
 Decide only whether the new entry makes an older one factually obsolete. \
@@ -415,20 +418,30 @@ pub fn detect_supersede(new_id: &str) -> Outcome {
 /// 画像与普通记忆的区别：它是**编译产物**，每次重生成都覆盖同一批
 /// `type=profile` 条目（按 `sub` 区分四类），而不是无限追加。否则一年后
 /// `memory_core` 里会塞进几十份互相矛盾的人格描述。
-pub fn build_profile(force: bool) -> Outcome {
+///
+/// 传 `sub` 就是「只重生成这一类」：改了一类结论、或只想刷新技术偏好时，没必要
+/// 把另外三类也重算一遍（既是 token 浪费，也会让**已经满意的三类结论被无谓地
+/// 洗掉**——模型每次措辞都不一样）。
+pub fn build_profile(sub: Option<&str>, force: bool) -> Outcome {
     if !config::bool_of("deep.enabled") || !config::bool_of("deep.personaEnabled") {
         return Outcome::Skipped("画像生成已关闭（deep.personaEnabled）".into());
     }
+    let scope: Option<&'static str> = sub.map(super::profile_sub);
     let min = config::usize_of("deep.personaMinMemories").max(5);
     let all = store::load_all();
     let live: Vec<&model::MemoryEntry> = all.iter().filter(|entry| entry.is_live()).collect();
     if live.len() < min {
         return Outcome::Skipped(format!("记忆只有 {} 条，未达画像门槛 {min}", live.len()));
     }
+    // 本次要重写的那几类旧结论。别的类的条目一个字都不动。
     let existing: Vec<&model::MemoryEntry> = live
         .iter()
         .copied()
         .filter(|entry| entry.kind == MemoryKind::Profile)
+        .filter(|entry| match scope {
+            Some(want) => super::profile_sub(entry.tags.first().map(String::as_str).unwrap_or("")) == want,
+            None => true,
+        })
         .collect();
     if !force && !existing.is_empty() {
         let newest = existing.iter().map(|entry| entry.updated_at).max().unwrap_or(0);
@@ -453,14 +466,25 @@ pub fn build_profile(force: bool) -> Outcome {
     });
     material.truncate(config::usize_of("deep.batchSize").max(20).min(200));
 
+    // 四类的定义直接取自 `PROFILE_SUBS`：这里再抄一遍的话，改分类就得改两处，
+    // 而且必然出现「prompt 说三类、界面画四类」的漂移。
+    // `copied()` 让元素从 `&(&str, &str, &str)` 变成元组本体：直接解构引用
+    // 会得到 `&&str`，与 `scope` 的 `&str` 比较时还要额外解一层。
+    let outline = super::PROFILE_SUBS
+        .iter()
+        .copied()
+        .filter(|(key, _, _)| scope.is_none_or(|want| *key == want))
+        .map(|(key, label, hint)| format!("{key}（{label}）：{hint}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let example = scope.unwrap_or(super::PROFILE_SUBS[0].0);
+
     let ask = format!(
-        "以下是某位工程师自己的记忆条目。请归纳出四类画像，每类 1-4 条，每条一句话。\n\
-         preference：长期偏好（工具、写法、沟通方式）\n\
-         habit：工作习惯（怎么排查、怎么验证、什么时间做什么）\n\
-         expertise：擅长领域（有反复出现的深度证据才算）\n\
-         context：长期背景（在做什么项目、受什么约束）\n\n\
+        "以下是某位工程师自己的记忆条目。请归纳出下列每一类的画像结论，每类 1-4 条，每条一句话。\n\
+         {outline}\n\n\
+         每一类必须正交：一条结论只属于一类，不要换个说法把同一条写进两类。\n\
          每条必须给出支撑它的条目 id（evidence）。证据不足就少写几条，不要凑。\n\
-         输出 JSON：{{\"items\":[{{\"sub\":\"preference\",\"title\":\"不超过 30 字\",\"body\":\"一句话\",\"evidence\":[\"id\"]}}]}}\n\n\
+         输出 JSON：{{\"items\":[{{\"sub\":\"{example}\",\"title\":\"不超过 30 字\",\"body\":\"一句话\",\"evidence\":[\"id\"]}}]}}\n\n\
          条目：\n{}",
         material
             .iter()
@@ -486,9 +510,20 @@ pub fn build_profile(force: bool) -> Outcome {
         return Outcome::Skipped("模型没给出画像条目".into());
     }
 
+    // ── 手动置顶的条目要活过重新生成 ────────────────────────────
+    // 用户钉住一条结论，表达的是「这句我认，别动它」。这是这个页面上唯一
+    // **人的判断压过模型**的地方，所以它必须在替换时被排除，而不是照常进回收站
+    // 再让用户从一堆新结论里找回来。
+    let kept: Vec<&model::MemoryEntry> = existing
+        .iter()
+        .copied()
+        .filter(|entry| entry.pinned && entry.tags.iter().any(|tag| tag == super::PROFILE_PIN_TAG))
+        .collect();
+    let kept_ids: Vec<&str> = kept.iter().map(|entry| entry.id.as_str()).collect();
+
     // 旧画像进回收站（不物理删除：用户可能想对比上一版）
     let mut replaced = 0usize;
-    for stale in &existing {
+    for stale in existing.iter().filter(|entry| !kept_ids.contains(&entry.id.as_str())) {
         let mut entry = (*stale).clone();
         entry.deleted_at = Some(crate::server::logging::now_ms());
         entry.updated_at = entry.deleted_at.unwrap_or(entry.updated_at);
@@ -502,6 +537,7 @@ pub fn build_profile(force: bool) -> Outcome {
     }
 
     let mut written = 0usize;
+    let mut superseded_pins = 0usize;
     for item in items.iter().take(24) {
         let body = item.get("body").and_then(Value::as_str).unwrap_or("").trim();
         if body.chars().count() < 8 {
@@ -515,7 +551,12 @@ pub fn build_profile(force: bool) -> Outcome {
         if config::bool_of("deep.evidenceRequired") && evidence.is_empty() {
             continue;
         }
-        let sub = item.get("sub").and_then(Value::as_str).unwrap_or("preference");
+        let sub = super::profile_sub(item.get("sub").and_then(Value::as_str).unwrap_or(""));
+        // 只重生成一类时，模型偶尔会顺带写别的类 —— 丢掉，不然「只刷新技术偏好」
+        // 会悄悄改掉沟通类。
+        if scope.is_some_and(|want| want != sub) {
+            continue;
+        }
         let title = item
             .get("title")
             .and_then(Value::as_str)
@@ -523,6 +564,12 @@ pub fn build_profile(force: bool) -> Outcome {
             .trim()
             .to_string();
         let id = model::make_profile_id(sub, body);
+        // 与保留下来的置顶条目同 id（正文一字不差）→ 不重写：重写会把 pinned
+        // 清成 false，等于用户钉住的那条被「重新生成」偷偷摘了钉。
+        if kept_ids.contains(&id.as_str()) {
+            superseded_pins += 1;
+            continue;
+        }
         let mut entry = model::MemoryEntry::draft(
             id,
             if title.is_empty() { model::truncate_chars(body, 40) } else { title },
@@ -534,9 +581,10 @@ pub fn build_profile(force: bool) -> Outcome {
         entry.device = Some(store::device_id());
         entry.tags = vec![sub.to_string()];
         entry.importance = 0.9;
-        // 钉住 + 星标：画像条目每一条都应该出现在 `memory_core` 里，而不是等到
-        // 预算不够时被截掉
-        entry.pinned = true;
+        // 星标但不钉住：星标表达「这是精选结论」，钉住表达「别动它」。生成的条目
+        // 两者都不该占 —— 钉住留给用户，否则「保留手动置顶」就无从判定（上一版
+        // 给每一条都设了 pinned，用户根本分不出哪条是自己钉的）。
+        entry.pinned = false;
         entry.starred = true;
         entry.evidence = evidence;
         entry.path = store::rel(&store::entry_path(&entry, false));
@@ -551,13 +599,19 @@ pub fn build_profile(force: bool) -> Outcome {
     }
     crate::server::logging::log(
         "[Memory]",
-        &format!("画像已重生成：{written} 条（替换 {replaced} 条旧画像）"),
+        &format!(
+            "画像已重生成：{written} 条（替换 {replaced} 条旧画像，保留 {} 条置顶）",
+            kept.len()
+        ),
     );
     Outcome::Done(json!({
         "written": written,
         "replaced": replaced,
+        "kept": kept.len(),
+        "duplicatePins": superseded_pins,
         "material": material.len(),
         "model": reply.model,
+        "scope": scope.unwrap_or("all"),
     }))
 }
 
@@ -578,7 +632,7 @@ pub fn run_task(task: &str, project: Option<&str>) -> Outcome {
         "distill" => distill(project, 0),
         "tag" => tag(&[], false, 10),
         "summarize" => summarize(&[], 10),
-        "profile" => build_profile(false),
+        "profile" => build_profile(None, false),
         other => Outcome::Skipped(format!("未知任务：{other}")),
     }
 }

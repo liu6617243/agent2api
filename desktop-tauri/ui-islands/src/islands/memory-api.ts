@@ -288,18 +288,34 @@ export type Outcome = {
 
 /* ─── 画像（memory::profile_view）──────────────────────────── */
 
-export type ProfileItem = MemoryEntry & { evidenceCount?: number }
+/**
+ * 画像条目：`MemoryEntry` + 后端算好的两个展示字段。
+ *
+ * `sub` 是**归一之后**的四类 key（`identity` / `communication` / `technical` /
+ * `workstyle`）。后端会把旧 key（`preference` / `habit` / `expertise` /
+ * `context`）映射到新 key 再回填，所以页面永远只见到这四个 —— 「单独生成」
+ * 直接把 `sub` 发回去即可，不需要前端再认一套历史拼写。
+ */
+export type ProfileItem = MemoryEntry & { evidenceCount?: number; sub?: string }
 
 export type ProfileGroup = {
   sub: string
   label: string
+  /** 这一类在讲什么（分组卡与面板标题下的一行小字） */
+  hint: string
   items: ProfileItem[]
 }
 
 export type ProfileView = {
   groups: ProfileGroup[]
+  /** 画像条目数（四类之和） */
   count: number
+  /** 库里活着的记忆条数（门槛判据） */
   total: number
+  /** 真正会喂给模型的素材条数（排序后截到 deep.batchSize） */
+  material: number
+  /** 手动置顶（重生成时保留）的条数 */
+  pinned: number
   minMemories: number
   ready: boolean
   freshSinceProfile: number
@@ -307,6 +323,15 @@ export type ProfileView = {
   generatedText: string | null
   enabled: boolean
   evidenceRequired: boolean
+  /** 事实源位置：画像落在本地 `.md`，重启 / 断网都不丢 */
+  storage?: { root: string; persistent: boolean }
+  /** WebDAV 同步状态：顶部「持久缓存与 WebDAV 同步保护中」那枚徽标的判据 */
+  sync?: {
+    configured: boolean
+    enabled: boolean
+    provider: string
+    lastSyncAt: number | null
+  }
 }
 
 /* ─── 接入（agents::list）──────────────────────────────────── */
@@ -827,8 +852,27 @@ export function setAutoTask(task: string, patch: AutoTaskPatch): Promise<AutoSta
   return api('POST', '/api/memory/auto/task', { task, ...patch })
 }
 
-export function buildProfile(): Promise<{ outcome: Outcome; profile: ProfileView }> {
-  return api('POST', '/api/memory/profile/build')
+/**
+ * 重生成画像。`sub` 传四类 key 之一 = 只重算这一类，不传 = 四类全量。
+ *
+ * 为什么给「只算一类」留一个参数而不是让前端循环调四次：四次调用会把四份
+ * 结论分别写进库，中间任何一次模型失败都会留下「三类是新的、一类是旧的」
+ * 这种界面上看不出来的混合态 —— 而这类混合态正是用户最不能判断可信度的
+ * 状态。一次调用、后端决定范围，失败就整体不变。
+ */
+export function buildProfile(sub?: string): Promise<{ outcome: Outcome; profile: ProfileView }> {
+  return api('POST', '/api/memory/profile/build', sub ? { sub } : {})
+}
+
+/**
+ * 置顶 / 取消置顶一条画像结论。
+ *
+ * 置顶的语义只有一条：**重新生成时保留**。它不是「排到最前面」那种一次性的
+ * 视觉偏好 —— 那条用 `starred` 就够了（生成器给每条都打星）。所以这个动作
+ * 走独立端点：它要顺带在条目上留一个可判定标记，后端才知道下一次重算该跳过谁。
+ */
+export function pinProfileItem(id: string, pinned: boolean): Promise<{ entry: MemoryEntry; profile: ProfileView }> {
+  return api('POST', '/api/memory/profile/pin', { id, pinned })
 }
 
 /** 写进客户端的 key 身份（不含明文）。`picked=true` 表示前端没选、由后端挑的第一把。 */

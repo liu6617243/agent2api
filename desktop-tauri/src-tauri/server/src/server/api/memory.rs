@@ -622,14 +622,54 @@ pub async fn get_profile(State(_state): State<ServerState>) -> Response {
 }
 
 /// 强制重生成画像（不等门槛）。同步等待模型。
-pub async fn post_profile_build(State(_state): State<ServerState>) -> Response {
-    let outcome = crate::server::core::blocking::run(|| {
-        memory::schedule::run_now("profile", None)
+///
+/// 请求体可选：`{"sub": "technical"}` 表示只重算这一类。四类是正交的，改一类
+/// 结论时不该把另外三类也洗一遍（模型每次措辞都不同，无谓地重算只会让用户
+/// 已经满意的结论变得陌生）。
+pub async fn post_profile_build(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(error) => return errors::management_error(400, error.message),
+    };
+    // 空 `sub` / 空体 / 不认识的 key 一律当「全量」：见 `memory::profile_sub`
+    // 的兜底说明 —— 猜错的代价是少刷一类，报 400 的代价是按钮点了没反应。
+    let sub = payload
+        .get("sub")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let outcome = crate::server::core::blocking::run(move || {
+        memory::schedule::run_profile_now(sub.as_deref())
     })
     .await;
     match outcome {
         Ok(outcome) => ok_json(json!({ "outcome": outcome.to_json(), "profile": memory::profile_view() })),
         Err(error) => errors::management_error(500, error.message),
+    }
+}
+
+/// 置顶 / 取消置顶一条画像结论（重生成时保留）。
+///
+/// 与通用 `POST /api/memory/update` 的差别只在语义：这个入口专门给画像页的
+/// 置顶开关用，额外把 `PROFILE_PIN_TAG` 打上/摘掉，好让下一次重生成认得出
+/// 「这是用户的钉子」。走通用 update 也能生效（`update()` 里有同样的分支），
+/// 但前端要为此知道这个标记的存在 —— 那是磁盘格式细节，不该泄进页面。
+pub async fn post_profile_pin(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(error) => return errors::management_error(400, error.message),
+    };
+    let Some(id) = payload.get("id").and_then(Value::as_str) else {
+        return errors::management_error(400, "缺少 id");
+    };
+    let pinned = payload.get("pinned").and_then(Value::as_bool).unwrap_or(true);
+    match memory::update(id, &json!({ "pinned": pinned })) {
+        Ok(value) => ok_json(json!({
+            "entry": value.get("entry").cloned().unwrap_or(Value::Null),
+            "profile": memory::profile_view(),
+        })),
+        Err(message) => errors::management_error(400, message),
     }
 }
 

@@ -924,6 +924,33 @@ pub fn skip_list() -> Value {
 
 // ── 状态与查询 ───────────────────────────────────────────────
 
+/// 同步状态的**轻量摘要**：只回「配没配 / 开没开 / 上次什么时候」。
+///
+/// ── 为什么不能拿 `status()` 顶替 ────────────────────────────
+/// `status()` 里有 `local_manifest()`，那是一次**全目录递归扫描**（记忆几千条时
+/// 几百毫秒）。`status()` 的调用者是同步页 —— 用户主动打开、可以等；而画像页顶
+/// 那枚「持久缓存与 WebDAV 同步保护中」的徽标会在每次 `profile_view()` 时重算，
+/// 让一次「看一眼画像」的请求去扫全盘是明显的浪费。这里只读配置与一个 kv 时间戳。
+pub fn summary() -> Value {
+    let last_at = index::global()
+        .sync_get(LAST_KEY)
+        .and_then(|(raw, _)| raw.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    // 先在 `json!` **外面**算好：宏里的 `{}` 只会被解析成嵌套对象，写成
+    // `"provider": { let x = ..; }` 会得到 `missing tokens in macro arguments`
+    // 的编译错（宏把 `let` 当成了键名）。`status()` 里同一个值也是这么算的。
+    let provider = {
+        let value = config::text_of("sync.provider");
+        if value.trim().is_empty() { "webdav".to_string() } else { value.trim().to_string() }
+    };
+    json!({
+        "configured": !base_url().is_empty(),
+        "enabled": config::bool_of("sync.enabled"),
+        "provider": provider,
+        "lastSyncAt": if last_at > 0 { json!(last_at) } else { Value::Null },
+    })
+}
+
 /// 同步页顶部状态。
 pub fn status() -> Value {
     let configured = !base_url().is_empty();

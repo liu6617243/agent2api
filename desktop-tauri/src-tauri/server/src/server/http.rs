@@ -399,9 +399,10 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/memory/auto/run", post(api::memory::post_auto_run))
         // 任务执行审计（?limit=）。`/auto` 里已带 30 条预览，这条只为翻页。
         .route("/api/memory/auto/runs", get(api::memory::get_auto_runs))
-        // 画像：视图 + 强制重生成（不等门槛）
+        // 画像：视图 + 强制重生成（不等门槛）+ 置顶（重生成时保留）
         .route("/api/memory/profile", get(api::memory::get_profile))
         .route("/api/memory/profile/build", post(api::memory::post_profile_build))
+        .route("/api/memory/profile/pin", post(api::memory::post_profile_pin))
         // 体检：锚定文件改过 / 队列积压 / 索引漂移
         .route("/api/memory/health", get(api::memory::get_health))
         // 历史导入：来源清单 / 干跑预览 / 真导入。预览与导入是两个端点 ——

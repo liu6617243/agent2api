@@ -147,8 +147,14 @@ function MemoryPage(): React.ReactElement {
    */
   React.useEffect(() => {
     const onTab = (event: Event) => {
-      const next = (event as CustomEvent<{ tab?: string }>).detail?.tab
-      if (next && TABS.some(item => item.key === next)) switchTab(next as Tab)
+      const detail = (event as CustomEvent<{ tab?: string; focusId?: string }>).detail
+      const next = detail?.tab
+      if (!next || !TABS.some(item => item.key === next)) return
+      // `focusId`：「在浏览页打开这一条」。画像页的证据 chip 走的就是这条路 ——
+      // 它比 `switchTab` 多带一个目标，否则切过去只会看到列表第一屏，
+      // 用户还得自己再搜一遍刚才点的那条 id。
+      if (detail?.focusId) setFocusId(detail.focusId)
+      switchTab(next as Tab)
     }
     window.addEventListener('mm:tab', onTab)
     return () => window.removeEventListener('mm:tab', onTab)
