@@ -75,10 +75,19 @@ function runStamp(at: number): string {
     : `${date.getFullYear()}-${day} ${clock}`
 }
 
-/** 毫秒 → 「6.0s / 240ms」。跑满一秒的任务写秒，几十毫秒的写毫秒。 */
+/**
+ * 毫秒 → 「6.0s」。
+ *
+ * ── 为什么全部按秒写、不切到毫秒 ────────────────────────────
+ * 这一列是和下面几列一起竖着扫的：整列都用「秒 + 一位小数」时，小数点会落在
+ * 同一个位置上，`6.0s / 8.9s / 0.0s` 一眼就能比出谁慢。混进 `240ms` 之后
+ * 数字位少一位、单位多两个字符，整列立刻错位，反而更难比较。
+ * 毫秒级的差异对「调度任务跑了多久」没有决策价值 —— 3ms 与 240ms 都是
+ * 「几乎没花时间」，写 0.0s / 0.2s 足够；精确的毫秒值在导出的 CSV 里
+ * （那一列是原始 `latencyMs`，给统计脚本用）。
+ */
 function latencyText(ms: number): string {
   if (!Number.isFinite(ms) || ms < 0) return '—'
-  if (ms < 1000) return `${Math.round(ms)}ms`
   return `${(ms / 1000).toFixed(1)}s`
 }
 
