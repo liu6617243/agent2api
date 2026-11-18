@@ -54,7 +54,7 @@ pub const GLOBAL_SLUG: &str = "_global";
 /// 先写那一节静默消失 —— 文件层不会报任何错。并发来源至少三路：
 ///   · 多个客户端各自的 `tools/call`（`mcp.rs` 每调用一次丢一个 spawn_blocking）；
 ///   · 面板 `/api/memory/write`（直接在 tokio worker 上跑，连 spawn_blocking 都没包）；
-///   · 调度器十二个任务（distill / tag / consolidate / cleanup …）。
+///   · 调度器十一个任务（distill / tag / consolidate / cleanup …）。
 /// 这三路都写同一个 `l1/<agent>/<YYYY-MM-DD>.md`。
 ///
 /// ── 为什么是进程内 Mutex 而不是文件锁 ───────────────────────

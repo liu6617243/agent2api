@@ -209,7 +209,7 @@ function Dashboard({ status, onGo, onChanged }: DashboardProps): React.ReactElem
                 })}
               </ul>
               <Button type='button' size='sm' variant='ghost' onClick={() => onGo('auto')}>
-                {t('查看全部 12 个任务')}
+                {t('查看全部 {n} 个任务', { n: auto.data.tasks.length })}
               </Button>
             </>
           ) : <Empty>{auto.error || t('读不到调度器状态')}</Empty>}

@@ -209,8 +209,7 @@ static SCHEMA: &[Knob] = &[
           \"profile\":{\"enabled\":false,\"weekly\":1,\"weeklyTime\":\"11:10\"},\
           \"index-scan\":{\"enabled\":true,\"intervalMin\":360},\
           \"cleanup\":{\"enabled\":true,\"daily\":\"11:20\"},\
-          \"health\":{\"enabled\":true,\"daily\":\"11:30\"},\
-          \"sync\":{\"enabled\":false,\"intervalMin\":60}}"),
+          \"health\":{\"enabled\":true,\"daily\":\"11:30\"}}"),
 
     // ===== 去重 =====
     knob("dedup.enabled", Kind::Bool, Tier::Basic, "去重", "去重总开关", "true"),

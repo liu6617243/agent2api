@@ -32,7 +32,7 @@ import { TabBoundary } from './memory-shared'
  *   projects  项目    —— 按仓库归档、改名、合并
  *   profile   画像    —— 关于「我」的长期事实，每条带证据
  *   agents    接入    —— 11 个客户端装没装、真的调过没
- *   auto      自动化  —— 12 个后台任务的节奏与消耗
+ *   auto      自动化  —— 11 个后台任务的节奏与消耗
  *   import    导入    —— 把别处的历史会话搬进来
  *   sync      同步    —— WebDAV 多设备，冲突裁决
  *   settings  配置    —— 一百多个旋钮，schema 驱动

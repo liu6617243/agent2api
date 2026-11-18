@@ -796,7 +796,7 @@
 /* ── 自动化 · 任务卡片网格 ──
    三列：卡片再窄（四列）时节奏面板里的「上次运行 / 下次计划」就要换行，
    再宽（两列）则在 1440 的屏上一行两张、每张 660px —— 大片空白反而看不出
-   12 个任务之间的对比。列宽用 minmax(0, 1fr) 而不是固定 px：卡片要能随窗口
+   11 个任务之间的对比。列宽用 minmax(0, 1fr) 而不是固定 px：卡片要能随窗口
    收窄，收窄时由下面两档媒体查询降列。 */
 .mm-auto-grid {
   display: grid;
@@ -1007,25 +1007,58 @@
 /* 「N / 12 已开启」：页签标题右侧的一枚概览，替代原先被删掉的「已开启」状态行。 */
 .mm-auto-count { font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
 
-/* 执行记录：时间 / 任务 / 结果 / 明细 / token / 耗时。
-   明细列吃满剩余宽度 —— 它是这张表唯一的自由文本，也是用户真正要看的一列。 */
+/* 执行记录：执行时间 / 任务名称 / 状态 / 耗时 / 消耗 Token / 执行详情。
+   前五列定宽（都是短值，定宽才能对成竖线），末列吃满剩余宽度 ——
+   它唯一的自由文本，也是用户真正要看的那一列。 */
 .mm-run-row {
   display: grid;
-  grid-template-columns: 92px minmax(86px, 0.8fr) 58px minmax(160px, 2.2fr) 74px 66px;
-  gap: 8px;
+  grid-template-columns: 126px minmax(96px, 0.9fr) 68px 62px 88px minmax(180px, 2.4fr);
+  gap: 10px;
   align-items: center;
-  padding: 5px 0;
+  padding: 4px 0;
   border-bottom: 1px solid var(--hairline);
   font-size: 12px;
+  min-width: 0;
 }
 .mm-run-row:last-child { border-bottom: none; }
 .mm-run-head {
   font-size: 11.5px;
   color: var(--text-3);
-  font-weight: 600;
+  font-weight: 500;
+  padding: 6px 0;
   border-bottom: 1px solid var(--border);
 }
+/* 时刻与数字用等宽：`11-18 07:56` 这类串里冒号与数字宽度浮动，
+   非等宽字体下整列会左右抖，扫一列时间时要重新找对齐点。 */
+/* 时刻与它后面的「×2 / 手动」小标在一行里，不换行也不省略 ——
+   等宽字体下 `11-18 08:35` 是 66px，加一枚 ×2（约 26px）刚好落在 126px 内。
+   早先用 `overflow:hidden` 兜底，结果是「11-18 09:39 …」把时刻本身切掉，
+   而时刻恰恰是这一列唯一的信息。 */
+.mm-run-at {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.mm-run-task {
+  color: var(--text);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mm-run-latency, .mm-run-tokens {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+  text-align: right;
+  white-space: nowrap;
+}
 .mm-run-detail {
+  color: var(--text-3);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1039,6 +1072,9 @@
   color: var(--text-3);
   font-size: 10px;
 }
+/* 「导出报告」与「查看全部」并排：两个都是描边小按钮，
+   间距 6px 让它们读成一组动作而不是两个孤立控件。 */
+.mm-run-export { gap: 4px; }
 
 .mm-mono { font-family: var(--font-mono); font-size: 11.5px; }
 
@@ -2139,8 +2175,11 @@
      明细是被砍列之外唯一有解释力的列，不能丢。
      任务卡的降列在 .mm-auto-grid 自己身上做（640px 起单列），这里不再
      重复一套 .mm-task-row 的列覆盖 —— 那张表已经不存在了。 */
-  .mm-run-row { grid-template-columns: 78px minmax(70px, 0.9fr) 52px minmax(0, 1.6fr); }
-  .mm-run-row > :nth-child(5), .mm-run-row > :nth-child(6) { display: none; }
+  /* 窄屏砍掉「耗时」与「消耗 Token」（第 4、5 列），留执行时间 / 任务 / 状态 /
+     执行详情。详情是被砍列之外唯一有解释力的列，不能丢；状态留着是因为
+     它决定这一行要不要往下读。 */
+  .mm-run-row { grid-template-columns: 96px minmax(80px, 0.9fr) 56px minmax(0, 1.8fr); }
+  .mm-run-row > :nth-child(4), .mm-run-row > :nth-child(5) { display: none; }
   .mm-preview-row { grid-template-columns: 1fr 84px 54px; }
   .mm-preview-row > :nth-child(4) { display: none; }
   .mm-dialog-row { grid-template-columns: 1fr; }

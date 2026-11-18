@@ -14,7 +14,7 @@
 //! GET  /api/memory/review      待确认队列（?status=pending&type=dedup）
 //! POST /api/memory/review      裁决（{id, approve} 或 {rejectAll: true}）
 //! GET  /api/memory/calls       内部 LLM 调用台账（?limit=100）
-//! GET  /api/memory/auto        自动化：调度器状态 + 12 个任务的节奏与累计统计
+//! GET  /api/memory/auto        自动化：调度器状态 + 11 个任务的节奏与累计统计
 //! POST /api/memory/auto/task   改一个任务的开关 / 节奏（返回刷新后的整份状态）
 //! POST /api/memory/auto/run    立即执行一个任务（同步等结果）
 //! GET  /api/memory/auto/runs   任务执行审计（?limit=100）
@@ -553,7 +553,7 @@ pub async fn post_rebuild(State(_state): State<ServerState>) -> Response {
 
 // ── 自动化 ───────────────────────────────────────────────────
 
-/// 自动化页顶部：调度线程状态 + 12 个任务的节奏与上次执行。
+/// 自动化页顶部：调度线程状态 + 11 个任务的节奏与上次执行。
 pub async fn get_auto(State(_state): State<ServerState>) -> Response {
     ok_json(memory::schedule::status())
 }

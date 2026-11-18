@@ -59,7 +59,10 @@ pub use model::{DedupStatus as MemoryDedupStatus, Layer as MemoryLayer, MemoryKi
 pub use search::Query as MemoryQuery;
 
 /// 自动化任务的中文名（状态页与服务清单共用一份，避免两处漂移）。
-pub const TASK_LABELS: [(&str, &str); 12] = [
+///
+/// 条目数必须与 `schedule::TASKS` 一致 —— `status()` 是按 `TASKS` 遍历、
+/// 用这张表取名字的，少一条就会出现「有卡没名」或「有名没卡」。
+pub const TASK_LABELS: [(&str, &str); 11] = [
     ("extract", "抽取结构化信息"),
     ("summarize", "生成摘要"),
     ("tag", "自动打标签"),
@@ -71,7 +74,6 @@ pub const TASK_LABELS: [(&str, &str); 12] = [
     ("index-scan", "索引自愈扫描"),
     ("cleanup", "异常记忆清理"),
     ("health", "记忆体检"),
-    ("sync", "WebDAV 同步"),
 ];
 
 // ── 设置 ─────────────────────────────────────────────────────

@@ -1,12 +1,12 @@
 import * as React from 'react'
-import { Badge, Button, Input, SegmentedControl, Switch } from '@ui'
+import { Badge, Button, Input, SegmentedControl, StatusDot, Switch } from '@ui'
 import { t } from '../i18n'
 import * as m from './memory-api'
-import { Empty, Panel, Section, StateBadge, num, useLoad } from './memory-shared'
+import { Empty, Panel, Section, num, useLoad } from './memory-shared'
 import { OutcomeLine } from './memory-tab-profile'
 
 /**
- * 自动化页：12 个后台任务的开关、节奏、上次/下次执行、累计统计与执行记录。
+ * 自动化页：11 个后台任务的开关、节奏、上次/下次执行、累计统计与执行记录。
  *
  * ── 为什么是卡片网格而不是表格 ──────────────────────────────
  * 表格的每一行只放得下一个短语（「每 30 分钟」），而这一页要回答的问题比短语
@@ -34,14 +34,95 @@ import { OutcomeLine } from './memory-tab-profile'
  * 后端收口：页面只说「这个任务开关变成 X」「这个任务改成每天 11:00」。
  */
 
-/** 执行结果 → 徽标。跳过着灰色而不是红色：它是常态，不是故障。 */
+/**
+ * 执行结果 → 徽标。跳过着灰色而不是红色：它是常态，不是故障。
+ *
+ * 圆点是目标界面的那枚：一眼扫一列「● 成功 / ● 成功 / ○ 跳过」，
+ * 形状与颜色双通道，比只靠文字色更快分辨（绿色文字在深色底上并不显眼）。
+ */
 function StatusBadge({ status }: { status: TaskRunStatus }): React.ReactElement {
-  const state = status === 'done' ? 'ok' : status === 'failed' ? 'bad' : 'idle'
-  const label = status === 'done' ? t('完成') : status === 'failed' ? t('失败') : t('跳过')
-  return <StateBadge state={state} label={label} />
+  const variant = status === 'done' ? 'success' : status === 'failed' ? 'destructive' : 'outline'
+  const dot = status === 'done' ? 'success' : status === 'failed' ? 'destructive' : 'muted'
+  const label = status === 'done' ? t('成功') : status === 'failed' ? t('失败') : t('跳过')
+  return (
+    <Badge variant={variant} shape='tag'>
+      <StatusDot variant={dot} />
+      {label}
+    </Badge>
+  )
 }
 
 type TaskRunStatus = m.TaskRun['status']
+
+/**
+ * 执行记录里的「时刻」：`11-18 07:56`。
+ *
+ * ── 为什么不用后端给的 `atText`（「26 分钟前」）────────────────
+ * 这是一段**审计**：用户翻它的时候在问「昨天 11:00 那一轮到底干了什么」。
+ * 「26 分钟前」只有在打开页面的那一秒是对的，滚动两屏之后每一行都在骗人，
+ * 而这一页恰好是停久了会一直看的地方。绝对时刻不会过期 —— 同年省掉年份
+ * （`11-18`），跨年才写全（`2025-11-18`），既短又不含糊。
+ */
+function runStamp(at: number): string {
+  const date = new Date(at)
+  if (!Number.isFinite(date.getTime())) return '—'
+  const pad = (part: number): string => String(part).padStart(2, '0')
+  const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  const day = `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+  // 跨年才带年份：日常翻的都是这几天，多写四个字符换来的是每行都更挤。
+  return date.getFullYear() === new Date().getFullYear()
+    ? `${day} ${clock}`
+    : `${date.getFullYear()}-${day} ${clock}`
+}
+
+/** 毫秒 → 「6.0s / 240ms」。跑满一秒的任务写秒，几十毫秒的写毫秒。 */
+function latencyText(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '—'
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  return `${(ms / 1000).toFixed(1)}s`
+}
+
+/**
+ * 「导出报告」：把当前这张表写成 CSV 下到本地。
+ *
+ * ── 为什么是 CSV 而不是 JSON / PDF ──────────────────────────
+ * 导出的用途是拿去核对与统计（「这周抽取跑了多少次、烧了多少 token」），
+ * 落点几乎一定是 Excel 或脚本。CSV 两边都能直接吃；JSON 要用户会写代码，
+ * PDF 要额外依赖且再也没法排序。这张表的每一行都是扁平的六个字段，
+ * 不需要保留嵌套。
+ *
+ * ── 为什么带 BOM ────────────────────────────────────────────
+ * 不带 BOM 的 UTF-8 CSV 在中文 Windows 的 Excel 里首列会变乱码（那是 Excel
+ * 按 GBK 猜的，不是文件坏了）。`\ufeff` 是这一条的唯一可靠解法。
+ *
+ * ── 为什么字段要加引号并转义 ────────────────────────────────
+ * `detail` 是后端生成的人话，可能带逗号（「处理 20 条，写入 20 条」）、
+ * 也可能带引号（错误信息里常有）。不包不转义，列会错位。
+ */
+function exportRuns(rows: m.TaskRun[], labelOf: (task: string) => string): void {
+  const cell = (value: string): string => `"${value.replace(/"/g, '""')}"`
+  const header = ['执行时间', '任务名称', '状态', '耗时(ms)', '消耗 Token', '执行详情']
+  const lines = [header.map(cell).join(',')]
+  for (const row of rows) {
+    lines.push([
+      cell(runStamp(row.at)),
+      cell(labelOf(row.task)),
+      cell(row.status === 'done' ? t('成功') : row.status === 'failed' ? t('失败') : t('跳过')),
+      cell(String(row.latencyMs)),
+      cell(String(row.tokens)),
+      cell(row.detail || ''),
+    ].join(','))
+  }
+  // `\r\n`：RFC 4180 规定的行尾，也是 Excel 在全平台都认的那一个。
+  const blob = new Blob([`\ufeff${lines.join('\r\n')}\r\n`], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  const stamp = runStamp(Date.now()).replace(/[: ]/g, '-').replace(/-/g, '')
+  anchor.download = `memory-auto-runs-${stamp}.csv`
+  anchor.click()
+  URL.revokeObjectURL(url)
+}
 
 /**
  * 待确认裁决积压卡。
@@ -122,6 +203,18 @@ function PlayIcon(): React.ReactElement {
   return (
     <svg width='10' height='10' viewBox='0 0 24 24' fill='currentColor' aria-hidden>
       <path d='M8 5.5v13l10-6.5z' />
+    </svg>
+  )
+}
+
+/** 导出报告的图标：纸 + 向下的箭头（「拿出去」而不是「刷新」）。 */
+function ExportIcon(): React.ReactElement {
+  return (
+    <svg width='11' height='11' viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round' aria-hidden>
+      <path d='M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z' />
+      <path d='M14 3v5h5' />
+      <path d='M12 11v6' />
+      <path d='m9.5 14.5 2.5 2.5 2.5-2.5' />
     </svg>
   )
 }
@@ -342,8 +435,8 @@ function CadenceDialog({
  * 摊成四行普通文字则会和上面那句说明混成一段。
  *
  * ── 为什么左侧有一条绿竖条 ──────────────────────────────────
- * 12 张卡里哪几张在跑，是这一页最需要一眼看到的分布。开关本身很小（24px），
- * 扫一列 12 个开关要逐个数；一条 3px 的竖条在卡片外缘，余光就能看出「开了几个」。
+ * 11 张卡里哪几张在跑，是这一页最需要一眼看到的分布。开关本身很小（24px），
+ * 扫一列 11 个开关要逐个数；一条 3px 的竖条在卡片外缘，余光就能看出「开了几个」。
  */
 function TaskCard({
   task,
@@ -369,7 +462,8 @@ function TaskCard({
       <div className='mm-auto-card-head'>
         <div className='mm-auto-card-title'>
           <span className='mm-auto-card-name'>{label}</span>
-          {task.task === 'sync' ? <Badge variant='outline' shape='tag'>{t('WebDAV')}</Badge> : null}
+          {/* 「WebDAV」这枚灰徽标随 `sync` 任务一起下线了：WebDAV 同步不再是
+              后台任务，它只活在同步页。名字里带不带 WebDAV 都不影响这里。 */}
           {task.usesModel ? (
             <Badge variant='info' shape='tag' title={t('开它会在后台调模型、消耗额度')}>
               {t('调用模型')}
@@ -652,17 +746,18 @@ function Auto({ onGo }: { onGo: (tab: 'browse') => void }): React.ReactElement {
       </Section>
 
       <Section
-        title={t('执行记录')}
-        hint={t('每次任务跑完（含跳过与失败）都落一行。想知道「昨天 11:00 它到底动了什么」看这里。')}
+        title={t('任务执行审计记录')}
+        hint={t('最近记录的调度耗时、Token 消耗与执行结果详情')}
         action={
           <div className='mm-inline-actions'>
             {runRows > data.recentRuns.length ? (
-              <Button type='button' size='sm' variant='ghost' onClick={() => setShowAllRuns(value => !value)}>
+              <Button type='button' size='sm' variant='outline' onClick={() => setShowAllRuns(value => !value)}>
                 {showAllRuns ? t('只看最近 {n} 条', { n: data.recentRuns.length }) : t('查看全部 {n} 条', { n: num(runRows) })}
               </Button>
             ) : null}
-            <Button type='button' size='sm' variant='ghost' onClick={() => { void refreshQuietly(); if (showAllRuns) allRuns.reload() }}>
-              {t('刷新')}
+            <Button type='button' size='sm' variant='outline' className='mm-run-export' onClick={() => exportRuns(runs, labelOf)}>
+              <ExportIcon />
+              {t('导出报告')}
             </Button>
           </div>
         }
@@ -672,27 +767,29 @@ function Auto({ onGo }: { onGo: (tab: 'browse') => void }): React.ReactElement {
         ) : (
           <div className='mm-run-table'>
             <div className='mm-run-row mm-run-head'>
-              <span>{t('时间')}</span>
-              <span>{t('任务')}</span>
-              <span>{t('结果')}</span>
-              <span>{t('明细')}</span>
-              <span>{t('token')}</span>
+              <span>{t('执行时间')}</span>
+              <span>{t('任务名称')}</span>
+              <span>{t('状态')}</span>
               <span>{t('耗时')}</span>
+              <span>{t('消耗 Token')}</span>
+              <span>{t('执行详情')}</span>
             </div>
             {runs.map((row, index) => (
               <div key={`${row.at}-${row.task}-${index}`} className='mm-run-row'>
-                <span className='mm-muted' title={row.manual ? t('用户点「立即执行」触发') : t('自动轮次触发')}>
-                  {row.atText}
+                <span className='mm-run-at' title={new Date(row.at).toLocaleString()}>
+                  {runStamp(row.at)}
                   {row.repeat > 1 ? <span className='mm-run-manual' title={t('连续 {n} 次相同结果，合并成一行', { n: row.repeat })}>{t('×{n}', { n: row.repeat })}</span> : null}
                   {row.manual ? <span className='mm-run-manual'>{t('手动')}</span> : null}
                 </span>
-                <span>{labelOf(row.task)}</span>
+                <span className='mm-run-task'>{labelOf(row.task)}</span>
                 <span><StatusBadge status={row.status} /></span>
-                {/* 明细是后端 `detail_of` 生成的一句人话，原样显示：
+                <span className='mm-run-latency'>{latencyText(row.latencyMs)}</span>
+                {/* 「消耗 Token」列：跳过与零成本任务是真正的 0，不是没记账 ——
+                    写 0 而不是 `—`，与目标界面一致（0 在这列是有意义的事实）。 */}
+                <span className='mm-mono mm-run-tokens'>{num(row.tokens)}</span>
+                {/* 详情是后端 `detail_of` 生成的一句人话，原样显示：
                     失败/跳过的原因已经在里面，不再拼前缀。 */}
-                <span className='mm-muted mm-run-detail' title={row.detail}>{row.detail || '—'}</span>
-                <span className='mm-mono'>{row.tokens > 0 ? num(row.tokens) : '—'}</span>
-                <span className='mm-mono'>{row.latencyMs} ms</span>
+                <span className='mm-run-detail' title={row.detail || ''}>{row.detail || '—'}</span>
               </div>
             ))}
           </div>

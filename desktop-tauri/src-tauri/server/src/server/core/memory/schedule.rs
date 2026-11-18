@@ -43,7 +43,15 @@ use super::{config, index, store};
 const TICK: Duration = Duration::from_secs(60);
 
 /// 任务名清单（顺序即界面上的展示顺序）。
-pub const TASKS: [&str; 12] = [
+///
+/// ── 为什么 `sync` 不在里面 ──────────────────────────────────
+/// WebDAV 同步有自己的页面（`GET /api/memory/sync` 那一族），配置、账号、
+/// 冲突裁决、预览、手动上传/下载都在那边，语义是「我点一下同步」而不是
+/// 「后台每隔 N 分钟悄悄跑」。把它同时挂成第 12 个自动任务，等于让同一个
+/// 动作有两个入口、两套开关、两份统计 —— 用户关掉卡片上的开关以为停了，
+/// 同步页点一下还是照跑。所以调度器只认这 11 个，`sync` 模块本身照旧
+/// 供同步页使用。
+pub const TASKS: [&str; 11] = [
     "extract",
     "summarize",
     "tag",
@@ -55,7 +63,6 @@ pub const TASKS: [&str; 12] = [
     "index-scan",
     "cleanup",
     "health",
-    "sync",
 ];
 
 /// 每个任务的默认节奏（分钟），与 `config.rs` 里 `auto.tasks` 的默认值保持一致。
@@ -67,7 +74,6 @@ fn default_interval(task: &str) -> i64 {
         // 这里只是「两次之间至少隔多久」的兜底
         "supersede" | "distill" | "cleanup" | "health" => 1_440,
         "consolidate" | "profile" => 10_080,
-        "sync" => 60,
         _ => 30,
     }
 }
@@ -80,9 +86,9 @@ fn task_enabled(task: &str) -> bool {
         return flag;
     }
     // 表里没有这个任务：零 token 的默认开，花 token 的默认关。
-    // `sync` 虽然也不调模型，但它需要先配 WebDAV 才有意义 —— 默认开着只会
-    // 每分钟往日志里写一条「没配远端」，所以这里仍按白名单，不跟
-    // `task_uses_model` 走。
+    // 这里仍然显式写白名单、而不是跟 `task_uses_model` 取补集：万一将来加
+    // 一个「不烧 token 但很吵」的任务（早先 `sync` 就是 —— 没配 WebDAV 时
+    // 每分钟往日志里写一条「没配远端」），它不该因为免费就自动默认开启。
     matches!(task, "classify" | "index-scan" | "cleanup" | "health")
 }
 
@@ -90,7 +96,7 @@ fn task_enabled(task: &str) -> bool {
 ///
 /// ── 为什么单独一个函数，而不是在界面里写死一张表 ──────────────
 /// 「哪个任务花 token」是实现事实，不是界面事实：`classify` 早先调过模型，
-/// 后来改成纯 slug 相似度、`sync` 走 WebDAV 不碰模型。这类变化只在后端可见，
+/// 后来改成纯 slug 相似度。这类变化只在后端可见，
 /// 前端抄一份必然漂移 —— 漂移的后果是界面写着「零成本」而它在扣额度。
 ///
 /// 口径是**当前实现**：`extract` / `summarize` / `tag` / `distill` /
@@ -360,7 +366,7 @@ pub fn apply_task(payload: &Value) -> Result<Value, String> {
 /// 上次执行时间（epoch ms）。
 ///
 /// ── 内存 + 库里的一层 ───────────────────────────────────────
-/// 进程内的 `LAST_RUN` 是热路径（每轮 tick 读 12 次），不能每次都查库；
+/// 进程内的 `LAST_RUN` 是热路径（每轮 tick 读 11 次），不能每次都查库；
 /// 启动时用 `task_run` 的 `MAX(at)` 预热一次（[`hydrate_last_run`]），
 /// 于是重启后页面不会说「还没跑过」，按天任务也不会在同一天跑两遍。
 ///
@@ -546,7 +552,7 @@ fn tick() {
 /// 这条函数是**唯一**知道「这一轮从哪开始、到哪结束」的地方，也是唯一同时
 /// 拿到 `manual` 的地方（自动轮次与手动点击的审计行要能区分）。各任务自己
 /// 的返回值只有 `Outcome`，没有耗时与 token 合计；在这里埋一圈计时即可，
-/// 不用去改十二个任务的签名。
+/// 不用去改十一个任务的签名。
 ///
 /// ── 三个入口都走它 ────────────────────────────────────────
 /// 自动 tick、频道里的手动请求、调度线程没起来时的就地执行，最终都落到
@@ -556,7 +562,7 @@ fn tick() {
 /// ── 为什么 token 用 `llm_call` 的增量算，而不是读 `Outcome` 载荷 ──
 /// 只有少数任务的载荷里带 `tokens`（蒸馏带、摘要不带），字段名还各不相同。
 /// 跑前读一次「今日累计」、跑后再读一次，差就是这一轮烧掉的 —— 与载荷无关，
-/// 十二个任务一套逻辑。
+/// 十一个任务一套逻辑。
 pub fn run_once(task: &str, project: Option<&str>, manual: bool) -> Outcome {
     let before = index::global().tokens_today();
     let started = crate::server::logging::now_ms();
@@ -603,7 +609,6 @@ fn run_inner(task: &str, project: Option<&str>, manual: bool) -> Outcome {
         "profile" => enrich::build_profile(manual),
         "supersede" => supersede_recent(project),
         "consolidate" => consolidate(project, manual),
-        "sync" => super::sync::run(manual),
         other => Outcome::Skipped(format!("未知任务：{other}")),
     }
 }
@@ -657,13 +662,6 @@ fn detail_of(task: &str, outcome: &Outcome) -> String {
                 "index-scan" => format!("重建索引 {} 条", n("indexed")),
                 "cleanup" => format!("清回收站 {} 条，失效入回收站 {} 条", n("trashPurged"), n("supersededTrashed")),
                 "health" => format!("陈旧 {} 条，待确认 {} 条", n("stale"), n("pending")),
-                "sync" => format!(
-                    "上传 {} 个文件（{}），下行 {} 条，冲突 {} 条",
-                    n("packed"),
-                    bytes_text(payload.get("bytes").and_then(Value::as_i64).unwrap_or(0)),
-                    n("pulled"),
-                    n("conflicts"),
-                ),
                 // 将来加了任务但这里没跟上：不编措辞，把载荷压成一行即可，
                 // 至少能看出「它确实干了点什么」。
                 //
@@ -683,23 +681,6 @@ fn short(text: String, max: usize) -> String {
     }
     let cut: String = text.chars().take(max).collect();
     format!("{cut}…")
-}
-
-/// 字节数 → 「5.3MB」。与前端 `sizeText` 同口径（这里只给审计行的摘要用）。
-fn bytes_text(bytes: i64) -> String {
-    if bytes <= 0 {
-        return "0B".to_string();
-    }
-    let value = bytes as f64;
-    if value < 1024.0 {
-        format!("{}B", bytes)
-    } else if value < 1024.0 * 1024.0 {
-        format!("{:.1}KB", value / 1024.0)
-    } else if value < 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.1}MB", value / 1024.0 / 1024.0)
-    } else {
-        format!("{:.2}GB", value / 1024.0 / 1024.0 / 1024.0)
-    }
 }
 
 /// 归类建议：把 `general/` 里未归类的 l1 记忆，按 cwd 的 git 身份补建议。
@@ -1012,8 +993,8 @@ fn consolidate(project: Option<&str>, manual: bool) -> Outcome {
 pub fn status() -> Value {
     let now = crate::server::logging::now_ms();
     // 每个任务的累计统计（跑过几次 / 成了几次 / 烧了多少 token）。
-    // 一次查完再分发，不在下面每个任务里各查一遍 —— 12 个任务 =
-    // 12 次 `GROUP BY`，而它们读的是同一张表的同一批行。
+    // 一次查完再分发，不在下面每个任务里各查一遍 —— 11 个任务 =
+    // 11 次 `GROUP BY`，而它们读的是同一张表的同一批行。
     let stats = index::global().task_stats();
     let tasks: Vec<Value> = TASKS
         .iter()
@@ -1087,7 +1068,7 @@ pub fn status() -> Value {
         // 这里再给一次是因为自动化页不该为了一个数字去拉整个 status。
         "pendingReview": index::global().review_count(),
         // 最近几次执行（「任务执行记录」那张表）。取 30 条：一页表格看得完，
-        // 又不至于把一轮 12 个任务的整轮吞掉一半。
+        // 又不至于把一轮 11 个任务的整轮吞掉一半。
         // `runRows` 是可翻的**行数**，`runCount` 是**执行次数**（合并后的
         // 一行代表多次）—— 前者给「查看全部 N 条」，后者给页面顶部的概览。
         "recentRuns": index::global().recent_task_runs(30),
@@ -1132,7 +1113,9 @@ fn task_summary(task: &str) -> &'static str {
         "index-scan" => "全库文件与索引一致性自检及修复（零成本）",
         "cleanup" => "清理回收站与异常无用记录（零成本）",
         "health" => "",
-        "sync" => "把记忆文件夹打包同步到 WebDAV 远端",
+        // `sync` 不在这里：WebDAV 同步已从自动化任务里摘出去，它有自己的
+        // 页面（`GET /api/memory/sync` 一族）。留一句文案在这里只会让
+        // 「为什么有说明却没有卡」变成下一个要解释的问题。
         _ => "",
     }
 }
@@ -1403,14 +1386,27 @@ mod tests {
             }
             assert!(!task_summary(task).is_empty(), "{task} 没有说明文案");
         }
-        // 零 token 的四个 + sync（它走 WebDAV，不调模型）必须标成零成本：
-        // 界面据此写「零成本」，写错就等于让用户以为一个后台任务在烧钱。
-        for task in ["classify", "index-scan", "cleanup", "health", "sync"] {
+        // 零 token 的四个必须标成零成本：界面据此写「零成本」，写错就等于
+        // 让用户以为一个后台任务在烧钱。
+        for task in ["classify", "index-scan", "cleanup", "health"] {
             assert!(!task_uses_model(task), "{task} 不该被标成调用模型");
         }
         for task in ["extract", "summarize", "tag", "distill", "consolidate", "profile", "supersede"] {
             assert!(task_uses_model(task), "{task} 会调模型，必须标出来");
         }
+    }
+
+    #[test]
+    fn task_labels_cover_exactly_the_scheduler_tasks() {
+        // `status()` 按 `TASKS` 遍历、用 `TASK_LABELS` 取名字：两张表错位就会
+        // 出现「有卡没名」或「有名没卡」。改任何一张都得同步改另一张，
+        // 所以把顺序和内容一起钉住 —— 也让「加任务忘了加标签」在 CI 就炸。
+        assert_eq!(TASKS.len(), super::super::TASK_LABELS.len());
+        for (index, task) in TASKS.iter().enumerate() {
+            assert_eq!(*task, super::super::TASK_LABELS[index].0, "第 {index} 个任务名不一致");
+        }
+        // WebDAV 同步已经摘出自动化：它有自己的页面，不该再出现在这里。
+        assert!(!TASKS.contains(&"sync"), "sync 不该是自动化任务");
     }
 
     #[test]
