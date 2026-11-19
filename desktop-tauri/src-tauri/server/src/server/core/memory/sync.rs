@@ -649,18 +649,44 @@ struct Merge {
     /// 要从本地删掉的（远端已删）
     delete: Vec<String>,
     /// 冲突（不进包，等人工裁决）
-    conflicts: Vec<(String, String, String, String)>,
+    conflicts: Vec<Conflict>,
+}
+
+/// 一条冲突：两侧各是什么版本。
+///
+/// `local` / `remote` 是 `Option` 而不是空串：`None` 的含义是**这一侧没有这个
+/// 文件**（被删了）。原来用四个 `String` 表达不了「一侧已删」—— 空串既可能是
+/// 「删了」也可能只是「哈希没算出来」，于是「本地删、远端改了」这种冲突根本
+/// 进不了队列（见 `merge` 的判据）。数据库里这两列本来就是可空的，存 `NULL`
+/// 不需要改表。
+struct Conflict {
+    path: String,
+    local: Option<String>,
+    remote: Option<String>,
+    base: Option<String>,
+    /// 远端那一侧的体积。裁决「保留本地」之后基线要记**远端版本**，那时得知道
+    /// 它的体积；哈希在冲突行里本来就有，体积没有，所以一并带上。
+    remote_size: Option<u64>,
 }
 
 /// 三方合并：`base`（上次同步后的基线）/ `local` / `remote`。
 ///
-/// 判定规则（每条路径独立）：
-/// - 两边都一样 → 无事发生；
-/// - 只有远端变了（本地 == 基线）→ 采纳远端；
-/// - 只有本地变了（远端 == 基线）→ 保留本地（上行）；
-/// - 两边都变了且结果不同 → 冲突。
-/// - 基线里有、远端包里没有 → 远端删了 → 本地跟着删。
-/// - 基线没有、远端有 → 远端新增 → 直接写下来（除非本地也有一份不同内容）。
+/// 判定规则（每条路径独立），与 AgentHub `sync.cjs` 的 `decide()` 同口径：
+/// - 两边结果一致（含「两边都删了」「两边改成同一版」）→ 无事发生；
+/// - 只有远端变了：远端删了 → 本地跟着删；远端改了 → 采纳远端；
+/// - 只有本地变了（含本地删了）→ 保留本地，上行会把结果推上去；
+/// - 两边都变了且结果不同 → 冲突。**一边是删除也算「变了」**。
+///
+/// ── 为什么「本地删、远端没改」不能把文件拉回来 ──────────────
+/// 基线记的是「上次同步后两边一致的状态」。本地删掉某个文件后，基线里还有它，
+/// 而别的设备的包里同样还有 —— 那一侧相对基线**没变**。只看「本地没有、远端有
+/// → 远端新增，直接写下来」会把本地删除当成「远端新增」处理，于是用户删掉的
+/// 记忆被别的设备的旧包复活（删三条、同步一次全回来）。判据必须两边都跟基线
+/// 比，而不是拿本地跟远端比。
+///
+/// ── 为什么「本地改了、远端删了」要进队列 ────────────────────
+/// 静默保留本地等于**撤销对方的删除**，而对方删之前可能刚把结论挪到了别处。
+/// 记忆是长期事实，猜错一次两台机器就各说一套，所以交给人。
 fn merge(
     base: &BTreeMap<String, FileEntry>,
     local: &BTreeMap<String, FileEntry>,
@@ -676,52 +702,49 @@ fn merge(
     paths.extend(remote.files.keys());
 
     for path in paths {
-        let base_entry = base.get(path);
+        let base_hash = base.get(path).map(|item| item.hash.as_str());
         let local_entry = local.get(path);
         let remote_entry = remote.files.get(path);
         let local_hash = local_entry.map(|item| item.hash.as_str());
         let remote_hash = remote_entry.map(|item| item.hash.as_str());
-        let base_hash = base_entry.map(|item| item.hash.as_str());
 
-        match (local_hash, remote_hash) {
-            (None, None) => {}
-            (Some(l), None) => {
-                // 远端包里没有这条：远端删了它。本地也刚删 → 一致；
-                // 本地还在且相对基线没改过 → 跟着删。
-                if base_hash == Some(l) {
-                    delete.push(path.clone());
-                }
-            }
-            (None, Some(_)) => {
-                // 远端新增：直接写下来。
+        // 两边结果一致（含「两边都没有这个文件」「两边改成同一版」）→ 无事发生。
+        if local_hash == remote_hash {
+            continue;
+        }
+        // 每一侧各自跟**基线**比，而不是拿本地跟远端比。这一条是删除语义的地基：
+        // 「本地删了、远端没动」时 `local_changed` 为真而 `remote_changed` 为假，
+        // 于是走「保留本地」——删除不会被对方的旧包复活。
+        let local_changed = local_hash != base_hash;
+        let remote_changed = remote_hash != base_hash;
+
+        match (local_hash, remote_hash, local_changed, remote_changed) {
+            // 只有远端变了，且远端那个文件不见了 → 远端删了 → 本地跟着删。
+            (_, None, false, true) => delete.push(path.clone()),
+            // 只有远端变了，远端有内容 → 采纳远端（远端新增也落这一支：
+            // 那时本地与基线都是「没有」，本地相对基线没变）。
+            (_, Some(_), false, true) => {
                 if let Some(text) = remote_files.get(path) {
                     down.push((path.clone(), text.clone()));
                 }
             }
-            (Some(l), Some(r)) => {
-                if l == r {
-                    continue;
-                }
-                let local_changed = base_hash != Some(l);
-                let remote_changed = base_hash != Some(r);
-                match (local_changed, remote_changed) {
-                    (false, true) => {
-                        if let Some(text) = remote_files.get(path) {
-                            down.push((path.clone(), text.clone()));
-                        }
-                    }
-                    (true, false) => {}
-                    (true, true) => {
-                        conflicts.push((
-                            path.clone(),
-                            l.to_string(),
-                            r.to_string(),
-                            base_hash.unwrap_or_default().to_string(),
-                        ));
-                    }
-                    (false, false) => {}
-                }
-            }
+            // 只有本地变了 → 保留本地。上行的那一包会把结果推上去，
+            // 别的设备下一轮读到的就是它。
+            (_, _, true, false) => {}
+            // 两边都变了且结果不同 → 冲突。任一侧可能是 `None`（那一侧删了），
+            // 交给裁决的人判断「这边还在、那边删了」到底谁对。
+            (l, r, true, true) => conflicts.push(Conflict {
+                path: path.clone(),
+                local: l.map(str::to_string),
+                remote: r.map(str::to_string),
+                base: base_hash.map(str::to_string),
+                remote_size: remote_entry.map(|item| item.size),
+            }),
+            // 走到这里说明两边的哈希不同、却都相对基线没变 —— 基线里两侧
+            // 一定是同一个值，不可能同时等于两个不同的哈希。留着兜底而不是
+            // `unreachable!()`：同步是后台任务，为一个理论上到不了的分支让
+            // 整轮 panic 不值得。
+            _ => {}
         }
     }
     Merge {
@@ -729,6 +752,25 @@ fn merge(
         delete,
         conflicts,
     }
+}
+
+/// 两边都改过、但内容是**同一个 l1 容器**（两台设备同一天各写了几条）→ 能不能拼。
+///
+/// 返回合并后的全文；拼不了（不是容器 / 节冲突 / 头不一致）返回 `None`，交给
+/// 冲突队列。
+///
+/// ── 为什么要在 `merge` 之外做 ───────────────────────────────
+/// `merge` 只拿得到哈希（清单是 {hash,size}），而容器合并必须看正文。把正文
+/// 塞进 `merge` 意味着每次同步都要把全库读一遍；放在冲突循环里做，只有
+/// **真正冲突的那几条**才读一次本地文件 —— 一次同步通常零到两条。
+///
+/// ── 为什么这条路径优先级高于冲突 ───────────────────────────
+/// l1 一天一文件，两台机器同一天都干活时这个文件必然两边都改过。不合并的话
+/// 用户每个工作日都要裁决一次「今天的日志听谁的」，答案永远是「都要」。
+/// 能拼就拼掉，冲突队列才只剩真需要人判断的。
+fn auto_merge_container(path: &str, remote_text: &str) -> Option<String> {
+    let local_text = read_file(path)?;
+    store::merge_container(&local_text, remote_text)
 }
 
 // ── 一次同步 ─────────────────────────────────────────────────
@@ -764,6 +806,11 @@ pub fn run(manual: bool) -> super::enrich::Outcome {
     let mut deleted = 0usize;
     let mut conflicted = 0usize;
     let mut skipped = 0usize;
+    // 自动合并掉的容器条数。与 `pulled` 分开报：合并是「两边的这一天拼起来」，
+    // 不是「从别的设备拿了一条新的」—— 混在一起会让人以为多出一条记忆。
+    let mut merged = 0usize;
+    // 本轮自动合并过的路径。基线更新时要把它们**退回旧值**（见下面的注释）。
+    let mut merged_paths: BTreeSet<String> = BTreeSet::new();
 
     ensure_remote_dir();
 
@@ -791,13 +838,54 @@ pub fn run(manual: bool) -> super::enrich::Outcome {
                 continue;
             }
         };
-        // 每台设备都重新扫一次本地清单：上一台设备的包可能刚改过本地文件，
+        // ── 空包守卫：远端包声称有 N 个文件、实际一个字节都没带
+        //
+        // 正常的空包（对方确实清空了记忆）不应该触发这里 —— 那种情况下
+        // `manifest.files` 也是空的。这里挡的是**清单与内容不一致**：清单说
+        // 有一百个文件、包里一个都没解出来。这时 `merge` 会得出「远端把这一百个
+        // 全删了」，于是本机把这一百份记忆全部留档后删掉 —— 对端一旦是半截上传
+        // 或打包中途崩，就变成一次跨设备的批量误删。
+        if !manifest.files.is_empty() && files.is_empty() {
+            let message = format!(
+                "同步包 {name} 的清单列了 {} 个文件，但包里一个都读不到（可能上传中断）；本轮跳过该设备，未改动本地",
+                manifest.files.len()
+            );
+            index::global().sync_log_add(&name, "error", &message, false);
+            crate::server::logging::log("[Memory]", &format!("⚠️ {message}"));
+            continue;
+        }
+        // ── 每台设备都重新扫一次本地清单：上一台设备的包可能刚改过本地文件，
         // 用循环外那份旧清单做三方比对会把「刚写下来的内容」当成本地改动。
         let local_now = local_manifest();
         let result = merge(&base, &local_now.files, &manifest, &files);
+        // ── 批量删除守卫：一次下行要删掉一半以上（且至少 10 个）→ 停下来问人
+        //
+        // 与 AgentHub「冲突时暂停上传」同一种取向：宁可这一轮不同步，也不要
+        // 在一轮里把本机大半个记忆库删掉。同步是无人值守的后台任务 —— 删掉
+        // 之后用户可能几天才发现，而删除是本模块唯一不可逆的操作（虽然有
+        // `sync-trash/` 留档，但那只是最后一道保险，不是常规路径）。
+        //
+        // 阈值「一半且至少 10 个」：小记忆库里删 3 个是正常操作，不该被拦；
+        // 大记忆库里一轮删掉一半更像对面出了问题（包被别的设备覆盖、对方清了
+        // 记忆目录、打包中途崩）。
+        if let Some(message) = bulk_delete_guard(local_now.files.len(), result.delete.len()) {
+            index::global().sync_log_add(&name, "error", &message, false);
+            crate::server::logging::log("[Memory]", &format!("⚠️ {message}"));
+            // 这一轮不上传：本地已经被别的设备改过一部分，此时把「半合并」的
+            // 状态推上去会把自己的包覆盖成那个中间态。直接整轮失败，等人处理。
+            index::global().sync_log_add(
+                &device,
+                "error",
+                &format!("本轮未上传：远端包 {name} 触发了批量删除守卫"),
+                false,
+            );
+            return Outcome::Failed(message);
+        }
         // 本台设备这一轮的跳过条数。不能用全局 `skipped` 算 —— 那是累加值，
         // 第二台设备的日志会把第一台的跳过数也扣掉。
         let mut skipped_here = 0usize;
+        // 本台设备这一轮拼起来的条数（与 `skipped_here` 同理：`merged` 是累加值）
+        let mut merged_here = 0usize;
         for (path, text) in &result.down {
             if skip.contains(path) {
                 skipped += 1;
@@ -809,24 +897,84 @@ pub fn run(manual: bool) -> super::enrich::Outcome {
             }
         }
         for path in &result.delete {
-            if remove_file(path) {
-                deleted += 1;
-            }
-        }
-        for (path, local_hash, remote_hash, base_hash) in &result.conflicts {
+            // 跳过名单也要管删除。用户点「忽略」时表达的是「这条别动」——
+            // 若只拦下行写入、不拦删除，对方哪天把这个文件从包里去掉，本机
+            // 就会在用户明确说过「别动」之后把它删掉。
             if skip.contains(path) {
                 skipped += 1;
                 skipped_here += 1;
                 continue;
             }
+            if remove_file(path) {
+                deleted += 1;
+            }
+        }
+        for conflict in &result.conflicts {
+            if skip.contains(&conflict.path) {
+                skipped += 1;
+                skipped_here += 1;
+                continue;
+            }
+            // ── 先试容器自动合并：两边都是「同一天的 l1」，内容能拼
+            //
+            // 判据在 `store::merge_container` 里：按节 id 对齐，两边共有的节
+            // 正文一致、各自独有的节并进来。拼成了就直接落盘、不占冲突队列 ——
+            // 这条路径覆盖的是「两台机器同一天都干了活」，它每个工作日都会发生，
+            // 而答案永远是「两边都要」。
+            //
+            // 落盘用的是 `write_file`（原子写 + 写锁），与下行同一条路径。
+            // 成功后这一条算「已合并」而不是「冲突」：`conflicted` 不增长，
+            // 但它也不进 `pulled` —— 界面上的「下行 N 条」说的是「从别的设备
+            // 拿过来的条数」，合并是两边各出一半，混进去会让人以为多了一条新记忆。
+            if let Some(remote_text) = files.get(&conflict.path) {
+                if let Some(merged_text) = auto_merge_container(&conflict.path, remote_text) {
+                    // 内容已经拼平（上一轮拼过、对方包还没更新）→ 不重复落盘，
+                    // 只算一次「已合并」。否则每次同步都会重写一遍同一个文件，
+                    // 白白刷 mtime 与备份。
+                    if read_file(&conflict.path).as_deref() == Some(merged_text.as_str())
+                        || write_file(&conflict.path, &merged_text)
+                    {
+                        merged += 1;
+                        merged_here += 1;
+                        // **不推进基线**：合并结果只在本机与上传包里，对方的包
+                        // 还是它自己那半份。若把基线记成合并后的哈希，下一轮
+                        // merge 会得到「本地 == 基线、远端变了」→ 把对方那半份
+                        // 覆盖回来，本地独有的节静默消失（与「保留本地」的基线
+                        // 口径是同一个坑，见 `resolve_conflict`）。
+                        // 基线留在旧值上，下一轮两边都算「改过」→ 再拼一次；
+                        // 等对方拉到合并后的包，两边哈希一致，自然收敛。
+                        merged_paths.insert(conflict.path.clone());
+                        // 上一轮进过队列的，现在拼平了 → 把那条待裁决关掉。
+                        // 不关的话它会一直挂在「冲突裁决」里等人点，而点下去
+                        // 是把刚拼好的结果覆盖成半份。
+                        let closed = index::global().conflict_resolve_merged(&conflict.path);
+                        if closed > 0 {
+                            index::global().sync_log_add(
+                                &manifest.device,
+                                "conflict",
+                                &format!("{} → merged（自动拼接，撤销待裁决）", conflict.path),
+                                true,
+                            );
+                        }
+                        continue;
+                    }
+                }
+            }
             conflicted += 1;
             index::global().conflict_enqueue(
-                path,
+                &conflict.path,
                 &manifest.device,
-                local_hash,
-                remote_hash,
-                base_hash,
-                "本地与远端都改过同一份记忆",
+                conflict.local.as_deref(),
+                conflict.remote.as_deref(),
+                conflict.remote_size.unwrap_or(0),
+                conflict.base.as_deref(),
+                if conflict.local.is_none() {
+                    "本地已删，远端改了同一份记忆"
+                } else if conflict.remote.is_none() {
+                    "本地改了，远端删了同一份记忆"
+                } else {
+                    "本地与远端都改过同一份记忆"
+                },
             );
         }
         // 第一次见到这台设备（或它改过显示名）时记下名字，设备列表要用。
@@ -835,10 +983,13 @@ pub fn run(manual: bool) -> super::enrich::Outcome {
             &manifest.device,
             "pull",
             &format!(
-                "下行 {} 条 / 删除 {} 条 / 冲突 {} 条 / 跳过 {} 条",
+                "下行 {} 条 / 拼接 {} 条 / 删除 {} 条 / 冲突 {} 条 / 跳过 {} 条",
                 result.down.len().saturating_sub(skipped_here),
+                merged_here,
                 result.delete.len(),
-                result.conflicts.len(),
+                // 拼掉的不算冲突：`result.conflicts` 是「merge 判出的待处理条数」，
+                // 里面有一部分这一轮已经自动拼平了，照原数报会让人以为还有那么多条要裁决。
+                result.conflicts.len().saturating_sub(merged_here),
                 skipped_here
             ),
             true,
@@ -901,9 +1052,24 @@ pub fn run(manual: bool) -> super::enrich::Outcome {
     for path in &conflicted_paths() {
         next_base.remove(path);
     }
+    // 自动合并过的路径**不能**记进基线。
+    //
+    // 基线记的是「两边一致的状态」，而合并结果此刻只在本机：对方的包里还是它
+    // 自己那半份。把合并后的哈希写进基线，下一轮就是
+    //     localChanged  = 本地 == 基线 → false
+    //     remoteChanged = 远端 != 基线 → true
+    // 于是走「仅远端改」把本机独有的那几节覆盖掉 —— 与「保留本地」裁决的
+    // 基线口径是同一个坑，只是这次受害者是刚拼好的那半天记忆。
+    //
+    // 把这几条从基线里摘掉（=「两边都算改过」），下一轮会再拼一次：拼出来
+    // 的内容与现有文件一致时直接跳过写盘，等对方拉到合并后的包、两边哈希相同
+    // 自然收敛。中间那几轮不会产生冲突条目，也不会重写文件。
+    for path in &merged_paths {
+        next_base.remove(path);
+    }
     save_base(&next_base);
 
-    if pulled > 0 || deleted > 0 {
+    if pulled > 0 || deleted > 0 || merged > 0 {
         let _ = super::index::global().rebuild(&super::store::load_all());
     }
 
@@ -913,6 +1079,9 @@ pub fn run(manual: bool) -> super::enrich::Outcome {
         "deleted": deleted,
         "pushed": pushed,
         "conflicts": conflicted,
+        // 自动拼起来的 l1 容器条数。与 `pulled` 分开：合并是两边各出一半，
+        // 界面上「下行 N 条」说的是「从别的设备拿来的」，混进去会多算。
+        "merged": merged,
         "skipped": skipped,
         "files": manifest.files.len(),
         // 真正进包的文件数。`files` 是「本地清单里有多少个」，两者可能差几个
@@ -928,12 +1097,10 @@ pub fn run(manual: bool) -> super::enrich::Outcome {
 }
 
 fn conflicted_paths() -> Vec<String> {
-    index::global()
-        .conflict_list(200)
-        .into_iter()
-        .filter(|item| item.get("status").and_then(Value::as_str) == Some("pending"))
-        .filter_map(|item| item.get("path").and_then(Value::as_str).map(str::to_string))
-        .collect()
+    // 用**不截断**的查询。原来这里走 `conflict_list(200)`，冲突超过 200 条时
+    // 第 201 条起的路径不会从基线里摘掉 → 下一轮三方比对把它读成「本地没变、
+    // 远端改了」→ 静默采纳远端，还没裁决的冲突被覆盖，而界面上那条还挂着。
+    index::global().conflict_pending_paths()
 }
 
 fn own_package_name(device: &str) -> String {
@@ -976,10 +1143,69 @@ fn write_file(relative: &str, text: &str) -> bool {
 fn remove_file(relative: &str) -> bool {
     let _guard = super::store::lock_writes();
     let path = store::abs(relative);
-    if path.exists() {
-        return std::fs::remove_file(&path).is_ok();
+    if !path.exists() {
+        return false;
     }
-    false
+    // ── 先留档，再删
+    //
+    // 远端「包里没有这个文件」不一定等于「对方真的删了它」：对面包可能被别的
+    // 设备覆盖、对方可能手动清空过记忆目录、传输可能截断。而删除是本模块唯一
+    // 不可逆的操作。所以这里把原字节原样搬进 `sync-trash/<时刻>-<设备>/<原路径>`
+    // 再删活文件 —— 报告里「删除 N 条」之后如果发现删错了，人还能从磁盘上捞。
+    //
+    // 留档失败就不删：宁可这一轮少删一次（下一轮还会再判定一次），也不要
+    // 在没有副本的情况下抹掉用户的记忆。
+    if archive_before_remove(relative, &path).is_err() {
+        crate::server::logging::log(
+            "[Memory]",
+            &format!("⚠️ 同步删除留档失败，本次保留 {relative}（下次同步会再判定）"),
+        );
+        return false;
+    }
+    std::fs::remove_file(&path).is_ok()
+}
+
+/// 把即将同步删除的文件原样搬进 `sync-trash/`。
+///
+/// 保持相对路径（`projects/<slug>/l1/<agent>/2026-11-19.md` 在留档里也是这个
+/// 形状），这样「从留档里捞回来」就是一次复制，不用再查任何映射。
+/// 留档的相对路径：`<时刻>-<设备>/<原相对路径>`。
+///
+/// 纯函数，能离线测 —— 这里最容易错的是「路径段校验」：同步包里的路径来自
+/// 别的设备，`..` 段能让留档写到记忆根目录外面去。
+fn archive_rel_path(relative: &str) -> Result<String, String> {
+    archive_rel_path_at(relative, crate::server::logging::now_ms(), &store::device_id())
+}
+
+/// [`archive_rel_path`] 的可测内核：时刻与设备 id 由调用方给。
+fn archive_rel_path_at(relative: &str, stamp: i64, device: &str) -> Result<String, String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in relative.split('/') {
+        // 只取正常路径段：`..` 与空段一律不认。不认就整条拒绝（这一轮既不留档
+        // 也不删），而不是拼出一个跳出根目录的路径。
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(format!("路径段非法：{relative}"));
+        }
+        parts.push(segment);
+    }
+    if parts.is_empty() {
+        return Err(format!("路径为空：{relative}"));
+    }
+    let device = device.trim();
+    Ok(format!(
+        "{stamp}-{}/{}",
+        if device.is_empty() { "unknown" } else { device },
+        parts.join("/")
+    ))
+}
+
+fn archive_before_remove(relative: &str, path: &Path) -> Result<(), String> {
+    let target = store::sync_trash_root().join(archive_rel_path(relative)?);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("建留档目录失败：{error}"))?;
+    }
+    std::fs::copy(path, &target).map_err(|error| format!("写留档失败：{error}"))?;
+    Ok(())
 }
 
 // ── 基线存取 ─────────────────────────────────────────────────
@@ -1239,24 +1465,40 @@ pub fn resolve_conflict(id: i64, resolution: &str) -> Result<(), String> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let remote_hash = row.get("remoteHash").and_then(Value::as_str).map(str::to_string);
+    // 远端那一侧的体积。老记录里没有这一列（补列时是 NULL），按 0 走 ——
+    // 体积只影响同步预览里显示的大小，不参与「哪边改过」的判定。
+    let remote_size = row.get("remoteSize").and_then(Value::as_u64).unwrap_or(0);
     match resolution {
         // 忽略：把这条路径拉进跳过名单。只把冲突记录标成 resolved 不够 ——
         // 下一轮同步两边内容还是不同，没有跳过名单就会重新入队。
         "ignore" => {
             set_skip(&path, true);
         }
-        // 保留本地：基线改成本地当前哈希。下一轮「本地 == 基线、远端变了」，
-        // 于是本地的内容会被推上去，对方再拉下来 —— 正是用户想要的结果。
-        // 这里如果改成「从基线里删掉」，下一轮会变成「两边都改过」，又冲突一次。
+        // 保留本地：基线记**远端那一侧**的版本，而不是本地当前版本。
+        //
+        // ── 为什么必须是远端 ────────────────────────────────────
+        // 裁决表达的是「我要本地这版」。此刻远端还没收到它，远端包还是旧版。
+        // 若把基线推成本地版本，下一轮 merge 会得到：
+        //     localChanged  = 本地 == 基线 → false
+        //     remoteChanged = 远端 != 基线 → true
+        // 于是走「仅远端改」把本地的裁决结果**用远端旧版覆盖回去**，裁决被静默
+        // 撤销（用户点完「保留本地」，再同步一次改动就没了）。
+        // 记远端版本则相反：本地相对基线算「改过」，远端算「没改」→ 保留本地，
+        // 随后上行把本地这版推上去，语义正确。这与 AgentHub `sync.cjs` 的
+        // `resolve()` 同一口径。
+        //
+        // 远端那一侧是 `None`（远端删了这个文件）时，基线里这一条要删掉：
+        // 「远端没有它」本身就是远端当前状态。删掉之后本地算「新增」，上行会带上。
         "local" => {
             let mut base = load_base();
-            match read_file(&path) {
-                Some(text) => {
+            match remote_hash {
+                Some(hash) => {
                     base.insert(
                         path.clone(),
                         FileEntry {
-                            hash: super::model::content_hash(&text),
-                            size: text.len() as u64,
+                            hash,
+                            size: remote_size,
                         },
                     );
                 }
@@ -1276,12 +1518,27 @@ pub fn resolve_conflict(id: i64, resolution: &str) -> Result<(), String> {
             let name = own_package_name(device_id);
             let bytes = fetch_package(&name)?;
             let (_manifest, files) = unpack(&bytes)?;
-            if let Some(text) = files.get(&path) {
+            // ── 先判「远端已删」，再判「远端有内容」
+            //
+            // 顺序不能反：远端删了这个文件时 `remote_hash` 是 `None`，此时
+            // `files.get(&path)` 也返回 `None` —— 两件事在类型上长得一样。
+            // 若先判「`files` 里没有 → 删本地」，那么「包里该有这条、却读不出
+            // 文本」（解包截断、内容读取失败）也会走到「删本地」，一次网络抖动
+            // 就把用户的记忆删掉。所以「远端有内容」以冲突行里记的哈希为准，
+            // 哈希在而文本不在 = 数据不完整，宁可让用户重同步。
+            if remote_hash.is_some() {
+                let Some(text) = files.get(&path) else {
+                    return Err(format!(
+                        "远端包里缺 {path} 的内容（清单里有、包里读不到），为防误删未改动本地；请重新同步后再裁决"
+                    ));
+                };
                 write_file(&path, text);
             } else {
                 remove_file(&path);
             }
-            // 裁决完之后这条路径两边已经一致，补进基线，下一轮不再当冲突
+            // 裁决完之后这条路径两边已经一致，补进基线，下一轮不再当冲突。
+            // 「保留远端」这一支的基线就是远端当前版本 —— 与「保留本地」相反，
+            // 因为此刻本地已经被写成远端那份了（或已按远端删除）。
             let mut base = load_base();
             match files.get(&path) {
                 Some(text) => {
@@ -1583,6 +1840,25 @@ pub fn purge_cache() -> Result<usize, String> {
     Ok(removed)
 }
 
+/// 这一轮要删掉的文件数是不是「可疑的大批删除」。是则返回一句人能读的说明。
+///
+/// 阈值：`deleting >= 10 && deleting * 2 >= local_files`。
+/// - 至少 10 个：小记忆库（十几个文件）里删掉一半是正常整理，拦下来只会烦人；
+/// - 一半以上：大记忆库里一轮删掉一半，更像对面包出了问题（被别的设备覆盖、
+///   对方清空了记忆目录、打包中途崩），而不是用户真的一次删了一半。
+///
+/// 纯函数，能离线测 —— 这条判据如果写错，要么永远拦（同步变成摆设），
+/// 要么永远不拦（误删没人挡）。
+fn bulk_delete_guard(local_files: usize, deleting: usize) -> Option<String> {
+    if deleting < 10 || deleting * 2 < local_files {
+        return None;
+    }
+    Some(format!(
+        "远端包要求删除本机 {deleting} 个文件（本机共 {local_files} 个），一次删掉这么多更像对面出了问题；本轮已中止，本地未改动。\
+         先确认对端设备的记忆目录是不是被清过 / 包是不是被覆盖；确实要删的话，把「同步总开关」暂时关掉，在同步页「打开目录」里备份远端包，再逐条手工删本机文件，最后重新打开同步"
+    ))
+}
+
 /// 同步包所在目录（给「打开目录」用）。
 pub fn package_dir() -> PathBuf {
     store::root()
@@ -1597,6 +1873,37 @@ mod tests {
             hash: hash.to_string(),
             size: 1,
         }
+    }
+
+    #[test]
+    fn archive_path_keeps_the_relative_layout() {
+        // 留档保持原相对路径：从留档里捞回来就是一次复制，不用查映射
+        let path = archive_rel_path_at("projects/o--r/l1/manual/2026-11-19.md", 1_700_000_000_000, "dev1")
+            .expect("正常路径应通过");
+        assert_eq!(path, "1700000000000-dev1/projects/o--r/l1/manual/2026-11-19.md");
+    }
+
+    #[test]
+    fn archive_path_rejects_traversal() {
+        // 同步包里的路径来自别的设备：`..` 段能让留档写到记忆根目录外面去
+        assert!(archive_rel_path_at("../escape.md", 1, "dev").is_err());
+        assert!(archive_rel_path_at("a/../../b.md", 1, "dev").is_err());
+        assert!(archive_rel_path_at("", 1, "dev").is_err());
+        assert!(archive_rel_path_at("a//b.md", 1, "dev").is_err());
+    }
+
+    #[test]
+    fn bulk_delete_guard_only_stops_big_deletions() {
+        // 小记忆库删几条不拦：那是正常整理
+        assert!(bulk_delete_guard(12, 5).is_none());
+        // 大记忆库里删掉一半 → 拦
+        assert!(bulk_delete_guard(200, 120).is_some());
+        // 一半但不到 10 个 → 不拦
+        assert!(bulk_delete_guard(12, 7).is_none());
+        // 恰好一半且够 10 个 → 拦（`deleting * 2 >= local_files` 含等号）
+        assert!(bulk_delete_guard(20, 10).is_some());
+        // 什么都没删 → 不拦
+        assert!(bulk_delete_guard(200, 0).is_none());
     }
 
     #[test]
@@ -1656,7 +1963,7 @@ mod tests {
     #[test]
     fn local_deletion_alone_is_not_propagated() {
         // 本地已经删了、远端还在：不该反过来去删远端，也不该把文件又拉下来
-        // （`(None, Some(_))` 分支只处理「远端新增」，这里远端相对基线没变）
+        // （远端相对基线没变，走「保留本地」那一支）
         let mut base = BTreeMap::new();
         base.insert("a.md".to_string(), entry("h1"));
         let local = BTreeMap::new();
@@ -1665,6 +1972,78 @@ mod tests {
         let result = merge(&base, &local, &remote, &BTreeMap::new());
         assert!(result.delete.is_empty());
         assert!(result.down.is_empty());
+        assert!(result.conflicts.is_empty());
+    }
+
+    #[test]
+    fn remote_new_file_is_pulled() {
+        // 基线没有、本地没有、远端有 → 远端新增，直接写下来。
+        // （新判据里这一条落在「仅远端变了」：本地与基线都是「没有」。）
+        let base = BTreeMap::new();
+        let local = BTreeMap::new();
+        let mut remote = Manifest::empty("dev");
+        remote.files.insert("a.md".to_string(), entry("h9"));
+        let mut files = BTreeMap::new();
+        files.insert("a.md".to_string(), "brand new".to_string());
+        let result = merge(&base, &local, &remote, &files);
+        assert_eq!(result.down.len(), 1);
+        assert!(result.conflicts.is_empty());
+        assert!(result.delete.is_empty());
+    }
+
+    #[test]
+    fn local_deletion_against_remote_change_is_a_conflict() {
+        // 本地删了、远端改了 → 冲突。不能静默把文件拉回来（用户的删除被撤销），
+        // 也不能静默保留删除（对方刚写的内容凭空消失）。
+        let mut base = BTreeMap::new();
+        base.insert("a.md".to_string(), entry("h1"));
+        let local = BTreeMap::new();
+        let mut remote = Manifest::empty("dev");
+        remote.files.insert("a.md".to_string(), entry("h2"));
+        let mut files = BTreeMap::new();
+        files.insert("a.md".to_string(), "remote edit".to_string());
+        let result = merge(&base, &local, &remote, &files);
+        assert!(result.down.is_empty(), "不能把用户删掉的文件拉回来");
+        assert_eq!(result.conflicts.len(), 1);
+        let conflict = &result.conflicts[0];
+        assert!(conflict.local.is_none(), "本地那一侧应记为「没有」");
+        assert_eq!(conflict.remote.as_deref(), Some("h2"));
+    }
+
+    #[test]
+    fn local_change_against_remote_deletion_is_a_conflict() {
+        // 本地改了、远端删了 → 冲突。静默保留本地等于撤销对方的删除。
+        let mut base = BTreeMap::new();
+        base.insert("a.md".to_string(), entry("h1"));
+        let mut local = BTreeMap::new();
+        local.insert("a.md".to_string(), entry("h2"));
+        let remote = Manifest::empty("dev");
+        let result = merge(&base, &local, &remote, &BTreeMap::new());
+        assert!(result.delete.is_empty(), "不能删掉用户刚改过的本地文件");
+        assert_eq!(result.conflicts.len(), 1);
+        let conflict = &result.conflicts[0];
+        assert_eq!(conflict.local.as_deref(), Some("h2"));
+        assert!(conflict.remote.is_none(), "远端那一侧应记为「没有」");
+    }
+
+    #[test]
+    fn keep_local_baseline_follows_remote_so_the_decision_survives() {
+        // 回归：裁决「保留本地」后基线必须记**远端**版本。
+        //
+        // 场景：本地 h2 / 远端 h1 / 基线 h1，用户裁决保留本地。
+        // 基线记远端（h1）时，下一轮 merge 得到 localChanged=true、remoteChanged=false
+        // → 保留本地，裁决成立。
+        // 若基线记成本地（h2），下一轮得到 localChanged=false、remoteChanged=true
+        // → 采纳远端，本地 h2 被 h1 覆盖 —— 这正是修掉的那个 bug。
+        let mut base = BTreeMap::new();
+        base.insert("a.md".to_string(), entry("h1"));
+        let mut local = BTreeMap::new();
+        local.insert("a.md".to_string(), entry("h2"));
+        let mut remote = Manifest::empty("dev");
+        remote.files.insert("a.md".to_string(), entry("h1"));
+
+        let result = merge(&base, &local, &remote, &BTreeMap::new());
+        assert!(result.down.is_empty(), "基线已是远端版本，本地改动不该被覆盖");
         assert!(result.conflicts.is_empty());
     }
 

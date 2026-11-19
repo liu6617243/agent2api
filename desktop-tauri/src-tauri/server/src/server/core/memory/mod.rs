@@ -1538,11 +1538,16 @@ pub fn purge(id: &str) -> Result<Value, String> {
 }
 
 /// 清空回收站（`storage.trashKeepDays` 到期的清理任务也走它）。
+///
+/// 顺手清一次同步删除留档（`sync-trash/`）：两者共用一个保留窗口，
+/// 用户点「清空回收站」时脑子里想的就是「把删掉的东西真的删掉」，
+/// 留档偏偏是另一份「删掉的东西」，不一起清就等于骗人。
 pub fn purge_trash() -> Value {
     let days = config::usize_of("storage.trashKeepDays").max(1);
     let removed = store::purge_expired_trash(days);
+    let archived = store::purge_expired_sync_trash(days);
     bump_revision();
-    json!({ "removed": removed, "keepDays": days })
+    json!({ "removed": removed, "syncTrashRemoved": archived, "keepDays": days })
 }
 
 /// 回收站文件清单（界面上「回收站」那张表的数据源）。

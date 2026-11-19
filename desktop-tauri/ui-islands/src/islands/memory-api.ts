@@ -584,9 +584,18 @@ export type SyncConflict = {
   id: number
   path: string
   device: string
+  /**
+   * 本地 / 远端 / 基线三侧的哈希。
+   *
+   * `null` 不是「算不出来」，而是**这一侧没有这个文件**（删了）。界面上必须能把
+   * 它显示成「已删除」—— 「本地删了、远端改了」和「两边都改了」需要的判断完全
+   * 不同，拿一个空哈希糊过去等于让用户在不知道发生了什么的情况下选边。
+   */
   localHash: string | null
   remoteHash: string | null
   baseHash: string | null
+  /** 远端那一侧的体积（字节）。裁决「保留本地」时基线要记远端那一版，用它。 */
+  remoteSize?: number
   detail: string | null
   status: string
   createdAt: number

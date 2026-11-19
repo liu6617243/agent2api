@@ -135,6 +135,26 @@ pub fn trash_root() -> PathBuf {
     root().join("trash")
 }
 
+/// 同步删除留档目录：`sync-trash/<时间戳>-<设备 id>/<原相对路径>`。
+///
+/// ── 为什么不直接进 `trash/` ─────────────────────────────────
+/// `trash/` 里的文件是**记忆条目**：一条一个 `.md`、frontmatter 里有
+/// `deleted_at` / `origin_path`，`load_all` 会把它读成一条「已删除的记忆」，
+/// 于是能在界面上按 id 恢复。而同步删除的是一**个文件**，可能是 l1 容器
+/// （一天一文件、里面几十节），把它整份塞进 `trash/` 会被当成一条垃圾记忆：
+/// 标题取到第一行、正文混着所有节、恢复按单条写回 —— 数据形状就错了。
+///
+/// 所以同步删除走另一条路：原文件**原样留档**在这个目录里（保持相对路径），
+/// 不进索引、不进同步包、不出现在回收站列表。它的用途只有一个 —— 真删错了
+/// 的时候，人还能从磁盘上把那份字节捞回来。
+///
+/// 为什么要留档而不是物理删：远端「包里没有这个文件」这个信号本身可能是错的
+/// （对面包被别的设备覆盖、对方手动清空过记忆目录、传输途中截断）。而删除是
+/// 唯一不可逆的操作：一条记忆没了，两台机器就再也对不上「当时是怎么判断的」。
+pub fn sync_trash_root() -> PathBuf {
+    root().join("sync-trash")
+}
+
 /// 配置文件本身的路径：**固定**在默认目录下，绝不调用 [`root()`]。
 ///
 /// 为什么不能写成 `root().join("config.json")`：`root()` 要读 `storage.root`，
@@ -163,7 +183,16 @@ pub fn device_file() -> PathBuf {
 
 /// 建齐目录。幂等，每次访问前调用（允许用户中途手工删掉某个子目录）。
 pub fn ensure_layout() -> Result<(), String> {
-    for dir in [root(), projects_root(), general_root(), profile_root(), trash_root()] {
+    for dir in [
+        root(),
+        projects_root(),
+        general_root(),
+        profile_root(),
+        trash_root(),
+        // 同步删除留档目录：建出来才能保证「先留档、再删」这一步在首次同步时
+        // 不会因为目录不存在而失败（失败就整条不删，同步表现成「删不掉」）。
+        sync_trash_root(),
+    ] {
         fs::create_dir_all(&dir).map_err(|error| format!("创建记忆目录失败 {}：{error}", dir.display()))?;
     }
     Ok(())
@@ -432,6 +461,112 @@ fn strip_section(text: &str, id: &str) -> (String, bool) {
         }
     }
     (out, removed)
+}
+
+/// 把容器文本按 id 分出「节 id → 这一节的正文（含 `## HH:MM · 标题` 行）」。
+///
+/// 同步合并要的是**原始切片**，而不是 [`split_sections`] 那种去掉标题行、
+/// 只留正文的形状：合并结果要原样写回去，重新渲染一遍标题行会丢掉用户手改的
+/// 文案。返回 `None` 表示文件根本不是容器（没有 `type: daily-log` 头）。
+fn container_sections(text: &str) -> Option<(String, Vec<(String, String)>)> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    // 容器头 = 第一个 `<!-- mem ... -->` 之前的部分。不是容器就没有标记行，
+    // 或者头里没有 `daily-log`，两种情况都返回 `None`。
+    let first_marker = normalized.find("<!-- mem ")?;
+    let head = &normalized[..first_marker];
+    if !head.contains("type: daily-log") {
+        return None;
+    }
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut current: Option<(String, String)> = None;
+    for line in normalized[first_marker..].lines() {
+        if let Some(meta) = parse_marker(line) {
+            if let Some(done) = current.take() {
+                sections.push(done);
+            }
+            let id = meta
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            current = Some((id, format!("{line}\n")));
+            continue;
+        }
+        if let Some((_, body)) = current.as_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if let Some(done) = current {
+        sections.push(done);
+    }
+    Some((head.to_string(), sections))
+}
+
+/// 把两份**同一个 l1 容器**（两台设备各写过同一天）拼成一份。拼不了就返回 `None`。
+///
+/// ── 判据为什么不是「按行 diff」────────────────────────────
+/// l1 容器的形状是「头 + 一串 `<!-- mem {json} -->` 开头的节」，每节带稳定 id。
+/// 同一天的容器在两个设备上几乎必然共有几节（同步过），各自又有对方没有的新节
+/// （那天各写了几条）。所以判据是**按节 id 对齐**：
+/// - 两边都有的 id：正文必须一模一样，否则真冲突（同一条被两边各改了一版，
+///   拼不了，交给人）；
+/// - 只有一边有的 id：直接并进来（对方那天多写的，本机没有）。
+///
+/// 这与 AgentHub `tryMergeDailyFiles` 同口径，只是它按 `time` 排序后再渲染，
+/// 这里保留各自的原始切片、按「本地节在前、远端新增节在后」排列 —— 原始切片
+/// 里带着对方写的可读性标题，重新渲染会改掉用户看得见的东西。
+///
+/// ── 为什么这条路径值得特别做 ────────────────────────────────
+/// l1 是「一天一文件」，两台机器同一天都干活时这个文件**必然**两边都改过。
+/// 不合并的话，每次同步都会往冲突队列里塞一条，用户每个工作日都要裁决一次
+/// 「今天的日志听谁的」—— 而这个答案其实是「都要」。合并掉它，冲突队列才
+/// 只剩真正需要人判断的那些。
+pub(crate) fn merge_container(local: &str, remote: &str) -> Option<String> {
+    let (local_head, local_sections) = container_sections(local)?;
+    let (remote_head, remote_sections) = container_sections(remote)?;
+    // 头不一致（agent / project / date 被改过）就不猜：头决定这个文件属于哪天、
+    // 哪个 agent，猜错会把记忆挂到错的地方。
+    if local_head.trim() != remote_head.trim() {
+        return None;
+    }
+    let known: std::collections::HashSet<&str> =
+        local_sections.iter().map(|(id, _)| id.as_str()).collect();
+    let mut merged = local_sections.clone();
+    for (id, body) in &remote_sections {
+        // ── 没有 id 的节（用户手写的段落 / 早期格式）──
+        //
+        // 空 id 不能按「id 相同」处理：两份文件里各有几段没 id 的正文时，它们
+        // 的 id 都是空串，按 id 对齐会把「不同的两段」判成「同一条改了两版」，
+        // 明明能拼的内容被判成冲突。这里退化成按正文去重：本机已有完全相同
+        // 的一段就跳过，否则并进来。
+        if id.is_empty() {
+            if !merged.iter().any(|(_, existing)| existing.trim_end() == body.trim_end()) {
+                merged.push((id.clone(), body.clone()));
+            }
+            continue;
+        }
+        // 远端这一节是不是「本机已有」用哈希集合判：容器可能有几百节，
+        // 每节都线性扫一遍是 O(n²)。
+        if known.contains(id.as_str()) {
+            let Some((_, existing)) = merged.iter().find(|(existing, _)| existing == id) else {
+                return None;
+            };
+            // 同一条两边都在：正文必须一字不差，否则是真冲突
+            if existing.trim_end() != body.trim_end() {
+                return None;
+            }
+        } else {
+            // 远端那天多写的节：并到后面
+            merged.push((id.clone(), body.clone()));
+        }
+    }
+    let mut out = local_head;
+    for (_, body) in merged {
+        out.push_str(body.trim_end());
+        out.push_str("\n\n");
+    }
+    Some(out)
 }
 
 /// 把一条 l1 记忆写进（或更新到）它所属的当天容器。
@@ -1022,6 +1157,45 @@ pub fn purge_expired_trash(days: usize) -> usize {
     removed
 }
 
+/// 清掉超过保留天数的**同步删除留档**（见 [`sync_trash_root`]）。返回删掉的目录数。
+///
+/// ── 为什么要清 ──────────────────────────────────────────────
+/// 留档是「删错了还能捞回来」的保险，不是永久归档。l1 容器一天一份、每份几十 KB，
+/// 一次误判的批量删除会留下上百份副本；不清的话它会随同步次数单调增长，
+/// 而用户根本不知道那个目录存在。所以给它和回收站同一个保留窗口。
+///
+/// ── 为什么按「批次目录」整份删 ────────────────────────────────
+/// 一个批次目录（`<时刻>-<设备>/`）是同一轮同步删掉的所有文件，它们的价值是同
+/// 一份：要捞就是整批一起捞，捞一条没有意义（其它同批的早被同样的判断删了）。
+/// 按目录删也让「删了一半」不会发生 —— 保留窗口到了就整批走。
+///
+/// 按目录 mtime 判：目录 mtime 是「最后一次往里写文件」的时刻，也就是这一批
+/// 删除真正完成的时刻，比 `created_at` 这类记账字段可信。
+pub fn purge_expired_sync_trash(days: usize) -> usize {
+    let days = days.max(1) as i64;
+    let cutoff = now_ms() - days * 24 * 3600 * 1000;
+    let Ok(reader) = fs::read_dir(sync_trash_root()) else { return 0 };
+    let mut removed = 0usize;
+    for item in reader.flatten() {
+        let path = item.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let stamp = fs::metadata(&path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0);
+        // `stamp == 0` 说明读不到 mtime（权限 / 文件系统不支持）：这种**不删**。
+        // 留档本身就是最后一道保险，读不准的时候留下比删掉安全。
+        if stamp > 0 && stamp < cutoff && fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,6 +1276,77 @@ mod tests {
         let meta = parse_marker(line.trim_end()).expect("能解析");
         assert_eq!(meta.get("title").and_then(Value::as_str), Some("标题 里 有 空格"));
         assert_eq!(meta.get("tags").and_then(Value::as_array).map(Vec::len), Some(2));
+    }
+
+    /// 造一份「某一天的 l1 容器」。
+    fn container(day: &str, entries: &[(&str, &str)]) -> String {
+        let mut text = container_head(day, "manual", None);
+        for (id, body) in entries {
+            let entry = MemoryEntry::draft(*id, "标题", MemoryKind::Daily, *body);
+            text.push_str(&section_text(&entry));
+        }
+        text
+    }
+
+    #[test]
+    fn container_merge_joins_each_sides_own_sections() {
+        // 两台机器同一天各写了一条：共用 a1，各有一条对方没有的
+        let local = container("2026-11-16", &[("a1", "共用那条"), ("a2", "本机新写的")]);
+        let remote = container("2026-11-16", &[("a1", "共用那条"), ("a3", "对方新写的")]);
+        let merged = merge_container(&local, &remote).expect("能拼");
+        assert!(merged.contains("共用那条"));
+        assert!(merged.contains("本机新写的"));
+        assert!(merged.contains("对方新写的"));
+        // 共用那一条不能重复出现（按 id 对齐，不是简单拼接）
+        assert_eq!(merged.matches("共用那条").count(), 1);
+    }
+
+    #[test]
+    fn container_merge_refuses_when_the_same_id_differs() {
+        // 同一个 id 两边各改了一版 → 真冲突，不能猜
+        let local = container("2026-11-16", &[("a1", "我改的版本")]);
+        let remote = container("2026-11-16", &[("a1", "对方改的版本")]);
+        assert!(merge_container(&local, &remote).is_none());
+    }
+
+    #[test]
+    fn container_merge_refuses_different_days() {
+        // 头不一样（不同日期 / 不同 agent）→ 根本不是同一个容器，不猜
+        let local = container("2026-11-16", &[("a1", "一")]);
+        let remote = container("2026-11-17", &[("a1", "一")]);
+        assert!(merge_container(&local, &remote).is_none());
+    }
+
+    #[test]
+    fn container_merge_refuses_plain_notes() {
+        // 普通 l2 单条不是容器 → 不参与这种合并（它没有节 id 可对齐）
+        let plain = "---\nid: x\ntitle: 结论\n---\n\n正文\n";
+        assert!(merge_container(plain, plain).is_none());
+    }
+
+    #[test]
+    fn container_merge_keeps_the_head_once() {
+        // 头只能出现一次：拼出来的必须是「一份容器」，不是两份文件首尾相接
+        let local = container("2026-11-16", &[("a1", "一")]);
+        let remote = container("2026-11-16", &[("a2", "二")]);
+        let merged = merge_container(&local, &remote).expect("能拼");
+        assert_eq!(merged.matches("type: daily-log").count(), 1);
+        assert_eq!(merged.matches("date: 2026-11-16").count(), 1);
+    }
+
+    #[test]
+    fn container_merge_treats_empty_id_sections_by_content() {
+        // 没有 id 的节（手写段落 / 早期格式）不能按「id 都是空串」对齐 ——
+        // 那会把两段不同的正文判成「同一条改了两版」，明明能拼的判成冲突。
+        let local = container("2026-11-16", &[("", "本机手写的一段")]);
+        let remote = container("2026-11-16", &[("", "对方手写的一段")]);
+        let merged = merge_container(&local, &remote).expect("无 id 的段落应能并进来");
+        assert!(merged.contains("本机手写的一段"));
+        assert!(merged.contains("对方手写的一段"));
+
+        // 同一段完全相同 → 只留一份，不重复
+        let same = merge_container(&local, &local).expect("能拼");
+        assert_eq!(same.matches("本机手写的一段").count(), 1);
     }
 
     #[test]

@@ -82,6 +82,8 @@ type LastSummary = {
   deleted?: number
   pushed?: number
   conflicts?: number
+  /** 自动拼起来的 l1 容器条数（两台机器同一天都写过日志）。 */
+  merged?: number
   skipped?: number
   bytes?: number
 }
@@ -102,6 +104,9 @@ function stageText(summary: LastSummary | null, running: boolean): string {
     parts.push(t('上传 {size}', { size: sizeText(summary.bytes) }))
   }
   if (summary.pulled) parts.push(t('下行 {n} 条', { n: summary.pulled }))
+  // 「拼接」而不是「合并」：这条说的是**同一天的日志被拼成一份**，不是两条记忆
+  // 被合成一条。用「合并」会和「合并项目」撞词，而那件事会改项目归属。
+  if (summary.merged) parts.push(t('拼接 {n} 条', { n: summary.merged }))
   if (summary.deleted) parts.push(t('删除 {n} 条', { n: summary.deleted }))
   if (summary.conflicts !== undefined) parts.push(t('冲突 {n} 条', { n: summary.conflicts }))
   return parts.length > 0 ? `${t('同步完成：')}${parts.join(' · ')}` : t('同步完成，没有变化')
@@ -336,7 +341,15 @@ function Sync(): React.ReactElement {
   if (!data) return <Empty>{t('读不到同步状态。')}</Empty>
 
   const devices = data.devices?.devices ?? []
-  const pending = conflicts.data?.conflicts ?? []
+  // 后端把「待裁决」排在前面，但**没有过滤掉已裁决的**（那张表是历史留痕：
+  // 裁决过的行会保留 status=resolved，供流水追溯）。页面这一栏说的是「要你
+  // 处理的」，所以这里必须按 status 过滤 —— 否则点完「保留本地」，那一条还
+  // 挂在原位，用户会以为没生效，再点一次。
+  const conflictRows = conflicts.data?.conflicts ?? []
+  const pending = conflictRows.filter(row => row.status === 'pending')
+  // 「N 条待裁决」用后端的**总数**，不是这一页的行数：`conflict_list(200)` 截断到
+  // 200 条，用行数报会在第 201 条起永久少报，而且没有任何提示。
+  const pendingTotal = conflicts.data?.count ?? pending.length
   const summary = (lastRun?.result ?? data.lastResult ?? null) as LastSummary | null
   const running = busy === 'run'
   const badge = runBadge(data.configured, running, lastRun, data.lastSyncAt)
@@ -905,19 +918,26 @@ function Sync(): React.ReactElement {
         <div className='mm-cfg-card-head'>
           <div className='mm-cfg-card-title'>
             {t('冲突裁决')}
-            <span className='mm-sync-info' title={t('两边都改且内容不同时进队列，一律等人裁决 —— 自动挑一边必然丢掉另一边的工作。')}>i</span>
+            {/* 这句原来写「一律等人裁决」。加了 l1 容器按节拼接之后它不再成立
+                （同一份「某天的日志」两台机器各写几条时会自动拼平），所以改成
+                「不自动**挑边**」—— 拼接不是挑边，它是两边都留下；真正需要选
+                一边的情形仍然一律进队列。 */}
+            <span className='mm-sync-info' title={t('两边都改且内容不同时进队列，等人裁决 —— 自动挑一边必然丢掉另一边的工作。同一天的日志能按节拼起来的会先拼平，拼不平的才进这里。')}>i</span>
           </div>
           <div className='mm-cfg-card-actions'>
             {/* 一行小字而不是徽标：零条是好消息，给它一个绿色圆角框会显得
                 页面到处都在「报警/OK」。这里只想让人扫到「有没有要处理的」，
                 有的话按下面会列出条目，标题行不必抢戏。
                 两段之间用 · 分隔而不是靠 gap：它们在读的时候是一句话
-                （「0 条待裁决，且一律不合并」），不该被当成两栏。 */}
-            <span className={pending.length > 0 ? 'mm-sync-flag-warn' : 'mm-cfg-card-note'}>
-              {t('{n} 条待裁决', { n: pending.length })}
+                （「0 条待裁决，且不自动挑边」），不该被当成两栏。 */}
+            <span className={pendingTotal > 0 ? 'mm-sync-flag-warn' : 'mm-cfg-card-note'}>
+              {t('{n} 条待裁决', { n: pendingTotal })}
             </span>
             <span className='mm-cfg-card-note'>·</span>
-            <span className='mm-cfg-card-note'>{t('一律不自动合并')}</span>
+            {/* 「不自动挑边」不是「不自动合并」：同一天的日志会按节拼平（两边
+                的内容都留下），那是合并、但没挑边。原句写「一律不自动合并」，
+                与新行为直接矛盾 —— 用户看到一次「拼接 1 条」就会发现这行在骗人。 */}
+            <span className='mm-cfg-card-note'>{t('不自动挑边')}</span>
           </div>
         </div>
 
@@ -934,10 +954,17 @@ function Sync(): React.ReactElement {
               <span className='mm-muted'>{t('来自设备 {device}', { device: row.device })}</span>
               <span className='mm-muted' title={fullTime(row.createdAt)}>{timeText(row.createdAt)}</span>
             </div>
-            {row.detail ? <div className='mm-muted'>{row.detail}</div> : null}
+            {/* `detail` 是后端写入的原因（「本地已删、远端改了」这类）。它本身
+                就是一句中文，所以按「中文即键」的规矩过一遍 `t()`：词典里有就
+                翻译，没有就原样显示 —— 不包这一层，非中文界面上这段原因永远是
+                中文，而它恰恰是用户判断「该留哪边」的唯一依据。 */}
+            {row.detail ? <div className='mm-muted'>{t(row.detail)}</div> : null}
             <div className='mm-conflict-hashes'>
-              <span>{t('本地')} <code>{row.localHash?.slice(0, 12) ?? '—'}</code></span>
-              <span>{t('远端')} <code>{row.remoteHash?.slice(0, 12) ?? '—'}</code></span>
+              {/* 三侧各是什么。`null` 哈希 = 这一侧没有这个文件（删了），
+                  必须显示成「已删除」而不是「—」：用户要选的正是「删除还是改动
+                  说了算」，把删除显示成空白等于把判断依据藏起来。 */}
+              <span>{t('本地')} <code>{row.localHash?.slice(0, 12) ?? t('已删除')}</code></span>
+              <span>{t('远端')} <code>{row.remoteHash?.slice(0, 12) ?? t('已删除')}</code></span>
               <span>{t('基线')} <code>{row.baseHash?.slice(0, 12) ?? '—'}</code></span>
             </div>
             <div className='mm-detail-actions'>
@@ -948,7 +975,7 @@ function Sync(): React.ReactElement {
                 {t('保留远端')}
               </Button>
               <Button type='button' size='sm' variant='ghost' onClick={() => void act(`c${row.id}`, () => m.resolveSyncConflict(row.id, 'ignore'))}>
-                {t('忽略（两个都留着）')}
+                {t('忽略（这条不再同步）')}
               </Button>
             </div>
           </div>

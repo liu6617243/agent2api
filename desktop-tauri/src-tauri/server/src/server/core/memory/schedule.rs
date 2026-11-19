@@ -882,6 +882,9 @@ fn best_project_match(
 fn cleanup(manual: bool) -> Outcome {
     let days = config::usize_of("storage.trashKeepDays").max(1);
     let removed = store::purge_expired_trash(days);
+    // 同步删除留档共用同一个保留窗口：它是「删错了能捞回来」的保险，
+    // 不是永久归档。不清的话一批误判删除会在磁盘上留一辈子。
+    let archived = store::purge_expired_sync_trash(days);
     let now = crate::server::logging::now_ms();
     let entries = store::load_all();
     let mut trashed = 0usize;
@@ -1035,11 +1038,14 @@ fn cleanup(manual: bool) -> Outcome {
         }
     }
 
-    if removed == 0 && trashed == 0 && purged_rows == 0 && !manual {
+    if removed == 0 && trashed == 0 && purged_rows == 0 && archived == 0 && !manual {
         return Outcome::Skipped("没有需要清理的内容".into());
     }
     Outcome::Done(json!({
         "trashPurged": removed,
+        // 同步删除留档清掉的批次数。单独报而不并进 `trashPurged`：那一栏在界面上
+        // 说的是「回收站」，而留档根本不在回收站里，混在一起用户会对不上数。
+        "syncTrashPurged": archived,
         "supersededTrashed": trashed,
         "indexPurged": purged_rows,
         "kinds": touched,

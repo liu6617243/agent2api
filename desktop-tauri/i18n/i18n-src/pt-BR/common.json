@@ -947,5 +947,12 @@
   "待填 WebDAV 账号": "Conta WebDAV pendente",
   "电脑名（下方设备列表里显示）": "Nome do computador (aparece na lista de dispositivos abaixo)",
   "还没填 WebDAV 密码": "Senha WebDAV ainda não preenchida",
-  "WebDAV 地址是空的": "O endereço WebDAV está vazio"
+  "WebDAV 地址是空的": "O endereço WebDAV está vazio",
+  "已删除": "excluído",
+  "本地已删，远端改了同一份记忆": "Excluído localmente, alterado remotamente",
+  "本地改了，远端删了同一份记忆": "Alterado localmente, excluído remotamente",
+  "拼接 {n} 条": "Juntar {n}",
+  "不自动挑边": "sem escolha automática de lado",
+  "两边都改且内容不同时进队列，等人裁决 —— 自动挑一边必然丢掉另一边的工作。同一天的日志能按节拼起来的会先拼平，拼不平的才进这里。": "Os dois lados mudaram de formas diferentes → entra na fila para decisão humana. Escolher um lado automaticamente sempre perde o trabalho do outro. Logs do mesmo dia que podem ser unidos seção a seção são unidos primeiro; só o que não pode ser unido aparece aqui.",
+  "忽略（这条不再同步）": "Ignorar (não sincronizar este item)"
 }

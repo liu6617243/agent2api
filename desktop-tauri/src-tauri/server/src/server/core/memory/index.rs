@@ -316,12 +316,17 @@ impl MemoryIndex {
 
              -- 同步冲突：本地与远端同时改了同一个文件，且都不同于上次同步的基线。
              -- 不自动裁决 —— 记忆是长期事实，猜错一次的代价远大于多问一句。
+             --
+             -- `local_hash` / `remote_hash` 可以为 NULL：NULL 表示**这一侧没有这个
+             -- 文件**（删了），而不是「哈希算不出来」。裁决「保留本地」时基线要记
+             -- 远端那一侧，所以远端体积也得存（只靠哈希算不出来）。
              CREATE TABLE IF NOT EXISTS sync_conflict (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                path TEXT NOT NULL,
                device TEXT NOT NULL,        -- 远端设备 id
                local_hash TEXT,
                remote_hash TEXT,
+               remote_size INTEGER,
                base_hash TEXT,
                detail TEXT,
                status TEXT NOT NULL DEFAULT 'pending',  -- pending / resolved / ignored
@@ -405,6 +410,21 @@ impl MemoryIndex {
                     "ALTER TABLE agent_beat ADD COLUMN {column} INTEGER DEFAULT 0;"
                 ));
             }
+        }
+
+        // 老库补列：`sync_conflict.remote_size` 是后加的（裁决「保留本地」时基线
+        // 要记远端那一侧的体积）。老记录没有它，补成 NULL —— 那时裁决会退回
+        // 「体积未知按 0」，只影响同步预览里显示的大小，不影响同步判定。
+        let conflict_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(sync_conflict)")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .map(|rows| rows.flatten().collect())
+            })
+            .unwrap_or_default();
+        if !conflict_columns.iter().any(|name| name == "remote_size") {
+            let _ = conn.execute_batch("ALTER TABLE sync_conflict ADD COLUMN remote_size INTEGER;");
         }
 
         // FTS5 探测：建不起来就退化（编译期选项，不是运行期错误）
@@ -1180,13 +1200,23 @@ impl MemoryIndex {
 
     /// 记一条同步冲突。同一个路径重复冲突时更新旧记录而不是不断追加 ——
     /// 用户没处理之前，同一个文件的冲突记录应该只有一条。
+    ///
+    /// 哈希参数是 `Option<&str>`：`None` = 这一侧没有这个文件（删了）。表里这两列
+    /// 本来就是 `TEXT`（可空），存 `NULL` 不用改 schema；而界面上「本地 / 远端」
+    /// 那一行要能显示「已删除」，所以必须能区分「没有」和「哈希算不出来」。
+    ///
+    /// `remote_size` 与 `remote` 同生共死：`remote` 是 `None` 时它没有意义，传 0。
+    /// 之所以要单独带体积：裁决「保留本地」时基线要记**远端**那一版，而基线里的
+    /// 条目是 `{hash, size}` —— 只存哈希，那一版在同步预览里会显示成 0 字节。
+    #[allow(clippy::too_many_arguments)]
     pub fn conflict_enqueue(
         &self,
         path: &str,
         device: &str,
-        local: &str,
-        remote: &str,
-        base: &str,
+        local: Option<&str>,
+        remote: Option<&str>,
+        remote_size: u64,
+        base: Option<&str>,
         detail: &str,
     ) {
         let Ok(conn) = self.conn.lock() else { return };
@@ -1198,9 +1228,10 @@ impl MemoryIndex {
             params![path, device],
         );
         let _ = conn.execute(
-            "INSERT INTO sync_conflict (path, device, local_hash, remote_hash, base_hash, detail, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
-            params![path, device, local, remote, base, detail, now],
+            "INSERT INTO sync_conflict
+               (path, device, local_hash, remote_hash, remote_size, base_hash, detail, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
+            params![path, device, local, remote, remote_size as i64, base, detail, now],
         );
     }
 
@@ -1208,7 +1239,7 @@ impl MemoryIndex {
         let Ok(conn) = self.conn.lock() else { return Vec::new() };
         // `query_map` 挂在 `Statement` 上，不挂在 `Connection` 上：先 prepare 再查
         let Ok(mut statement) = conn.prepare(
-            "SELECT id, path, device, local_hash, remote_hash, base_hash, detail, status, created_at
+            "SELECT id, path, device, local_hash, remote_hash, base_hash, detail, status, created_at, remote_size
              FROM sync_conflict ORDER BY status = 'pending' DESC, created_at DESC LIMIT ?1",
         ) else {
             return Vec::new();
@@ -1224,6 +1255,9 @@ impl MemoryIndex {
                 "detail": row.get::<_, Option<String>>(6)?,
                 "status": row.get::<_, String>(7)?,
                 "createdAt": row.get::<_, i64>(8)?,
+                // 老记录没有这一列值时是 NULL，按 0 给 —— 界面只说「体积未知」，
+                // 不用它做判断。
+                "remoteSize": row.get::<_, Option<i64>>(9)?.unwrap_or(0),
             }))
         });
         match mapped {
@@ -1242,6 +1276,29 @@ impl MemoryIndex {
         .unwrap_or(0) as usize
     }
 
+    /// **全部**待裁决冲突的路径（不截断）。
+    ///
+    /// 为什么不能拿 [`conflict_list`] 的结果当全集：那个接口带 `LIMIT`，是给
+    /// 界面列表用的。而基线更新必须覆盖**每一条**待裁决的路径 —— 漏掉一条，
+    /// 它的本地哈希就会留在基线里，下一轮三方比对得出「本地没变、远端变了」，
+    /// 于是静默采纳远端、把还没裁决的冲突覆盖掉。冲突一多（>200 条）就会整片
+    /// 出现这种静默覆盖，而界面上还挂着那些「待裁决」条目。
+    ///
+    /// 这里只取 `path`：调用方要的就是路径集合。
+    pub fn conflict_pending_paths(&self) -> Vec<String> {
+        let Ok(conn) = self.conn.lock() else { return Vec::new() };
+        let Ok(mut statement) = conn
+            .prepare("SELECT DISTINCT path FROM sync_conflict WHERE status = 'pending'")
+        else {
+            return Vec::new();
+        };
+        let mapped = statement.query_map([], |row| row.get::<_, String>(0));
+        match mapped {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// 裁决一条冲突。`resolution` = `local` / `remote` / `ignore`。
     pub fn conflict_resolve(&self, id: i64, resolution: &str) -> usize {
         let Ok(conn) = self.conn.lock() else { return 0 };
@@ -1254,11 +1311,30 @@ impl MemoryIndex {
         .unwrap_or(0)
     }
 
+    /// 把某条路径上**还挂着**的待裁决冲突改成「已自动拼接」。
+    ///
+    /// 场景：上一轮同步这条进了冲突队列（两边都改、内容不同），这一轮恰好能按节
+    /// 拼平 —— 冲突在逻辑上已经不存在了，但队列里那行还在。不主动关掉的话它会
+    /// 一直显示「待裁决」，用户去点「保留本地」会把刚拼好的合并结果覆盖成半份。
+    ///
+    /// `resolution` 记成 `merged` 而不是 `resolved`：同步流水与冲突表里能区分
+    /// 「人裁决的」与「自动拼掉的」，排查时不用猜。
+    pub fn conflict_resolve_merged(&self, path: &str) -> usize {
+        let Ok(conn) = self.conn.lock() else { return 0 };
+        let now = crate::server::logging::now_ms();
+        conn.execute(
+            "UPDATE sync_conflict SET status = 'resolved', resolution = 'merged', resolved_at = ?2
+             WHERE path = ?1 AND status = 'pending'",
+            params![path, now],
+        )
+        .unwrap_or(0)
+    }
+
     /// 冲突详情（裁决「用远端」时要把远端内容落盘，得先拿到它）。
     pub fn conflict_get(&self, id: i64) -> Option<Value> {
         let Ok(conn) = self.conn.lock() else { return None };
         conn.query_row(
-            "SELECT id, path, device, local_hash, remote_hash, base_hash, detail, status, created_at
+            "SELECT id, path, device, local_hash, remote_hash, base_hash, detail, status, created_at, remote_size
              FROM sync_conflict WHERE id = ?1",
             params![id],
             |row| {
@@ -1272,6 +1348,7 @@ impl MemoryIndex {
                     "detail": row.get::<_, Option<String>>(6)?,
                     "status": row.get::<_, String>(7)?,
                     "createdAt": row.get::<_, i64>(8)?,
+                    "remoteSize": row.get::<_, Option<i64>>(9)?.unwrap_or(0),
                 }))
             },
         )

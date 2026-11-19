@@ -958,5 +958,12 @@
   "待填 WebDAV 账号": "WebDAV account pending",
   "电脑名（下方设备列表里显示）": "Computer name (shown in the device list below)",
   "还没填 WebDAV 密码": "WebDAV password not set yet",
-  "WebDAV 地址是空的": "WebDAV address is empty"
+  "WebDAV 地址是空的": "WebDAV address is empty",
+  "已删除": "deleted",
+  "本地已删，远端改了同一份记忆": "Deleted locally, changed remotely",
+  "本地改了，远端删了同一份记忆": "Changed locally, deleted remotely",
+  "拼接 {n} 条": "Joined {n}",
+  "不自动挑边": "no auto side-picking",
+  "两边都改且内容不同时进队列，等人裁决 —— 自动挑一边必然丢掉另一边的工作。同一天的日志能按节拼起来的会先拼平，拼不平的才进这里。": "Both sides changed it differently → queued for a human. Picking one side automatically always loses the other side's work. Same-day logs that can be joined section by section are joined first; only what cannot be joined shows up here.",
+  "忽略（这条不再同步）": "Ignore (stop syncing this)"
 }
