@@ -869,6 +869,10 @@ pub fn status() -> Value {
     let l1 = entries.iter().filter(|entry| entry.is_live() && entry.layer == Layer::L1).count();
     let l2 = entries.iter().filter(|entry| entry.is_live() && entry.layer == Layer::L2).count();
     let index_count = index::global().count();
+    // 「今日新增 / 昨日」按**本地自然日**切：用户看的「今天」是他自己的今天，
+    // 按 UTC 切会让东八区早上 8 点前的写入落到前一天（热力图那条注释踩过同一个坑）。
+    // 只数 live 条目 —— 已删除的不算「新增」，否则删一条会让数字倒扣。
+    let (today, yesterday) = daily_counts(&entries);
     json!({
         "root": store::root().to_string_lossy(),
         "indexFile": store::index_file().to_string_lossy(),
@@ -879,6 +883,12 @@ pub fn status() -> Value {
         "l2": l2,
         "deleted": deleted,
         "superseded": superseded,
+        "today": today,
+        "yesterday": yesterday,
+        // 「已连通 Agent」：`called / injected`。放在 status 里而不是让前端再打
+        // 一次 `/agents` —— 那个端点会为每张卡探测路径、版本、读两份文件，
+        // 而仪表盘只要两个数字。口径说明见 `agents::connectivity`。
+        "agents": agents::connectivity(),
         "projects": projects().get("items").map(|items| items.as_array().map(Vec::len).unwrap_or(0)).unwrap_or(0),
         "review": {
             "pending": index::global().review_count(),
@@ -890,6 +900,41 @@ pub fn status() -> Value {
         // 内容版本号：每次写入 +1。排障时用来判断「Agent 看到的是不是最新」。
         "revision": revision(),
     })
+}
+
+/// 今天与昨天各新增了多少条（按本地自然日、只算 live）。
+///
+/// ── 为什么用 `chrono::Local` 而不是 `core::beijing` ──────────
+/// `beijing` 服务的是**上游自然日**（额度重置、签到），必须恒为 UTC+8；
+/// 这里服务的是**用户视角的今天**，跟着本机时区走才是对的（`schedule` 的
+/// 「每天 11:00」也是这个口径）。两者不可互换。
+fn daily_counts(entries: &[MemoryEntry]) -> (usize, usize) {
+    use chrono::{Local, TimeZone};
+    let now = crate::server::logging::now_ms();
+    let Some(moment) = Local.timestamp_millis_opt(now).single() else {
+        return (0, 0);
+    };
+    let today = moment.date_naive();
+    // 取本地零点：夏令时空档会回 None（`and_local_timezone` 的已知行为），
+    // 那种情况下退化成「按 24h 回退」，宁可差一小时也不要整块归零。
+    let start_of = |day: chrono::NaiveDate| {
+        day.and_hms_opt(0, 0, 0)
+            .and_then(|at| at.and_local_timezone(Local).single())
+            .map(|at| at.timestamp_millis())
+            .unwrap_or_else(|| now - (today - day).num_days() * 86_400_000)
+    };
+    let today_start = start_of(today);
+    let yesterday_start = today.pred_opt().map(start_of).unwrap_or(today_start - 86_400_000);
+    let mut today_count = 0;
+    let mut yesterday_count = 0;
+    for entry in entries.iter().filter(|entry| entry.is_live()) {
+        if entry.created_at >= today_start {
+            today_count += 1;
+        } else if entry.created_at >= yesterday_start {
+            yesterday_count += 1;
+        }
+    }
+    (today_count, yesterday_count)
 }
 
 // ── 写 ───────────────────────────────────────────────────────

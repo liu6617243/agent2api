@@ -143,6 +143,49 @@
   color: var(--text-3);
   line-height: 1.5;
 }
+
+/* 指标卡里的「双数字」副行（有效记忆卡：普通记忆 / 深层记忆）。
+   数字在上、标签在下，两列并排 —— 同一维度纵向对齐才比得出来。
+   不用「沉淀 X · 流水 Y」那种一句话里塞两个量的写法：读的人得先在心里
+   把句子拆开，才知道哪个数对应哪个层级。 */
+.mm-metric-pair {
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+  margin-top: 5px;
+}
+.mm-metric-pair > div {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+}
+/* 字号刻意压在 MetricValue（13px）之下：这张卡的主数字是「有效记忆」总数，
+   副行只是把它拆成两层。副行要是比主数字还大，眼睛会先读到拆分后的两个数，
+   而不是总数 —— 层级就反了。 */
+.mm-mp-value {
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* 「条」紧贴数字：目标界面里它是一个后缀，不是独立单词。
+   颜色比下面的标签亮一档 —— 它属于数字那一行，不是说明文字。 */
+.mm-mp-unit {
+  margin-left: 1px;
+  font-size: 10px;
+  font-weight: 500;
+  font-style: normal;
+  color: var(--text-2);
+}
+.mm-mp-label {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-3);
+  white-space: nowrap;
+}
 .mm-warn-text { color: var(--warn); }
 
 .mm-todo-list { display: flex; flex-direction: column; gap: 2px; }

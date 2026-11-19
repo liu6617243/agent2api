@@ -126,6 +126,18 @@ export type MemoryStatus = {
   l2: number
   deleted: number
   superseded: number
+  /** 本地自然日（零点起）新增的条数，只算 live。 */
+  today: number
+  /** 昨天的同口径条数，用来给「今日新增」一个参照。 */
+  yesterday: number
+  /**
+   * 「已连通 Agent」的分子分母。
+   *
+   * 分母 `injected` = 配置文件里真有 `agent2api-memory` 这一条的客户端数；
+   * 分子 `called` = 其中心跳 `calls > 0`（真的调过记忆工具）的数量。
+   * 口径与接入页卡片同一套，见后端 `agents::connectivity`。
+   */
+  agents: { called: number; injected: number }
   projects: number
   review: { pending: number; warnThreshold: number }
   index: { count: number; fts: boolean; inSync: boolean }

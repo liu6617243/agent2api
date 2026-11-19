@@ -912,6 +912,12 @@
   "{day} · 共 {n} 条": "{day} · {n} entries",
   "这一天没有记录": "Nothing was recorded on this day",
   "重要": "Score",
-  "重要度": "Importance"
+  "重要度": "Importance",
+  "普通记忆": "Regular memories",
+  "深层记忆": "Deep memories",
+  "已连通 Agent": "Connected agents",
+  "真实调用过 / 已配置": "Actually called / configured",
+  "今日新增": "Added today",
+  "昨日 {n}": "Yesterday {n}"
 
 }

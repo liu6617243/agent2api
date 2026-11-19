@@ -67,6 +67,13 @@ function Dashboard({ status, onGo, onChanged }: DashboardProps): React.ReactElem
   const conflicts = sync.data?.conflicts ?? 0
   const stale = health.data?.staleCount ?? 0
   const drift = health.data ? !health.data.index.inSync : false
+  // `today` / `yesterday` / `agents` 是本轮新加的字段。桌面端前端 bundle 与后端
+  // 二进制不一定同批更新（旧后端 + 新界面会读到 undefined），缺字段时退成 0/0
+  // 而不是让整页白屏 —— 这张卡坏了不该带走整个仪表盘。
+  const today = status.today ?? 0
+  const yesterday = status.yesterday ?? 0
+  const agentCalled = status.agents?.called ?? 0
+  const agentInjected = status.agents?.injected ?? 0
 
   return (
     <div className='mm-dashboard'>
@@ -74,8 +81,26 @@ function Dashboard({ status, onGo, onChanged }: DashboardProps): React.ReactElem
         <MetricCard>
           <MetricLabel>{t('有效记忆')}</MetricLabel>
           <MetricValue>{num(status.live)}</MetricValue>
-          <div className='mm-metric-sub'>
-            {t('沉淀 {l2} · 流水 {l1}', { l2: num(status.l2), l1: num(status.l1) })}
+          {/* 分层用「两个大数字 + 各自标签」并排，不用「沉淀 X · 流水 Y」一行：
+              后者把两个不同的量塞进一句里，读的时候要先在心里拆开才知道谁是谁；
+              并排之后左边永远是普通、右边永远是深层，扫一眼就能比。
+              数字大、单位小、标签在下一行 —— 与 AgentHub 仪表盘同一读法。
+
+              这里刻意不用 `num()`：它带千分位（`24,286`），副行本来就是小字号，
+              多出来的逗号会把两位数字挤得更长、也更吵。目标界面的副行是裸数字。 */}
+          <div className='mm-metric-pair'>
+            <div>
+              <span className='mm-mp-value'>
+                {status.l1}<i className='mm-mp-unit'>{t('条')}</i>
+              </span>
+              <span className='mm-mp-label'>{t('普通记忆')}</span>
+            </div>
+            <div>
+              <span className='mm-mp-value'>
+                {status.l2}<i className='mm-mp-unit'>{t('条')}</i>
+              </span>
+              <span className='mm-mp-label'>{t('深层记忆')}</span>
+            </div>
           </div>
         </MetricCard>
         <MetricCard>
@@ -95,16 +120,14 @@ function Dashboard({ status, onGo, onChanged }: DashboardProps): React.ReactElem
           </div>
         </MetricCard>
         <MetricCard>
-          <MetricLabel>{t('今日模型消耗')}</MetricLabel>
-          <MetricValue>{num(auto.data?.tokensToday ?? 0)}</MetricValue>
-          <div className='mm-metric-sub'>
-            {t('上限 {limit} token', { limit: num(auto.data?.dailyTokenLimit ?? 0) })}
-          </div>
+          <MetricLabel>{t('已连通 Agent')}</MetricLabel>
+          <MetricValue>{agentCalled}/{agentInjected}</MetricValue>
+          <div className='mm-metric-sub'>{t('真实调用过 / 已配置')}</div>
         </MetricCard>
         <MetricCard>
-          <MetricLabel>{t('项目')}</MetricLabel>
-          <MetricValue>{num(status.projects)}</MetricValue>
-          <div className='mm-metric-sub'>{t('按 git 远程自动归档')}</div>
+          <MetricLabel>{t('今日新增')}</MetricLabel>
+          <MetricValue>{num(today)}</MetricValue>
+          <div className='mm-metric-sub'>{t('昨日 {n}', { n: num(yesterday) })}</div>
         </MetricCard>
         <MetricCard>
           <MetricLabel>{t('回收站')}</MetricLabel>

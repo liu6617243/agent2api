@@ -185,6 +185,43 @@ pub fn list() -> Value {
 
 // ── 配置读取的小工具 ──────────────────────────────────────────
 
+/// 仪表盘「已连通 Agent」那一个数字的专用口径。
+///
+/// ── 为什么不能直接拿 `list()` 数一下 ────────────────────────
+/// `list()` 每张卡要做四件重活：探测客户端路径与版本、读 MCP 配置文件、
+/// 读提示词文件、算受控块状态。仪表盘每次刷新都要这两个数字，把整套探测
+/// 拉一遍是白花的 —— 用户看仪表盘时并不需要知道「Codex 装的是 0.44 还是 0.45」。
+/// 这里只读心跳表 + 配置里「有没有我们这一条」，回答的就是那一个问题。
+///
+/// ── 分子分母为什么都只算「已配置」 ──────────────────────────
+/// 分母若用「探测到的客户端总数」，会混进用户根本没接的客户端 —— 界面上
+/// `0/7` 读起来像「全坏了」，实际是「6 个从来就没接过」。所以分母是
+/// `injected`（配置文件里真有 `agent2api-memory` 这一条），分子是这些里
+/// 「心跳 `calls > 0`」的数量。只配置不调用不算连通 —— 那是假绿灯。
+pub fn connectivity() -> Value {
+    let beats = index::global().beats();
+    let mut injected = 0;
+    let mut called = 0;
+    for def in hub::CLIENTS {
+        let mcp = resources::snapshot(def, "mcp");
+        if mcp_entry_of(mcp.as_ref().ok()).is_none() {
+            continue;
+        }
+        injected += 1;
+        // 心跳行的 `agent` 是安装器写进配置的 `X-Agent`，与 `def.id` 同一套取值；
+        // 老版本安装器没写这个头，那条记忆会落进 `l1/mcp/`，心跳也记在 `mcp` 上，
+        // 于是这里数不到 —— 这与接入页卡片显示「未接入身份」是同一件事。
+        let live = beats.iter().any(|beat| {
+            beat.get("agent").and_then(Value::as_str) == Some(def.id)
+                && beat.get("calls").and_then(Value::as_i64).unwrap_or(0) > 0
+        });
+        if live {
+            called += 1;
+        }
+    }
+    json!({ "called": called, "injected": injected })
+}
+
 /// 从 MCP 快照里取出本服务那一条的 `config`。
 ///
 /// 快照的 `servers` 是 `[{name, endpoint, config}]`；不同客户端的 `config` 形态

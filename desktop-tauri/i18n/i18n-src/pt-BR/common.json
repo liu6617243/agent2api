@@ -901,6 +901,12 @@
   "{day} · 共 {n} 条": "{day} · {n} registros",
   "这一天没有记录": "Nada foi registrado neste dia",
   "重要": "Nota",
-  "重要度": "Importância"
+  "重要度": "Importância",
+  "普通记忆": "Memórias comuns",
+  "深层记忆": "Memórias profundas",
+  "已连通 Agent": "Agentes conectados",
+  "真实调用过 / 已配置": "Já chamaram / configurados",
+  "今日新增": "Adicionadas hoje",
+  "昨日 {n}": "Ontem {n}"
 
 }
