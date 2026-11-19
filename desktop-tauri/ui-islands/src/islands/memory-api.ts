@@ -264,6 +264,13 @@ export type AutoTask = {
   runs: number
   /** 成功次数（status = done）。 */
   success: number
+  /**
+   * 跳过次数（status = skipped）：没素材 / 待确认积压 / 记忆中枢关着。
+   *
+   * 成功率的分母要把它减掉 —— 跳过不是失败。早先分母直接用 `runs`，
+   * 于是一个每小时都正常跳过的任务会长期显示「成功率 0%」，看起来像坏了。
+   */
+  skipped: number
   /** 累计消耗的 token（零成本任务恒为 0）。 */
   tokens: number
   /** 这个任务会不会调模型 —— 界面据此标「零成本 / 调用模型」。 */

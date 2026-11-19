@@ -512,6 +512,7 @@ function RoutingTable({
   onChange: (task: string, patch: { model?: string; tags?: string[] }) => void
   onEffortChange: (task: string, level: string) => void
 }): React.ReactElement {
+  // 本地模型池里的名字，只用来给输入框出候选提示 —— 不是可选项的边界。
   const unique = Array.from(new Set(pool.map(item => item.model).filter(Boolean)))
 
   return (
@@ -554,24 +555,17 @@ function RoutingTable({
               <code>{task}</code>
             </span>
             <span className='mm-route-fixed'>{t('本机网关')}</span>
-            <select
-              className='mm-select mm-select-sm'
+            <ModelInput
+              task={task}
               value={row?.model ?? ''}
-              onChange={event => onChange(task, { model: event.target.value })}
-            >
-              <option value=''>{t('按标签 + 优先级')}</option>
-              {unique.map(model => (
-                <option key={model} value={model}>{model}</option>
-              ))}
-              {row?.model && !unique.includes(row.model) ? (
-                <option value={row.model}>{row.model}</option>
-              ) : null}
-            </select>
+              options={unique}
+              onCommit={model => onChange(task, { model })}
+            />
             <span className='mm-route-tag'>
               {tag ? t(tag === 'heavy' ? '重（heavy）' : '轻（light）') : '—'}
             </span>
             <select
-              className='mm-select mm-select-sm'
+              className='mm-select mm-select-sm mm-route-effort'
               value={level}
               onChange={event => onEffortChange(task, event.target.value)}
             >
@@ -587,6 +581,109 @@ function RoutingTable({
         )
       })}
     </div>
+  )
+}
+
+/**
+ * 「指定模型」—— 可自由输入的模型名，不是下拉。
+ *
+ * ── 为什么改成输入框 ────────────────────────────────────────
+ * 这一格填的是**下游请求体里的 `model` 字段**，取值空间由上游决定，不由本地
+ * 模型目录决定。用下拉等于把「能填什么」锁死在 `models.models` 里 —— 想指定一个
+ * 只存在于上游、还没登记进池子的模型（新上线的、别家别名、私有部署的），
+ * 下拉里根本没有这个选项，用户只能先去模型页登记一遍再回来。
+ *
+ * ── 为什么不用「下拉 + 允许手输」那种组合控件 ────────────────
+ * 原生 `<input list>` 的候选面板由浏览器画，样式与本页其余控件完全不一致，
+ * 且只在部分平台可点选。这里用纯 `<input>` + 一行候选提示：候选是参考，不是边界。
+ *
+ * ── 为什么本地 state 而不是直接受控于 routing ────────────────
+ * `onChange` 会把值写进页面 draft，draft 变化会让整张表重渲染。若输入框直接
+ * `value={row?.model}`，每敲一个字符都走一遍「draft → 重算 routing → 重渲染」，
+ * 中间还会因为「空值不落盘」的规则把行删掉再建回来 —— 光标会跳、输入会丢字
+ * （中文输入法尤其明显）。所以框内自己管草稿，失焦 / 回车时才提交。
+ */
+function ModelInput({
+  task,
+  value,
+  options,
+  onCommit,
+}: {
+  task: string
+  value: string
+  options: string[]
+  onCommit: (model: string) => void
+}): React.ReactElement {
+  const [text, setText] = React.useState(value)
+  // 外部值变了（刷新链路、点「默认」）才回灌，正在输入时不打扰
+  const last = React.useRef(value)
+  React.useEffect(() => {
+    if (last.current !== value) {
+      last.current = value
+      setText(value)
+    }
+  }, [value])
+
+  const commit = (next: string) => {
+    const trimmed = next.trim()
+    last.current = trimmed
+    setText(trimmed) // 去掉首尾空白后回显，用户看得出它被怎么理解了
+    if (trimmed !== value) onCommit(trimmed)
+  }
+
+  // 候选只是提示：输入框接受任何字符串，这里是「本地模型池里像的那几个」
+  const typed = text.trim()
+  const hints = typed
+    ? options
+        .filter(model => model !== typed && model.toLowerCase().includes(typed.toLowerCase()))
+        .slice(0, 4)
+    : []
+
+  return (
+    <span className='mm-route-model'>
+      <input
+        className='mm-input mm-route-model-input'
+        type='text'
+        value={text}
+        placeholder={t('留空 = 按标签 + 优先级')}
+        aria-label={t('{task} 指定模型', { task })}
+        spellCheck={false}
+        autoComplete='off'
+        onChange={event => setText(event.target.value)}
+        onBlur={() => commit(text)}
+        onKeyDown={event => {
+          if (event.key === 'Enter') {
+            event.preventDefault()
+            commit(text)
+            ;(event.target as HTMLInputElement).blur()
+          }
+          if (event.key === 'Escape') {
+            // 放弃这次编辑：回到已保存的值，别让「后悔」变成一次脏写入
+            setText(value)
+            ;(event.target as HTMLInputElement).blur()
+          }
+        }}
+      />
+      {hints.length ? (
+        <span className='mm-route-model-hints'>
+          {hints.map(model => (
+            <button
+              key={model}
+              type='button'
+              className='mm-route-model-hint'
+              // mousedown 而不是 click：input 先失焦就会 commit 并重渲染，
+              // 候选按钮随即被卸载，click 就永远等不到了
+              onMouseDown={event => {
+                event.preventDefault()
+                commit(model)
+              }}
+            >
+              {model}
+            </button>
+          ))}
+        </span>
+      ) : null}
+    </span>
   )
 }
 

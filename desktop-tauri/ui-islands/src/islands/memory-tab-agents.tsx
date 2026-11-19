@@ -154,6 +154,39 @@ function Agents(): React.ReactElement {
   })
 
   /**
+   * 全部校验：对每个「配置里真有这一条」的客户端各发一次 MCP `initialize`。
+   *
+   * 结论必须**逐卡落回** `notes[id]`，不能只在顶部留一句汇总 —— 汇总说「2 个连不上」
+   * 等于把「是哪两个」又推回给用户，还得对着卡片一张张点「测试连接」重测一遍，
+   * 那这个按钮就白点了。所以先按行写回，再决定要不要额外抛一句错。
+   *
+   * 分母只算已写入配置的客户端：把没接入的算作失败，用户会看到「0 / 7 个正常」
+   * 这种毫无信息量的结论 —— 那 6 个从来就没接过，谈不上好坏。
+   */
+  const verifyAll = () => run('__all__', async () => {
+    const result = await m.verifyAgents([])
+    const wired = result.rows.filter(row => row.mcp)
+    if (!wired.length) throw new Error(t('没有任何客户端写入过记忆配置'))
+    setNotes(current => {
+      const next = { ...current }
+      for (const row of wired) {
+        next[row.id] = {
+          ok: row.ok,
+          text: row.detail || (row.ok ? t('检测通过') : t('检测没通过')),
+        }
+      }
+      return next
+    })
+    const dead = wired.filter(row => !row.ok)
+    if (!dead.length) return t('{n} 个已接入的客户端全部握手成功', { n: wired.length })
+    throw new Error(t('{ok} / {total} 个握手成功；{names} 连不上', {
+      ok: wired.length - dead.length,
+      total: wired.length,
+      names: dead.map(row => row.name ?? row.id).join('、'),
+    }))
+  })
+
+  /**
    * 一键注入：写 MCP 条目（带 `X-Agent` 身份）+ 按配置写指令文件受控块。
    *
    * 提示里带上「重启客户端」这一步 —— 配置只在启动时读一次，写完不重启等于没写，
@@ -234,31 +267,6 @@ function Agents(): React.ReactElement {
                     : t('还没有可用的 API Key —— 先到「账号与密钥 → API Key」建一把')}
               </span>
             )}
-            <Button
-              type='button'
-              size='sm'
-              variant='ghost'
-              disabled={busyId !== ''}
-              onClick={() => void run('__all__', async () => {
-                const result = await m.verifyAgents([])
-                // 分母只算「配置里真有我们这一条」的客户端：把没接入的算成失败，
-                // 用户会看到「0 / 7 个正常」这种毫无信息量的结论 —— 那 6 个从来
-                // 就没接过，谈不上好坏。
-                const wired = result.rows.filter(row => row.mcp)
-                if (!wired.length) throw new Error(t('没有任何客户端写入过记忆配置'))
-                const dead = wired.filter(row => !row.ok)
-                if (dead.length) {
-                  throw new Error(t('{ok} / {total} 个握手成功；{names} 连不上', {
-                    ok: wired.length - dead.length,
-                    total: wired.length,
-                    names: dead.map(row => row.name ?? row.id).join('、'),
-                  }))
-                }
-                return t('{n} 个已接入的客户端全部握手成功', { n: wired.length })
-              })}
-            >
-              {busyId === '__all__' ? t('校验中…') : t('全部校验')}
-            </Button>
           </div>
         )}
       >
@@ -272,15 +280,28 @@ function Agents(): React.ReactElement {
           <span>{t('服务名')}</span><code>{data.serverName}</code>
           <span>{t('端点')}</span><code>{data.endpoint}</code>
         </div>
-        {notes.__all__ ? (
-          <p className={notes.__all__.ok ? 'mm-hint' : 'mm-warn'}>{notes.__all__.text}</p>
-        ) : null}
       </Section>
 
       <Section
         title={t('客户端')}
         hint={t('每张卡上直接测、直接写、直接卸。写入前会自动备份原配置文件。')}
+        action={(
+          <Button
+            type='button'
+            size='sm'
+            variant='ghost'
+            disabled={busyId !== ''}
+            onClick={() => void verifyAll()}
+          >
+            {busyId === '__all__' ? t('校验中…') : t('全部校验')}
+          </Button>
+        )}
       >
+        {/* 批量校验的结论已经逐卡写回 `notes[id]`，这里只留「一条都没接」这种
+            没法落到任何一张卡上的全局失败，否则用户点完看不见任何反应。 */}
+        {notes.__all__ && !notes.__all__.ok ? (
+          <p className='mm-warn'>{notes.__all__.text}</p>
+        ) : null}
         <div className='mm-agent-grid'>
           {data.cards.map(card => {
             const busy = busyId === card.id

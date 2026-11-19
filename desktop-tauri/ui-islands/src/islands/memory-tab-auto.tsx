@@ -229,21 +229,18 @@ function ExportIcon(): React.ReactElement {
 }
 
 /**
- * 成功率。只数「跑过几次成功几次」—— 跳过不算失败（没素材 / 预算用完 / 未配
- * 模型都是常态），把它算进分母会让一个健康的任务显示 60%。
+ * 成功率。分母是「真正做出判断的次数」= `runs - skipped`。
  *
- * 因此分母是 `success` 与 `runs` 的差加上 `success`……不对：`runs` 含跳过，
- * 直接 `success / runs` 会把跳过算成失败。这里用后端给的 `runs`（含跳过）与
- * `success`，两者相减得到「非成功次数」，其中跳过的部分无法从这两个数里区分。
- *
- * 取舍：既然区分不出，就不假装精确 —— 页面显示的成功率是
- * `success / runs`，并在 title 里写明「含跳过」。用户真正要看的是「有没有
- * 大面积失败」，差几个百分点的口径不影响这个判断；而另开一次查询只为了让
- * 标签好看，代价不划算。
+ * 跳过（没素材 / 待确认积压 / 记忆中枢关着）既不是成功也不是失败。把它放进
+ * 分母，一个健康的任务会长期显示 0% —— 「每小时扫一遍、每遍都没有可归的碎片」
+ * 本来就是健康状态，显示成 0% 只会让人以为它坏了。所以跳过的次数单列
+ * （后端 `skipped`），从分母里剔掉；当 `runs - skipped == 0` 时返回 null，
+ * 界面改说「全部跳过」—— 那种情况下谈成功率没有意义。
  */
 function successRate(task: m.AutoTask): number | null {
-  if (task.runs <= 0) return null
-  return (task.success / task.runs) * 100
+  const judged = task.runs - (task.skipped ?? 0)
+  if (judged <= 0) return null
+  return (task.success / judged) * 100
 }
 
 /** 百分比保留一位小数，但整数不带 `.0`（「100%」而不是「100.0%」）。 */
@@ -538,12 +535,26 @@ function TaskCard({
           {task.runs > 0 ? (
             <>
               <span className='mm-auto-card-runs'>{t('{n} 次运行', { n: num(task.runs) })}</span>
-              {rate === null ? null : (
+              {rate === null ? (
+                /* 全跳过的任务不谈成功率：分母是 0，写「0%」等于判它失败。
+                   这类任务最典型的就是「每小时扫一遍、每次都没有可归的碎片」。 */
                 <span
                   className='mm-auto-card-rate'
-                  title={t('成功 {ok} 次 / 共 {runs} 次（跳过也计入分母）', {
+                  title={t('成功 {ok} 次 / 有效运行 {judged} 次（跳过 {skipped} 次不计入）', {
                     ok: num(task.success),
-                    runs: num(task.runs),
+                    judged: num(Math.max(0, task.runs - (task.skipped ?? 0))),
+                    skipped: num(task.skipped ?? 0),
+                  })}
+                >
+                  {t('全部跳过')}
+                </span>
+              ) : (
+                <span
+                  className='mm-auto-card-rate'
+                  title={t('成功 {ok} 次 / 有效运行 {judged} 次（跳过 {skipped} 次不计入）', {
+                    ok: num(task.success),
+                    judged: num(Math.max(0, task.runs - (task.skipped ?? 0))),
+                    skipped: num(task.skipped ?? 0),
                   })}
                 >
                   {t('成功率 {percent}', { percent: percentText(rate) })}

@@ -936,5 +936,9 @@
   "清理完成：移入回收站 {a} 条，彻底删除 {b} 个过期文件": "Limpeza concluída: {a} movidas para a lixeira, {b} arquivos expirados excluídos",
   "清理任务已提交": "Tarefa de limpeza enviada",
   "已清理 {n} 个超期文件": "{n} arquivos expirados limpos",
-  "只显示最新的 {shown} 个文件（共 {n} 个）。更早的请先「清理超期文件」。": "Mostrando os {shown} arquivos mais recentes de {n}. Use \"Limpar arquivos expirados\" para os mais antigos."
+  "只显示最新的 {shown} 个文件（共 {n} 个）。更早的请先「清理超期文件」。": "Mostrando os {shown} arquivos mais recentes de {n}. Use \"Limpar arquivos expirados\" para os mais antigos.",
+  "成功 {ok} 次 / 有效运行 {judged} 次（跳过 {skipped} 次不计入）": "{ok} sucessos / {judged} execuções efetivas ({skipped} ignoradas não entram no cálculo)",
+  "全部跳过": "Tudo ignorado",
+  "留空 = 按标签 + 优先级": "Vazio = seguir tag + prioridade",
+  "{task} 指定模型": "Modelo definido para {task}"
 }

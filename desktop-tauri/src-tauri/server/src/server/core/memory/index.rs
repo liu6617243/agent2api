@@ -871,26 +871,30 @@ impl MemoryIndex {
         out
     }
 
-    /// 每个任务的累计统计：跑了几次、成功几次、一共烧了多少 token。
+    /// 每个任务的累计统计：跑了几次、成功几次、跳过几次、一共烧了多少 token。
     ///
     /// ── 口径 ────────────────────────────────────────────────
     /// `runs` 数的是**所有状态**（done / skipped / failed）的行 —— 用户问
     /// 「这个任务跑过几次」时，跳过的那几次同样是跑过的；把它们剔掉会让
     /// 「从没跑过」与「跑了但一直跳过」看起来一样。
     ///
-    /// `ok` 只数 `done`，成功率的分母是 `runs`。零成本任务永远 `done`，
-    /// 于是显示 100% —— 这在语义上是对的（它没有失败的可能）。
+    /// `ok` 只数 `done`，`skipped` 单列。**成功率的分母是 `runs - skipped`**：
+    /// 跳过不是失败（没素材 / 待确认积压 / 记忆中枢关着都是常态）。早先分母
+    /// 用 `runs`，于是一个每小时都正常跳过 `classify` 报 0% —— 用户会以为它
+    /// 坏了，实际是「扫过了，没什么可归的」。反过来说，`runs - skipped == 0`
+    /// 时成功率没有意义，界面该说「全部跳过」而不是「0%」。
     ///
     /// ── 为什么要乘 `repeat` ─────────────────────────────────
     /// 连续相同结果会合并成一行（见 [`Self::log_task_run`]），表里一行可能
     /// 代表 24 次执行。按行数统计会把「每小时跑一次、整天都在跳过」报成
     /// 「跑了 1 次」，用户据此判断「这个任务是不是没在跑」就会判错。
-    pub fn task_stats(&self) -> std::collections::HashMap<String, (i64, i64, i64)> {
+    pub fn task_stats(&self) -> std::collections::HashMap<String, (i64, i64, i64, i64)> {
         let mut out = std::collections::HashMap::new();
         let Ok(conn) = self.conn.lock() else { return out };
         let mut statement = match conn.prepare(
             "SELECT task, COALESCE(SUM(COALESCE(repeat, 1)), 0),
                     COALESCE(SUM(CASE WHEN status = 'done' THEN COALESCE(repeat, 1) ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'skipped' THEN COALESCE(repeat, 1) ELSE 0 END), 0),
                     COALESCE(SUM(tokens), 0)
                FROM task_run GROUP BY task",
         ) {
@@ -903,11 +907,12 @@ impl MemoryIndex {
                 row.get::<_, i64>(1).unwrap_or(0),
                 row.get::<_, i64>(2).unwrap_or(0),
                 row.get::<_, i64>(3).unwrap_or(0),
+                row.get::<_, i64>(4).unwrap_or(0),
             ))
         });
         if let Ok(rows) = rows {
-            for (task, runs, ok, tokens) in rows.flatten() {
-                out.insert(task, (runs, ok, tokens));
+            for (task, runs, ok, skipped, tokens) in rows.flatten() {
+                out.insert(task, (runs, ok, skipped, tokens));
             }
         }
         out

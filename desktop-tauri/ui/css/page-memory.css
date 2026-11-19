@@ -3184,6 +3184,46 @@
 }
 .mm-select-sm { height: 26px; font-size: 11.5px; padding: 0 6px; max-width: 100%; }
 
+/* ── 「指定模型」输入框 ───────────────────────────────────────
+   这一格填的是下游请求体里的 `model`，取值由上游决定 —— 所以是输入框而不是
+   下拉，候选只作提示。外观与 `.mm-select-sm` 对齐（同高、同字号、同边框），
+   否则同一张表里会同时出现两种控件高度，行高跟着参差。
+   等宽字体：模型名里全是 `-` `.` `:` `/`，非等宽时很难一眼比对两个近似名字。 */
+.mm-route-model { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.mm-route-model-input {
+  width: 100%;
+  height: 26px;
+  padding: 0 7px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  min-width: 0;
+}
+.mm-route-model-input::placeholder { color: var(--text-3); font-family: var(--font-sans); font-size: 11.5px; }
+.mm-route-model-input:focus { outline: none; border-color: var(--primary); box-shadow: var(--shadow-focus); }
+/* 候选：一行小药丸。点击替换输入内容，不做下拉展开 —— 它没有「必须从里面选」
+   的权威性，弹层会让人误以为是必选项。 */
+.mm-route-model-hints { display: flex; flex-wrap: wrap; gap: 4px; }
+.mm-route-model-hint {
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.6;
+  padding: 0 5px;
+  cursor: pointer;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mm-route-model-hint:hover { color: var(--primary-fg); border-color: var(--primary); }
+
 /* 不调模型的任务（分类 / 去重）：后三列合并成一句说明。
    它们真的在跑，只是没有模型可配 —— 摆三个禁用下拉等于假装能配。 */
 .mm-route-inert {
@@ -3370,6 +3410,18 @@
   .mm-route-row { grid-template-columns: minmax(90px, 1fr) minmax(0, 1.4fr); }
   /* 窄屏只有两列，合并列改成从第 2 列起（写 3 / -1 在这里会越界） */
   .mm-route-inert { grid-column: 2 / -1; }
+  /* 模型名独占一整行：两列里塞进「任务 / 网关 / 模型 / 标签 / 强度 / 推导」
+     六项时，输入框只能分到半列宽（约 150px），长模型名显示不全、也没法确认
+     自己敲对了哪个。让它跨两列，剩下四格按两列两行排，读起来仍然成对。 */
+  .mm-route-model { grid-column: 1 / -1; }
+  /* 标签与强度合成一对放在同一行：`.mm-route-tag` 一格（`—` / `轻（light）`），
+     `.mm-route-effort` 占其余宽。两者一个是被动推导、一个是主动选择，摆在一起
+     正好能相互对照 —— 选了「低（low）」右边标签就变「轻（light）」。 */
+  .mm-route-effort { grid-column: 2 / -1; }
+  /* 推导结果也跨两列：模型独占一行后，剩下「标签 / 强度 / 推导」三格按两列排
+     会剩一个右边空位，读起来像少了一格。让推导整行展开，「— | 轻（light）」
+     一行、「deepseek-v3 兜底」一行，成对且不留空。 */
+  .mm-route-resolved { grid-column: 1 / -1; }
   .mm-route-head { display: none; }
   .mm-cfg-item { grid-template-columns: minmax(0, 1fr); }
   /* 执行记录：窄屏砍掉 token 与耗时，留下「时间 / 任务 / 结果 / 明细」——

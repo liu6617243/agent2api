@@ -703,10 +703,11 @@ fn detail_of(task: &str, outcome: &Outcome) -> String {
                 "summarize" => format!("生成摘要 {} 条", n("summarized")),
                 "tag" => format!("打标 {} 条", n("tagged")),
                 "distill" => format!("读 {} 条素材，产出 {} 条结论", n("material"), n("queued")),
-                // 分类不产建议（建议在写入时就产生了，见 `classify_pending` 的
-                // 注释），所以这里只能报「扫了多少条还没归类」—— 写「产出 0 条
-                // 建议」是把一件从未发生的事说成没发生，读起来像故障。
-                "classify" => format!("扫描 {} 条未归类（建议在写入时产生）", n("unclassified")),
+                // 归类巡检报两个数：扫了多少条没项目的、其中新提了几条建议。
+                // 只报「扫描 0 条」读起来像它没干活；只报建议数又在全部 skipped
+                // 的轮次里没有内容 —— 两件事分开写，用户看得出「扫过了、没命中」
+                // 与「扫都没扫」的区别。
+                "classify" => format!("扫描 {} 条未归类，新增 {} 条建议", n("unclassified"), n("suggested")),
                 "supersede" => format!("检查 {} 条，产出 {} 条失效建议", n("checked"), n("suggestions")),
                 "consolidate" => format!("检查 {} 条，产出 {} 条合并建议", n("checked"), n("queued")),
                 // 「保留 N 条置顶」只在真的有钉子时出现：大多数轮次没有用户钉的
@@ -743,11 +744,32 @@ fn short(text: String, max: usize) -> String {
     format!("{cut}…")
 }
 
-/// 归类建议：把 `general/` 里未归类的 l1 记忆，按 cwd 的 git 身份补建议。
+/// 归类巡检：给没有项目的活条目补「项目归属建议」。
 ///
-/// 只对**有 cwd 记录的条目**发建议 —— 没有 cwd 就没法判断它属于哪个项目，
-/// 而按内容猜项目等于编造。
+/// ── 这条链路的两半 ──────────────────────────────────────────
+/// 写入时那一半：写方带着 cwd，`layout::classify` 读 `git remote` / 目录名，
+/// 模糊命中已登记项目就顺手入队一条建议（`write_inner` 里的 `enqueue`）。
+///
+/// 但那个前提是「写方报了 cwd」。Agent 不报 cwd、批量导入、旧版本写下的条目，
+/// 都走不到那一步 —— 它们会永远停在 `general/` 里，没人再回头看。这项巡检补的
+/// 就是这一半：**只用条目自己带得动的线索**（`files` 的路径段、标签、标题），
+/// 与已登记项目名做 `name_similarity`，过阈值就入队一条建议。
+///
+/// ── 为什么只发建议、不直接归档 ──────────────────────────────
+/// 没有 cwd 就没有事实依据，只有名字像。归错项目的代价高于「先留在全局」，
+/// 所以巡检**无论 `classify.autoCreateProject` 开没开都只入待确认** —— 那个
+/// 开关是给写入侧的（它手里有 git remote，证据强度不一样）。人点头后
+/// `apply_classification` 才真的搬文件，且可反悔。
+///
+/// ── 为什么不比正文 ──────────────────────────────────────────
+/// `name_similarity` 是给**短名字**算的（归一化 + 编辑距离 + 包含关系）。
+/// 整段正文与项目名比，分数恒接近 0，除了给自己制造噪音没有别的作用。
 fn classify_pending(project: Option<&str>) -> Outcome {
+    // 项目范围这项巡检用不上：它处理的恰恰是「没有项目」的条目，再按
+    // `Some(slug)` 过滤就是自相矛盾的条件集合。早先这里正是这么写的 ——
+    // 带范围调用时两个过滤器互斥，结果恒为空，永远报「没有未归类的记忆」。
+    // 参数留着只为与其它任务同形。
+    let _ = project;
     let pending = index::global().review_count();
     if pending >= config::usize_of("dedup.pendingWarnThreshold").max(10) {
         return Outcome::Skipped(format!("待确认已积压 {pending} 条，先处理队列再说"));
@@ -755,19 +777,87 @@ fn classify_pending(project: Option<&str>) -> Outcome {
     let entries = store::load_all();
     let unclassified: Vec<_> = entries
         .iter()
+        // 画像不是「待归类」的东西：它按设计就不属于任何项目。
         .filter(|entry| entry.is_live() && entry.project.is_none())
-        .filter(|entry| match project {
-            Some(slug) => entry.project.as_deref() == Some(slug),
-            None => true,
-        })
+        .filter(|entry| entry.kind != super::MemoryKind::Profile)
         .collect();
     if unclassified.is_empty() {
         return Outcome::Skipped("没有未归类的记忆".into());
     }
-    Outcome::Done(json!({
-        "unclassified": unclassified.len(),
-        "note": "归类建议在写入时就已产生（写入方知道 cwd）；这里只做计数与提示",
-    }))
+    let projects = store::load_projects();
+    if projects.is_empty() {
+        return Outcome::Skipped("还没登记过任何项目（没有可比对的归档）".into());
+    }
+    let threshold = config::number("classify.fuzzyThreshold");
+    // 已有待确认建议的条目不再重复插：`enqueue` 自身幂等，但它命中的是更新
+    // 旧行，不告诉我们「这次真的新增了吗」—— 统计会每小时报同一个数字。
+    let known: std::collections::HashSet<String> = index::global()
+        .review_list(Some("pending"), Some("classify"), 1000)
+        .into_iter()
+        .map(|row| row.target)
+        .collect();
+    let mut suggested = 0usize;
+    for entry in unclassified.iter().copied() {
+        if known.contains(&entry.id) {
+            continue;
+        }
+        let Some((slug, confidence)) = best_project_match(entry, &projects, threshold) else {
+            continue;
+        };
+        let _ = index::global().enqueue(
+            "classify",
+            &entry.id,
+            &json!({ "suggestion": slug, "confidence": confidence, "foundBy": "scan" }),
+            confidence,
+        );
+        suggested += 1;
+    }
+    Outcome::Done(json!({ "unclassified": unclassified.len(), "suggested": suggested }))
+}
+
+/// 一条未归类记忆最像哪个已登记项目。
+///
+/// 取「最像的那一项线索」而不是全部平均：一条记忆挂十个文件时，只有路径里
+/// 带项目名的那一个是有证据的，其余都是背景噪音 —— 平均会把证据摊薄到阈值
+/// 以下，于是明明有线索也发不出建议。
+fn best_project_match(
+    entry: &super::model::MemoryEntry,
+    projects: &[store::Project],
+    threshold: f64,
+) -> Option<(String, f64)> {
+    let mut hints: Vec<String> = Vec::new();
+    for file in &entry.files {
+        let path = std::path::Path::new(file);
+        if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+            hints.push(stem.to_string());
+        }
+        // 目录段也要：项目身份通常写在目录上（`agent2api/src/...`），
+        // 文件名本身（`lib.rs`、`index.ts`）几乎没有辨识度。
+        for part in path.components() {
+            if let std::path::Component::Normal(segment) = part {
+                hints.push(segment.to_string_lossy().to_string());
+            }
+        }
+    }
+    hints.extend(entry.tags.iter().cloned());
+    if !entry.title.is_empty() {
+        hints.push(entry.title.clone());
+    }
+    let mut best: Option<(String, f64)> = None;
+    for project in projects {
+        let score = hints.iter().fold(0.0f64, |acc, hint| {
+            let score = super::layout::name_similarity(hint, &project.name)
+                .max(super::layout::name_similarity(hint, &project.slug));
+            acc.max(score)
+        });
+        if score < threshold {
+            continue;
+        }
+        if best.as_ref().map(|current| score > current.1).unwrap_or(true) {
+            best = Some((project.slug.clone(), score));
+        }
+    }
+    best
 }
 
 /// 清理：回收站过期文件 + 五类异常记忆入回收站（五类默认全关）。
@@ -1224,7 +1314,7 @@ pub fn status() -> Value {
         .iter()
         .map(|task| {
             let last = last_of(task);
-            let (runs, ok, tokens) = stats.get(*task).copied().unwrap_or((0, 0, 0));
+            let (runs, ok, skipped, tokens) = stats.get(*task).copied().unwrap_or((0, 0, 0, 0));
             // `nextRun` 与 `nextRunText` 必须来自同一个数：一个是机器用的闹钟，
             // 一个是给人看的话。先前这里按「上次 + 间隔」算，文字按配置时刻算，
             // 于是同一个任务同时存在两个「下次」—— 页面写 11:00、闹钟响在 15:20。
@@ -1242,9 +1332,11 @@ pub fn status() -> Value {
                 // 「下次」的人话：按 `daily` / `weeklyTime`（按天/按周）或
                 // `intervalMin`（其余）推，与 `nextRun` 同一个来源。
                 "nextRunText": next_run_text(task, last, now),
-                // 累计统计。`runs` 含跳过（跳过也是跑过的），`ok` 只数成功。
+                // 累计统计。`runs` 含跳过（跳过也是跑过的），`ok` 只数成功，
+                // `skipped` 单列 —— 成功率的分母是 `runs - skipped`，跳过不是失败。
                 "runs": runs,
                 "success": ok,
+                "skipped": skipped,
                 "tokens": tokens,
                 // 这个任务要不要花 token。零 token 的标「零成本」，
                 // 花 token 的标「调用模型」——用户扫一眼就知道开它会烧钱。

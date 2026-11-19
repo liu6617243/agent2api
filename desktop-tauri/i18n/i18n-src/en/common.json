@@ -947,5 +947,9 @@
   "清理完成：移入回收站 {a} 条，彻底删除 {b} 个过期文件": "Cleanup done: {a} moved to trash, {b} expired files permanently deleted",
   "清理任务已提交": "Cleanup task submitted",
   "已清理 {n} 个超期文件": "Purged {n} expired files",
-  "只显示最新的 {shown} 个文件（共 {n} 个）。更早的请先「清理超期文件」。": "Showing the latest {shown} of {n} files. Use \"Purge expired files\" for older ones."
+  "只显示最新的 {shown} 个文件（共 {n} 个）。更早的请先「清理超期文件」。": "Showing the latest {shown} of {n} files. Use \"Purge expired files\" for older ones.",
+  "成功 {ok} 次 / 有效运行 {judged} 次（跳过 {skipped} 次不计入）": "{ok} succeeded / {judged} effective runs ({skipped} skipped, not counted)",
+  "全部跳过": "All skipped",
+  "留空 = 按标签 + 优先级": "Empty = follow tag + priority",
+  "{task} 指定模型": "Model override for {task}"
 }
