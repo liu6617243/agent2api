@@ -27,6 +27,35 @@ export function timeText(timestamp: number | null | undefined): string {
   return new Date(timestamp).toLocaleDateString()
 }
 
+/**
+ * 紧凑时间戳 `MM-DD HH:mm`（列表表格用）。
+ *
+ * 为什么不用 `timeText`：表格一列几十行，「3 分钟前」读不出是哪天写的，
+ * 而「11-19 10:41」既能横向比较又保留了精确度。悬停另有全量时间。
+ */
+export function stamp(timestamp: number | null | undefined): string {
+  if (!timestamp) return '—'
+  const date = new Date(timestamp)
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+/**
+ * 写入方显示名。
+ *
+ * 只映射 `manual` / `import` 两个固定来源：其余都是用户自己配的 Agent 名
+ * （`WorkBuddy` / `distill` 之类），照原样显示才对 —— 用户认的是自己写的那个名字。
+ */
+const AGENT_LABELS: Record<string, string> = {
+  manual: '手动',
+  import: '导入',
+}
+
+export function agentText(agent: string | null | undefined): string {
+  if (!agent) return '—'
+  return AGENT_LABELS[agent] ?? agent
+}
+
 /** 绝对时间（悬停提示用）。 */
 export function fullTime(timestamp: number | null | undefined): string {
   if (!timestamp) return '—'

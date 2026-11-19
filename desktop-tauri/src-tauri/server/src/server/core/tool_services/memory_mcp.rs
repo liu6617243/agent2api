@@ -418,6 +418,12 @@ fn dispatch(name: &str, args: &Value, agent: Option<&str>) -> Result<Value, Call
                 include_deleted: false,
                 include_expired: bool_arg(args, "includeExpired").unwrap_or(false),
                 limit: number_arg(args, "limit").unwrap_or(30),
+                // MCP 侧不分页：`memory_search` 一次给模型一屏最相关的就够，
+                // 让它翻页只会多烧几轮上下文。
+                offset: 0,
+                // 时间窗是界面热力图用的（点某天看当天清单），MCP 侧不暴露。
+                created_from: None,
+                created_to: None,
             };
             let page = memory::list(&request);
             let lines = page.get("lines").cloned().unwrap_or_else(|| json!([]));

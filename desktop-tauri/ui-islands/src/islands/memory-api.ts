@@ -65,7 +65,10 @@ export type MemoryEntry = {
 export type MemoryList = {
   items: MemoryEntry[]
   lines: string[]
+  /** 命中总数（**截断前**）。页数按它算，不要用 items.length */
   total: number
+  /** 本次请求的跳过条数，回显用 */
+  offset?: number
   fts: boolean
 }
 
@@ -149,6 +152,7 @@ export type MemoryTimelineItem = {
 export type ListParams = {
   query?: string
   project?: string
+  agent?: string
   type?: string
   layer?: string
   tag?: string
@@ -158,6 +162,22 @@ export type ListParams = {
   includeDeleted?: boolean
   includeExpired?: boolean
   limit?: number
+  /** 跳过前 N 条。分页用：`offset = page * pageSize` */
+  offset?: number
+  /** 写入时间下界（毫秒，含）。热力图点某天 → 拉那一天的清单 */
+  from?: number
+  /** 写入时间上界（毫秒，不含） */
+  to?: number
+}
+
+/** 热力图：每日写入量（`memory::heat`） */
+export type MemoryHeat = {
+  items: { day: string; count: number }[]
+  days: number
+  total: number
+  activeDays: number
+  /** 今天（`YYYY-MM-DD`），前端据此对齐网格右端 */
+  end: string
 }
 
 /* ─── 配置 schema（config::schema_json）────────────────────── */
@@ -715,6 +735,16 @@ export function resetConfig(keys?: string[]): Promise<{ config: MemoryConfig; va
 
 export function loadList(params: ListParams): Promise<MemoryList> {
   return api('GET', `/api/memory/list${query(params as Record<string, string | number | boolean | undefined>)}`)
+}
+
+/** 每日写入量：浏览页热力图视图的数据源。
+ *
+ * `tz` 必须是「本地时间比 UTC 快多少分钟」：`-new Date().getTimezoneOffset()`。
+ * 后端按它切天，热力图的「今天」才跟用户日历一致（东八区 = 480）。
+ */
+export function loadHeat(days = 365): Promise<MemoryHeat> {
+  const tz = -new Date().getTimezoneOffset()
+  return api('GET', `/api/memory/heat${query({ days, tz })}`)
 }
 
 export function loadEntry(id: string): Promise<{ items: MemoryEntry[] }> {

@@ -362,6 +362,7 @@ pub fn panel_router(state: ServerState) -> Router {
             post(api::memory::post_config_reset),
         )
         .route("/api/memory/list", get(api::memory::get_list))
+        .route("/api/memory/heat", get(api::memory::get_heat))
         .route("/api/memory/get", get(api::memory::get_one))
         .route("/api/memory/core", get(api::memory::get_core))
         .route("/api/memory/digest", get(api::memory::get_digest))

@@ -300,7 +300,7 @@ pub fn rebuild() -> Result<usize, String> {
 pub fn list(query: &Query) -> Value {
     ensure_index_once();
     let now = crate::server::logging::now_ms();
-    let rows = search::search(query);
+    let (rows, total) = search::search_page(query);
     let items: Vec<Value> = rows.iter().map(|row| row.to_json()).collect();
     index::global().log_recall(
         "search",
@@ -313,8 +313,52 @@ pub fn list(query: &Query) -> Value {
     json!({
         "items": items,
         "lines": rows.iter().map(|row| search::compact_line(row, now)).collect::<Vec<_>>(),
-        "total": items.len(),
+        // 命中总数（截断前）。前端按它算页数 —— 用 items.len() 会永远显示第 1/1 页。
+        "total": total,
+        "offset": query.offset,
         "fts": index::global().fts_enabled(),
+    })
+}
+
+/// 每日写入量的日历桶（浏览页「热力图」视图）。
+///
+/// ── 为什么按 `created_at` 而不是 `updated_at` ──────────────
+/// 热力图回答的是「我哪天写了东西」。`updated_at` 会被星标、置顶、改标签这些
+/// 不产生新内容的操作推到现在，用它画出来的图会把「改了个标签」记成一次写作 ——
+/// 越用越失真。
+///
+/// ── 为什么把时区当参数传进来 ──────────────────────────────
+/// 界面说「今天写了 12 条」，用户心里的「今天」是本地日历。后端跑在同一台机器上，
+/// 但 Rust 标准库拿不到本地时区偏移（要引 chrono），所以由前端把
+/// `-new Date().getTimezoneOffset()` 算好的分钟数送进来，这里只做加法。
+/// 不传就按 UTC —— 与 `search::format_date` 的默认行为一致，不会跑偏成第三种结果。
+pub fn heat(days: usize, tz_minutes: i64) -> Value {
+    ensure_index_once();
+    let span = days.clamp(7, 366);
+    let now = crate::server::logging::now_ms();
+    // 时区偏移夹在 ±14 小时内：这是现实世界的极限，越界值（例如前端传了毫秒）
+    // 会把「今天」推到几百年后，热力图直接空掉，看不出是参数错。
+    let offset = tz_minutes.clamp(-840, 840) * 60_000;
+    let since = now - (span as i64) * 86_400_000;
+    let mut buckets: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for entry in store::load_all().iter().filter(|item| item.is_live()) {
+        if entry.created_at < since {
+            continue;
+        }
+        *buckets.entry(search::format_date(entry.created_at + offset)).or_insert(0) += 1;
+    }
+    let items: Vec<Value> = buckets
+        .iter()
+        .map(|(day, count)| json!({ "day": day, "count": count }))
+        .collect();
+    let total: usize = buckets.values().sum();
+    json!({
+        "items": items,
+        "days": span,
+        "total": total,
+        // 「活跃天」= 至少写过一条的天数，不是跨度天数 —— 图例上的数字
+        "activeDays": buckets.len(),
+        "end": search::format_date(now + offset),
     })
 }
 

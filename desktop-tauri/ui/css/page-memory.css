@@ -213,13 +213,162 @@
   min-height: 0;
   flex: 1;
 }
-.mm-filters {
+/* 视图切换行：新建按钮 + 四段分段控件（对齐 AgentHub 的 mem-head） */
+.mm-browse-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+/* 顶部「新增一条记忆」是**实心绿**：它是这一页唯一的创建入口，需要比表格里
+   那个描边的「查看记忆」更抢眼。表格里用描边是为了不跟数据抢注意力，这里相反。 */
+.mm-cta-solid {
+  border-color: transparent !important;
+  color: var(--bg) !important;
+  background: var(--ok) !important;
+  font-weight: 600;
+}
+.mm-cta-solid:hover {
+  background: var(--ok) !important;
+  filter: brightness(1.08);
+}
+
+/* ── 分段控件 ─────────────────────────────────────────────────
+   一个滑块 + 一排等宽按钮：滑块靠 `--sw-i`（当前下标）位移。
+   为什么不用「选中的按钮自己加底色」：切换时滑块是**平移**过去的，
+   眼睛能跟上「从第 2 段滑到第 3 段」这件事；各自加底色只有一次闪断，
+   四段控件里很容易看错点中了哪个。 */
+.mm-switch {
+  position: relative;
+  display: inline-flex;
+  padding: 2px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-inset);
+  flex: none;
+}
+.mm-switch-thumb {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 2px;
+  width: calc((100% - 4px) / var(--sw-count, 4));
+  border-radius: calc(var(--r-sm) - 1px);
+  /* 选中态是「绿边 + 淡绿底」而不是纯白底：这一页的绿色代表「当前视图 / 当前
+     层级」这一层语义，跟表格里的数据绿（重要度、⋯ 菜单）不是一回事。 */
+  background: color-mix(in oklab, var(--ok) 12%, var(--surface));
+  border: 1px solid var(--ok-bd);
+  transform: translateX(calc(var(--sw-i, 0) * 100%));
+  transition: transform 160ms ease;
+  pointer-events: none;
+}
+.mm-switch.is-3 { --sw-count: 3; }
+.mm-switch.is-4 { --sw-count: 4; }
+.mm-switch-item {
+  position: relative;
+  z-index: 1;
+  flex: 1 1 auto;
+  min-width: 56px;
+  height: 26px;
+  padding: 0 12px;
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+.mm-switch-item.active { color: var(--ok); font-weight: 600; }
+.mm-switch-n {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 0 5px;
+  border-radius: var(--r-pill);
+  background: var(--warn-soft, var(--surface-2));
+  color: var(--warn, var(--text));
+}
+/* 待确认视图的「有活」红点：数字告诉人有多少，点告诉人「有事要处理」 */
+.mm-switch-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--danger, #e5534b);
+}
+/* 等级 tab 上的 ⓘ：鼠标悬停出完整解释，但不用悬停也知道「这里有说明」 */
+.mm-info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong, var(--border));
+  font-size: 8.5px;
+  line-height: 1;
+  font-style: italic;
+  color: var(--text-3);
+  cursor: help;
+}
+.mm-switch-item.active .mm-info { border-color: var(--ok-bd); }
+
+/* 等级 tab 行：左边分段控件，右边「共 N 条」 */
+.mm-browse-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.mm-browse-count {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 常显筛选行：整条是一张「工具条面板」，不是几个浮在页面上的控件。
+   有了边框与底色，筛选区与下面的数据区在视觉上分成两块 —— 用户一眼知道
+   「上面是条件，下面是结果」。 */
+.mm-browse-filters {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
 }
-.mm-filters > input { max-width: 260px; }
+/* 提高特异性压过 ui.css 里的 Tailwind `.w-full { width: 100% }`
+   —— 两者同特异性，而 ui.css 在 page-memory.css 之后加载。 */
+.mm-browse-filters .mm-browse-search { width: 180px; flex: none; }
+.mm-browse-filters .mm-browse-tag { width: 180px; flex: none; }
+.mm-browse-filters .mm-select { max-width: 180px; }
+.mm-browse-spacer { flex: 1 1 auto; }
+/* 「更多筛选」是带边框的按钮（打开时转绿），「重置筛选」是纯文字按钮 */
+.mm-filter-more {
+  border: 1px solid var(--border) !important;
+  background: var(--surface-2) !important;
+  color: var(--text-2) !important;
+}
+.mm-filter-more.is-on {
+  color: var(--ok) !important;
+  border-color: var(--ok-bd) !important;
+  background: color-mix(in oklab, var(--ok) 12%, var(--surface-2)) !important;
+}
+.mm-filter-reset { color: var(--text-3) !important; }
+.mm-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-2);
+  cursor: pointer;
+  user-select: none;
+}
+.mm-check input { accent-color: var(--ok); }
 .mm-select {
   height: 30px;
   padding: 0 8px;
@@ -229,74 +378,211 @@
   color: var(--text);
   font-size: 12.5px;
 }
-.mm-project-select { max-width: 190px; }
 .mm-priority-input { max-width: 92px; }
 /* key 选择器：宽度够放「名称（sk-abc...1234）」但不抢走「全部校验」的位置。 */
 .mm-key-select { min-width: 200px; max-width: 260px; }
 .mm-key-empty { font-size: 12px; }
 
-.mm-split {
-  display: grid;
-  grid-template-columns: minmax(260px, 1fr) minmax(360px, 1.5fr);
-  gap: 12px;
-  min-height: 0;
-  flex: 1;
-}
-@media (max-width: 1100px) {
-  .mm-split { grid-template-columns: 1fr; }
-}
-
-.mm-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  overflow: auto;
-  min-height: 0;
-  padding-right: 2px;
-}
-.mm-row {
-  display: block;
-  width: 100%;
-  text-align: left;
-  padding: 9px 11px;
-  border-radius: var(--r-sm);
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: inherit;
-  cursor: pointer;
-}
-.mm-row:hover { background: var(--row-hover); }
-.mm-row.active { border-color: var(--primary-bd); background: var(--primary-soft); }
-.mm-row-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.mm-row-title { font-weight: 600; font-size: 13.5px; }
-.mm-row-summary {
-  margin-top: 3px;
-  font-size: 12.5px;
-  color: var(--text-2);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-.mm-row-meta {
-  margin-top: 5px;
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-  font-size: 11.5px;
-  color: var(--text-3);
-}
-
-.mm-detail {
+/* ── 列表表格 ─────────────────────────────────────────────────
+   定高滚动 + 粘顶表头：几十行时表头必须一直在，否则滚到第 30 行就不知道
+   哪列是「项目」哪列是「Agent」了。
+   列宽用 table-layout: fixed 才生效 —— 标题列自适应吃掉剩余宽度，
+   其余六列按内容定宽。 */
+.mm-browse-card {
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--surface);
-  padding: 14px 16px;
+  overflow: hidden;
+  min-height: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+}
+.mm-browse-scroll {
   overflow: auto;
   min-height: 0;
+  flex: 1 1 auto;
 }
-.mm-detail-head h3 { margin: 0 0 6px; font-size: 15.5px; }
-.mm-detail-meta {
+.mm-browse-table {
+  width: 100%;
+  min-width: 940px;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 12.5px;
+}
+.mm-browse-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 8px 10px;
+  text-align: left;
+  font-weight: 500;
+  font-size: 11.5px;
+  color: var(--text-3);
+  background: var(--surface-2, var(--surface-inset));
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.mm-browse-table th.mm-bt-actions,
+.mm-browse-table td.mm-bt-actions { text-align: right; }
+
+.mm-bt-time { width: 92px; }
+.mm-bt-title { width: auto; }
+.mm-bt-layer { width: 72px; }
+.mm-bt-project { width: 132px; }
+.mm-bt-agent { width: 108px; }
+.mm-bt-mark { width: 128px; }
+.mm-bt-tags { width: 168px; }
+.mm-bt-actions { width: 56px; }
+
+.mm-browse-table tbody td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--text-2);
+  vertical-align: middle;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.mm-bt-row { cursor: pointer; }
+.mm-bt-row:hover td { background: var(--row-hover); }
+.mm-bt-row.is-active td { background: var(--primary-soft); }
+/* 已失效的行整行压暗：它的标题还在列表里（演化链要留着），但视觉上让位给
+   当前有效的那些。只压文字，不隐藏 —— 隐藏会让人以为记录丢了。 */
+.mm-bt-row.is-superseded td { opacity: 0.55; }
+
+.mm-bt-title-text {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.mm-bt-link { cursor: pointer; }
+.mm-bt-link:hover span { color: var(--primary); text-decoration: underline; }
+.mm-ellipsis {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mm-bt-mark-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+/* 重要度徽标：圆圈 + 整数档（1..5）。用圆圈而不是胶囊，是为了让「这一格是
+   一个数字」和「这一格是一段状态文字」在扫视时区分得开。 */
+.mm-bt-score {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 21px;
+  height: 21px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong, var(--border));
+  color: var(--text-2);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.mm-bt-empty {
+  padding: 30px 0 !important;
+  text-align: center;
+  color: var(--text-3);
+}
+/* 骨架屏：宽度靠内联 style 给，高度与圆角统一在这里 */
+.mm-bt-skeleton td span {
+  display: block;
+  height: 14px;
+  border-radius: 4px;
+  background: var(--surface-inset);
+  animation: mm-skeleton 1.2s ease-in-out infinite;
+}
+@keyframes mm-skeleton {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
+/* 行尾 ⋯：锚点容器 + 绝对定位菜单（不受表格 overflow: hidden 裁剪） */
+.mm-bt-menu-wrap { position: relative; display: inline-block; }
+.mm-bt-more {
+  width: 26px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--ok);
+  border-radius: var(--r-xs);
+  cursor: pointer;
+}
+.mm-bt-more:hover { background: var(--surface-2); }
+.mm-bt-menu-mask { position: fixed; inset: 0; z-index: 40; }
+.mm-bt-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 41;
+  width: 176px;
+  padding: 5px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.28);
+}
+.mm-pt-menu-item.is-danger { color: var(--danger, #e5534b); }
+
+/* 分页条 */
+.mm-browse-pager {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+.mm-pager-info {
+  margin-right: auto;
+  font-size: 12px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── 详情抽屉 ─────────────────────────────────────────────────
+   从右侧滑出、占 460px。为什么不做成「点行就地展开」：记忆正文是 Markdown，
+   高度随内容剧烈变化，就地展开会把下面所有行顶走；抽屉有固定的边界，
+   关掉就回到原位，滚动位置也不丢。 */
+.mm-drawer-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgb(0 0 0 / 0.42);
+  display: flex;
+  justify-content: flex-end;
+}
+.mm-drawer {
+  width: min(460px, 92vw);
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px 20px;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  overflow: auto;
+  box-shadow: -12px 0 32px rgb(0 0 0 / 0.28);
+}
+.mm-drawer-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.mm-drawer-title {
+  flex: 1 1 auto;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--text);
+}
+.mm-drawer-meta {
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
@@ -304,6 +590,122 @@
   font-size: 12px;
   color: var(--text-3);
 }
+.mm-drawer-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+/* ── 热力图 ───────────────────────────────────────────────────
+   53 列（周）× 7 行（星期）。格子 10px + 2px 间距：一年在一屏里装得下，
+   又大到能点中。颜色五档固定在类里，见 `HeatView` 的 bucket() 注释。 */
+.mm-heat {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  padding: 14px 16px;
+}
+.mm-heat-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  font-size: 12px;
+}
+.mm-heat-legend {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+.mm-heat-grid {
+  display: flex;
+  gap: 2px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.mm-heat-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mm-heat-cell {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  border: none;
+  padding: 0;
+  background: var(--surface-inset);
+  cursor: pointer;
+}
+.mm-heat-cell.is-0 { background: var(--surface-inset); }
+.mm-heat-cell.is-1 { background: color-mix(in oklab, var(--ok) 26%, var(--surface-inset)); }
+.mm-heat-cell.is-2 { background: color-mix(in oklab, var(--ok) 48%, var(--surface-inset)); }
+.mm-heat-cell.is-3 { background: color-mix(in oklab, var(--ok) 72%, var(--surface-inset)); }
+.mm-heat-cell.is-4 { background: var(--ok); }
+.mm-heat-cell:hover { outline: 1px solid var(--ok-bd); outline-offset: 1px; }
+/* 选中某天：白框套在绿块外，色深不影响「哪一天被点了」的辨识 */
+.mm-heat-cell.is-picked { outline: 2px solid var(--text); outline-offset: 1px; }
+
+/* 当日清单（点热力图某天后展开） */
+.mm-heat-day {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  padding: 12px 14px 14px;
+}
+.mm-heat-day-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+.mm-heat-day-head strong { font-weight: 600; }
+.mm-heat-day-head .btn { margin-left: auto; }
+.mm-heat-day-empty {
+  padding: 18px 0;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 12px;
+}
+.mm-heat-day-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 12.5px;
+}
+.mm-heat-day-table thead th {
+  padding: 6px 8px;
+  text-align: left;
+  font-weight: 500;
+  font-size: 11.5px;
+  color: var(--text-3);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.mm-heat-day-table tbody td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.mm-heat-day-table tbody tr { cursor: pointer; }
+.mm-heat-day-table tbody tr:hover td { background: var(--row-hover); }
+.mm-hd-time { width: 72px; }
+.mm-hd-title { width: auto; }
+.mm-hd-layer { width: 72px; }
+.mm-hd-score { width: 56px; }
+.mm-hd-agent { width: 108px; }
+
+.mm-review-page { display: flex; flex-direction: column; gap: 10px; }
 .mm-tags { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 7px; align-items: center; }
 .mm-files { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 7px; }
 .mm-files code {

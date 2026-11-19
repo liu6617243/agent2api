@@ -2,7 +2,7 @@ import * as React from 'react'
 import { Badge, Button, Input, Popover, PopoverContent, PopoverTrigger } from '@ui'
 import { t } from '../i18n'
 import * as m from './memory-api'
-import { Empty, Panel, timeText } from './memory-shared'
+import { agentText, Empty, Panel, timeText } from './memory-shared'
 
 /**
  * 项目页：一张表，一行一个项目。
@@ -35,25 +35,9 @@ import { Empty, Panel, timeText } from './memory-shared'
 /** 活跃窗口：7 天内有更新算活跃 */
 const ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 
-/** 写入方 → 界面显示名。
- *
- * 为什么只映射 `manual` / `import` 这两个固定值：其它都是用户自己配的
- * Agent 名（`WorkBuddy` / `distill` 之类），照原样显示才对 —— 用户认的是
- * 自己写的那个名字，替它改个说法反而认不出来。`manual` 与 `import` 不是
- * Agent，是两个固定来源，用中文更清楚。
- */
-const AGENT_LABELS: Record<string, string> = {
-  manual: '手动',
-  import: '导入',
-}
-
-function agentLabel(agent: string): string {
-  return AGENT_LABELS[agent] ?? agent
-}
-
-/** 关联 Agent 列表 → 「A · B · C」 */
+/** 写入方 → 界面显示名（`memory-shared` 里与浏览页共用一份，见 `agentText`）。 */
 function agentNames(agents: string[] | undefined): string {
-  return (agents ?? []).map(agentLabel).join(' · ')
+  return (agents ?? []).map(agentText).join(' · ')
 }
 
 type ProjectsProps = {

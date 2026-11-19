@@ -57,6 +57,16 @@ pub struct Query {
     /// 包含已过有效期（`valid_to`）的记忆
     pub include_expired: bool,
     pub limit: usize,
+    /// 跳过前 N 条。分页用：`offset = page * limit`
+    pub offset: usize,
+    /// 写入时间下界（含）。热力图点某天 → 拉那一天的清单。
+    ///
+    /// 为什么传毫秒而不是传「YYYY-MM-DD」：切天依赖**用户本地时区**，
+    /// 服务端不知道浏览器在哪个时区，跨零点那条会被切到错的一天。
+    /// 由前端按本地日历算出 `[from, to)` 两个端点传过来，边界最准。
+    pub created_from: Option<i64>,
+    /// 写入时间上界（不含）
+    pub created_to: Option<i64>,
 }
 
 fn now_ms() -> i64 {
@@ -64,7 +74,28 @@ fn now_ms() -> i64 {
 }
 
 /// 一次检索：取候选 → 过滤 → 打分排序 → 截断 → 记热度。
+///
+/// 只要当前页，不要总数 —— 调用方需要翻页时用 [`search_page`]。
+///
+/// 目前唯一调用方 `memory::list` 已改用 `search_page`（它要总数算页数）。
+/// 这条留着当「只取一页」的简写入口：MCP 侧与测试都在找它，删掉会让
+/// 调用方各写一遍 `.0`。
+#[allow(dead_code)]
 pub fn search(query: &Query) -> Vec<IndexRow> {
+    search_page(query).0
+}
+
+/// 一次检索，同时返回**过滤后的命中总数**。
+///
+/// ── 为什么总数必须在这里算 ──────────────────────────────────
+/// 分页要按命中数算页数。让调用方拿 `items.len()` 当总数，页数永远是
+/// 「第 1 / 1 页」—— 因为 `items` 已经被 `limit` 截断了。而重算一遍过滤
+/// 意味着把 `rows()` / `search()` / `keep()` / 打分排序整套再跑一次，等于
+/// 一次翻页做两遍全表扫描。所以总数在截断**之前**取，和当前页一起返回。
+///
+/// ── 热度只记当前页 ──────────────────────────────────────────
+/// `hit()` 表示「用户真的看到了这几条」，翻到第 5 页不该把第 1 页也算一次曝光。
+pub fn search_page(query: &Query) -> (Vec<IndexRow>, usize) {
     let mut rows = if query.text.trim().is_empty() {
         index::global().rows(query.include_deleted)
     } else {
@@ -72,14 +103,18 @@ pub fn search(query: &Query) -> Vec<IndexRow> {
     };
     rows.retain(|row| keep(row, query));
     score_and_sort(&mut rows, query);
+    let total = rows.len();
     let limit = if query.limit == 0 { 30 } else { query.limit.min(500) };
-    rows.truncate(limit);
+    let start = query.offset.min(total);
+    let end = (start + limit).min(total);
+    let mut rows = rows[start..end].to_vec();
     // 热度只记「关键词检索」的命中：无关键词的列表浏览不算「用户要看这条」
     if !query.text.trim().is_empty() {
         let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
         index::global().hit(&ids);
     }
-    rows
+    rows.shrink_to_fit();
+    (rows, total)
 }
 
 fn keep(row: &IndexRow, query: &Query) -> bool {
@@ -88,6 +123,18 @@ fn keep(row: &IndexRow, query: &Query) -> bool {
     }
     if row.superseded_by.is_some() && !query.include_superseded {
         return false;
+    }
+    // 写入时间窗（热力图点某天）。端点由前端按本地日历算好传进来，
+    // 这里只做区间判断，不再自己切天。
+    if let Some(from) = query.created_from {
+        if row.created_at < from {
+            return false;
+        }
+    }
+    if let Some(to) = query.created_to {
+        if row.created_at >= to {
+            return false;
+        }
     }
     if !query.include_expired {
         if let Some(until) = row.valid_to {

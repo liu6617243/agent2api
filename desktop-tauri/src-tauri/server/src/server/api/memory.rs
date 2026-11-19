@@ -4,7 +4,8 @@
 //! GET  /api/memory/config      模块设置 + schema + 一句话状态
 //! PUT  /api/memory/config      部分更新（只改传进来的键，扁平点号键）
 //! POST /api/memory/config/reset 恢复默认（?keys=a.b,c.d 或全量）
-//! GET  /api/memory/list        检索 / 列表（query 为空 = 按时间列）
+//! GET  /api/memory/list        检索 / 列表（query 为空 = 按时间列；offset+limit 分页）
+//! GET  /api/memory/heat        每日写入量（浏览页热力图，?days=365）
 //! GET  /api/memory/get         按 id 取全文（?ids=a,b 或 ?id=a）
 //! GET  /api/memory/core        核心记忆文本（MCP `memory_core` 的同一份产出）
 //! GET  /api/memory/digest      索引概览（≤200 行）
@@ -72,6 +73,15 @@ fn flag(map: &HashMap<String, String>, key: &str) -> Option<bool> {
 
 fn number(map: &HashMap<String, String>, key: &str) -> Option<usize> {
     map.get(key).and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+/// 有符号整数参数。
+///
+/// 单独一支是因为 `number()` 只认 `usize`：西半球时区偏移是负数（纽约 -300），
+/// 传进来会被 `parse::<usize>` 判失败、静默退回 0 —— 热力图的「今天」就
+/// 跑到 UTC 那天上，界面不报错但日期对不上。
+fn signed(map: &HashMap<String, String>, key: &str) -> Option<i64> {
+    map.get(key).and_then(|value| value.trim().parse::<i64>().ok())
 }
 
 fn text(map: &HashMap<String, String>, key: &str) -> Option<String> {
@@ -153,8 +163,26 @@ pub async fn get_list(State(_state): State<ServerState>, Query(params): Query<Ha
         include_deleted: flag(&params, "includeDeleted").unwrap_or(false),
         include_expired: flag(&params, "includeExpired").unwrap_or(false),
         limit: number(&params, "limit").unwrap_or_else(|| memory_config::usize_of("ui.pageSize").max(1)),
+        // 分页偏移。不传 = 第一页；传了也由 `search_page` 自己夹到 [0, total]，
+        // 页面数变少后停在末页不会拿到空表以外的错误。
+        offset: number(&params, "offset").unwrap_or(0),
+        // 写入时间窗（毫秒）。热力图点某天 → 拉那一天的清单。
+        // 端点由前端按**本地日历**算好传过来，服务端不再自己切天，
+        // 免得跨零点那条被切到错的一天。
+        created_from: signed(&params, "from"),
+        created_to: signed(&params, "to"),
     };
     ok_json(memory::list(&query))
+}
+
+/// `GET /api/memory/heat?days=365&tz=480` —— 浏览页热力图视图的日粒度写入量。
+///
+/// `tz` 是「本地时间比 UTC 快多少分钟」（东八区 = 480），由前端从
+/// `-new Date().getTimezoneOffset()` 直接取，这样热力图的「今天」与用户日历一致。
+pub async fn get_heat(State(_state): State<ServerState>, Query(params): Query<HashMap<String, String>>) -> Response {
+    let days = number(&params, "days").unwrap_or(365);
+    let tz = signed(&params, "tz").unwrap_or(0);
+    ok_json(memory::heat(days, tz))
 }
 
 pub async fn get_one(State(_state): State<ServerState>, Query(params): Query<HashMap<String, String>>) -> Response {
