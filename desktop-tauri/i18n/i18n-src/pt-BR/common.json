@@ -940,5 +940,12 @@
   "成功 {ok} 次 / 有效运行 {judged} 次（跳过 {skipped} 次不计入）": "{ok} sucessos / {judged} execuções efetivas ({skipped} ignoradas não entram no cálculo)",
   "全部跳过": "Tudo ignorado",
   "留空 = 按标签 + 优先级": "Vazio = seguir tag + prioridade",
-  "{task} 指定模型": "Modelo definido para {task}"
+  "{task} 指定模型": "Modelo definido para {task}",
+  "（预填默认值，可改）": "(valor padrão preenchido, editável)",
+  "还没填 WebDAV 账号": "Conta WebDAV ainda não preenchida",
+  "还没填 WebDAV 账号，远端没有设备。": "Sem conta WebDAV, não há dispositivos no remoto.",
+  "待填 WebDAV 账号": "Conta WebDAV pendente",
+  "电脑名（下方设备列表里显示）": "Nome do computador (aparece na lista de dispositivos abaixo)",
+  "还没填 WebDAV 密码": "Senha WebDAV ainda não preenchida",
+  "WebDAV 地址是空的": "O endereço WebDAV está vazio"
 }

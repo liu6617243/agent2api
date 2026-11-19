@@ -490,8 +490,22 @@ export type AgentSnippet = {
 /* ─── 同步（sync::status / devices / conflicts）─────────────── */
 
 export type SyncStatus = {
+  /**
+   * 「配好了没」——判据是**账号非空**，不是地址非空。
+   *
+   * 地址有默认值（坚果云）之后恒有值，从没动过配置的机器也有地址；如果还按
+   * 「地址非空」判断，第一次打开同步页就会显示「已配置」，而实际连一次都跑不成。
+   */
   configured: boolean
+  /** 生效地址（用户填的，或默认值；保留用户写的尾斜杠形态） */
   url: string
+  /**
+   * 这串地址是不是我们预填的默认值（`sync.url` 没填过）。
+   *
+   * 没有它，界面分不出「用户填的坚果云」和「从没动过、我们预填的坚果云」——
+   * 两种情况下输入框里是同一串字符。有它就能给地址标一句「默认值」。
+   */
+  urlDefault?: boolean
   remoteDir: string
   /**
    * 存储类型。本仓只实现了 `webdav`；`s3` 是**存得下、跑不起来**的配置
@@ -511,6 +525,14 @@ export type SyncStatus = {
   preset?: string
   device: string
   deviceName: string
+  /**
+   * 系统电脑名（Windows 上是 `COMPUTERNAME`）。
+   *
+   * 「这台机器叫什么」系统本来就知道，让用户手打一遍只会多出一个打错的机器名。
+   * `deviceName` 没填过时用它当默认值；取不到时是空串（不是 `"unknown"` ——
+   * 那个词会被当成真实的机器名写进配置、再传到别的设备的列表里）。
+   */
+  hostName?: string
   enabled: boolean
   auto: boolean
   intervalMin: number
@@ -528,7 +550,15 @@ export type SyncStatus = {
   /** 五个模块各自的远端目录，以及本仓有没有实现它的同步 */
   modules?: SyncModuleDir[]
   devices?: {
-    devices: { package: string; device: string; self: boolean; lastSyncAt?: number }[]
+    devices: {
+      package: string
+      /** 设备 id（包名去掉 `.tar.gz`）—— 身份，不随改名而变 */
+      device: string
+      /** 人看得懂的名字（别的设备报上来的 `sync.deviceName`）；空串 = 还没读到过 */
+      name?: string
+      self: boolean
+      lastSyncAt?: number
+    }[]
     configured: boolean
   }
   skippedPaths?: { paths: string[] }

@@ -230,12 +230,17 @@ type SetupForm = {
 function formOf(data: m.SyncStatus): SetupForm {
   return {
     provider: data.provider ?? 'webdav',
+    // 地址后端已经兜了默认值（坚果云），所以这里拿到的一定是「该显示的那串」：
+    // 用户填过就是他填的，没填过就是默认值。地址框因此不是空的 —— 用户只需补账号密码。
     url: data.url ?? '',
     username: data.username ?? '',
     password: '',
     confirmPhrase: '',
     remoteDir: data.remoteDir ?? '',
-    deviceName: data.deviceName ?? '',
+    // 电脑名没填过就用系统电脑名预填：系统本来就知道这台机器叫什么，让用户手打
+    // 一遍只会多出一个打错的机器名（多设备列表里就多出一台不存在的机器）。
+    // 预填之后它就是一个**看得见、可改、保存即落盘**的值，而不是一个空框。
+    deviceName: data.deviceName || data.hostName || '',
     preset: String(data.preset ?? 'custom'),
     modules: Object.fromEntries((data.modules ?? []).map(item => [item.id, item.dir])),
   }
@@ -381,7 +386,15 @@ function Sync(): React.ReactElement {
 
         <div className='mm-sync-pair'>
           <label className='mm-sync-field'>
-            <span className='mm-sync-field-label'>{t('服务器地址（WebDAV）')}</span>
+            <span className='mm-sync-field-label'>
+              {t('服务器地址（WebDAV）')}
+              {/* 「默认值」这枚标记只在 `sync.url` 没填过时出现：框里那串是后端
+                  替我们填的坚果云地址，不是用户确认过的。不标出来，用户会以为
+                  自己上次填过它。改任何一个字符（或保存一次）它就消失。 */}
+              {data.urlDefault ? (
+                <span className='mm-sync-field-aside'>{t('（预填默认值，可改）')}</span>
+              ) : null}
+            </span>
             <Input
               value={current.url}
               placeholder='https://dav.jianguoyun.com/dav/'
@@ -624,7 +637,11 @@ function Sync(): React.ReactElement {
             按钮也紧跟在输入框右边。 */}
         <div className='mm-sync-device'>
           <label className='mm-sync-field-label' htmlFor='mm-sync-device-name'>
-            {t('电脑名（用量统计在多设备列表中显示）')}
+            {/* 这里是「同步设备列表」里显示的名字，不是用量统计的 —— 本仓的用量
+                统计没有多设备视图，照抄目标界面那句「多设备列表中显示」等于承诺了
+                一个不存在的地方。名字真正的去处：随包上传进 `manifest.name`，
+                别的机器在下面「设备列表」里看到的就是它。 */}
+            {t('电脑名（下方设备列表里显示）')}
           </label>
           <div className='mm-sync-inline'>
             <Input
@@ -632,6 +649,9 @@ function Sync(): React.ReactElement {
               className='mm-sync-device-input'
               value={current.deviceName}
               spellCheck={false}
+              /* 占位符给设备 id：电脑名已经预填成系统电脑名了，框里通常不是空的，
+                 这行占位符只在用户手动清空后可见 —— 那时他需要知道「留空会退到什么」，
+                 答案就是同步包名用的设备 id。 */
               placeholder={data.device}
               onChange={event => put({ deviceName: event.target.value })}
             />
@@ -688,10 +708,12 @@ function Sync(): React.ReactElement {
         </div>
 
         {quick.map(item => {
-          // 记忆那行才需要「就绪」判断：地址与密码是它跑起来的前提。
+          // 记忆那行才需要「就绪」判断：账号与密码是它跑起来的前提。
+          // `configured` 的判据是**账号非空**（地址有默认值，恒有值），所以
+          // 不满足时该说的是「还没填账号」，而不是「还没填地址」。
           const ready = data.configured && data.hasPassword !== false
           const blocked = !data.configured
-            ? t('还没填 WebDAV 地址')
+            ? t('还没填 WebDAV 账号')
             : t('还没填 WebDAV 密码')
           const enabled = item.implemented && ready
           return (
@@ -779,7 +801,7 @@ function Sync(): React.ReactElement {
         <div className='mm-sync-grid'>
           <span>{t('服务器')}</span>
           <div className='mm-sync-cell'>
-            <code>{data.url || t('未填写 WebDAV 地址')}</code>
+            <code>{data.url}</code>
             {/* 「修改凭据」和「测连接」都只跟服务器地址有关，所以都放在这一行，
                 而不是散在页头 —— 用户要改/验的就是眼前这一个地址。
                 「修改凭据」不再跳页签：凭据输入框就在本页最上面，点它滚过去即可。 */}
@@ -790,7 +812,11 @@ function Sync(): React.ReactElement {
               type='button'
               size='sm'
               variant='ghost'
-              disabled={busy === 'test' || !data.configured}
+              /* 不再按 `configured` 禁用：地址有默认值之后，「先点一下测连接」是
+                 一个有用的第一动作 —— 没填账号时它会如实回「认证失败（HTTP 401）」，
+                 而那恰好证明「地址是对的，只缺账号密码」。灰掉这个按钮等于把
+                 「验证地址」这件事从首屏拿走了。 */
+              disabled={busy === 'test'}
               onClick={() =>
                 void act('test', async () => {
                   const result = await m.testSync()
@@ -948,7 +974,10 @@ function Sync(): React.ReactElement {
 
         {devices.length === 0 ? (
           <div className='mm-sync-empty'>
-            {data.configured ? t('远端还没有任何包，下一次「立即同步」会创建第一个。') : t('未配置 WebDAV，没有设备。')}
+            {/* 两种空态：没账号 = 「还没开始配」，有账号 = 「配好了但远端还没有包」。
+                这里不能再说「未配置 WebDAV」—— 地址栏里明明白白填着地址，用户会
+                觉得页面在自相矛盾。 */}
+            {data.configured ? t('远端还没有任何包，下一次「立即同步」会创建第一个。') : t('还没填 WebDAV 账号，远端没有设备。')}
           </div>
         ) : (
           <div className='mm-device-table'>
@@ -959,7 +988,16 @@ function Sync(): React.ReactElement {
             {devices.map(item => (
               <div key={item.package} className={item.self ? 'mm-device-row is-self' : 'mm-device-row'}>
                 <span className='mm-device-name'>
-                  <code title={item.device}>{item.device}</code>
+                  {/* 主名用人看得懂的显示名（`sync.deviceName`），设备 id 进 title：
+                      「我的笔记本」是给人认的，`3f7a1c0e` 是用来对包的。
+                      名字没读到过（这台设备还没被同步过）就退回设备 id，
+                      而不是显示一片空白。
+                      不把 id 也排在名字后面：这一列只有 120px（见
+                      `page-memory.css` 的注释），两段挤在一行会把名字截成省略号，
+                      而这一列唯一的用途就是「哪台设备」。 */}
+                  <code title={item.name ? `${item.name} · ${item.device}` : item.device}>
+                    {item.name || item.device}
+                  </code>
                 </span>
                 <span
                   className={item.self ? 'mm-device-when self' : 'mm-device-when'}

@@ -53,6 +53,16 @@ pub struct FileEntry {
 pub struct Manifest {
     /// 打包设备 id
     pub device: String,
+    /// 打包设备的**显示名**（`sync.deviceName`，没填过就是系统电脑名）。
+    ///
+    /// 加它是为了让「设备列表」能显示人看得懂的名字：包名是设备 id（那串
+    /// 十六进制是**身份**，改名会换掉远端文件名、把「自己」认成别人），
+    /// 而列表里该出现的是「我的笔记本」。
+    ///
+    /// `serde(default)` 不能省：旧版本打出的包里没有这个键，没有默认值会让
+    /// 整个清单解析失败 —— 那不是「少个名字」，是「这个包读不出来」。
+    #[serde(default)]
+    pub name: String,
     /// 打包时刻（epoch ms）
     pub created_at: i64,
     /// 相对路径 → 文件信息
@@ -63,9 +73,24 @@ impl Manifest {
     fn empty(device: &str) -> Self {
         Self {
             device: device.to_string(),
+            name: String::new(),
             created_at: crate::server::logging::now_ms(),
             files: BTreeMap::new(),
         }
+    }
+}
+
+/// 本机显示名：`sync.deviceName`，没填过退到系统电脑名，再取不到就是空串。
+///
+/// 「空串」在这里是合法且常见的：用户可能既没填显示名、环境里也读不到
+/// `COMPUTERNAME`。调用方据此决定「显示什么」—— 包名那边仍用设备 id，
+/// 这里只负责「给人看的那一份」。
+fn display_name() -> String {
+    let configured = config::text_of("sync.deviceName").trim().to_string();
+    if configured.is_empty() {
+        store::hostname().trim().to_string()
+    } else {
+        configured
     }
 }
 
@@ -80,6 +105,17 @@ const LAST_KEY: &str = "sync.last.at";
 
 /// 最近一次同步结果摘要。
 const LAST_RESULT_KEY: &str = "sync.last.result";
+
+/// 远端设备 id → 它自己报的显示名（`Manifest::name`）。
+///
+/// 为什么要有这份缓存：设备列表是 PROPFIND 出来的，只能看到包名（设备 id），
+/// 看不到包里那份 manifest。而「把那串十六进制显示成我的笔记本」唯一的来源
+/// 就是包里的 `name` —— 它只在下行那一刻被读到过。存下来，列表才有名字可用。
+///
+/// 不为了拿名字去逐个下载远端包：列表页会因此等上几秒甚至几十秒（每个包都要
+/// 完整下载一次），而名字只是显示层的锦上添花。缓存不到就退回设备 id，如实显示
+/// 「这一台的名字我还不知道」。
+const NAMES_KEY: &str = "sync.names";
 
 /// 「不再同步这个文件」的路径集合（用户裁决为 ignore 的那些）。
 ///
@@ -112,6 +148,8 @@ fn excluded(name: &str) -> bool {
 pub fn local_manifest() -> Manifest {
     let root = store::root();
     let mut manifest = Manifest::empty(&store::device_id());
+    // 显示名随包走：别的设备解包时没有本机的 config.json，只能从清单里读。
+    manifest.name = display_name();
     for prefix in sync_roots() {
         let dir = root.join(prefix);
         collect(&dir, &root, &mut manifest);
@@ -214,8 +252,68 @@ fn unpack(bytes: &[u8]) -> Result<(Manifest, BTreeMap<String, String>), String> 
 
 // ── WebDAV 客户端 ────────────────────────────────────────────
 
+/// 拼 URL 用的地址：**无尾斜杠**（`format!("{}/{}", base_url(), dir)` 靠这个）。
 fn base_url() -> String {
-    config::text_of("sync.url").trim().trim_end_matches('/').to_string()
+    configured_url().trim_end_matches('/').to_string()
+}
+
+/// 默认 WebDAV 地址（坚果云）。
+///
+/// ── 为什么要有默认值而不是「留空 = 未配置」──────────────
+/// 第一次打开同步页时，用户面对的是空地址 + 一句「未配置」，还得自己去查
+/// 「坚果云的 WebDAV 地址是什么」。而绝大多数人就接坚果云 —— 填好默认值，
+/// 界面一打开就是「填了地址、缺账号密码」，用户只需要补两格。
+///
+/// ── 为什么它必须和「用户主动清空」区分开 ─────────────────
+/// `sync.url` 的存储值仍然是空串（默认值不写进配置），所以：
+///   · 用户没填过 → 这里返回默认地址，界面显示它；
+///   · 用户填了别的 → 用他填的；
+///   · 用户想过「我不同步」→ 走「清除配置」或者关 `sync.enabled`，
+///     而不是清空地址框（清空了下一帧又会回到默认值）。
+/// 这个取舍是为了「打开就能用」，代价是「清空地址」不再等于「关闭同步」——
+/// 后者本来就该由开关表达，而不是由一个输入框是否为空表达。
+///
+/// 尾斜杠留在这里：它就是界面输入框里显示的那串（截图里也是带斜杠的），
+/// `base_url()` 拼路径前自己会剥掉。
+const DEFAULT_URL: &str = "https://dav.jianguoyun.com/dav/";
+
+/// 生效地址：用户填的，或者默认值（**保留用户写的那个形态**）。
+///
+/// 与 `base_url()` 的分工：这里不做任何修剪，就是「界面上该显示的那串」；
+/// `base_url()` 在它上面只做一件事 —— 剥尾斜杠给拼 URL 用。
+///
+/// 为什么回显要保留尾斜杠：`base_url()` 剥完变成 `https://dav.jianguoyun.com/dav`，
+/// 与用户（以及坚果云文档里）看到的写法差一个字符，看起来像「我填的那串被改过」。
+fn configured_url() -> String {
+    resolve_url(&config::text_of("sync.url"))
+}
+
+/// `configured_url` 的纯函数内核：`sync.url` 的存值 → 生效地址。
+///
+/// 拆出来是为了**可测**：`configured_url` 要读磁盘上的 config.json，而这里的
+/// 关键约定恰好是「空串 → 默认值、非空 → 原样」这一条 —— 测不到它，就等于
+/// 「默认地址」这个功能没有回归测试。
+fn resolve_url(stored: &str) -> String {
+    let trimmed = stored.trim();
+    if trimmed.is_empty() {
+        DEFAULT_URL.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// 凭据齐没齐 —— 也就是界面上那句「配好了没」。
+///
+/// 地址有默认值之后，「地址非空」不再能回答这个问题 —— 从没动过配置的机器也有
+/// 地址。所以判据改成**账号非空**（密码允许为空：少数自建 WebDAV 只认用户名，
+/// 或者走匿名写）。同步页的「未配置」徽标、设备列表的空态、快速同步的就绪判断、
+/// 自动化任务的跳过条件都读这一个判据，避免「一次都没配过」被显示成「已配置」。
+///
+/// 不用 `has_password`：坚果云这类必须密码，但自建服务里「只填用户名」是合法
+/// 配置，把它判成未配置会让用户永远停在「未配置」。密码缺失在真发请求时由
+/// 401 如实报出来，不需要在这里猜。
+fn has_credentials() -> bool {
+    !config::text_of("sync.username").trim().is_empty()
 }
 
 fn remote_dir() -> String {
@@ -642,14 +740,22 @@ pub fn run(manual: bool) -> super::enrich::Outcome {
     if !config::bool_of(config::ENABLE_KEY) {
         return Outcome::Skipped("记忆中枢已关闭".into());
     }
-    if base_url().is_empty() {
-        return Outcome::Skipped("未配置 WebDAV 地址（sync.url）".into());
-    }
     if !manual && !config::bool_of("sync.enabled") {
         return Outcome::Skipped("同步总开关已关闭（sync.enabled）".into());
     }
     if !manual && !config::bool_of("sync.auto") {
         return Outcome::Skipped("自动同步已关闭（sync.auto）".into());
+    }
+    // 自动跑（定时）没账号就直接跳过。地址现在有默认值（坚果云），
+    // `base_url()` 不再是「配没配」的判据 —— 不在这里拦，一台从没填过账号的
+    // 机器会定期往坚果云发一次注定 401 的 PROPFIND，日志里堆满「失败」，
+    // 而用户从没打算用同步。
+    //
+    // 手动跑不拦：用户点「立即同步」就是想看到真实结果（包括那句「认证失败」）。
+    // 原来那句「未配置 WebDAV 地址（sync.url）」的跳过分支随之删掉 —— 地址恒有值，
+    // 它已经是不可达代码；「没配好」由 `has_credentials()` 表达。
+    if !manual && !has_credentials() {
+        return Outcome::Skipped("还没填 WebDAV 账号（sync.username）".into());
     }
 
     let device = store::device_id();
@@ -723,6 +829,8 @@ pub fn run(manual: bool) -> super::enrich::Outcome {
                 "本地与远端都改过同一份记忆",
             );
         }
+        // 第一次见到这台设备（或它改过显示名）时记下名字，设备列表要用。
+        remember_name(&manifest.device, &manifest.name);
         index::global().sync_log_add(
             &manifest.device,
             "pull",
@@ -876,6 +984,33 @@ fn remove_file(relative: &str) -> bool {
 
 // ── 基线存取 ─────────────────────────────────────────────────
 
+/// 读设备名缓存（`device id → 显示名`）。
+fn load_names() -> BTreeMap<String, String> {
+    index::global()
+        .sync_get(NAMES_KEY)
+        .and_then(|(raw, _)| serde_json::from_str::<BTreeMap<String, String>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// 记下某台设备的显示名。空名字不落盘 —— 那等于把「不知道」记成「叫空串」。
+///
+/// 只在名字变了才写库：每次同步都会走到这里，无条件写会让 `sync_state` 的
+/// `updated_at` 每轮都跳一次，而它本来代表的是「名字这份数据什么时候变过」。
+fn remember_name(device: &str, name: &str) {
+    let name = name.trim();
+    if device.is_empty() || name.is_empty() {
+        return;
+    }
+    let mut names = load_names();
+    if names.get(device).map(String::as_str) == Some(name) {
+        return;
+    }
+    names.insert(device.to_string(), name.to_string());
+    if let Ok(raw) = serde_json::to_string(&names) {
+        index::global().sync_set(NAMES_KEY, &raw);
+    }
+}
+
 fn load_base() -> BTreeMap<String, FileEntry> {
     index::global()
         .sync_get(BASE_KEY)
@@ -944,7 +1079,9 @@ pub fn summary() -> Value {
         if value.trim().is_empty() { "webdav".to_string() } else { value.trim().to_string() }
     };
     json!({
-        "configured": !base_url().is_empty(),
+        // 这里不再看 `base_url()`：地址有默认值，恒非空。判据是「有没有账号」，
+        // 与 `status()` / 快速同步 / 自动同步的跳过条件同一口径。
+        "configured": has_credentials(),
         "enabled": config::bool_of("sync.enabled"),
         "provider": provider,
         "lastSyncAt": if last_at > 0 { json!(last_at) } else { Value::Null },
@@ -953,7 +1090,7 @@ pub fn summary() -> Value {
 
 /// 同步页顶部状态。
 pub fn status() -> Value {
-    let configured = !base_url().is_empty();
+    let configured = has_credentials();
     let device = store::device_id();
     let last_at = index::global()
         .sync_get(LAST_KEY)
@@ -980,12 +1117,21 @@ pub fn status() -> Value {
     };
     json!({
         "configured": configured,
-        "url": base_url(),
+        // 回显用 `configured_url()`（保留用户写的形态，含尾斜杠）：这是输入框里
+        // 该出现的那串。`base_url()` 剥过尾斜杠，只适合拼路径。
+        "url": configured_url(),
+        // 这串地址是不是「我们替他填的默认值」。
+        //
+        // 没有这个字段，界面分不出「用户填的坚果云地址」与「用户从没动过、
+        // 我们预填的坚果云地址」—— 两种情况下输入框里都是同一个字符串。
+        // 有了它，界面可以在地址旁边标一句「默认值」，用户就知道这一格还没确认过。
+        "urlDefault": config::text_of("sync.url").trim().is_empty(),
         "remoteDir": remote_dir(),
         "provider": provider,
-        // 远端完整地址（地址 + 目录）。地址为空时给空串而不是「/目录」——
-        // 后者在界面上看起来像「配置了一半」，实际上就是没配。
-        "remoteUrl": if configured { remote_url() } else { String::new() },
+        // 远端完整地址（地址 + 目录）。地址恒有值（默认值兜底），所以这里不再
+        // 按 `configured` 置空 —— 拼出来的地址是「真要去连的那个」，与地址框
+        // 里显示的一致；「没配好」由 `configured` 单独表达。
+        "remoteUrl": remote_url(),
         // 凭据的三个事实：账号有没有、密码有没有。密码是 Secret 键，这里只问
         // 「配过没有」，不去解它 —— 解出来唯一需要的地方是发请求时的
         // `auth_headers`。
@@ -997,6 +1143,13 @@ pub fn status() -> Value {
         "preset": preset,
         "device": device,
         "deviceName": config::text_of("sync.deviceName"),
+        // 系统电脑名（Windows 上是 `COMPUTERNAME`）。界面在 `sync.deviceName`
+        // 还没填过时拿它当默认值 —— 「这台机器叫什么」系统本来就知道，让用户
+        // 自己手打一遍（打错了多设备列表里就多出一台不存在的机器）没有意义。
+        //
+        // 取不到时是空串，不是 `"unknown"`：那个词会被当成一个真实的机器名
+        // 写进配置、再传到别的设备的列表里。
+        "hostName": store::hostname(),
         "enabled": config::bool_of("sync.enabled"),
         "auto": config::bool_of("sync.auto"),
         "intervalMin": config::number("sync.intervalMin") as i64,
@@ -1019,11 +1172,19 @@ pub fn status() -> Value {
 }
 
 /// 远端设备列表。
+///
+/// 没账号就**不发请求**：地址有默认值之后这里恒有 URL，照旧往下走会变成
+/// 「每次打开同步页都向坚果云发一次匿名 PROPFIND」—— 结果是 401 + 空列表，
+/// 而界面已经知道「未配置」，这次出网纯属浪费（且无人账号下请求日志会很难看）。
 pub fn devices() -> Value {
-    if base_url().is_empty() {
+    if !has_credentials() {
         return json!({ "devices": [], "configured": false });
     }
     let own = own_package_name(&store::device_id());
+    let names = load_names();
+    // 本机的名字就地算：其他设备的名字来自同步包里报的那份（`remember_name`
+    // 缓存），本机不用等一次下行 —— 它现在就能读自己的配置。
+    let own_name = display_name();
     let last_at = index::global()
         .sync_get(LAST_KEY)
         .and_then(|(raw, _)| raw.trim().parse::<i64>().ok())
@@ -1032,12 +1193,22 @@ pub fn devices() -> Value {
         .into_iter()
         .map(|pack| {
             let is_self = pack.name == own;
+            let device = pack.name.trim_end_matches(".tar.gz").to_string();
+            // 名字的优先级：本机现算 → 下行时缓存下来的那份 → 空串（界面退回设备 id）。
+            let name = if is_self {
+                own_name.clone()
+            } else {
+                names.get(&device).cloned().unwrap_or_default()
+            };
             json!({
                 // 本机的「最后同步」用本机记录的同步时刻；别的设备只能靠远端包的
                 // 修改时间 —— 那个包是它上传的那一刻写的，语义上就是它的最后同步。
                 "lastSyncAt": if is_self { last_at } else { pack.modified_at },
                 "package": pack.name,
-                "device": pack.name.trim_end_matches(".tar.gz").to_string(),
+                "device": device,
+                // 人看得懂的那个名字。空串表示「还没从它的包里读到过」——
+                // 界面据此显示设备 id，而不是编一个名字出来。
+                "name": name,
                 "self": is_self,
             })
         })
@@ -1200,7 +1371,17 @@ impl Credentials {
     fn with_probe(probe: &Probe) -> Self {
         let mut next = Self::saved();
         if let Some(url) = &probe.url {
-            next.url = url.trim().trim_end_matches('/').to_string();
+            // 空串按「回到默认地址」处理，而不是「测一个空地址」。地址有默认值
+            // 之后，界面上把地址框清空的语义就是「用默认的」，与保存时同口径
+            // （`sync.url` 存空串 → `configured_url()` 给默认值）。照抄成空串会让
+            // 「清空地址框 + 测连接」得到一句「未填写 WebDAV 地址」，而框里实际
+            // 显示着一串默认地址 —— 界面与结论互相打架。
+            let trimmed = url.trim();
+            next.url = if trimmed.is_empty() {
+                DEFAULT_URL.trim_end_matches('/').to_string()
+            } else {
+                trimmed.trim_end_matches('/').to_string()
+            };
         }
         if let Some(user) = &probe.username {
             next.username = user.trim().to_string();
@@ -1242,8 +1423,13 @@ impl Credentials {
 /// 才有值 —— 有些实现（坚果云的根路径、部分 S3 网关）会拒绝或多回，那种情况下
 /// 保持 `None`，界面上只报「连接正常」，不编一个数字出来。
 fn probe_with(creds: &Credentials) -> (bool, String, Option<usize>) {
+    // 正常路径下到不了这里：`saved()` 走 `base_url()`（默认值兜底），
+    // `with_probe()` 把空串也折回默认值，两条来源都恒非空。留着这道闸是防
+    // 「以后有人从别处拼一份 Credentials 进来」—— 那时该报的是「地址是空的」，
+    // 而不是让 `format!("{}/{}")` 拼出一条 `/agent2api-memory` 这种相对路径去
+    // 发给 reqwest（它会当成无 host 的非法 URL，错误信息里看不出是配置问题）。
     if creds.url.is_empty() {
-        return (false, "未填写 WebDAV 地址".to_string(), None);
+        return (false, "WebDAV 地址是空的".to_string(), None);
     }
     let url = creds.remote_url();
     let client = crate::server::core::egress::client_for(None);
@@ -1527,6 +1713,42 @@ mod tests {
         assert_eq!(packs.len(), 1);
         assert_eq!(packs[0].name, "dev-a.tar.gz");
         assert!(packs[0].modified_at > 0);
+    }
+
+    /// 默认地址这条链路的三条约定：空串兜底、用户值原样、拼 URL 时剥尾斜杠。
+    ///
+    /// 三个断言各自锁住一个曾经/可能出错的点：
+    ///   · `""` 不兜底 → 第一次打开同步页是个空框，用户得自己去查坚果云地址；
+    ///   · 非空值被改写（比如被 `trim_end_matches` 处理过）→ 回显的地址与用户
+    ///     填的那串差一个字符，看起来像「我的配置被系统改了」；
+    ///   · `base_url()` 没剥尾斜杠 → `format!("{}/{}", ..)` 拼出 `.../dav//dir`，
+    ///     部分反代会 404，而错误信息里那串双斜杠看起来像客户端 bug。
+    #[test]
+    fn url_falls_back_to_default_and_strips_trailing_slash_for_requests() {
+        assert_eq!(resolve_url(""), DEFAULT_URL);
+        assert_eq!(resolve_url("   "), DEFAULT_URL);
+        assert_eq!(resolve_url(" https://dav.example.com/dav/ "), "https://dav.example.com/dav/");
+        assert!(!DEFAULT_URL.trim_end_matches('/').ends_with('/'));
+        // 回显形态带斜杠、拼 URL 用的形态不带 —— 两者必须都能从同一个值推出来。
+        assert_eq!(resolve_url("").trim_end_matches('/'), "https://dav.jianguoyun.com/dav");
+    }
+
+    /// 旧版本打的包里没有 `name`，解析不能因此整包失败。
+    ///
+    /// `Manifest::name` 是后加的字段。缺了 `serde(default)`，`serde_json::from_str`
+    /// 会报 `missing field 'name'`，`unpack` 里那句 `.ok()` 把它吞成 `None`，
+    /// 于是整个包被当成「没有 manifest.json」—— 用户看到的是「同步包缺少
+    /// manifest.json」，而包其实完好。这条断言就是拦这个的。
+    #[test]
+    fn manifest_without_name_field_still_parses() {
+        let legacy = json!({
+            "device": "abc123",
+            "created_at": 1700000000000i64,
+            "files": {},
+        });
+        let manifest: Manifest = serde_json::from_value(legacy).expect("旧包必须能解析");
+        assert_eq!(manifest.device, "abc123");
+        assert!(manifest.name.is_empty(), "缺字段时是空串，不是猜一个名字");
     }
 
     #[test]

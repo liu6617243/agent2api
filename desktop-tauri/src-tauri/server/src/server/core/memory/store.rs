@@ -962,10 +962,20 @@ pub fn device_id() -> String {
         .clone()
 }
 
-fn hostname() -> String {
+/// 系统电脑名。
+///
+/// Windows 上 `COMPUTERNAME` 就是「此电脑 → 属性」里那个名字；Unix 上退到
+/// `HOSTNAME`（`gethostname` 在多数发行版也塞进这个环境变量）。不引
+/// `hostname` / `sysinfo` 这类 crate —— 这里要的只是「界面上默认填什么」，
+/// 取不到时给空串让界面自己回落，不值得为它加一个依赖。
+///
+/// 为什么不给 `"unknown"`：那个词会被当成一个真实的机器名写进配置、传到
+/// 仪表盘和设备列表里，用户看到会以为自己的机器叫什么 unknown。空串的语义
+/// 是「没取到」，界面据此保留占位符。
+pub(crate) fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
+        .unwrap_or_default()
 }
 
 /// 进程内伪随机（不引 rand：设备 id 只需要「本机唯一」，不需要密码学强度）。

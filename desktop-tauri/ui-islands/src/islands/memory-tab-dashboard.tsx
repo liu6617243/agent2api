@@ -245,11 +245,17 @@ function Dashboard({ status, onGo, onChanged }: DashboardProps): React.ReactElem
               {sync.data
                 ? sync.data.configured
                   ? (sync.data.lastSyncAt ? t('上次 {when}', { when: timeText(sync.data.lastSyncAt) }) : t('已配置，还没同步过'))
-                  : t('未配置 WebDAV')
+                  /* `configured` 的判据是账号非空（地址有默认值）。所以这句话
+                     不能说「未配置 WebDAV」—— 地址一直是有的，缺的是账号。
+                     在仪表盘这一格里，用户需要知道的是「还差哪一步」。 */
+                  : t('待填 WebDAV 账号')
                 : '—'}
             </code>
             <span>{t('设备')}</span>
-            <code>{sync.data?.deviceName || sync.data?.device || '—'}</code>
+            {/* 顺序：显示名 → 系统电脑名 → 设备 id。
+                `deviceName` 没填过时用 `hostName`（系统电脑名）而不是直接掉到那串
+                十六进制 id —— 仪表盘上「设备」这一格是给人看的，`3f7a1c0e` 谁也认不出。 */}
+            <code>{sync.data?.deviceName || sync.data?.hostName || sync.data?.device || '—'}</code>
             <span>{t('记忆根')}</span>
             <code>{status.root}</code>
             <span>{t('索引')}</span>

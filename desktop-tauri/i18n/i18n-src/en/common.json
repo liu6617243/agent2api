@@ -951,5 +951,12 @@
   "成功 {ok} 次 / 有效运行 {judged} 次（跳过 {skipped} 次不计入）": "{ok} succeeded / {judged} effective runs ({skipped} skipped, not counted)",
   "全部跳过": "All skipped",
   "留空 = 按标签 + 优先级": "Empty = follow tag + priority",
-  "{task} 指定模型": "Model override for {task}"
+  "{task} 指定模型": "Model override for {task}",
+  "（预填默认值，可改）": "(prefilled default, editable)",
+  "还没填 WebDAV 账号": "WebDAV account not set yet",
+  "还没填 WebDAV 账号，远端没有设备。": "No WebDAV account yet, so there are no devices.",
+  "待填 WebDAV 账号": "WebDAV account pending",
+  "电脑名（下方设备列表里显示）": "Computer name (shown in the device list below)",
+  "还没填 WebDAV 密码": "WebDAV password not set yet",
+  "WebDAV 地址是空的": "WebDAV address is empty"
 }
