@@ -119,16 +119,17 @@ export const SERVICE_NAME: Record<string, string> = {
   'web-search': t('网络搜索'),
   vision: t('视觉分析'),
   'image-generation': t('图片生成'),
-  // 记忆中枢也在这张表里登记：它的接入动作（选客户端 → 写 mcpServers）
-  // 与另外三个服务完全同一套 UI，不该在它自己的页面里再抄一遍。
-  memory: t('记忆中枢'),
+  // 记忆中枢**不在这张表里** —— 它不在「MCP & Skills」页出现，有自己的
+  // 九页签页面（见后端 `tool_services::LISTED_SERVICE_IDS` 的注释）。
+  // 这里留过一条，代价是那一行点「详情」会掉进 `_ =>` 分支，渲染出**网络搜索**
+  // 的供应商配置面板。服务注册本身仍在后端（接入页要靠它查客户端清单），
+  // 但那张表里没有它，这个映射就没有读者。
 }
 
 export const SERVICE_DESC: Record<string, string> = {
   'web-search': t('聚合标准搜索服务及已有 WorkBuddy、Kiro 账号的搜索能力；网页抓取仍使用标准服务。'),
   vision: t('把图片与提示词交给后台配置的视觉模型分析，并把模型回复返回给调用方的大模型。'),
   'image-generation': t('使用已有账号生成或编辑图片，支持任务查询与本机文件保存。'),
-  memory: t('把本机项目记忆（决策、避坑、接口规矩）以 11 个工具暴露给 Agent，由它按需检索与写回；记忆正文是本地 Markdown 文件，不经过转发链路。'),
 }
 
 /** 接入协议说明（列表页与详情页共用同一份文案） */

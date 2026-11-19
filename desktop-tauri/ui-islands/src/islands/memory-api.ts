@@ -1180,9 +1180,10 @@ export type InstallTarget = {
 /**
  * 查「记忆已接入哪些客户端」。
  *
- * 复用工具服务那套 `/api/tools/install-targets`（记忆在 `SERVICE_IDS` 里是
- * 第四个服务）：安装/卸载的完整流程在「MCP & Skills」页，这里只读状态 ——
- * 否则记忆页会在没有任何人操作时静默变成「装了但不知道有没有接上」。
+ * 复用工具服务那套 `/api/tools/install-targets`（记忆是一个**合法的服务 id**，
+ * 只是不出现在「MCP & Skills」页的表格里 —— 见后端 `LISTED_SERVICE_IDS`）；
+ * 安装 / 卸载的完整流程在本页的「接入」页签，这里只读状态 —— 否则记忆页会在
+ * 没有任何人操作时静默变成「装了但不知道有没有接上」。
  */
 export function loadInstallTargets(): Promise<{ targets: InstallTarget[] }> {
   return api('GET', '/api/tools/install-targets?service=memory&protocol=mcp')

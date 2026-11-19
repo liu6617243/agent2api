@@ -76,7 +76,36 @@ use crate::server::core::crypto::{self, SecretScope};
 /// 配置在网关配置里的键名（kv 表一行）
 pub const KEY_TOOL_SERVICES: &str = "toolServices";
 
-/// 固定服务 id（顺序即界面展示顺序）
+/// 固定服务 id：**「MCP & Skills」页会列出来的那几个**（顺序即展示顺序）。
+///
+/// ── 为什么记忆中枢不在这里 ──────────────────────────────────
+/// 它原来在这张表的第四位，于是「MCP & Skills」页多出一行「记忆中枢」——
+/// 而那一行是自己的拖累：
+///   · 「详情」按 `service.id` 分支渲染配置面板，记忆没有面板，掉进 `_ =>`，
+///     屏幕上是**网络搜索**的供应商配置；
+///   · 「安装」弹窗共用同一个组件，装的其实是记忆 MCP —— 但记忆接入页自己
+///     就有逐卡「接入 / 测试 / 卸载」，两个入口改同一个配置文件；
+///   · 描述写「11 个工具」，而实际是 16 个（`memory_mcp::spec_tools`）。
+/// 记忆是**独立页面**（九个页签），不是这一页的一行表格项，所以从这里摘掉。
+///
+/// ── 但「不列出来」≠「不存在」 ────────────────────────────────
+/// [`MEMORY_SERVICE_ID`] 仍然是一个合法的服务 id，[`is_service`] 仍认它，
+/// [`endpoint`] / [`package_name`] / [`capability_count`] 仍给它值 ——
+/// 记忆接入页靠 `/api/tools/install-targets?service=memory&protocol=mcp`
+/// 查「哪些客户端写了配置」，靠 `endpoint` 拼客户端要连的地址。把这些一并
+/// 删掉会让接入页整页报「未知的工具服务」。
+///
+/// 换成 [`LISTED_SERVICE_IDS`] 只影响「哪几行会出现在那张表里」这一件事。
+pub const LISTED_SERVICE_IDS: [&str; 3] = [
+    WEB_SEARCH_SERVICE_ID,
+    VISION_SERVICE_ID,
+    IMAGE_GENERATION_SERVICE_ID,
+];
+
+/// 全部合法服务 id（含不出现在「MCP & Skills」页的那个）。
+///
+/// 配置归一化要遍历它 —— 记忆的超时与开关仍存在 `toolServices` 里，
+/// 漏掉它会让旧配置在每次读取时被「补齐」逻辑忽略。
 pub const SERVICE_IDS: [&str; 4] = [
     WEB_SEARCH_SERVICE_ID,
     VISION_SERVICE_ID,
@@ -161,6 +190,27 @@ pub fn service_protocols(service: &str) -> Vec<&'static str> {
         .iter()
         .copied()
         .filter(|protocol| !endpoint(service, protocol).is_empty())
+        .collect()
+}
+
+/// 记忆中枢那 16 个工具的名字（`/api/tools/install-info?service=memory` 用）。
+///
+/// ── 为什么不在这里手写一份名单 ──────────────────────────────
+/// `memory_mcp::spec_tools()` 才是工具清单的唯一事实 —— 它的描述、schema、
+/// 名字都在那里，`spec_exposes_sixteen_tools` 那条测试也钉在那儿。另抄一份
+/// 数组的结局是：加了第 17 个工具，界面上仍写着 16 个，而「差一个」这种错
+/// 恰恰最难在页面上发现（数字看起来完全合理）。
+///
+/// 返回值是 `Vec<String>` 而不是借用 spec 里那些 `&str`：`spec()` 每次调用都
+/// 新建一份 `Vec<Value>`，名字的字符串跟着它一起活 —— 借出来的引用在函数返回
+/// 时就悬空了。这个接口一页只点一次「详情」才调，多几次 `to_string` 不值得
+/// 为它设计一个缓存。
+pub fn memory_tool_names() -> Vec<String> {
+    memory_mcp::spec()
+        .tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .map(str::to_string)
         .collect()
 }
 
@@ -383,7 +433,11 @@ pub fn service_info(service: &str, protocol: &str) -> Value {
 
 pub fn list_services(protocol: Option<&str>) -> Vec<Value> {
     let mut rows = Vec::new();
-    for service in SERVICE_IDS {
+    // 只遍历 [`LISTED_SERVICE_IDS`]：这个函数的唯一调用方是
+    // `GET /api/tools/servers`，也就是「MCP & Skills」页那张表。记忆中枢不
+    // 出现在那张表里（理由见 `LISTED_SERVICE_IDS` 的注释），但它的服务注册
+    // 仍在 —— 靠 `is_service` / `endpoint` / `package_name` 活着，供记忆接入页使用。
+    for service in LISTED_SERVICE_IDS {
         for supported in service_protocols(service) {
             if protocol.is_none() || protocol == Some(supported) {
                 rows.push(service_info(service, supported));
@@ -615,4 +669,67 @@ pub fn update_selection(
         }
     })?;
     Ok(provider_selection())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 「MCP & Skills」页不能再列出记忆中枢。
+    ///
+    /// 那一行是三处错配的源头：`tools-detail` 按 `service.id` 分支渲染配置面板，
+    /// 记忆没有面板，掉进 `_ =>` 就变成**网络搜索**的供应商配置；「安装」弹窗装的
+    /// 是记忆 MCP，与记忆接入页的逐卡按钮改同一个文件；描述里那句「11 个工具」
+    /// 也与实际的 16 个不符。三处都是「这一页不该有它」的症状，不是三个独立的 bug。
+    #[test]
+    fn memory_hub_is_not_listed_as_a_tool_service_row() {
+        let listed = list_services(None);
+        let ids: Vec<&str> = listed
+            .iter()
+            .filter_map(|row| row.get("id").and_then(Value::as_str))
+            .collect();
+        assert!(
+            !ids.contains(&MEMORY_SERVICE_ID),
+            "记忆中枢不该出现在工具服务列表里：{ids:?}"
+        );
+        // 另外三个还在：这个断言防的是「过滤写过头」，把整页清空也能让上面那条过。
+        for expected in [WEB_SEARCH_SERVICE_ID, VISION_SERVICE_ID, IMAGE_GENERATION_SERVICE_ID] {
+            assert!(ids.contains(&expected), "{expected} 从列表里消失了：{ids:?}");
+        }
+    }
+
+    /// 但「不列出来」不等于「不存在」—— 记忆接入页整个建立在它仍然合法之上。
+    ///
+    /// `GET /api/tools/install-targets?service=memory&protocol=mcp` 是这个页签
+    /// 每次刷新都要调的接口，`endpoint` 拼的是客户端要连的那个地址。谁要是顺手把
+    /// `MEMORY_SERVICE_ID` 从服务注册里也删了，接入页会整页 400「未知的工具服务」，
+    /// 而报错离改动点很远（一个 Rust 常量 → 一个前端页签的每一张卡）。
+    #[test]
+    fn memory_service_is_still_a_valid_registration() {
+        assert!(is_service(MEMORY_SERVICE_ID), "记忆仍是合法服务 id");
+        assert_eq!(service_protocols(MEMORY_SERVICE_ID), vec!["mcp"], "记忆只支持 mcp");
+        assert_eq!(endpoint(MEMORY_SERVICE_ID, "mcp"), "/mcp/memory");
+        assert_eq!(package_name(MEMORY_SERVICE_ID), "agent2api-memory");
+        assert_eq!(version(MEMORY_SERVICE_ID), MEMORY_VERSION);
+    }
+
+    /// 工具名清单必须与 spec 里的真实数量一致。
+    ///
+    /// `install-info?service=memory` 回给前端的那份 `tools`，是「这个服务有哪些
+    /// 能力」的唯一来源。它曾经硬编码成视觉的 `["image_analyze"]` —— 那是
+    /// `_ =>` 兜底分支吞掉记忆服务的结果。这条断言把它钉在 spec 上。
+    #[test]
+    fn memory_tool_names_come_from_the_spec() {
+        let names = memory_tool_names();
+        assert_eq!(
+            names.len() as u32,
+            capability_count(MEMORY_SERVICE_ID),
+            "工具名数量与「能力数量」不一致：{names:?}"
+        );
+        assert!(names.iter().all(|name| name.starts_with("memory_")), "{names:?}");
+        // 抽查三个跨页签的关键工具，防「数量对但内容错」
+        for expected in ["memory_core", "memory_search", "memory_write"] {
+            assert!(names.iter().any(|name| name == expected), "缺 {expected}：{names:?}");
+        }
+    }
 }

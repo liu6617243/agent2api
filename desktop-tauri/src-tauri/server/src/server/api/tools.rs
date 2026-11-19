@@ -341,15 +341,25 @@ pub async fn install_info(State(state): State<ServerState>, headers: HeaderMap, 
         return errors::management_error(400, "未知的工具服务");
     }
     let base = base_url(&headers, &state);
-    let tools: Vec<&str> = match service {
-        tool_services::WEB_SEARCH_SERVICE_ID => vec!["web_search", "web_fetch"],
+    // `Vec<String>` 而不是 `Vec<&str>`：记忆那一路的名字来自 `memory_mcp::spec()`，
+    // 是运行时构造的、不是字面量。另外三路是字面量，用 `.to_string()` 统一上来 ——
+    // 混两种所有权会让这个 `match` 的每个分支都多一层转换，得不偿失。
+    let tools: Vec<String> = match service {
+        tool_services::WEB_SEARCH_SERVICE_ID => vec!["web_search".into(), "web_fetch".into()],
         tool_services::IMAGE_GENERATION_SERVICE_ID => {
-            let mut tools = vec!["generate_images"];
-            if tool_services::image_config::editing_available(state.store(), None) { tools.push("edit_images"); }
-            tools.push("get_image_result");
+            let mut tools = vec!["generate_images".to_string()];
+            if tool_services::image_config::editing_available(state.store(), None) { tools.push("edit_images".to_string()); }
+            tools.push("get_image_result".to_string());
             tools
         }
-        _ => vec!["image_analyze"],
+        // 记忆中枢不在「MCP & Skills」页出现（见 `LISTED_SERVICE_IDS`），但这个
+        // 端点仍然可达 —— 记忆接入页要拿这里的 `url` / `timeout_seconds` 拼片段。
+        // 原来它掉进 `_ => vec!["image_analyze"]`，也就是把**视觉**的工具名当
+        // 记忆的工具名回给调用方。直接从 spec 里取真实清单，避免再抄一份会漂移
+        // 的名单（`spec()` 里那 16 个才是唯一事实）。
+        tool_services::MEMORY_SERVICE_ID => tool_services::memory_tool_names(),
+        tool_services::VISION_SERVICE_ID => vec!["image_analyze".to_string()],
+        _ => Vec::new(),
     };
     let mut value = json!({
         "base_url": base,
