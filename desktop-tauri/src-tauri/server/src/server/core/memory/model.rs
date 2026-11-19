@@ -257,6 +257,15 @@ pub struct MemoryEntry {
     pub body: String,
     /// 文件相对路径（相对 memory 根）。恢复/重写时按它定位
     pub path: String,
+    /// 进回收站前的原相对路径（`general/l1/.../2026-11-19.md` 这种）。
+    ///
+    /// 为什么必须存：`path` 在删除那一刻会被改写成 `trash/<id>.md`，原路径就
+    /// 丢了；而恢复要「回到它原来待的地方」—— 只按 layer/kind 重算会算错：
+    /// 容器里的一节（`l1/<agent>/YYYY-MM-DD.md`）和 v1 那种独立单文件是两种
+    /// 形态，重算的结果与删除前不一致，恢复会把记忆写到错误的位置。
+    /// 空串 = 不是从回收站里读出来的（活条目）。
+    #[serde(default)]
+    pub origin_path: String,
 }
 
 impl MemoryEntry {
@@ -295,6 +304,7 @@ impl MemoryEntry {
             summary_text: String::new(),
             body,
             path: String::new(),
+            origin_path: String::new(),
         }
     }
 
@@ -377,6 +387,7 @@ impl MemoryEntry {
             "summaryText": self.summary_text,
             "chars": self.body.chars().count(),
             "path": self.path,
+            "originPath": self.origin_path,
         });
         if with_body {
             value["body"] = Value::String(self.body.clone());
@@ -536,6 +547,11 @@ impl MemoryEntry {
         }
         if let Some(deleted) = self.deleted_at {
             out.push_str(&format!("deleted_at: {deleted}\n"));
+            // 只在回收站文件里写原路径：活文件的 path 就是它自己，写出去是噪音，
+            // 而且会在下次保存时与事实不一致（文件被搬走后 key 还留在原地）。
+            if !self.origin_path.is_empty() {
+                out.push_str(&format!("origin_path: {}\n", yaml_scalar(&self.origin_path)));
+            }
         }
         if self.dedup_status != DedupStatus::Unique {
             out.push_str(&format!("dedup_status: {}\n", self.dedup_status.as_str()));
@@ -614,6 +630,9 @@ impl MemoryEntry {
             summary_text: get("summary").unwrap_or_default(),
             body,
             path: path.to_string(),
+            // 回收站文件里写着它原来待在哪（见 `to_markdown` 的 `origin_path`）；
+            // 活条目读不到这一项，就是空串。
+            origin_path: get("origin_path").filter(|v| !v.is_empty()).unwrap_or_default(),
         };
         if entry.valid_from == 0 {
             entry.valid_from = entry.created_at;
@@ -787,6 +806,32 @@ mod tests {
         assert_eq!(back.access_count, 7);
         assert_eq!(back.last_hit_at, Some(1_700_000_500_000));
         assert_eq!(back.hash, entry.hash);
+    }
+
+    /// `origin_path` 只在回收站文件里出现，且必须能往返 —— 恢复靠它回原处。
+    ///
+    /// 两条都要测：
+    /// ① 进了回收站（`deleted_at` 非空）→ 写出去、读回来都还在；
+    /// ② 活着（`deleted_at` 空）→ **不写**这一项。活文件的 `path` 就是它自己，
+    ///    写出去是噪音，而且下次保存时它已经不成立了（文件搬走了 key 还在原地）。
+    #[test]
+    fn origin_path_round_trips_only_when_trashed() {
+        let mut entry = sample();
+        entry.deleted_at = Some(1_700_000_100_000);
+        entry.path = "trash/m1.md".into();
+        entry.origin_path = "projects/agent2api/l1/manual/2026-11-19.md".into();
+        let text = entry.to_markdown();
+        assert!(text.contains("origin_path:"), "回收站文件必须写出 origin_path");
+        let back = MemoryEntry::from_markdown(&text, "fallback", &entry.path);
+        assert_eq!(back.origin_path, entry.origin_path);
+
+        // 活条目：写了也不该落盘
+        let mut live = sample();
+        live.origin_path = "projects/agent2api/l1/manual/2026-11-19.md".into();
+        let text = live.to_markdown();
+        assert!(!text.contains("origin_path:"), "活文件不该写 origin_path");
+        let back = MemoryEntry::from_markdown(&text, "fallback", &live.path);
+        assert!(back.origin_path.is_empty());
     }
 
     /// 存量文件（没有 layer / dedup_status / hash）必须照常读得出来，

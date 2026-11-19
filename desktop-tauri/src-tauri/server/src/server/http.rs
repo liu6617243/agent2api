@@ -391,6 +391,7 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/memory/restore", post(api::memory::post_restore))
         .route("/api/memory/purge", post(api::memory::post_purge))
         .route("/api/memory/trash/purge", post(api::memory::post_trash_purge))
+        .route("/api/memory/trash", get(api::memory::get_trash))
         .route("/api/memory/rebuild", post(api::memory::post_rebuild))
         // 自动化：状态 + 立即执行（同步等结果 —— 点了就要看到跑成什么样）
         .route("/api/memory/auto", get(api::memory::get_auto))

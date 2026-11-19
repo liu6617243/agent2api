@@ -278,7 +278,17 @@ pub async fn get_auto_runs(State(_state): State<ServerState>, Query(params): Que
 pub async fn get_agents(State(_state): State<ServerState>) -> Response {
     // 接入页要的是「卡片 + 心跳」一整套，不再是单纯的心跳列表：
     // 每张卡都要能回答「装了吗 / 配置在哪 / 写进去了吗 / 提示词块还在吗」。
-    ok_json(memory::agents::list())
+    //
+    // ── 为什么必须搬进 spawn_blocking ─────────────────────────
+    // 这一坨是纯同步读盘：PATH 上逐个目录 stat 可执行文件（Windows 上带实时
+    // 防护就是几十毫秒级）、解析每个客户端的配置文件、读提示词文件。直接写在
+    // async fn 里会**占住 tokio 的 worker 线程**，于是「正在读取…」那几百毫秒
+    // 里连状态接口都跟着变慢，用户看到的是整页发木。搬进阻塞池之后，慢的只有
+    // 这一个请求，别的页签照常出数。
+    match crate::server::core::blocking::run(memory::agents::list).await {
+        Ok(value) => ok_json(value),
+        Err(error) => errors::management_error(500, error.message),
+    }
 }
 
 /// 一键接入：往选中的客户端写 MCP 条目 + 提示词受控块。
@@ -570,6 +580,14 @@ pub async fn post_trash_purge(State(_state): State<ServerState>, Query(params): 
         memory_config::patch(&json!({ "storage.trashKeepDays": days })).ok();
     }
     ok_json(memory::purge_trash())
+}
+
+/// `GET /api/memory/trash` —— 回收站文件清单（删除时间 / 原路径 / 体积 / 剩余天数）。
+///
+/// 与 `GET /api/memory/list?includeDeleted=1` 是两种口径：那条走记忆索引按
+/// 相关度排序，这条直接读 `trash/` 目录按删除时间倒序 —— 见 `memory::trash_list`。
+pub async fn get_trash(State(_state): State<ServerState>) -> Response {
+    ok_json(memory::trash_list())
 }
 
 pub async fn post_rebuild(State(_state): State<ServerState>) -> Response {

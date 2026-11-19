@@ -38,6 +38,17 @@ pub fn mcp_config_path(def: &ClientDef) -> Option<std::path::PathBuf> {
     paths::for_client(def).mcp.as_ref().map(|(path, _, _)| path.clone())
 }
 
+/// 该客户端提示词文件的路径（**不读内容**）。
+///
+/// ── 为什么单独开一个入口 ────────────────────────────────────
+/// 接入页的卡片只需要「路径 + 受控块在不在」。走 `snapshot("prompt")` 的话，
+/// 每张卡都要把整份 `AGENTS.md` / `CLAUDE.md`（上限 1 MB）读进内存、转成
+/// 字符串、再算一次 revision —— 结果只用了返回里的 `path` 一个字段。14 个
+/// 客户端就是十几份白读的大文件，而这正是「正在读取…」的另一半耗时。
+pub fn prompt_path(def: &ClientDef) -> Option<std::path::PathBuf> {
+    paths::for_client(def).prompt
+}
+
 pub fn snapshot(def: &ClientDef, kind: &str) -> Result<Value, String> {
     let paths = paths::for_client(def);
     match kind {

@@ -674,6 +674,16 @@ pub fn retire(previous: &MemoryEntry, current: &MemoryEntry) -> Result<(), Strin
     write_atomic(&trash_root().join(format!("{}.md", current.id)), &current.to_markdown())
 }
 
+/// 这条记忆**活着时**的相对路径（忽略 `deleted_at`）。
+///
+/// 删除那一刻必须先把原路径按这个函数算出来，再改 `deleted_at`：`entry_path`
+/// 见到 `deleted_at` 非空就返回 `trash/<id>.md`，顺序反了记下的「原路径」
+/// 其实是回收站路径，恢复时会把记忆搬到 `trash/` 里。
+pub fn live_rel(entry: &MemoryEntry) -> String {
+    let live = MemoryEntry { deleted_at: None, ..entry.clone() };
+    rel(&entry_path(&live, false))
+}
+
 /// 复活：把回收站里的一条写回活位置，再把回收站那份删掉，整段一个临界区。
 ///
 /// 与 [`retire`] 对称。分成「save 一次 + remove_file 一次」两步的话，中间那一瞬

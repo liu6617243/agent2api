@@ -589,6 +589,170 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* ── 回收站 ───────────────────────────────────────────────────
+   与列表视图是两套东西：列表看「记忆条目」（八列检索维度），回收站看
+   「文件」（删除时间 / 原路径 / 体积）。八列在已经删掉的一小堆里没有区分
+   价值，反而把「还剩几天、多大」挤没了。
+   上方「自动清理卡」是配置卡（五个开关 + 保留期），下方才是数据卡。 */
+.mm-trash {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  flex: 1;
+}
+.mm-trash-card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+/* 下面这张是数据卡：吃掉剩余高度，表体自己滚，卡片本身不滚。 */
+.mm-trash-list {
+  min-height: 0;
+  flex: 1 1 auto;
+}
+.mm-trash-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  flex-wrap: wrap;
+}
+.mm-trash-list > .mm-trash-card-head { border-bottom: 1px solid var(--border); }
+.mm-trash-card-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: .01em;
+}
+.mm-trash-keep {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.mm-trash-days { width: 66px; }
+.mm-trash-flags {
+  display: flex;
+  align-items: center;
+  gap: 10px 20px;
+  flex-wrap: wrap;
+  padding: 0 12px 11px;
+}
+.mm-trash-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-2);
+  user-select: none;
+}
+.mm-trash-flag-text {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.mm-trash-flag-text:hover { color: var(--text); }
+.mm-trash-summary {
+  font-size: 12px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+/* 「清理超期文件」是破坏性操作，用红描边：与旁边的绿色「立即清理一次」
+   区分开 —— 后者只是跑一次清理任务，前者是不可恢复的物理删除。 */
+.mm-trash-purge {
+  color: var(--danger) !important;
+  border-color: color-mix(in oklab, var(--danger) 40%, var(--border)) !important;
+  background: transparent !important;
+}
+.mm-trash-purge:hover {
+  background: color-mix(in oklab, var(--danger) 10%, transparent) !important;
+}
+.mm-trash-note {
+  margin: 9px 12px 0;
+  padding: 6px 9px;
+  border-radius: var(--r-sm);
+  font-size: 12px;
+  color: var(--text-2);
+  background: color-mix(in oklab, var(--ok) 12%, var(--surface-inset));
+  border: 1px solid color-mix(in oklab, var(--ok) 26%, var(--border));
+}
+.mm-trash-empty {
+  padding: 40px 12px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+.mm-trash-scroll {
+  overflow: auto;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+.mm-trash-table {
+  width: 100%;
+  min-width: 560px;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 12.5px;
+}
+.mm-trash-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 7px 12px;
+  text-align: left;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-3);
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.mm-trash-table tbody td {
+  padding: 8px 12px;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--hairline);
+  vertical-align: middle;
+}
+.mm-trash-table tbody tr:last-child td { border-bottom: none; }
+.mm-trash-table tbody tr:hover td { background: var(--row-hover); }
+.mm-tt-time { width: 152px; white-space: nowrap; }
+.mm-tt-path { width: auto; }
+.mm-tt-size { width: 92px; text-align: right; font-variant-numeric: tabular-nums; }
+.mm-trash-table th.mm-tt-size { text-align: right; }
+.mm-tt-actions { width: 84px; text-align: right; }
+.mm-trash-table th.mm-tt-actions { text-align: right; }
+.mm-tt-path-text {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.mm-tt-path-text:hover { color: var(--primary); text-decoration: underline; }
+.mm-trash-more {
+  padding: 8px 12px;
+  font-size: 11.5px;
+  color: var(--text-3);
+  border-top: 1px solid var(--hairline);
+  background: var(--surface-2);
+}
+
 /* ── 详情抽屉 ─────────────────────────────────────────────────
    从右侧滑出、占 460px。为什么不做成「点行就地展开」：记忆正文是 Markdown，
    高度随内容剧烈变化，就地展开会把下面所有行顶走；抽屉有固定的边界，

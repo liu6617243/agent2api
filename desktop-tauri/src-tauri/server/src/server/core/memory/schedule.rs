@@ -770,47 +770,211 @@ fn classify_pending(project: Option<&str>) -> Outcome {
     }))
 }
 
-/// 清理：回收站过期文件 + 失效记忆入回收站（后者默认关）。
+/// 清理：回收站过期文件 + 五类异常记忆入回收站（五类默认全关）。
+///
+/// ── 五个开关各自对应什么 ───────────────────────────────────
+/// 它们的区别是**判据**，不是「删什么」：
+///
+/// | 开关 | 判据 | 处理 |
+/// |---|---|---|
+/// | `autoDeleteSuperseded` | `superseded_by` 非空 / 过了 `valid_to` | 整份进回收站 |
+/// | `autoDeleteMissing` | 索引里有、磁盘上没这个文件 | 只清索引行（没内容可捡） |
+/// | `autoDeleteError` | 文件在、读出来解析异常（空正文 + 无 frontmatter） | 整份进回收站 |
+/// | `autoDeleteConflict` | `sync_conflict` 里有 pending 记录 | 整份进回收站 |
+/// | `autoDeleteInvalid` | 正文空壳、进不了索引的残骸 | 整份进回收站 |
+///
+/// 为什么要分开而不是合成一个「清理垃圾」：这五类里只有「过期」是客观判据，
+/// 其余四类都可能误判（权限故障读不出来、同步正在传、用户手写的空模板）。
+/// 合成一个开关意味着开启「过期」就顺手清掉四类可疑文件 —— 那是拿数据赌。
+///
+/// 共同的排除项：画像（`Profile`）与钉住（`pinned`）的条目一律不动。它们是
+/// 「要一直看见」的东西，任何自动清理都不该碰。
 fn cleanup(manual: bool) -> Outcome {
     let days = config::usize_of("storage.trashKeepDays").max(1);
     let removed = store::purge_expired_trash(days);
+    let now = crate::server::logging::now_ms();
+    let entries = store::load_all();
     let mut trashed = 0usize;
+    let mut purged_rows = 0usize;
+    let mut touched: Vec<&str> = Vec::new();
+
     // 「自动清理失效记忆」默认关：失效记忆可能是演化链的一环，
     // 用户看着历史的时候需要它还在
     if config::bool_of("cleanup.autoDeleteSuperseded") {
-        let now = crate::server::logging::now_ms();
-        for entry in store::load_all() {
+        // 每块单独记数：用全局 `trashed` 判「这一类有没有清到东西」，
+        // 上一块清过就会让下一块误报（开关开着但一条没匹配，却报「已清理」）。
+        let mut hit = 0usize;
+        for entry in entries.iter() {
             if entry.deleted_at.is_some() {
                 continue;
             }
             let stale = entry.superseded_by.is_some() || entry.is_expired(now);
-            if !stale {
+            if !stale || entry.pinned || entry.kind == super::MemoryKind::Profile {
                 continue;
             }
-            // 画像与被钉住的条目不动：它们是被显式标成「要一直看见」的
-            if entry.pinned || entry.kind == super::MemoryKind::Profile {
-                continue;
-            }
-            // 「摘活形态 + 写回收站」一个临界区（见 `store::retire`）：
-            // `entry` 是改动前的对象（摘活形态按它算路径），`trashed_entry` 是
-            // 改动后的（写进 `trash/`）。分成两次调用会露出「同 id 两份」的窗口。
-            let mut trashed_entry = entry.clone();
-            trashed_entry.deleted_at = Some(now);
-            trashed_entry.updated_at = now;
-            trashed_entry.path = store::rel(&store::entry_path(&trashed_entry, true));
-            if store::retire(&entry, &trashed_entry).is_ok() {
-                let _ = index::global().upsert(&trashed_entry);
+            if retire_entry(entry, now) {
                 trashed += 1;
+                hit += 1;
             }
-            if trashed >= 200 {
+            if hit >= 200 {
                 break;
             }
         }
+        if hit > 0 {
+            touched.push("失效");
+        }
     }
-    if removed == 0 && trashed == 0 && !manual {
+
+    // 「不存在记忆」：索引行在、文件没了。这里只能清索引 —— 文件不在就没有
+    // 内容可进回收站，把索引行留着只会让界面显示一条点不开的幽灵。
+    if config::bool_of("cleanup.autoDeleteMissing") {
+        let root = store::root();
+        for row in index::global().rows(true) {
+            if row.deleted_at.is_some() {
+                continue;
+            }
+            // 容器（`l1/<agent>/YYYY-MM-DD.md`）是「一天一文件」，磁盘上确实存在
+            // 那个容器，只是不叫 `<id>.md` —— 直接按 id 拼路径查会把它们全判成
+            // 「文件不存在」，一次清理就清掉整库的 daily 记忆。
+            if store::is_daily_container(&row.path) {
+                continue;
+            }
+            if root.join(&row.path).exists() {
+                continue;
+            }
+            index::global().drop_one(&row.id);
+            purged_rows += 1;
+            if purged_rows >= 500 {
+                break;
+            }
+        }
+        if purged_rows > 0 {
+            touched.push("不存在");
+        }
+    }
+
+    // 「报错记忆」：文件在、读出来是空壳。真正的读取失败（权限/损坏）在
+    // `read_dir_entries` 里只记日志、根本不产出条目，所以那条分支看到的是
+    // **零条** —— 判据改成「文件存在但 frontmatter 解析后既无标题也无正文」，
+    // 那才是能捡出来的一类。
+    if config::bool_of("cleanup.autoDeleteError") {
+        let mut hit = 0usize;
+        for entry in entries.iter() {
+            if entry.deleted_at.is_some() || entry.pinned || entry.kind == super::MemoryKind::Profile {
+                continue;
+            }
+            if !entry.body.trim().is_empty() {
+                continue;
+            }
+            // 「空正文」本身不足以判「报错」：还没生成的占位条目也长这样。
+            // 加一道「文件存在」的确认，缺文件的那类归 `autoDeleteMissing`。
+            let abs = store::root().join(&entry.path);
+            if !abs.exists() {
+                continue;
+            }
+            if retire_entry(entry, now) {
+                trashed += 1;
+                hit += 1;
+            }
+            if hit >= 200 {
+                break;
+            }
+        }
+        if hit > 0 {
+            touched.push("报错");
+        }
+    }
+
+    // 「冲突记忆」：同步冲突里还 pending 的那些。只处理**能定位到条目**的，
+    // 冲突记录本身的清理由同步页裁决（`resolve_conflict`），这里不越权。
+    if config::bool_of("cleanup.autoDeleteConflict") {
+        let mut conflicted: Vec<String> = Vec::new();
+        for row in index::global().conflict_list(200) {
+            let pending = row.get("status").and_then(Value::as_str) == Some("pending");
+            let path = row.get("path").and_then(Value::as_str).unwrap_or_default();
+            // 每日容器保守跳过：一天一文件里可能有十几条正常记忆，为一条冲突
+            // 把整份搬进回收站会连坐（这条与目标界面的说明一致）。
+            if !pending || path.is_empty() || store::is_daily_container(path) {
+                continue;
+            }
+            conflicted.push(path.to_string());
+        }
+        let mut hit = 0usize;
+        for entry in entries.iter() {
+            if entry.deleted_at.is_some() || entry.pinned || entry.kind == super::MemoryKind::Profile {
+                continue;
+            }
+            if !conflicted.contains(&entry.path) {
+                continue;
+            }
+            if retire_entry(entry, now) {
+                trashed += 1;
+                hit += 1;
+            }
+            if hit >= 200 {
+                break;
+            }
+        }
+        if hit > 0 {
+            touched.push("冲突");
+        }
+    }
+
+    // 「无效记忆」：正文是空壳、连标题都退成了兜底值的残骸。与「报错」的区别
+    // 在于这条**进不了索引**（hash 为空或正文全是分隔符），是迁移/删除留下的壳。
+    if config::bool_of("cleanup.autoDeleteInvalid") {
+        let mut hit = 0usize;
+        for entry in entries.iter() {
+            if entry.deleted_at.is_some() || entry.pinned || entry.kind == super::MemoryKind::Profile {
+                continue;
+            }
+            let shell = entry.body.trim().is_empty() && entry.title.trim() == "未命名记忆";
+            if !shell {
+                continue;
+            }
+            if retire_entry(entry, now) {
+                trashed += 1;
+                hit += 1;
+            }
+            if hit >= 200 {
+                break;
+            }
+        }
+        if hit > 0 {
+            touched.push("无效");
+        }
+    }
+
+    if removed == 0 && trashed == 0 && purged_rows == 0 && !manual {
         return Outcome::Skipped("没有需要清理的内容".into());
     }
-    Outcome::Done(json!({ "trashPurged": removed, "supersededTrashed": trashed, "keepDays": days }))
+    Outcome::Done(json!({
+        "trashPurged": removed,
+        "supersededTrashed": trashed,
+        "indexPurged": purged_rows,
+        "kinds": touched,
+        "keepDays": days,
+    }))
+}
+
+/// 把一条活记忆搬进回收站（连同 `origin_path`）。
+///
+/// 抽成函数是因为五类清理里四条都要做同一件事，而它必须精确按顺序做：
+/// **先按活形态算原路径**，再改 `deleted_at`，最后才 `retire`。顺序错一步
+/// 就会得到「恢复后立刻又进回收站」或「同 id 两份」。
+fn retire_entry(entry: &super::MemoryEntry, now: i64) -> bool {
+    let mut trashed_entry = entry.clone();
+    if trashed_entry.origin_path.is_empty() {
+        trashed_entry.origin_path = store::live_rel(entry);
+    }
+    trashed_entry.deleted_at = Some(now);
+    trashed_entry.updated_at = now;
+    trashed_entry.path = store::rel(&store::entry_path(&trashed_entry, true));
+    if store::retire(entry, &trashed_entry).is_err() {
+        return false;
+    }
+    let _ = index::global().upsert(&trashed_entry);
+    true
 }
 
 /// 体检：只统计、不改数据。结果进日志与状态页。

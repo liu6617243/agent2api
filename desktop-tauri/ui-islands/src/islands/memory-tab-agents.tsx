@@ -188,7 +188,10 @@ function Agents(): React.ReactElement {
     }
   }
 
-  if (loading) return <Panel loading error=''>{null}</Panel>
+  // 只在「第一次拿数据」时占满页面。刷新 / 注入 / 卸载后 `reload()` 会再跑一次，
+  // 那一次数据还在手上 —— 整页退回「正在读取…」既没必要，也让人以为刚才那一下
+  // 把页面弄坏了。保留旧卡片、就地更新，才是这张表该有的手感。
+  if (loading && !data) return <Panel loading error=''>{null}</Panel>
   if (error) return <Panel loading={false} error={error} onRetry={reload}>{null}</Panel>
   if (!data) return <Empty>{t('读不到客户端清单。')}</Empty>
 

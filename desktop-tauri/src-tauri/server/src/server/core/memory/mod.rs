@@ -1159,6 +1159,7 @@ fn write_inner(
         summary_text: String::new(),
         body: content,
         path: String::new(),
+        origin_path: String::new(),
     };
     entry.path = relative_path(&entry);
     // 容器（l1 daily）里追加一节时不动容器头的 project/agent，所以这里先写文件
@@ -1475,8 +1476,16 @@ pub fn remove(id: &str) -> Result<Value, String> {
     // v1 那种「独立单文件」的 l1 记忆算成容器路径，原文件既没删掉、又写了一份
     // 进回收站 —— 那是数据损坏。
     let previous = entry.clone();
+    // 原路径必须在动 `deleted_at` **之前**算：`relative_path` 见到 `deleted_at`
+    // 非空就返回 `trash/<id>.md`，顺序反了记下的「原路径」其实是回收站路径，
+    // 恢复时会把记忆搬回 `trash/` 里（等于恢复后立刻又进回收站）。
+    let origin = store::live_rel(&entry);
     entry.deleted_at = Some(crate::server::logging::now_ms());
     entry.updated_at = entry.deleted_at.unwrap_or(entry.updated_at);
+    // 已经在回收站里的条目再次删除时保留第一次记下的原路径。
+    if entry.origin_path.is_empty() {
+        entry.origin_path = origin;
+    }
     entry.path = relative_path(&entry);
     store::retire(&previous, &entry)?;
     index::global().upsert(&entry)?;
@@ -1497,7 +1506,15 @@ pub fn restore(id: &str) -> Result<Value, String> {
     let previous = store::entry_path(&entry, true);
     entry.deleted_at = None;
     entry.updated_at = crate::server::logging::now_ms();
-    entry.path = relative_path(&entry);
+    // 回原处，而不是按 layer/kind 重新算一个位置：原路径在删除那一刻记过
+    // （`origin_path`，见 `remove`）。没有它说明这条是手改 frontmatter 或从
+    // 别的设备同步过来、从没经过本机 `remove` —— 那时才退回重算，行为与旧版一致。
+    if entry.origin_path.is_empty() {
+        entry.path = relative_path(&entry);
+    } else {
+        entry.path = entry.origin_path.clone();
+        entry.origin_path.clear();
+    }
     // 「写回活位置」与「删掉回收站那份」必须是一个临界区：分两次做的话中间会有
     // 一瞬间同 id 两份都在，并发的 restore 会当成「已经活了」直接返回、并发的
     // purge 会把刚写出来的活文件一起删掉（见 `store::revive`）。
@@ -1526,6 +1543,95 @@ pub fn purge_trash() -> Value {
     let removed = store::purge_expired_trash(days);
     bump_revision();
     json!({ "removed": removed, "keepDays": days })
+}
+
+/// 回收站文件清单（界面上「回收站」那张表的数据源）。
+///
+/// ── 为什么不直接用 `list(includeDeleted: true)` ──────────────────
+/// 那张表是「记忆条目」，按项目/Agent/层级过滤、按相关度打分，返回的是记忆
+/// 视图；回收站要看的是**文件**：删了什么、多大、还能恢复几天。两件事的排序
+/// 与字段都不一样 —— 回收站按删除时间倒序，记忆表按更新时间倒序。
+///
+/// 排序与截断都在后端做：回收站可能有上千个文件，前端 `slice` 得先把全部
+/// 传过去，一个删过几百条的用户每次打开回收站都要多传几百 KB。
+pub fn trash_list() -> Value {
+    let days = config::usize_of("storage.trashKeepDays").max(1);
+    let now = crate::server::logging::now_ms();
+    let root = store::root();
+    let mut items: Vec<Value> = Vec::new();
+    // 文件 mtime 是「进回收站的时刻」，与 `purge_expired_trash` 用同一判据 ——
+    // 界面显示的「还剩几天」必须和真正会被清掉的时刻一致，否则用户会以为
+    // 还有三天，结果今晚就被清了。
+    let Ok(reader) = std::fs::read_dir(store::trash_root()) else {
+        return json!({ "items": [], "count": 0, "totalBytes": 0, "keepDays": days, "expiring": 0 });
+    };
+    let mut total_bytes = 0u64;
+    let mut expiring = 0usize;
+    for item in reader.flatten() {
+        let path = item.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        let size = meta.len();
+        total_bytes += size;
+        let stamp = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0);
+        // 到期时刻 = 进回收站时刻 + 保留天数；`purge_expired_trash` 用的是同一
+        // 条算式（`stamp < now - days`），所以这里算出来的 `expiresIn` 归零那天
+        // 就是它真被删掉那天。
+        let expire_at = if stamp > 0 { stamp + days as i64 * 86_400_000 } else { 0 };
+        let left_ms = expire_at - now;
+        let expires_in = if expire_at > 0 { (left_ms as f64 / 86_400_000.0).ceil() as i64 } else { days as i64 };
+        if expires_in <= 1 {
+            expiring += 1;
+        }
+        // 原路径与标题从文件本身读：回收站里的文件是自包含的（frontmatter 里
+        // 有 `origin_path` / `title`），不必再查索引 —— 索引可能已经不含这条
+        // （`purge` / 重建后索引里没有回收站条目）。
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let entry = MemoryEntry::from_markdown(&text, path.file_stem().and_then(|n| n.to_str()).unwrap_or(""), &store::rel(&path));
+        let origin = if entry.origin_path.is_empty() {
+            // 老版本删的条目没记原路径（那时还没这个字段）。给个能看懂的占位，
+            // 别在界面上留一列空白 —— 用户会以为是坏了。
+            String::from("（未记录原路径）")
+        } else {
+            entry.origin_path.clone()
+        };
+        items.push(json!({
+            "id": entry.id,
+            "name": path.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+            "title": entry.title,
+            "originPath": origin,
+            "size": size,
+            "trashedAt": stamp,
+            "expiresAt": expire_at,
+            "expiresIn": expires_in,
+            "keepDays": days,
+            "layer": entry.layer.as_str(),
+            "project": entry.project,
+            "agent": entry.agent,
+        }));
+    }
+    // 删除时间倒序：最近删的在最上面，与「先看刚删的」这个使用习惯一致。
+    items.sort_by(|a, b| {
+        let left = b.get("trashedAt").and_then(Value::as_i64).unwrap_or(0);
+        let right = a.get("trashedAt").and_then(Value::as_i64).unwrap_or(0);
+        left.cmp(&right)
+    });
+    let count = items.len();
+    json!({
+        "items": items,
+        "count": count,
+        "totalBytes": total_bytes,
+        "keepDays": days,
+        "expiring": expiring,
+        "root": store::rel(&root.join("trash")),
+    })
 }
 
 /// 全库去重巡检：扫一遍存量记忆，找出**已经重复但没被处理**的那些。

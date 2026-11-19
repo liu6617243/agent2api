@@ -877,8 +877,52 @@ export function purgeEntry(id: string): Promise<{ id: string }> {
   return api('POST', '/api/memory/purge', { id })
 }
 
-export function purgeTrash(days?: number): Promise<{ purged: number }> {
+export function purgeTrash(days?: number): Promise<{ removed: number; keepDays: number }> {
   return api('POST', `/api/memory/trash/purge${query({ days })}`)
+}
+
+/* ─── 回收站文件清单（memory::trash_list）─────────────────────── */
+
+/**
+ * 回收站里的**一个文件**。
+ *
+ * 与 `MemoryEntry` 不是同一口径：这份按「文件」组织（体积、剩余天数），
+ * 那份按「记忆条目」组织（项目、层级、标记）。回收站看的是「删了什么、
+ * 还能恢复几天」，所以字段跟着文件走。
+ */
+export type TrashItem = {
+  id: string
+  /** 回收站里的文件名（`<id>.md`） */
+  name: string
+  title: string
+  /** 删除前它待在哪。老版本删的条目没有这一项，后端给的是占位文案 */
+  originPath: string
+  /** 字节数 */
+  size: number
+  /** 进回收站的时刻（文件 mtime），与真正会被清掉的时刻同源 */
+  trashedAt: number
+  /** 到期时刻。0 = 算不出来（mtime 读不到） */
+  expiresAt: number
+  /** 还剩几天（向上取整）。1 表示「今天就会被清」 */
+  expiresIn: number
+  keepDays: number
+  layer: string
+  project: string | null
+  agent: string | null
+}
+
+export type TrashPayload = {
+  items: TrashItem[]
+  count: number
+  totalBytes: number
+  keepDays: number
+  /** 今天就会到期的条数，用于卡片上的提醒 */
+  expiring: number
+  root?: string
+}
+
+export function loadTrash(): Promise<TrashPayload> {
+  return api('GET', '/api/memory/trash')
 }
 
 export function rebuildIndex(): Promise<{ rebuilt: number; status: MemoryStatus }> {

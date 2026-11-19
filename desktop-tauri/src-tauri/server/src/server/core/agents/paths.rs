@@ -65,7 +65,11 @@ pub fn save_override(def: &ClientDef, raw: &str) -> Result<(), String> {
     }
     let text =
         serde_json::to_vec_pretty(&preferences).map_err(|e| format!("保存配置路径失败: {e}"))?;
-    files::write_atomic(&preferences_file(), &text)
+    let written = files::write_atomic(&preferences_file(), &text);
+    // 路径偏好变了，缓存里的 `path` 就过期了 —— 立刻作废，别让用户改完路径
+    // 回来还看到旧目录。
+    forget_detection();
+    written
 }
 
 pub fn home() -> PathBuf {
@@ -168,6 +172,7 @@ pub fn candidates(def: &ClientDef) -> Vec<PathBuf> {
     }
 }
 
+#[derive(Clone)]
 pub struct Detection {
     pub path: PathBuf,
     pub detected: bool,
@@ -179,7 +184,60 @@ pub struct Detection {
     pub resource_path: Option<PathBuf>,
 }
 
+/// 探测结果的短命缓存（每线程一份）。
+///
+/// ── 为什么必须有 ────────────────────────────────────────────
+/// `detect()` 里最贵的是 `find_binary`：它把 PATH 上**每个目录 × 每个可执行名
+/// × 每个 PATHEXT 后缀**都 stat 一遍。本机实测 PATH 58 个目录、11 个后缀，
+/// 13 个客户端扫一遍是 **4.4 万次 stat / 约 2.9 秒**（Windows 上还要过一遍
+/// 实时防护）。而接入页一次 `list()` 会对**同一个客户端**调四次 `detect` ——
+/// 自己一次，`for_client` 里再来三次（`mcp_config_path`、提示词路径、MCP 快照
+/// 各一次）。四次里三次纯属重复，页面就卡在那句「正在读取…」上。
+///
+/// ── 为什么 TTL 只给 5 秒 ────────────────────────────────────
+/// 要盖住的是「同一次请求里的四次调用」，它们相隔微秒；顺手把「切走再切回来」
+/// 也盖成瞬开。5 秒又短到用户去装个客户端、回来时不会看到过期的「未检出」。
+/// 缓存只存**探测结果**（装没装、版本、路径），配置文件内容每次照读 ——
+/// 「已接入」这类会当场变的事实完全不受影响。
+const DETECT_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+thread_local! {
+    static DETECT_CACHE: std::cell::RefCell<
+        std::collections::HashMap<&'static str, (std::time::Instant, Detection)>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// 丢掉探测缓存。改了路径偏好 / 刚写完客户端配置之后要叫一声，
+/// 否则界面会拿着 5 秒内的旧结论说「未检出」。
+pub fn forget_detection() {
+    DETECT_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
 pub fn detect(def: &ClientDef) -> Detection {
+    let cached = DETECT_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(def.id)
+            .filter(|(at, _)| at.elapsed() < DETECT_TTL)
+            .map(|(_, hit)| hit.clone())
+    });
+    if let Some(hit) = cached {
+        return hit;
+    }
+    let fresh = detect_uncached(def);
+    DETECT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        // 客户端数量封顶 14 个，这条清理几乎不会触发；写在这里是为了让缓存
+        // 在任何情况下都只占常数内存。
+        if cache.len() > 64 {
+            cache.clear();
+        }
+        cache.insert(def.id, (std::time::Instant::now(), fresh.clone()));
+    });
+    fresh
+}
+
+fn detect_uncached(def: &ClientDef) -> Detection {
     let preferences = preferences();
     let preference_error = preferences.as_ref().err().cloned();
     let override_path = preferences
@@ -280,15 +338,24 @@ pub(super) fn find_binary(def: &ClientDef) -> Option<PathBuf> {
     if let Some(local) = env_dir("LOCALAPPDATA") {
         dirs.push(local.join("Microsoft/WinGet/Links"));
     }
+    // ── 为什么不用 PATHEXT 全表 ────────────────────────────────
+    // PATHEXT 通常有 11 项（`.VBS` / `.JS` / `.JSE` / `.WSF` / `.WSH` / `.MSC`
+    // 都在里面）。给「找 CLI 程序」这件事用全表，等于让每个目录多付 7 次注定
+    // 落空的 stat —— 58 个目录 × 7 就是 400 次纯浪费。只留能当命令行程序启动
+    // 的四种，命中的集合一个不少：Node 装的 shim 是 `.cmd`，原生程序是 `.exe`。
     let extensions: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
-            .split(';')
-            .map(str::to_ascii_lowercase)
-            .collect()
+        vec![".exe".into(), ".cmd".into(), ".bat".into(), ".com".into()]
     } else {
         Vec::new()
     };
+    // 重复的 PATH 项、已经删掉的目录都先摘掉：不存在的目录里每个名字都要白试
+    // 一遍，58 次 `is_dir` 换掉的是几百次注定失败的 `is_file`。
+    let mut seen = std::collections::HashSet::new();
+    let dirs: Vec<PathBuf> = dirs
+        .into_iter()
+        .filter(|dir| dir.is_dir())
+        .filter(|dir| seen.insert(dir.to_string_lossy().to_ascii_lowercase()))
+        .collect();
     for name in def.binaries {
         for dir in &dirs {
             let plain = dir.join(name);

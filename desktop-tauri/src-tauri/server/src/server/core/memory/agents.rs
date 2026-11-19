@@ -77,9 +77,9 @@ pub fn list() -> Value {
     for def in hub::CLIENTS {
         let detection = hub::paths::detect(def);
         let mcp_path = resources::mcp_config_path(def);
-        let prompt_path = resources::snapshot(def, "prompt")
-            .ok()
-            .and_then(|snapshot| snapshot.get("path").and_then(Value::as_str).map(str::to_string));
+        // 只要路径：`snapshot(def, "prompt")` 会把整份 AGENTS.md 读进内存再算
+        // revision，而这里一个字段都用不到 —— 那是纯 I/O 浪费。
+        let prompt_path = resources::prompt_path(def);
 
         // 两个都没有的客户端（既写不了 MCP 也写不了提示词）不进卡片列表：
         // 卡片点了什么也做不了，只会让用户以为功能坏了。
@@ -100,12 +100,15 @@ pub fn list() -> Value {
         // 变量不能叫 `agent_header`：本模块有同名函数，局部绑定会把它遮住，
         // 后面再想调用就变成「调用一个 Option」（与 E0618 同一个坑）。
         let identity = entry.as_ref().and_then(agent_header);
-        let prompt = prompt_path.as_deref().map(block_state);
+        // 受控块状态要读文件，但只读提示词那几 KB —— 路径已经在手上了。
+        let prompt = prompt_path
+            .as_deref()
+            .map(|path| block_state(&path.to_string_lossy()));
         // `block_state` 里已有 path 之外的字段，卡片直接展开：
         // 前端不需要再自己拼路径，也就不用猜提示词文件叫什么。
         let instruction = match prompt {
             Some(state) => json!({
-                "path": prompt_path,
+                "path": prompt_path.as_ref().map(|path| path.display().to_string()),
                 "exists": state.exists,
                 "injected": state.injected,
                 "broken": state.broken,

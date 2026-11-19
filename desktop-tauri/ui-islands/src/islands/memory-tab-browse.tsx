@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Badge, Button, Input, Textarea } from '@ui'
+import { Badge, Button, Input, Switch, Textarea } from '@ui'
 import { t } from '../i18n'
 import * as m from './memory-api'
 import { agentText, Empty, num, Panel, Section, stamp, StateBadge, timeText, fullTime, useLoad } from './memory-shared'
@@ -29,6 +29,9 @@ import { agentText, Empty, num, Panel, Section, stamp, StateBadge, timeText, ful
 
 /** 每页条数。50 是「一屏能滚完、翻页又不至于太频繁」的折中。 */
 const PAGE_SIZE = 50
+/** 回收站一次最多画多少行。回收站没有分页（文件是按删除时间排的一串），
+ *  但也不能把上千行全铺进 DOM。 */
+const TRASH_ROWS = 200
 /** 热力图跨度（天）。一年是这类图的标准窗口（GitHub 同款）。 */
 const HEAT_DAYS = 365
 
@@ -100,8 +103,6 @@ function Browse({
   const [error, setError] = React.useState('')
   const [busy, setBusy] = React.useState('')
 
-  const trashMode = view === 'trash'
-
   const list = useLoad(
     () => m.loadList({
       query: submitted.trim(),
@@ -112,13 +113,11 @@ function Browse({
       tag: tag || undefined,
       starred: starred || undefined,
       pinned: pinned || undefined,
-      // 回收站要连「已失效」一起看：那些条目在真实数据里同样要能恢复
-      includeSuperseded: includeSuperseded || trashMode,
-      includeDeleted: trashMode,
+      includeSuperseded: includeSuperseded || undefined,
       limit: PAGE_SIZE,
       offset: page * PAGE_SIZE,
     }),
-    [submitted, kind, project, agent, level, tag, starred, pinned, includeSuperseded, trashMode, page],
+    [submitted, kind, project, agent, level, tag, starred, pinned, includeSuperseded, page],
   )
 
   const total = list.data?.total ?? 0
@@ -306,8 +305,8 @@ function Browse({
         </div>
       </div>
 
-      {/* ── 列表 / 回收站：等级 tab + 常显筛选行 ───────────────── */}
-      {view === 'list' || view === 'trash' ? (
+      {/* ── 列表：等级 tab + 常显筛选行 ───────────────── */}
+      {view === 'list' ? (
         <>
           <div className='mm-browse-toolbar'>
             <div className='mm-switch is-3' style={{ ['--sw-i' as string]: levelIndex }} role='tablist'>
@@ -479,9 +478,7 @@ function Browse({
                           <td colSpan={8} className='mm-bt-empty'>
                             {submitted
                               ? t('没有命中的记忆 —— 试试更短的关键词。')
-                              : trashMode
-                                ? t('回收站是空的。')
-                                : t('当前条件下没有记忆。')}
+                              : t('当前条件下没有记忆。')}
                           </td>
                         </tr>
                       ) : null}
@@ -530,16 +527,10 @@ function Browse({
                           <td className='mm-bt-actions' onClick={event => event.stopPropagation()}>
                             <RowMenu
                               item={item}
-                              trash={trashMode}
                               busy={busy === item.id}
                               onOpen={() => void openEntry(item.id)}
                               onStar={() => void act(item.id, () => m.updateEntry(item.id, { starred: !item.starred }))}
                               onPin={() => void act(item.id, () => m.updateEntry(item.id, { pinned: !item.pinned }))}
-                              onRestore={() => void act(item.id, () => m.restoreEntry(item.id))}
-                              onPurge={() => void act(item.id, async () => {
-                                await m.purgeEntry(item.id)
-                                if (selected?.id === item.id) setSelected(null)
-                              })}
                               onDelete={() => void act(item.id, async () => {
                                 await m.deleteEntry(item.id)
                                 if (selected?.id === item.id) setSelected(null)
@@ -579,6 +570,17 @@ function Browse({
             )}
           </div>
         </>
+      ) : null}
+
+      {/* ── 回收站：自动清理卡 + 文件表 ─────────────────────── */}
+      {view === 'trash' ? (
+        <TrashView
+          onOpen={id => void openEntry(id)}
+          onChanged={() => {
+            list.reload()
+            onChanged()
+          }}
+        />
       ) : null}
 
       {/* ── 热力图 ─────────────────────────────────────────── */}
@@ -908,26 +910,20 @@ function MarkCell({ item }: { item: m.MemoryEntry }): React.ReactElement {
   return <span className='mm-bt-mark-cell'>{marks}</span>
 }
 
-/** 行尾 `⋯` 菜单：列表态给「收藏/置顶/删除」，回收站态给「恢复/彻底删除」。 */
+/** 行尾 `⋯` 菜单：收藏 / 置顶 / 打开 / 删除。回收站有自己的表，不再复用这套。 */
 function RowMenu({
   item,
-  trash,
   busy,
   onOpen,
   onStar,
   onPin,
-  onRestore,
-  onPurge,
   onDelete,
 }: {
   item: m.MemoryEntry
-  trash: boolean
   busy: boolean
   onOpen: () => void
   onStar: () => void
   onPin: () => void
-  onRestore: () => void
-  onPurge: () => void
   onDelete: () => void
 }): React.ReactElement {
   const [open, setOpen] = React.useState(false)
@@ -950,32 +946,374 @@ function RowMenu({
             <button type='button' className='mm-pt-menu-item' onClick={() => { close(); onOpen() }}>
               {t('打开详情')}
             </button>
-            {trash ? (
-              <>
-                <button type='button' className='mm-pt-menu-item' onClick={() => { close(); onRestore() }}>
-                  {t('恢复')}
-                </button>
-                <button type='button' className='mm-pt-menu-item is-danger' onClick={() => { close(); onPurge() }}>
-                  {t('彻底删除')}
-                </button>
-              </>
-            ) : (
-              <>
-                <button type='button' className='mm-pt-menu-item' onClick={() => { close(); onStar() }}>
-                  {item.starred ? t('取消收藏') : t('收藏')}
-                </button>
-                <button type='button' className='mm-pt-menu-item' onClick={() => { close(); onPin() }}>
-                  {item.pinned ? t('取消置顶') : t('置顶')}
-                </button>
-                <button type='button' className='mm-pt-menu-item is-danger' onClick={() => { close(); onDelete() }}>
-                  {t('删除（移入回收站）')}
-                </button>
-              </>
-            )}
+            <button type='button' className='mm-pt-menu-item' onClick={() => { close(); onStar() }}>
+              {item.starred ? t('取消收藏') : t('收藏')}
+            </button>
+            <button type='button' className='mm-pt-menu-item' onClick={() => { close(); onPin() }}>
+              {item.pinned ? t('取消置顶') : t('置顶')}
+            </button>
+            <button type='button' className='mm-pt-menu-item is-danger' onClick={() => { close(); onDelete() }}>
+              {t('删除（移入回收站）')}
+            </button>
           </div>
         </>
       ) : null}
     </span>
+  )
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * 回收站
+ * ══════════════════════════════════════════════════════════════ */
+
+/**
+ * 五个自动清理开关。key 直接就是配置项（`cleanup.autoDelete*`），
+ * 所以「写配置」这一步不需要任何映射表，少一层会漂移的翻译。
+ *
+ * 默认全关：这五个动作都会把记忆挪走或把行抹掉，误开的代价是静默丢数据。
+ */
+const CLEANUP_FLAGS: { key: string; label: string; tip: string }[] = [
+  {
+    key: 'cleanup.autoDeleteSuperseded',
+    label: '失效记忆',
+    tip: '被新记忆取代、或有效期已过的记忆：移入回收站（保留期内可恢复）',
+  },
+  {
+    key: 'cleanup.autoDeleteMissing',
+    label: '不存在记忆',
+    tip: '索引里还有、磁盘上文件已丢失的记录：只清索引行（没有内容可入回收站）',
+  },
+  {
+    key: 'cleanup.autoDeleteError',
+    label: '报错记忆',
+    tip: '文件存在但读取失败（权限 / 损坏）的记忆：整份移入回收站',
+  },
+  {
+    key: 'cleanup.autoDeleteConflict',
+    label: '冲突记忆',
+    tip: '同步冲突未裁决的记忆：整份移入回收站并清掉冲突记录（每日记录类多节文件保守跳过）',
+  },
+  {
+    key: 'cleanup.autoDeleteInvalid',
+    label: '无效记忆',
+    tip: '内容为空壳、进不了索引的文件（迁移 / 删除后的残骸）：整份移入回收站',
+  },
+]
+
+/** `2026-11-19 13:11` —— 回收站表用绝对时间，不用「N 天前」：这列要回答的是
+ *  「它什么时候被删的」，相对时间在这里反而要心算。 */
+function trashTime(timestamp: number): string {
+  if (!timestamp) return '—'
+  const date = new Date(timestamp)
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+/** 体积。回收站里大多数文件只有几 KB，但整段会话摘要是几百 KB ——
+ *  一律 KB 会出现「2048 KB」这种读不出量级的数字。 */
+function sizeText(bytes: number): string {
+  const kb = Math.round(bytes / 1024)
+  if (kb < 1024) return `${num(kb)} KB`
+  return `${(kb / 1024).toFixed(1)} MB`
+}
+
+/**
+ * 回收站视图。
+ *
+ * ── 为什么表头是「删除时间 / 原路径 / 体积 / 操作」而不是记忆表那八列 ──
+ * 回收站里要回答的问题只有一个：「我删错了哪个、还能不能捞回来」。项目、
+ * Agent、标签这些是**检索**维度，在已经删掉的一小堆文件里没有区分价值；
+ * 体积和剩余天数才是这里真正需要看的（决定要不要马上恢复 / 要不要清）。
+ *
+ * ── 为什么原路径由后端在删除那一刻记下 ──────────────────────
+ * 恢复时按 `layer` / `kind` 重算路径，对「独立单文件」的历史 l1 条会算到
+ * 容器路径上去，捞回来的文件落在错的地方。所以删除时把当时的活路径写进
+ * frontmatter（`origin_path`），恢复就只是「搬回去」。
+ */
+function TrashView({
+  onOpen,
+  onChanged,
+}: {
+  onOpen: (id: string) => void
+  onChanged: () => void
+}): React.ReactElement {
+  const cfg = useLoad(() => m.loadConfig(), [])
+  const trash = useLoad(() => m.loadTrash(), [])
+  const [days, setDays] = React.useState(30)
+  const [busy, setBusy] = React.useState('')
+  const [note, setNote] = React.useState('')
+  const [error, setError] = React.useState('')
+
+  // 配置到手后把保留天数拉进输入框。只在第一次填 —— 之后用户可能正改着，
+  // 每次 reload 都覆盖会把输入框里的数字打回去。
+  const filled = React.useRef(false)
+  React.useEffect(() => {
+    if (filled.current || !cfg.data) return
+    const raw = cfg.data.values['storage.trashKeepDays']
+    const value = typeof raw === 'number' ? raw : Number(raw)
+    if (Number.isFinite(value) && value > 0) setDays(value)
+    filled.current = true
+  }, [cfg.data])
+
+  const flagOn = (key: string): boolean => {
+    const raw = cfg.data?.values[key]
+    return raw === true || raw === 'true'
+  }
+
+  // 提示条 6 秒后自己收：「已恢复到原路径」是一次性反馈，留在界面上会一直占一行，
+  // 用户下次进来还会以为刚刚又发生了什么。
+  React.useEffect(() => {
+    if (!note) return
+    const timer = window.setTimeout(() => setNote(''), 6000)
+    return () => window.clearTimeout(timer)
+  }, [note])
+
+  const saveDays = async (): Promise<void> => {
+    const value = Math.min(365, Math.max(7, Math.round(days || 30)))
+    setDays(value)
+    setBusy('__days__')
+    setError('')
+    try {
+      await m.saveConfig({ 'storage.trashKeepDays': value })
+      setNote(t('回收站保留期已设为 {n} 天', { n: value }))
+      trash.reload()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const toggleFlag = async (key: string, next: boolean): Promise<void> => {
+    setBusy(key)
+    setError('')
+    try {
+      await m.saveConfig({ [key]: next })
+      setNote(next
+        ? t('已开启：每天 04:00 自动清理，也可「立即清理一次」')
+        : t('已关闭自动清理'))
+      cfg.reload()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy('')
+    }
+  }
+
+  /** 立即跑一次清理任务。走调度器而不是直接调 `cleanup()`：忙的时候任务会排队，
+   *  两个清理同时跑会互相抢同一批文件。 */
+  const cleanNow = async (): Promise<void> => {
+    setBusy('__clean__')
+    setError('')
+    try {
+      const reply = await m.runAutoTask('cleanup')
+      const outcome = reply.outcome
+      const result = (outcome.result ?? {}) as Record<string, unknown>
+      const trashed = Number(result.supersededTrashed ?? 0)
+      const purged = Number(result.trashPurged ?? 0)
+      setNote(outcome.status === 'done'
+        ? t('清理完成：移入回收站 {a} 条，彻底删除 {b} 个过期文件', { a: trashed, b: purged })
+        : outcome.reason || outcome.error || t('清理任务已提交'))
+      trash.reload()
+      cfg.reload()
+      onChanged()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const purgeExpired = async (): Promise<void> => {
+    setBusy('__purge__')
+    setError('')
+    try {
+      const reply = await m.purgeTrash()
+      setNote(t('已清理 {n} 个超期文件', { n: reply.removed ?? 0 }))
+      trash.reload()
+      onChanged()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const restore = async (item: m.TrashItem): Promise<void> => {
+    setBusy(item.id)
+    setError('')
+    try {
+      await m.restoreEntry(item.id)
+      setNote(t('已恢复到原路径：{path}', { path: item.originPath }))
+      trash.reload()
+      onChanged()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const count = trash.data?.count ?? 0
+  const rows = trash.data?.items ?? []
+  /** 一次最多画 200 行（与目标界面同口径）。回收站可能有上千个文件，
+   *  全量铺进 DOM 会让这张表卡住；剩下的靠「清理超期文件」收掉，
+   *  真的要看更早的，路径在磁盘上，列表只是索引。 */
+  const shown = rows.slice(0, TRASH_ROWS)
+
+  return (
+    <div className='mm-trash'>
+      {error ? <div className='mm-error'>{error}</div> : null}
+
+      {/* ── 自动清理卡 ───────────────────────────────────── */}
+      <div className='mm-trash-card'>
+        <div className='mm-trash-card-head'>
+          <strong className='mm-trash-card-title'>{t('自动清理')}</strong>
+          <span className='mm-browse-spacer' />
+          <span className='mm-trash-keep'>
+            <span className='mm-muted'>{t('保留')}</span>
+            <Input
+              className='mm-trash-days'
+              type='number'
+              min='7'
+              max='365'
+              value={String(days)}
+              onChange={event => setDays(Number(event.target.value))}
+              onKeyDown={event => {
+                if (event.key === 'Enter') void saveDays()
+              }}
+            />
+            <span className='mm-muted'>{t('天')}</span>
+            <Button
+              type='button'
+              size='sm'
+              variant='ghost'
+              disabled={busy === '__days__'}
+              onClick={() => void saveDays()}
+            >
+              {t('保存')}
+            </Button>
+          </span>
+          <Button
+            type='button'
+            size='sm'
+            variant='outline'
+            disabled={busy === '__clean__'}
+            onClick={() => void cleanNow()}
+          >
+            {busy === '__clean__' ? t('已提交…') : t('立即清理一次')}
+          </Button>
+        </div>
+
+        <div className='mm-trash-flags'>
+          {CLEANUP_FLAGS.map(flag => (
+            <span key={flag.key} className='mm-trash-flag' title={t(flag.tip)}>
+              <Switch
+                size='sm'
+                variant='success'
+                checked={flagOn(flag.key)}
+                disabled={busy === flag.key || cfg.loading}
+                aria-label={t(flag.label)}
+                onCheckedChange={next => void toggleFlag(flag.key, next)}
+              />
+              {/* 标签本身也能点：这个开关只有 24px 宽，要求用户精确点中那颗小圆点
+                  是没必要的。用 button 而不是 label —— label 包着 Switch 时点一下
+                  会既触发 label 的 click 又触发 Switch 的切换，开关反而「点了没反应」。 */}
+              <button
+                type='button'
+                className='mm-trash-flag-text'
+                onClick={() => void toggleFlag(flag.key, !flagOn(flag.key))}
+              >
+                {t(flag.label)}
+              </button>
+            </span>
+          ))}
+        </div>
+      </div>
+
+      {/* ── 回收站文件表 ─────────────────────────────────── */}
+      <div className='mm-trash-card mm-trash-list'>
+        <div className='mm-trash-card-head'>
+          <strong className='mm-trash-card-title'>{t('回收站')}</strong>
+          <span className='mm-trash-summary'>
+            {t('{n} 个文件 · 保留 {days} 天，到期自动彻底删除', { n: num(count), days })}
+          </span>
+          <span className='mm-browse-spacer' />
+          <Button
+            type='button'
+            size='sm'
+            variant='outline'
+            className='mm-trash-purge'
+            disabled={busy === '__purge__'}
+            onClick={() => void purgeExpired()}
+          >
+            {t('清理超期文件')}
+          </Button>
+        </div>
+
+        {note ? <div className='mm-trash-note'>{note}</div> : null}
+
+        {trash.error ? (
+          <Panel loading={false} error={trash.error} onRetry={trash.reload}>{null}</Panel>
+        ) : trash.loading && !trash.data ? (
+          <Panel loading error=''>{null}</Panel>
+        ) : rows.length === 0 ? (
+          <div className='mm-trash-empty'>{t('回收站为空')}</div>
+        ) : (
+          <div className='mm-trash-scroll'>
+            <table className='mm-trash-table'>
+              <thead>
+                <tr>
+                  <th className='mm-tt-time'>{t('删除时间')}</th>
+                  <th className='mm-tt-path'>{t('原路径')}</th>
+                  <th className='mm-tt-size'>{t('体积')}</th>
+                  <th className='mm-tt-actions'>{t('操作')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map(item => (
+                  <tr key={item.id}>
+                    <td className='mm-tt-time' title={item.title}>
+                      <span className='mm-mono'>{trashTime(item.trashedAt)}</span>
+                    </td>
+                    <td className='mm-tt-path'>
+                      <button
+                        type='button'
+                        className='mm-tt-path-text'
+                        title={`${item.originPath}\n${item.title}`}
+                        onClick={() => onOpen(item.id)}
+                      >
+                        {item.originPath}
+                      </button>
+                    </td>
+                    <td className='mm-tt-size'>{sizeText(item.size)}</td>
+                    <td className='mm-tt-actions'>
+                      <Button
+                        type='button'
+                        size='sm'
+                        variant='ghost'
+                        disabled={busy === item.id}
+                        onClick={() => void restore(item)}
+                      >
+                        {t('恢复')}
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {count > TRASH_ROWS ? (
+              <div className='mm-trash-more'>
+                {t('只显示最新的 {shown} 个文件（共 {n} 个）。更早的请先「清理超期文件」。', {
+                  shown: TRASH_ROWS,
+                  n: num(count),
+                })}
+              </div>
+            ) : null}
+          </div>
+        )}
+      </div>
+    </div>
   )
 }
 
