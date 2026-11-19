@@ -483,18 +483,19 @@ pub fn recent(project: Option<&str>, agent: Option<&str>, days: usize) -> Value 
     json!({ "days": days, "count": count, "items": items })
 }
 
-/// 项目列表（登记表 + 实际落盘条数 + 分层计数）
+/// 项目列表（登记表 + 实际落盘条数 + 分层计数 + 关联 Agent）
+///
+/// ── 为什么要单独统计「通用」 ──────────────────────────────────
+/// 通用项目（`_global`）不是一张普通项目卡：它是**没有归属项目**的记忆的落脚点，
+/// 条数往往远大于任何一个具体项目。混在列表里既抢注意力，又让人误以为通用是个
+/// 可以合并/归档的对象。所以单独算一个 `general` 汇总挂在返回体上。
 pub fn projects() -> Value {
     ensure_index_once();
     let all = store::load_all();
     let now = crate::server::logging::now_ms();
     let mut stored = store::load_projects();
     for entry in all.iter().filter(|entry| entry.is_live()) {
-        let slug = entry
-            .project
-            .as_deref()
-            .map(store::slugify)
-            .unwrap_or_else(|| store::GLOBAL_SLUG.to_string());
+        let slug = entry_project_slug(entry);
         if !stored.iter().any(|project| project.slug == slug) {
             stored.push(store::Project {
                 slug: slug.clone(),
@@ -511,15 +512,16 @@ pub fn projects() -> Value {
         }
     }
     stored.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(a.name.cmp(&b.name)));
+    // 通用项目不进列表：它不是一张可维护的卡（名字固定、不可合并、不可归档），
+    // 条数往往远大于任何具体项目，混在表里只会抢注意力。单独走 `general` 汇总。
     let items: Vec<Value> = stored
         .iter()
+        .filter(|project| project.slug != store::GLOBAL_SLUG)
         .map(|project| {
             let mut entries: Vec<&MemoryEntry> = all
                 .iter()
                 .filter(|entry| entry.is_live())
-                .filter(|entry| {
-                    entry.project.as_deref().map(store::slugify).as_deref() == Some(project.slug.as_str())
-                })
+                .filter(|entry| entry_project_slug(entry) == project.slug)
                 .collect();
             entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
             let l1 = entries.iter().filter(|entry| entry.layer == Layer::L1).count();
@@ -539,6 +541,7 @@ pub fn projects() -> Value {
                 "l2": l2,
                 "updatedAt": latest,
                 "updatedText": search::relative_time(latest, now),
+                "agents": project_agents(&entries),
                 "latest": entries.iter().take(3).map(|entry| json!({
                     "id": entry.id,
                     "title": entry.title,
@@ -548,7 +551,59 @@ pub fn projects() -> Value {
             })
         })
         .collect();
-    json!({ "items": items })
+    // 通用项目的汇总：口径与列表里的 `count` 一致（同一个过滤条件），
+    // 但单独抽出来给顶部统计条用 —— 通用不是一张可维护的卡，不该混进列表。
+    let general_entries: Vec<&MemoryEntry> = all
+        .iter()
+        .filter(|entry| entry.is_live())
+        .filter(|entry| entry_project_slug(entry) == store::GLOBAL_SLUG)
+        .collect();
+    let general = json!({
+        "slug": store::GLOBAL_SLUG,
+        "count": general_entries.len(),
+        "l1": general_entries.iter().filter(|entry| entry.layer == Layer::L1).count(),
+        "l2": general_entries.iter().filter(|entry| entry.layer == Layer::L2).count(),
+        "latest": general_entries
+            .iter()
+            .map(|entry| entry.updated_at)
+            .max()
+            .unwrap_or(0),
+        "agents": project_agents(&general_entries),
+    });
+    json!({ "items": items, "general": general })
+}
+
+/// 一条记忆归属的项目 slug。
+///
+/// 没有 `project` 字段的条目属于「通用」（`_global`）—— 早先这里直接拿
+/// `Option::as_deref()` 比较，导致通用项目的计数恒为 0（`None != Some("_global")`）。
+/// 归属判断只有一个口径，所有地方都必须走这个函数。
+fn entry_project_slug(entry: &MemoryEntry) -> String {
+    entry
+        .project
+        .as_deref()
+        .map(store::slugify)
+        .unwrap_or_else(|| store::GLOBAL_SLUG.to_string())
+}
+
+/// 项目下所有条目的写入方（去重、首次出现顺序）。
+///
+/// 顺序用**条目时间倒序下的首次出现序**：新写入的 Agent 排前面，比按字母排
+/// 更符合「最近是谁在用这个项目」的直觉。
+fn project_agents(entries: &[&MemoryEntry]) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for entry in entries {
+        let Some(agent) = entry.agent.as_deref().map(str::trim) else {
+            continue;
+        };
+        if agent.is_empty() {
+            continue;
+        }
+        if !seen.iter().any(|item| item == agent) {
+            seen.push(agent.to_string());
+        }
+    }
+    seen
 }
 
 /// 改一张项目卡：重命名 / 置顶 / 归档。
@@ -580,7 +635,8 @@ pub fn update_project(slug: &str, patch: &Value) -> Result<Value, String> {
     project.updated_at = crate::server::logging::now_ms();
     store::save_projects(&cards)?;
     bump_revision();
-    Ok(json!({ "slug": slug, "items": projects()["items"] }))
+    let refreshed = projects();
+    Ok(json!({ "slug": slug, "items": refreshed["items"], "general": refreshed["general"] }))
 }
 
 /// 把 `from` 合并进 `into`：改写所有记忆的 `project` 字段与落盘路径，
@@ -636,7 +692,8 @@ pub fn merge_project(from: &str, into: &str) -> Result<Value, String> {
         "[Memory]",
         &format!("项目合并：{from_slug} → {into_slug}，迁移 {moved} 条"),
     );
-    Ok(json!({ "moved": moved, "items": projects()["items"] }))
+    let refreshed = projects();
+    Ok(json!({ "moved": moved, "items": refreshed["items"], "general": refreshed["general"] }))
 }
 
 /// 画像页视图：四类画像 + 生成门槛是否已达 + 上一版生成时间 + 存储与同步状态。

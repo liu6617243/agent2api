@@ -395,7 +395,16 @@
 }
 .mm-review-actions { margin-top: 7px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 
-/* ── 项目卡 ── */
+/* ── 项目表 ──
+   布局：工具条（搜索 + 统计 chip + 说明）→ 一张表（表头吸顶 + 行）。
+
+   为什么是表格而不是卡片网格：项目之间要横向比的东西很多（谁还活着、谁有远程、
+   记忆多不多、谁在用）。卡片把这些信息竖着摞，比一下就得来回扫；表格把同一维度
+   排成一列，扫一列就完事。项目一多（几十上百个仓库）差别尤其明显。
+
+   列宽的取法照 AgentHub 的项目页：状态 72 / 远程 96 / 路径 96 / 统计 155 /
+   Agent 130 / 操作 125，名称列自适应（width:auto）。`table-layout: fixed`
+   是这套宽度能生效的前提。 */
 .mm-projects-page {
   display: flex;
   flex-direction: column;
@@ -404,58 +413,288 @@
   flex: 1;
   overflow: auto;
 }
-.mm-projects {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 12px;
-  align-content: start;
+
+.mm-projects-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: none;
 }
-.mm-project-card {
+/* 搜索框定宽 280px。
+   为什么要多套一层 `.mm-projects-toolbar`：Input 组件自带 Tailwind 的 `w-full`
+   （`width:100%`），而 `islands/ui.css` 在 index.html 里排在 `page-memory.css`
+   **之后** —— 同特异性（单类）下后者赢，搜索框会被拉成整条工具条的宽度。
+   提高一级特异性是这条宽度能生效的最省事做法，不必给组件加 !important。
+   `flex: none` 同时挡住 flex 容器把它拉伸。 */
+.mm-projects-toolbar .mm-projects-search {
+  width: 280px;
+  max-width: 100%;
+  flex: none;
+}
+/* 工具条里的两枚统计 chip：胶囊形（与图二的圆头标签一致），且**不可点** ——
+   全局 `.mm-chip` 是给筛选器写的（`cursor: pointer` + 小圆角），这里的 chip
+   只是读数，套上去会让人以为点了能做什么。 */
+.mm-projects-toolbar .mm-chip {
+  border-radius: var(--r-pill);
+  padding: 2px 10px;
+  background: var(--surface-2, var(--surface-inset));
+  color: var(--text-2);
+  cursor: default;
+  white-space: nowrap;
+}
+/* 工具条右侧的次级动作（显示已归档 / 刷新）靠右推 */
+.mm-projects-toolbar-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+/* 说明问号：静态低调，悬停点亮（对齐 AgentHub 的 QMark） */
+.mm-projects-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  color: var(--text-3);
+  font-size: 10px;
+  line-height: 1;
+  cursor: help;
+  user-select: none;
+  transition: color 0.16s ease, border-color 0.16s ease;
+}
+.mm-projects-help:hover { color: var(--primary); border-color: var(--primary-bd); }
+
+.mm-projects-table-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--surface);
-  padding: 12px 14px;
+  scrollbar-gutter: stable;
+}
+
+.mm-projects-table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.mm-projects-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--surface-inset);
+  text-align: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.mm-projects-table tbody td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-2);
+  vertical-align: middle;
+}
+.mm-projects-table tbody tr:last-child td { border-bottom: none; }
+.mm-projects-table tbody tr:hover { background: var(--surface-inset); }
+.mm-projects-table tbody tr.archived { opacity: 0.55; }
+
+/* 列宽：名称列自适应，其余固定（照 AgentHub 的项目页）。
+   唯一的例外是「记忆统计」：AgentHub 给 155px，但那是它 12px 字号 + 更小内边距
+   下的账；本项目表格 12.5px、单元格左右各 10px，155px 的可用宽度只有 135px，
+   实测「393 条 · L2: 94 · 17 分钟前」要 167px —— 直接照抄会把时间压成「17 分…」。
+   列宽服从内容，不服从截图：宁可多 17px，也不让时间半截。
+   名称列是 auto，多出来的宽度从它那里扣，视觉上看不出差别。 */
+.mm-pt-name { width: auto; }
+.mm-pt-status { width: 72px; }
+.mm-pt-remote { width: 96px; }
+.mm-pt-path { width: 96px; }
+.mm-pt-stats { width: 172px; }
+.mm-pt-agents { width: 130px; }
+.mm-pt-actions { width: 125px; }
+
+/* 居中列：窄列里的内容是一枚胶囊 / 一个文字按钮，居中比左对齐更耐看 ——
+   左对齐时列宽一改，胶囊和列右边缘的留白就会忽宽忽窄。名称 / 统计 / Agent
+   三列内容长度差异大，保持左对齐（读起来是一条竖线）。 */
+.mm-pt-status,
+.mm-pt-remote,
+.mm-pt-path,
+.mm-pt-actions { text-align: center; }
+
+/* 名称 / slug 两行：展示名粗体在上，机器标识在下（slug 才是目录名） */
+.mm-pt-name-cell {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
 }
-.mm-project-card.archived { opacity: 0.62; }
-.mm-project-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  flex-wrap: wrap;
+.mm-pt-name-text {
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.mm-project-badges { display: flex; gap: 4px; flex-wrap: wrap; }
-.mm-project-meta {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-  font-size: 11.5px;
-  color: var(--text-3);
-}
-.mm-project-remote {
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  color: var(--text-2);
-  word-break: break-all;
-}
-.mm-project-path {
+.mm-pt-slug-text {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-3);
-  word-break: break-all;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.mm-project-latest { margin: 4px 0 0; padding-left: 16px; font-size: 12.5px; }
-.mm-project-latest li { margin-bottom: 3px; }
-.mm-project-actions {
-  margin-top: 6px;
+.mm-pt-flag {
+  margin-top: 2px;
+  align-self: flex-start;
+  font-size: 10px;
+  color: var(--primary);
+  border: 1px solid var(--primary-bd);
+  background: var(--primary-soft);
+  border-radius: var(--r-xs);
+  padding: 0 4px;
+  line-height: 15px;
+}
+
+/* 胶囊标签：状态 / 远程缺省 / L2 计数 */
+.mm-pill {
+  display: inline-block;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+/* 活跃 = 绿（语义色 --ok），静默 = 灰（无强调，只说明「还活着但没动」） */
+.mm-pill.ok {
+  color: var(--ok);
+  background: var(--ok-soft);
+  border: 1px solid var(--ok-bd);
+}
+.mm-pill.muted {
+  color: var(--text-3);
+  background: var(--surface-inset);
+  border: 1px solid var(--border);
+}
+/* 远程缺省 = 琥珀（--warn）：不是错误，但值得看一眼 */
+.mm-pill.warn {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border: 1px solid var(--warn-bd);
+}
+/* L2 沉淀条数 = 绿（--ok）。
+   为什么不用主蓝：这一格讲的是「已经沉下来的知识有多少」，和「已保护 / 已通过」
+   是同一类语义；画像页的主色调也已经是绿（见下方画像段的说明）。整块记忆中枢
+   共用一套强调色，切页签时不会觉得换了个产品。 */
+.mm-pill.l2 {
+  color: var(--ok);
+  background: var(--ok-soft);
+  border: 1px solid var(--ok-bd);
+  padding: 1px 6px;
+}
+
+.mm-pt-muted { color: var(--text-3); font-size: 11.5px; }
+/* 「查看 (N)」这种次级动作：做成可点的文字，不占按钮的视觉重量 */
+.mm-pt-link {
+  font-size: 11px;
+  color: var(--text-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  padding: 2px 8px;
+  cursor: default;
+  white-space: nowrap;
+}
+
+/* 记忆统计：条数 · L2 · 时间 挤在一格，整格不换行。
+   条数与时间**不许被压缩**（`flex: none`）：它们被压就会变成「393 …」这种
+   半截数字，比溢出更糟。真正允许吃紧的是中间的间隔。 */
+.mm-pt-stats-cell {
   display: flex;
-  gap: 4px;
-  flex-wrap: wrap;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
 }
+.mm-pt-stats-cell > .mm-mono,
+.mm-pt-stats-cell > .mm-pill,
+.mm-pt-time { flex: none; }
+.mm-pt-dot { margin: 0 3px; color: var(--text-3); flex: none; }
+.mm-pt-time {
+  margin-left: 4px;
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.mm-pt-ellipsis {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mm-pt-actions-cell {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+/* 操作列两个控件都按 AgentHub 的 24px 高度收：这一列只是入口，
+   高过数据行会把它顶成整行最厚的元素。 */
+.mm-pt-actions-cell .mm-cta,
+.mm-pt-actions-cell .mm-pt-more {
+  height: 24px;
+  font-size: 11.5px;
+}
+/* 主操作按钮：绿字 + 绿框 + 透明底，对齐 AgentHub 的 `.btn-cta`。
+   不用实心绿：一行里最重的那块颜色会压在这一列，把真正要扫的
+   「项目名 / 状态 / 记忆统计」三列一起吃掉了。描边只在悬停时补底色，
+   既保住「这是高频入口」的提示，又不跟数据抢注意力。 */
+.mm-cta {
+  border-color: var(--ok-bd) !important;
+  color: var(--ok) !important;
+  background: transparent !important;
+  font-weight: 500;
+}
+.mm-cta:hover {
+  background: var(--ok-soft) !important;
+}
+.mm-pt-more { padding: 0 6px; color: var(--text-3); }
+
+/* 行尾菜单 */
+.mm-pt-menu { width: 196px; padding: 5px; }
+.mm-pt-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 9px;
+  border: none;
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.mm-pt-menu-item:hover { background: var(--surface-inset); color: var(--text); }
+
 .mm-rename { display: flex; gap: 6px; align-items: center; width: 100%; }
+
+/* 窄屏：表格横向滚动，而不是把列挤扁（挤扁了就看不清哪列是什么了） */
+@media (max-width: 1080px) {
+  .mm-projects-table-wrap { overflow-x: auto; }
+  .mm-projects-table { min-width: 900px; }
+}
 
 /* ── 画像 ──
    布局：状态带（一行说明 + 两枚动作 + 一排徽标）→ 四宫格分类 → 单面板条目流。

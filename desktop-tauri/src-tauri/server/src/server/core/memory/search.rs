@@ -98,8 +98,17 @@ fn keep(row: &IndexRow, query: &Query) -> bool {
     }
     if let Some(project) = &query.project {
         let want = super::store::slugify(project);
-        let hit = row.project.as_deref().map(super::store::slugify).as_deref() == Some(want.as_str());
-        // `_global` 也接受「按项目筛」时显式指名它
+        // `_global` 要额外接住「没有 project 字段」的条目 —— 它们才是通用记忆的
+        // 主体（通用项目在项目列表里是单独汇总的，不是一张普通卡）。
+        // 少了这一支，按「通用」筛会一条都搜不出来。
+        let hit = if want == super::store::GLOBAL_SLUG {
+            match row.project.as_deref() {
+                None => true,
+                Some(name) => super::store::slugify(name) == super::store::GLOBAL_SLUG,
+            }
+        } else {
+            row.project.as_deref().map(super::store::slugify).as_deref() == Some(want.as_str())
+        };
         if !hit {
             return false;
         }

@@ -79,11 +79,13 @@ function MemoryPage(): React.ReactElement {
   const [status, setStatus] = React.useState<m.MemoryStatus | null>(null)
   const [kinds, setKinds] = React.useState<m.MemoryKindOption[]>([])
   const [projects, setProjects] = React.useState<m.MemoryProject[]>([])
+  const [general, setGeneral] = React.useState<m.MemoryGeneral | null>(null)
   const [projectsLoading, setProjectsLoading] = React.useState(true)
   const [projectsError, setProjectsError] = React.useState('')
   const [error, setError] = React.useState('')
   const [booted, setBooted] = React.useState(false)
   const [focusId, setFocusId] = React.useState<string | null>(null)
+  const [focusProject, setFocusProject] = React.useState<string | null>(null)
 
   /**
    * 首屏一次拉全「壳数据」：状态、类别枚举、项目列表。
@@ -98,6 +100,7 @@ function MemoryPage(): React.ReactElement {
       setStatus(config.status)
       setKinds(config.kinds)
       setProjects(projectList.items)
+      setGeneral(projectList.general ?? null)
       setProjectsError('')
     } catch (caught) {
       setProjectsError(caught instanceof Error ? caught.message : String(caught))
@@ -116,6 +119,7 @@ function MemoryPage(): React.ReactElement {
     try {
       const projectList = await m.loadProjects()
       setProjects(projectList.items)
+      setGeneral(projectList.general ?? null)
       setProjectsError('')
     } catch (caught) {
       setProjectsError(caught instanceof Error ? caught.message : String(caught))
@@ -175,6 +179,19 @@ function MemoryPage(): React.ReactElement {
     switchTab('browse')
   }
 
+  /**
+   * 「查看记忆」→ 跳浏览页并带上项目筛选。
+   *
+   * 为什么带筛选而不是只跳过去：浏览页默认是「全部项目」的列表，用户点了
+   * 「查看记忆」却看到一堆别的项目的条目，等于还得自己再筛一遍 —— 这一跳
+   * 就白跳了。筛选条件由浏览页消费后清掉（`onFocusProjectConsumed`），
+   * 否则用户手动改掉筛选后又被外力改回去。
+   */
+  const openProjectMemories = (slug: string) => {
+    setFocusProject(slug)
+    switchTab('browse')
+  }
+
   return (
     <div className='mm-page'>
       <div className='mm-head'>
@@ -231,6 +248,8 @@ function MemoryPage(): React.ReactElement {
                 onChanged={afterChange}
                 focusId={focusId}
                 onFocusConsumed={() => setFocusId(null)}
+                focusProject={focusProject}
+                onFocusProjectConsumed={() => setFocusProject(null)}
               />
             </TabBoundary>
           ) : null}
@@ -239,10 +258,12 @@ function MemoryPage(): React.ReactElement {
             <TabBoundary name='项目'>
               <Projects
                 projects={projects}
+                general={general}
                 loading={projectsLoading}
                 error={projectsError}
                 onReload={() => void refreshProjects()}
                 onOpenEntry={openEntryFromProject}
+                onOpenProject={openProjectMemories}
                 onChanged={afterChange}
               />
             </TabBoundary>

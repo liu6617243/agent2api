@@ -36,5 +36,11 @@ declare global {
 export function t(key: string, params?: TParams): string {
   const api = typeof window !== 'undefined' ? window.wbI18n : undefined
   if (api && typeof api.t === 'function') return api.t(key, params)
-  return key
+  // 兜底也要插值：运行时不在时直接 return key，会让 `共 {n} 个项目` 把占位符
+  // 原样漏到界面上 —— 比显示中文糟糕得多。这里与 ui/i18n.js 的 t() 保持同一套
+  // 替换规则（取不到的形参替换成空串，不留占位符）。
+  if (!params) return key
+  return key.replace(/\{(\w+)\}/g, (match, name) => (
+    Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : ''
+  ))
 }

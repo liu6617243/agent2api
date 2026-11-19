@@ -85,7 +85,19 @@ export type MemoryProject = {
   l2: number
   updatedAt: number
   updatedText: string
+  /** 写入过本项目记忆的 Agent（去重，按最近写入优先） */
+  agents: string[]
   latest: { id: string; title: string; type: string; layer: string }[]
+}
+
+/** 通用项目汇总（没有归属项目的记忆单独统计，不进项目列表） */
+export type MemoryGeneral = {
+  slug: string
+  count: number
+  l1: number
+  l2: number
+  latest: number
+  agents: string[]
 }
 
 export type MemoryKindOption = { value: string; label: string; prefersL2?: boolean }
@@ -717,7 +729,7 @@ export function loadDigest(maxLines?: number): Promise<{ text: string; lines: nu
   return api('GET', `/api/memory/digest${query({ maxLines })}`)
 }
 
-export function loadProjects(): Promise<{ items: MemoryProject[] }> {
+export function loadProjects(): Promise<{ items: MemoryProject[]; general: MemoryGeneral }> {
   return api('GET', '/api/memory/projects')
 }
 
@@ -1021,12 +1033,12 @@ export function dedupScan(): Promise<DedupScan> {
 
 /* ─── 项目卡操作 ──────────────────────────────────────────── */
 
-export function updateProject(slug: string, patch: { name?: string; pinned?: boolean; archived?: boolean }): Promise<{ slug: string; items: MemoryProject[] }> {
+export function updateProject(slug: string, patch: { name?: string; pinned?: boolean; archived?: boolean }): Promise<{ slug: string; items: MemoryProject[]; general: MemoryGeneral }> {
   return api('POST', '/api/memory/projects/update', { slug, ...patch })
 }
 
 /** 合并会逐条搬文件（改 frontmatter + 移动 .md），同步等待结果。 */
-export function mergeProject(from: string, into: string): Promise<{ moved: number; items: MemoryProject[] }> {
+export function mergeProject(from: string, into: string): Promise<{ moved: number; items: MemoryProject[]; general: MemoryGeneral }> {
   return api('POST', '/api/memory/projects/merge', { from, into })
 }
 

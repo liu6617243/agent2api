@@ -29,9 +29,20 @@ type BrowseProps = {
   /** 外部要求打开某条（项目页点标题跳过来） */
   focusId?: string | null
   onFocusConsumed?: () => void
+  /** 外部要求按某个项目筛选（项目页「查看记忆」跳过来） */
+  focusProject?: string | null
+  onFocusProjectConsumed?: () => void
 }
 
-function Browse({ kinds, projects, onChanged, focusId, onFocusConsumed }: BrowseProps): React.ReactElement {
+function Browse({
+  kinds,
+  projects,
+  onChanged,
+  focusId,
+  onFocusConsumed,
+  focusProject,
+  onFocusProjectConsumed,
+}: BrowseProps): React.ReactElement {
   const [query, setQuery] = React.useState('')
   const [kind, setKind] = React.useState('')
   const [project, setProject] = React.useState('')
@@ -83,6 +94,16 @@ function Browse({ kinds, projects, onChanged, focusId, onFocusConsumed }: Browse
     void openEntry(focusId)
     onFocusConsumed?.()
   }, [focusId, openEntry, onFocusConsumed])
+
+  // 项目页「查看记忆」跳过来时，把项目筛选落到下拉框上
+  //
+  // 消费后立刻清掉外层的 `focusProject`，否则用户手动换一个项目，下一次
+  // 任何重渲染都会把它顶回旧值 —— 筛选框看起来「不听话」。
+  React.useEffect(() => {
+    if (!focusProject) return
+    setProject(focusProject)
+    onFocusProjectConsumed?.()
+  }, [focusProject, onFocusProjectConsumed])
 
   const saveDraft = async () => {
     if (!draft) return
@@ -141,6 +162,8 @@ function Browse({ kinds, projects, onChanged, focusId, onFocusConsumed }: Browse
         </select>
         <select className='mm-select mm-project-select' value={project} onChange={event => setProject(event.target.value)}>
           <option value=''>{t('全部项目')}</option>
+          {/* 通用项目不在项目列表里（它不是一张可维护的卡），但仍要能按它筛 */}
+          <option value='_global'>{t('通用（general）')}</option>
           {projects.map(item => (
             <option key={item.slug} value={item.slug}>{item.name}（{item.count}）</option>
           ))}
