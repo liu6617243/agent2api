@@ -143,6 +143,11 @@ A2A_DELIVER=1 git push origin HEAD:main-patched
 单平台 `cancelled` 且 `steps: []`、job 日志 `BlobNotFound`、开始到结束恰好整数分钟，
 是 runner 没跑起来的基础设施问题，不是测试失败；先重跑失败任务。测试失败必有失败步骤与日志。
 
+**重跑也受 concurrency 约束。** `rust-tests` 对同一 workflow/ref 设置了
+`cancel-in-progress: true`：旧提交的 run 仍 queued / in_progress 时再点 rerun，
+会把当前 HEAD 的整组测试顶掉。先等同组在途 run 结束，再重跑当前 HEAD；
+「只重跑失败 job」不等于「不取消其他 run」。
+
 ### 单平台单条红：先怀疑测试时钟，别先怀疑实现
 
 真实案例（run `44720265261`）：Linux / Windows 全绿，只有 macOS 挂一条：
