@@ -3314,6 +3314,25 @@
   font-weight: 500;
   color: var(--warn);
 }
+/* 「本仓未接入」：不是警告（配置没问题），是状态说明 —— 用中性灰，
+   和 `mm-cfg-hot` 的橙分开，免得一片橙色让人以为配置出错了 */
+.mm-cfg-unwired {
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-3);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-xs);
+  padding: 0 4px;
+  line-height: 1.5;
+  background: var(--surface-inset);
+}
+/* 整行压暗：值仍然可读（要能导出、能对照另一台机器），但一眼看出不可改 */
+.mm-cfg-knob.unwired .mm-cfg-knob-control,
+.mm-cfg-knob.unwired .mm-cfg-knob-default { opacity: 0.55; }
+/* fieldset 默认带 padding/border，这里只借用它的 `disabled` 语义 */
+.mm-cfg-knob-lock { border: 0; margin: 0; padding: 0; min-width: 0; display: contents; }
+.mm-cfg-knob-lock:disabled { cursor: not-allowed; }
 .mm-cfg-knob-key { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-3); }
 .mm-cfg-knob-desc { font-size: 11.5px; color: var(--text-3); line-height: 1.6; margin-top: 1px; }
 .mm-cfg-knob-control { display: flex; align-items: center; gap: 7px; min-width: 0; }

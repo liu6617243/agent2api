@@ -426,37 +426,51 @@ pub fn classify_explicit(name: &str, cwd: Option<&str>) -> Classified {
 /// 从工作目录推断项目。
 ///
 /// 顺序（每一步命中就返回）：
-/// 1. `cwd` 自己的 origin 远程
-/// 2. 往上找到 git 根，根的 origin 远程
+/// 1. `cwd` 自己的 origin 远程 —— `classify.gitPreferred=false` 时跳过
+/// 2. 往上找到 git 根，根的 origin 远程 —— 同上
 /// 3. registry 里已登记项目名的模糊匹配 ≥ `classify.fuzzyThreshold`
 /// 4. 都没有 → general（`suggest` 有待确认候选）
 pub fn classify(cwd: &str, agent: Option<&str>) -> Classified {
     if cwd.trim().is_empty() {
         return Classified { slug: None, name: None, origin: "general", confidence: 0.0, suggestion: None };
     }
+    // `classify.gitPreferred=false` 时跳过 ①②，直接按目录名 + 已登记项目匹配。
+    //
+    // ── 为什么这个开关只作用于「推断」，不作用于「显式指名」──────
+    // 显式指名（`classify_explicit`）用 git slug 是为了让同一个仓库不因为
+    // 「用户随手写的项目名」分裂成两个项目 —— 那是**合并语义**，不是「优先」。
+    // 而这里 ①② 是「从 cwd 猜」，猜错的代价是记忆流进错误的项目目录。
+    // 用户关掉它的典型场景：一台机器上目录名比 git remote 更能表达项目
+    //（monorepo 里各子仓共用同一个 remote，但目录名各不相同）。
+    //
+    // 缓存不受影响：`detect_remotes` 的进程内缓存只是避免重复起子进程，
+    // 关掉开关时我们根本不调用它，缓存里有什么都不影响。
+    let git = super::config::bool_of("classify.gitPreferred");
     // ① 直接的 origin
-    if let Some(identity) = detect_identity(cwd) {
-        store::registry_upsert(&identity.slug, &identity.display, cwd, identity.url.as_str());
-        return Classified {
-            slug: Some(identity.slug),
-            name: Some(identity.display),
-            origin: "git",
-            confidence: 1.0,
-            suggestion: None,
-        };
-    }
-    // ② 从子目录找根
-    if let Some(root) = find_git_root(cwd) {
-        if root != cwd {
-            if let Some(identity) = detect_identity(&root) {
-                store::registry_upsert(&identity.slug, &identity.display, &root, identity.url.as_str());
-                return Classified {
-                    slug: Some(identity.slug),
-                    name: Some(identity.display),
-                    origin: "gitroot",
-                    confidence: 0.95,
-                    suggestion: None,
-                };
+    if git {
+        if let Some(identity) = detect_identity(cwd) {
+            store::registry_upsert(&identity.slug, &identity.display, cwd, identity.url.as_str());
+            return Classified {
+                slug: Some(identity.slug),
+                name: Some(identity.display),
+                origin: "git",
+                confidence: 1.0,
+                suggestion: None,
+            };
+        }
+        // ② 从子目录找根
+        if let Some(root) = find_git_root(cwd) {
+            if root != cwd {
+                if let Some(identity) = detect_identity(&root) {
+                    store::registry_upsert(&identity.slug, &identity.display, &root, identity.url.as_str());
+                    return Classified {
+                        slug: Some(identity.slug),
+                        name: Some(identity.display),
+                        origin: "gitroot",
+                        confidence: 0.95,
+                        suggestion: None,
+                    };
+                }
             }
         }
     }

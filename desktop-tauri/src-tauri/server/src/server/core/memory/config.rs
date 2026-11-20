@@ -96,14 +96,38 @@ pub struct Knob {
     pub options: &'static [&'static str],
     /// 改了立刻生效（`false` = 需要重启或重建索引）
     pub hot: bool,
+    /// 运行时代码**真的读它**（`false` = 只落盘、只显示，没有任何行为影响）。
+    ///
+    /// ── 为什么要这个字段，而不是把未接入的键直接删掉 ────────────
+    /// 这张表是**跨实现的配置契约**：磁盘上同一份 `config.json` 两边都能读
+    /// （见文件头）。删键会让「老配置 → 新代码」静默丢值，「新配置 → 老代码」
+    /// 被当未知键丢弃；而保留一个能改、能存、看不出没接线的旋钮，是更糟的一种：
+    /// 用户照着自己的理解调完、界面显示「已保存」、行为一点没变，然后开始怀疑
+    /// 整个页面是不是假的。
+    ///
+    /// 所以未接入的键**留着、标出来**：`wired=false` 下发到前端 → 控件置灰 +
+    /// 「本仓未接入」徽标；后端单测 `unwired_knobs_explain_themselves` 要求
+    /// 每个未接入的键都在 `desc` 里写清「为什么没接线」，不允许出现「静默的
+    /// 死旋钮」。同时 `wired_knobs_have_a_reader` 用源码扫描确保每个
+    /// `wired=true` 的键都真的有读取点 —— 这条是防**新加水**，比防旧水更重要。
+    pub wired: bool,
 }
 
 const fn knob(key: &'static str, kind: Kind, tier: Tier, group: &'static str, label: &'static str, default_json: &'static str) -> Knob {
-    Knob { key, kind, tier, group, label, desc: "", default_json, min: None, max: None, options: &[], hot: true }
+    Knob { key, kind, tier, group, label, desc: "", default_json, min: None, max: None, options: &[], hot: true, wired: true }
 }
 
 const fn knob_d(key: &'static str, kind: Kind, tier: Tier, group: &'static str, label: &'static str, desc: &'static str, default_json: &'static str) -> Knob {
-    Knob { key, kind, tier, group, label, desc, default_json, min: None, max: None, options: &[], hot: true }
+    Knob { key, kind, tier, group, label, desc, default_json, min: None, max: None, options: &[], hot: true, wired: true }
+}
+
+/// 标成「本仓未接入」：值照存、界面照显示，但不影响任何行为。
+///
+/// `desc` 必须由调用方写好「为什么」—— 用户看到灰掉的开关时需要的是原因，
+/// 不是一句「暂不支持」。这条由单测 `unwired_knobs_explain_themselves` 钉住。
+const fn unwired(mut item: Knob) -> Knob {
+    item.wired = false;
+    item
 }
 
 const fn range(mut item: Knob, min: f64, max: f64) -> Knob {
@@ -133,13 +157,16 @@ static SCHEMA: &[Knob] = &[
     range(knob("storage.backupKeep", Kind::Number, Tier::Advanced, "存储", "备份保留份数", "5"), 1.0, 50.0),
     range(knob_d("storage.trashKeepDays", Kind::Number, Tier::Basic, "存储", "回收站保留天数",
         "到期后每天自动清理任务把文件从磁盘彻底删除", "30"), 7.0, 365.0),
-    range(cold(knob("storage.maxFileSizeKB", Kind::Number, Tier::Internal, "存储", "单文件上限 (KB)", "512")), 16.0, 8192.0),
+    range(cold(knob_d("storage.maxFileSizeKB", Kind::Number, Tier::Internal, "存储", "单文件上限 (KB)",
+        "读取时跳过超过这个体积的记忆文件（手写的巨型日志不该整份进索引）；0 附近的值会连正常长文一起跳掉", "512")), 16.0, 8192.0),
 
     // ===== 索引与检索 =====
     cold(range(knob_d("index.titleBoost", Kind::Number, Tier::Advanced, "索引", "标题权重倍数",
-        "写入侧重复次数；改动需重建索引", "3"), 1.0, 10.0)),
-    range(knob("search.recallTopK", Kind::Number, Tier::Advanced, "检索", "检索召回条数", "20"), 5.0, 200.0),
-    range(knob("search.finalTopK", Kind::Number, Tier::Basic, "检索", "最终返回条数", "8"), 1.0, 50.0),
+        "写入索引时标题重复的次数；改动需重建索引", "3"), 1.0, 10.0)),
+    range(knob_d("search.recallTopK", Kind::Number, Tier::Advanced, "检索", "检索召回条数",
+        "关键词检索最多取多少条候选再打分排序；调大更全但一次检索更慢", "20"), 5.0, 200.0),
+    range(knob_d("search.finalTopK", Kind::Number, Tier::Basic, "检索", "最终返回条数",
+        "MCP memory_search 不传 limit 时用它；界面列表自己分页，不受它影响", "8"), 1.0, 50.0),
     range(knob_d("search.timeDecayHalfLife", Kind::Number, Tier::Advanced, "检索", "时间衰减半衰期（天）",
         "0 = 不衰减", "30"), 0.0, 365.0),
     range(knob("search.weightBm25", Kind::Number, Tier::Internal, "检索", "权重·相关度", "0.5"), 0.0, 1.0),
@@ -156,7 +183,8 @@ static SCHEMA: &[Knob] = &[
 
     // ===== 归类 =====
     range(knob("classify.fuzzyThreshold", Kind::Number, Tier::Advanced, "归类", "模糊匹配阈值", "0.62"), 0.3, 1.0),
-    knob("classify.gitPreferred", Kind::Bool, Tier::Basic, "归类", "Git 地址优先", "true"),
+    knob_d("classify.gitPreferred", Kind::Bool, Tier::Basic, "归类", "Git 地址优先",
+        "关掉后只按目录名与已登记项目匹配，不读工作目录的 git remote", "true"),
     knob_d("classify.autoCreateProject", Kind::Bool, Tier::Advanced, "归类", "模糊失败自动建新项目",
         "默认关，避免产生混乱的碎项目", "false"),
 
@@ -165,13 +193,21 @@ static SCHEMA: &[Knob] = &[
         "[\"zcode\",\"codex\",\"workbuddy\",\"claude\",\"dsh\",\"trae-solo\",\"antigravity\"]"),
         &["zcode", "codex", "workbuddy", "claude", "dsh", "trae-solo", "cursor", "qoder", "qoder-cn", "antigravity"]),
     knob("agents.custom", Kind::List, Tier::Advanced, "Agent 接入", "自定义 Agent（本机）", "[]"),
-    knob("agents.autoVerify", Kind::Bool, Tier::Basic, "Agent 接入", "接入后自动校验", "true"),
-    range(knob("agents.verifyInterval", Kind::Number, Tier::Advanced, "Agent 接入", "连接巡检间隔（秒）", "300"), 30.0, 3600.0),
+    // 这两条是 AgentHub 的轮询式接入模型（定时探活 + 自动校验）留下的。本仓的
+    // 接入是「用户点一下才握手」：没有后台巡检线程，也没有「刚接完就自动测一遍」
+    // 的动作。保留键是为了与 AgentHub 共用同一份 config.json，标 unwired 让界面
+    // 说清楚，而不是让人以为开了它就会有后台任务跑起来。
+    unwired(knob_d("agents.autoVerify", Kind::Bool, Tier::Basic, "Agent 接入", "接入后自动校验",
+        "本仓未接入：接入是手动的，没有「写入后自动握手」这一步；点接入页的「测试连接」等价", "true")),
+    unwired(range(knob_d("agents.verifyInterval", Kind::Number, Tier::Advanced, "Agent 接入", "连接巡检间隔（秒）",
+        "本仓未接入：没有后台巡检线程；探活只在点「测试连接 / 全部校验」时发生", "300"), 30.0, 3600.0)),
     knob_d("agents.injectAgentsMd", Kind::Bool, Tier::Advanced, "Agent 接入", "注入 AGENTS.md 受控块",
         "关掉则只在 MCP initialize.instructions 里给行为约定", "true"),
     range(knob("agents.coreMaxTokens", Kind::Number, Tier::Internal, "Agent 接入", "memory_core token 上限", "800"), 200.0, 4000.0),
-    range(knob("agents.digestMaxLines", Kind::Number, Tier::Internal, "Agent 接入", "memory_digest 行数上限", "200"), 50.0, 1000.0),
-    range(knob("agents.searchMaxTokens", Kind::Number, Tier::Internal, "Agent 接入", "memory_search token 上限", "1200"), 200.0, 4000.0),
+    range(knob_d("agents.digestMaxLines", Kind::Number, Tier::Internal, "Agent 接入", "memory_digest 行数上限",
+        "MCP memory_digest 不传 maxLines 时用它", "200"), 50.0, 1000.0),
+    range(knob_d("agents.searchMaxTokens", Kind::Number, Tier::Internal, "Agent 接入", "memory_search token 上限",
+        "检索结果超预算时从尾部丢行，直到估算 token 落回这个数", "1200"), 200.0, 4000.0),
 
     // ===== 深层记忆 =====
     knob("deep.enabled", Kind::Bool, Tier::Basic, "深层记忆", "深层记忆总开关", "true"),
@@ -195,7 +231,8 @@ static SCHEMA: &[Knob] = &[
         "0 = 不限", "200000"), 0.0, 100_000_000.0),
     opts(knob("auto.overBudgetAction", Kind::Enum, Tier::Advanced, "自动化", "超预算行为", "\"pause\""),
         &["pause", "ignore"]),
-    range(knob("auto.logKeepDays", Kind::Number, Tier::Internal, "自动化", "任务日志保留天数", "30"), 1.0, 365.0),
+    range(knob_d("auto.logKeepDays", Kind::Number, Tier::Internal, "自动化", "任务日志保留天数",
+        "每天清理任务按它删掉过期的 llm_call / task_run 行；条数上限另见 logKeepCount", "30"), 1.0, 365.0),
     range(knob("auto.logKeepCount", Kind::Number, Tier::Internal, "自动化", "任务日志保留条数", "200"), 20.0, 2000.0),
     knob_d("auto.tasks", Kind::Map, Tier::Advanced, "自动化", "任务开关与节奏",
         "默认开：零/低消耗任务；耗 token 的任务默认关",
@@ -212,9 +249,19 @@ static SCHEMA: &[Knob] = &[
           \"health\":{\"enabled\":true,\"daily\":\"11:30\"}}"),
 
     // ===== 去重 =====
+    //
+    // ── L3 / L4 为什么整组都标 unwired ─────────────────────────
+    // 本仓的去重只实现了两级：L1 精确哈希（`find_hash_duplicate`，写入前挡同一
+    // 内容）与 L2 词面近似（`near_duplicate`，只产建议进待确认队列）。
+    // L3（BM25 粗排候选）与 L4（让模型做 ADD/UPDATE/DELETE/NONE 四操作判定）
+    // 需要一套带 `dedup_status` 的状态机 + 逐条模型的裁决流水，本仓没有。
+    // 留键是为了 config.json 与 AgentHub 互通；标 unwired 是为了不让用户以为
+    // 打开「L4 语义判定」就会开始耗 token 判重 —— 那件事没接。
     knob("dedup.enabled", Kind::Bool, Tier::Basic, "去重", "去重总开关", "true"),
     knob("dedup.l1.enabled", Kind::Bool, Tier::Basic, "去重", "L1 精确哈希去重", "true"),
-    opts(knob("dedup.l1.normalizeLevel", Kind::Enum, Tier::Advanced, "去重", "归一化强度", "\"full\""),
+    opts(knob_d("dedup.l1.normalizeLevel", Kind::Enum, Tier::Advanced, "去重", "归一化强度",
+        "算内容哈希前怎么归一：full = 统一换行 + 去行尾空白 + 整体 trim；trim = 只 trim；none = 原样。改它会换掉整库哈希，需重建索引",
+        "\"full\""),
         &["none", "trim", "full"]),
     knob("dedup.l2.enabled", Kind::Bool, Tier::Basic, "去重", "L2 文本近似去重", "true"),
     range(knob("dedup.l2.autoMergeThreshold", Kind::Number, Tier::Advanced, "去重", "L2 自动合并阈值", "0.9"), 0.5, 1.0),
@@ -222,12 +269,16 @@ static SCHEMA: &[Knob] = &[
     range(knob("dedup.l2.wDice", Kind::Number, Tier::Internal, "去重", "L2 集合相似度权重", "0.5"), 0.0, 1.0),
     range(knob("dedup.l2.wEdit", Kind::Number, Tier::Internal, "去重", "L2 编辑距离权重", "0.3"), 0.0, 1.0),
     range(knob("dedup.l2.wTitle", Kind::Number, Tier::Internal, "去重", "L2 标题权重", "0.2"), 0.0, 1.0),
-    range(knob("dedup.l3.topK", Kind::Number, Tier::Advanced, "去重", "L3 BM25 候选条数", "8"), 1.0, 30.0),
-    knob_d("dedup.l4.enabled", Kind::Bool, Tier::Basic, "去重", "L4 语义判定（耗 token）",
-        "默认关以避免无意消耗 Token", "false"),
-    range(knob("dedup.l4.minCandidateScore", Kind::Number, Tier::Advanced, "去重", "L4 触发最低候选分", "0.62"), 0.0, 1.0),
-    range(knob("dedup.l4.autoUpdateThreshold", Kind::Number, Tier::Advanced, "去重", "L4 UPDATE 自动执行置信", "0.8"), 0.0, 1.0),
-    range(knob("dedup.l4.batchSize", Kind::Number, Tier::Internal, "去重", "L4 单批条数", "20"), 1.0, 50.0),
+    unwired(range(knob_d("dedup.l3.topK", Kind::Number, Tier::Advanced, "去重", "L3 BM25 候选条数",
+        "本仓未接入 L3：没有 BM25 粗排这一级，L2 直接对同类型条目做词面相似度", "8"), 1.0, 30.0)),
+    unwired(knob_d("dedup.l4.enabled", Kind::Bool, Tier::Basic, "去重", "L4 语义判定（耗 token）",
+        "本仓未接入 L4：没有让模型做 ADD/UPDATE/DELETE/NONE 判定的流水；近似重复只产待确认建议", "false")),
+    unwired(range(knob_d("dedup.l4.minCandidateScore", Kind::Number, Tier::Advanced, "去重", "L4 触发最低候选分",
+        "本仓未接入 L4：没有候选分门槛这一环（L2 的门槛是 dedup.l2.candidateThreshold）", "0.62"), 0.0, 1.0)),
+    range(knob_d("dedup.l4.autoUpdateThreshold", Kind::Number, Tier::Advanced, "去重", "L4 UPDATE 自动执行置信",
+        "「事实失效」自动应用的最低置信度（失效判定任务用这个门槛，不是 L4 判重）", "0.8"), 0.0, 1.0),
+    unwired(range(knob_d("dedup.l4.batchSize", Kind::Number, Tier::Internal, "去重", "L4 单批条数",
+        "本仓未接入 L4：没有分批判重；单批条数由 auto.tasks 里各任务的 batchSize 决定", "20"), 1.0, 50.0)),
     range(knob("dedup.pendingWarnThreshold", Kind::Number, Tier::Advanced, "去重", "队列积压告警阈值", "50"), 1.0, 999.0),
 
     // ===== 待确认队列的自动确认（默认全关）=====
@@ -251,16 +302,24 @@ static SCHEMA: &[Knob] = &[
         "内容为空壳、进不了索引的残骸，整份移入回收站", "false"),
 
     // ===== 模型与路由 =====
-    knob_d("models.sourceOrder", Kind::List, Tier::Advanced, "模型与网关", "模型来源优先级",
-        "[\"gateway\",\"custom\"] —— gateway = 用本机网关自己的路由", "[\"gateway\",\"custom\"]"),
-    knob("models.providers", Kind::List, Tier::Advanced, "模型与网关", "自定义供应商", "[]"),
+    //
+    // ── 本仓的模型选择只有一条链路（`llm::model_for`）───────────
+    // 显式路由（models.routing）→ 思考强度对应的标签（models.models 里的 tags）
+    // → 兜底模型（models.fallbackModel）→ 网关目录首个对话模型。所以真正接线
+    // 的只有这四个键 + timeout + gatewayBase。AgentHub 那套「模型来源排序 +
+    // 自定义供应商 + 用途标签集」在本仓没有对应的解析器，标 unwired 而不是
+    // 留一个改完没反应的输入框。
+    unwired(knob_d("models.sourceOrder", Kind::List, Tier::Advanced, "模型与网关", "模型来源优先级",
+        "本仓未接入：模型只从本机网关目录里取，没有「网关 / 自定义供应商」两个来源可排序", "[\"gateway\",\"custom\"]")),
+    unwired(knob("models.providers", Kind::List, Tier::Advanced, "模型与网关", "自定义供应商", "[]")),
     knob("models.models", Kind::List, Tier::Advanced, "模型与网关", "模型池", "[]"),
     knob_d("models.routing", Kind::List, Tier::Internal, "模型与网关", "按标签降级链",
         "每项 {\"task\":\"extract\",\"tags\":[\"light\"],\"model\":\"...\"}", "[]"),
-    knob("models.tagDefs", Kind::List, Tier::Internal, "模型与网关", "用途标签集",
-        "[\"light\",\"heavy\",\"dedup\",\"classify\",\"distill\",\"extract\",\"tag\",\"summarize\",\"profile\",\"supersede\",\"consolidate\",\"insight\"]"),
+    unwired(knob("models.tagDefs", Kind::List, Tier::Internal, "模型与网关", "用途标签集",
+        "[\"light\",\"heavy\",\"dedup\",\"classify\",\"distill\",\"extract\",\"tag\",\"summarize\",\"profile\",\"supersede\",\"consolidate\",\"insight\"]")),
     range(knob("models.timeout", Kind::Number, Tier::Advanced, "模型与网关", "请求超时（秒）", "60"), 5.0, 600.0),
-    range(knob("models.maxRetries", Kind::Number, Tier::Advanced, "模型与网关", "失败重试次数", "3"), 0.0, 10.0),
+    unwired(range(knob_d("models.maxRetries", Kind::Number, Tier::Advanced, "模型与网关", "失败重试次数",
+        "本仓未接入：内部模型调用失败即返回，重试由自动化任务下一轮承担；不在这里叠一层", "3"), 0.0, 10.0)),
     knob_d("models.gatewayBase", Kind::Text, Tier::Internal, "模型与网关", "网关基址",
         "留空 = 自动探测本机端口（面板与网关分端口时也能找对）", "\"\""),
     knob_d("models.fallbackModel", Kind::Text, Tier::Advanced, "模型与网关", "兜底模型",
@@ -281,8 +340,11 @@ static SCHEMA: &[Knob] = &[
         "用户主动关掉的内置来源；不在清单里 = 未被忽略", "[]"),
 
     // ===== 隐私 =====
-    knob_d("privacy.redact", Kind::Bool, Tier::Advanced, "隐私", "写入前脱敏", "", "false"),
-    knob("privacy.redactRules", Kind::List, Tier::Internal, "隐私", "脱敏规则（正则）",
+    knob_d("privacy.redact", Kind::Bool, Tier::Advanced, "隐私", "写入前脱敏",
+        "开启后，写入的正文按下面的规则逐条替换成 ***（导入与手动写入都过这一道）；规则为空时不脱敏并记一条告警",
+        "false"),
+    knob_d("privacy.redactRules", Kind::List, Tier::Internal, "隐私", "脱敏规则（正则）",
+        "每条一个 Rust 正则，命中即整段替换为 ***；写坏了某条只跳过那条并记日志，不影响其它规则",
         "[\"sk-[A-Za-z0-9_-]{8,}\",\"Bearer\\\\s+[A-Za-z0-9._-]+\",\"AKIA[0-9A-Z]{16}\",\
           \"password\\\\s*[:=]\\\\s*\\\\S+\",\"1[3-9]\\\\d{9}\",\"\\\\b\\\\d{17}[\\\\dXx]\\\\b\"]"),
     knob_d("privacy.pause", Kind::Bool, Tier::Advanced, "隐私", "隐私模式（暂停一切采集）", "", "false"),
@@ -317,33 +379,45 @@ static SCHEMA: &[Knob] = &[
     opts(knob_d("sync.preset", Kind::Enum, Tier::Advanced, "同步", "存储预设",
         "仅备忘：帮你记住这台服务器是哪家的，不改变任何同步行为", "\"custom\""),
         &["custom", "jianguoyun", "nextcloud", "synology", "fnos"]),
-    knob_d("sync.confirmPhrase", Kind::Secret, Tier::Advanced, "同步", "号池包加密口令",
-        "留空 = 沿用 WebDAV 密码；用于号池账号包，本仓尚未实现号池同步", "\"\""),
+    unwired(knob_d("sync.confirmPhrase", Kind::Secret, Tier::Advanced, "同步", "号池包加密口令",
+        "本仓未接入号池同步：这个口令只被记录与回显「已设置」，不参与任何加解密", "\"\"")),
     range(knob("sync.intervalMin", Kind::Number, Tier::Advanced, "同步", "同步间隔（分钟）", "60"), 5.0, 1440.0),
     range(knob("sync.packSizeLimitMB", Kind::Number, Tier::Internal, "同步", "单包体积上限 (MB)", "50"), 1.0, 2048.0),
     knob_d("sync.excludeIndex", Kind::Bool, Tier::Internal, "同步", "索引库不入同步包",
         "索引可重建，且是二进制无法三方合并", "true"),
 
     // ===== 各模块同步根目录 =====
-    knob_d("sync.modules.skills", Kind::Text, Tier::Advanced, "同步目录", "技能仓库根目录",
-        "空 = 不参与；本仓尚未实现技能同步", "\"/agent-skills\""),
-    knob_d("sync.modules.dosage", Kind::Text, Tier::Advanced, "同步目录", "用量统计根目录",
-        "空 = 不参与；本仓尚未实现用量同步", "\"/dosage-sync\""),
-    knob_d("sync.modules.pool", Kind::Text, Tier::Advanced, "同步目录", "号池管家号池根目录",
-        "空 = 不参与；本仓尚未实现号池同步", "\"/agenthub-proxy\""),
-    knob_d("sync.modules.memory", Kind::Text, Tier::Advanced, "同步目录", "记忆中枢根目录",
-        "本仓唯一实现了同步的模块", "\"/agenthub-memory\""),
-    knob_d("sync.modules.prompts", Kind::Text, Tier::Advanced, "同步目录", "提示词库根目录",
-        "空 = 不参与；本仓尚未实现提示词库同步", "\"/agenthub-prompts\""),
+    //
+    // 五个键里只有「记忆」那一行真的驱动同步；其余四个本仓没有对应的模块实现，
+    // 目录名只用于界面展示（同步页要能一眼说清「同一个网盘里谁在哪个目录」）。
+    // 所以那四个标 unwired：改了不会让任何东西开始同步。
+    unwired(knob_d("sync.modules.skills", Kind::Text, Tier::Advanced, "同步目录", "技能仓库根目录",
+        "本仓未接入技能同步：这里只决定同步页上显示的目录名，不会真的传", "\"/agent-skills\"")),
+    unwired(knob_d("sync.modules.dosage", Kind::Text, Tier::Advanced, "同步目录", "用量统计根目录",
+        "本仓未接入用量同步：这里只决定同步页上显示的目录名，不会真的传", "\"/dosage-sync\"")),
+    unwired(knob_d("sync.modules.pool", Kind::Text, Tier::Advanced, "同步目录", "号池管家号池根目录",
+        "本仓未接入号池同步：这里只决定同步页上显示的目录名，不会真的传", "\"/agenthub-proxy\"")),
+    unwired(knob_d("sync.modules.memory", Kind::Text, Tier::Advanced, "同步目录", "记忆中枢根目录",
+        "只作展示：记忆的上传目录由 sync.remoteDir 决定，改这里不会换目录", "\"/agenthub-memory\"")),
+    unwired(knob_d("sync.modules.prompts", Kind::Text, Tier::Advanced, "同步目录", "提示词库根目录",
+        "本仓未接入提示词库同步：这里只决定同步页上显示的目录名，不会真的传", "\"/agenthub-prompts\"")),
 
     // ===== 界面 =====
-    range(knob("ui.pageSize", Kind::Number, Tier::Basic, "界面", "列表每页条数", "50"), 10.0, 500.0),
+    // 这四条以前是纯死键：`ui.pageSize` 后端当成「没传 limit 时的默认值」，
+    // 而前端每次都显式传 50，等于永远不生效；`ui.defaultTab` / `ui.tabs` /
+    // `ui.realtimeRefresh` 前端根本不读。现在前三条由 `memory-page.tsx` 真读
+    //（`ui.tabs` 还带一条硬保护：配置页签永远可见，否则用户把「配置」关掉之后
+    // 就再也改不回来了）；`ui.realtimeRefresh` 本仓没有轮询，标 unwired。
+    range(knob("ui.pageSize", Kind::Number, Tier::Basic, "界面", "列表每页条数",
+        "浏览页每页条数；后端在 `limit` 缺省时也用这个值"), 10.0, 500.0),
     opts(knob("ui.defaultTab", Kind::Enum, Tier::Advanced, "界面", "默认页签", "\"dashboard\""),
-        &["dashboard", "browse", "projects", "profile", "agents", "auto", "import", "sync", "index"]),
-    opts(knob("ui.tabs", Kind::Multi, Tier::Advanced, "界面", "显示的页签",
+        &["dashboard", "browse", "projects", "profile", "agents", "auto", "import", "sync", "settings"]),
+    opts(knob_d("ui.tabs", Kind::Multi, Tier::Advanced, "界面", "显示的页签",
+        "只控制顶栏显示哪些页签；「配置」始终可见 —— 否则关掉它就再也改不回来",
         "[\"dashboard\",\"browse\",\"projects\",\"profile\",\"agents\",\"auto\",\"import\",\"sync\"]"),
-        &["dashboard", "browse", "projects", "profile", "agents", "auto", "import", "sync", "index"]),
-    knob("ui.realtimeRefresh", Kind::Bool, Tier::Basic, "界面", "浏览页实时刷新", "true"),
+        &["dashboard", "browse", "projects", "profile", "agents", "auto", "import", "sync", "settings"]),
+    unwired(knob_d("ui.realtimeRefresh", Kind::Bool, Tier::Basic, "界面", "浏览页实时刷新",
+        "本仓未接入轮询：浏览页只在写入后 / 点「刷新」时重取，没有后台定时重拉。开关打开也不会开始轮询", "true")),
 ];
 
 pub fn schema() -> &'static [Knob] {
@@ -980,6 +1054,10 @@ pub fn schema_json() -> Value {
                     "max": item.max,
                     "options": item.options,
                     "hot": item.hot,
+                    // 运行时代码有没有真的读它。`false` = 只落盘、只显示，
+                    // 前端据此把控件置灰并挂「本仓未接入」徽标 —— 不让用户
+                    // 对着一个改完没反应的输入框猜自己是不是操作错了。
+                    "wired": item.wired,
                     // 只有秘密字段有：库里有没有值。页面据此把占位符写成
                     // 「已保存口令，输入任意字符即进入修改」而不是「未设置」。
                     "set": if item.kind == Kind::Secret { Some(secret_set(item.key)) } else { None },
@@ -1183,6 +1261,131 @@ mod tests {
                     serde_json::to_string(&saved).unwrap_or_default()
                 );
             },
+        );
+    }
+
+    /// 每条 `wired=false` 的旋钮，说明里必须自己解释清楚。
+    ///
+    /// ── 这条测试防的是什么 ────────────────────────────────────
+    /// 把键标成「未接入」很容易，但界面上那句「本仓未接入」如果不带原因，
+    /// 用户看到的就是一个**没有出口的死胡同**：它为什么没接？我还要不要配？
+    /// 有没有等价操作？所以要求 `desc` 至少有一点实质长度，并且必须出现
+    /// 「本仓未接入」这句话 —— 前端徽标用的是同一个词，两边对得上。
+    ///
+    /// 长度门槛不用很高（24 字符）：只拦「空说明」和「就写个 not implemented」，
+    /// 不强迫每条都写小作文。
+    #[test]
+    fn unwired_knobs_explain_themselves() {
+        for item in schema() {
+            if item.wired {
+                continue;
+            }
+            assert!(
+                item.desc.contains("本仓未接入"),
+                "{} 标了 wired=false，但说明里没有「本仓未接入」：这会让界面上的徽标变成没头没尾的一句话",
+                item.key
+            );
+            assert!(
+                item.desc.chars().count() >= 24,
+                "{} 的说明太短（{} 字），没讲清楚「为什么没有」或「等价操作是什么」",
+                item.key,
+                item.desc.chars().count()
+            );
+        }
+    }
+
+    /// 每条 `wired=true` 的旋钮，本仓源码里必须真有读取点。
+    ///
+    /// ── 为什么把源码扫描写进单测 ───────────────────────────────
+    /// 「加了旋钮但忘了读取」是这类 schema 驱动的配置最典型的 bug，而且它
+    /// **不会让任何测试失败** —— 配置落盘正常、界面渲染正常，只有用户改了
+    /// 发现没效果。人工 review 一百多个键看不出来，扫描源码能。
+    ///
+    /// 判据：在 `memory/`、`tool_services/`、`api/` 的 `.rs` 里找完整字面量
+    /// `"<key>"` / `'<key>'`，且不在 `config.rs` 自身（schema 定义当然含全部键）。
+    /// 松一点的判据（只找键的后半段，如 `"finalTopK"`）会让漏接的键被同名
+    /// 变量蒙混过关，所以必须是带命名空间的完整串。
+    ///
+    /// ── 为什么前端读取点走 `NON_RUST_READERS` 而不是 `include_str!` ──
+    /// `include_str!` 在**编译期**把文件读进二进制：Docker 构建只 COPY
+    /// `server/src` 与 `ui/`（见 Dockerfile），不 COPY `ui-islands/` —— 用
+    /// `include_str!` 指向前端源码会让镜像构建直接失败。所以前端读取点记成
+    /// 「键 → 仓库内相对路径」，测试运行时用 `fs` 去读；文件不在（例如只
+    /// 打了服务端包的场景）就跳过这一条，不误报。
+    #[test]
+    fn wired_knobs_have_a_reader() {
+        // 把「读取点所在的 Rust 文件」列全。新增了读取点却没进这张表，就会
+        // 误报成死键 —— 那时把文件名加进来即可，比放宽判据安全得多。
+        const SOURCES: &[(&str, &str)] = &[
+            ("mod.rs", include_str!("mod.rs")),
+            ("model.rs", include_str!("model.rs")),
+            ("search.rs", include_str!("search.rs")),
+            ("index.rs", include_str!("index.rs")),
+            ("store.rs", include_str!("store.rs")),
+            ("layout.rs", include_str!("layout.rs")),
+            ("import.rs", include_str!("import.rs")),
+            ("import_registry.rs", include_str!("import_registry.rs")),
+            ("sync.rs", include_str!("sync.rs")),
+            ("schedule.rs", include_str!("schedule.rs")),
+            ("enrich.rs", include_str!("enrich.rs")),
+            ("llm.rs", include_str!("llm.rs")),
+            ("agents.rs", include_str!("agents.rs")),
+            ("rt.rs", include_str!("rt.rs")),
+            ("redact.rs", include_str!("redact.rs")),
+            ("api/memory.rs", include_str!("../../api/memory.rs")),
+            ("tool_services/memory_mcp.rs", include_str!("../tool_services/memory_mcp.rs")),
+        ];
+        // 读取点在前端的旋钮：键 → 仓库内相对路径。后端的职责只是落盘并下发。
+        const NON_RUST_READERS: &[(&str, &str)] = &[
+            ("ui.tabs", "desktop-tauri/ui-islands/src/islands/memory-page.tsx"),
+            ("ui.defaultTab", "desktop-tauri/ui-islands/src/islands/memory-page.tsx"),
+            ("ui.pageSize", "desktop-tauri/ui-islands/src/islands/memory-page.tsx"),
+        ];
+        // 表里不能有拼错的键：拼错了就等于悄悄给一个死键开了后门。
+        for (key, _) in NON_RUST_READERS {
+            assert!(find(key).is_some(), "NON_RUST_READERS 里的 {key} 不是 schema 中的键");
+        }
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .map(std::path::Path::to_path_buf);
+        let mut missing: Vec<String> = Vec::new();
+        for item in schema() {
+            if !item.wired {
+                continue;
+            }
+            // Rust 串用双引号，TSX 里习惯用单引号（`values['ui.pageSize']`），
+            // 两种都算命中。
+            let double = format!("\"{}\"", item.key);
+            let single = format!("'{}'", item.key);
+            if SOURCES
+                .iter()
+                .any(|(_, text)| text.contains(&double) || text.contains(&single))
+            {
+                continue;
+            }
+            let frontend = NON_RUST_READERS.iter().find(|(key, _)| *key == item.key);
+            let Some((_, path)) = frontend else {
+                missing.push(item.key.to_string());
+                continue;
+            };
+            // 仓库根找得到就核对一遍（防「表里写着前端读了，其实人家早删了」）；
+            // 找不到就放过 —— 只打服务端包时没有前端源码，那不是错误。
+            if let Some(root) = &repo {
+                let file = root.join(path);
+                if let Ok(text) = std::fs::read_to_string(&file) {
+                    if !text.contains(&double) && !text.contains(&single) {
+                        missing.push(format!("{}（{} 里找不到）", item.key, path));
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "这些旋钮标了 wired=true，但源码里找不到 `\"key\"` 字面量读取点：{}\n\
+             要么把读取点接上，要么用 `unwired(...)` 包起来并写清原因 —— \
+             两者都不做，用户改了它不会有任何效果。",
+            missing.join(", ")
         );
     }
 }

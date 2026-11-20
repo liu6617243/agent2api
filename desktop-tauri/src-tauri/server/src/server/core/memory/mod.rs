@@ -33,6 +33,7 @@ pub mod index;
 pub mod layout;
 pub mod llm;
 pub mod model;
+pub mod redact;
 pub mod rt;
 pub mod schedule;
 pub mod search;
@@ -184,6 +185,10 @@ impl Default for MemoryConfig {
         MemoryConfig {
             enabled: true,
             core_max_tokens: 800,
+            digest_max_lines: 200,
+            search_max_tokens: 1200,
+            final_top_k: 8,
+            recall_top_k: 20,
         }
     }
 }
@@ -193,6 +198,10 @@ pub fn config() -> MemoryConfig {
     MemoryConfig {
         enabled: config::bool_of(config::ENABLE_KEY),
         core_max_tokens: config::usize_of("agents.coreMaxTokens").clamp(200, 4000),
+        digest_max_lines: config::usize_of("agents.digestMaxLines").clamp(50, 1000),
+        search_max_tokens: config::usize_of("agents.searchMaxTokens").clamp(200, 4000),
+        final_top_k: config::usize_of("search.finalTopK").clamp(1, 50),
+        recall_top_k: config::usize_of("search.recallTopK").clamp(5, 200),
     }
 }
 
@@ -1073,9 +1082,21 @@ fn write_inner(
     input: WriteInput,
     mut seen: Option<&mut std::collections::HashSet<String>>,
 ) -> Result<Value, String> {
-    let content = input.content.trim().to_string();
+    // 写入前脱敏（`privacy.redact`）。放在 trim 之前还是之后？
+    // 放在**之后**：规则里常有「行尾结束」这类锚点，先 trim 掉首尾空白能让
+    // `^` / `$` 落在真正的第一行/最后一行的首尾，而不是撞上一个空行。
+    // 开关关着时 `apply` 一次配置读取就返回，代价可以忽略。
+    let (content, redacted) = redact::apply(input.content.trim());
+    let content = content.trim().to_string();
     if content.is_empty() {
         return Err("正文不能为空".into());
+    }
+    if redacted > 0 {
+        // 记一条：用户开了开关就要能看到它真的干了活，而不是只能凭信任
+        crate::server::logging::log(
+            "[Memory]",
+            &format!("写入前脱敏：替换 {redacted} 处（privacy.redactRules）"),
+        );
     }
     store::ensure_layout()?;
     let now = crate::server::logging::now_ms();
@@ -1418,7 +1439,16 @@ pub fn update(id: &str, patch: &Value) -> Result<Value, String> {
     }
     if let Some(body) = patch.get("body").and_then(Value::as_str) {
         if !body.trim().is_empty() {
-            entry.body = body.to_string();
+            // 改写正文也过同一道脱敏：否则「先写安全内容、再 update 塞秘密」
+            // 就能绕过写入侧的开关，那道闸门等于形同虚设。
+            let (clean, redacted) = redact::apply(body);
+            if redacted > 0 {
+                crate::server::logging::log(
+                    "[Memory]",
+                    &format!("更新前脱敏：替换 {redacted} 处（privacy.redactRules）"),
+                );
+            }
+            entry.body = clean;
             entry.hash = model::content_hash(&entry.body);
         }
     }
@@ -1572,8 +1602,16 @@ pub fn purge_trash() -> Value {
     let days = config::usize_of("storage.trashKeepDays").max(1);
     let removed = store::purge_expired_trash(days);
     let archived = store::purge_expired_sync_trash(days);
+    // 手动「清空回收站」也顺手按天清日志：用户此刻想清的就是过期数据，
+    // 而 `auto.logKeepDays` 那一栏在设置页里没有单独按钮。
+    let logs = index::global().purge_logs_by_age(config::usize_of("auto.logKeepDays").max(1));
     bump_revision();
-    json!({ "removed": removed, "syncTrashRemoved": archived, "keepDays": days })
+    json!({
+        "removed": removed,
+        "syncTrashRemoved": archived,
+        "logsRemoved": logs,
+        "keepDays": days,
+    })
 }
 
 /// 回收站文件清单（界面上「回收站」那张表的数据源）。

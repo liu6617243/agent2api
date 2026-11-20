@@ -885,6 +885,13 @@ fn cleanup(manual: bool) -> Outcome {
     // 同步删除留档共用同一个保留窗口：它是「删错了能捞回来」的保险，
     // 不是永久归档。不清的话一批误判删除会在磁盘上留一辈子。
     let archived = store::purge_expired_sync_trash(days);
+    // 按天清理调用台账（`auto.logKeepDays`）。放在回收站清理旁边：
+    // 两者都是「到期就真删」的动作，同一个定时任务里做，用户只需要理解
+    // 「清理任务会按保留窗口把过期东西删掉」这一条规则。
+    //
+    // 顺序上必须在 `load_all()` 之前 —— 它只动 SQLite 里的日志表，不动记忆
+    // 文件；放前面也就不可能影响下面那五类清理读到的内容。
+    let logs_purged = index::global().purge_logs_by_age(config::usize_of("auto.logKeepDays").max(1));
     let now = crate::server::logging::now_ms();
     let entries = store::load_all();
     let mut trashed = 0usize;
@@ -1038,7 +1045,7 @@ fn cleanup(manual: bool) -> Outcome {
         }
     }
 
-    if removed == 0 && trashed == 0 && purged_rows == 0 && archived == 0 && !manual {
+    if removed == 0 && trashed == 0 && purged_rows == 0 && archived == 0 && logs_purged == 0 && !manual {
         return Outcome::Skipped("没有需要清理的内容".into());
     }
     Outcome::Done(json!({
@@ -1046,6 +1053,8 @@ fn cleanup(manual: bool) -> Outcome {
         // 同步删除留档清掉的批次数。单独报而不并进 `trashPurged`：那一栏在界面上
         // 说的是「回收站」，而留档根本不在回收站里，混在一起用户会对不上数。
         "syncTrashPurged": archived,
+        // 按 `auto.logKeepDays` 删掉的日志行数（llm_call + task_run 合计）
+        "logsPurged": logs_purged,
         "supersededTrashed": trashed,
         "indexPurged": purged_rows,
         "kinds": touched,

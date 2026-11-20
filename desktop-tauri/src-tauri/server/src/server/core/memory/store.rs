@@ -969,6 +969,24 @@ fn read_dir_entries(dir: &Path, out: &mut Vec<MemoryEntry>) {
     let Ok(reader) = fs::read_dir(dir) else { return };
     let mut items: Vec<PathBuf> = reader.flatten().map(|item| item.path()).collect();
     items.sort();
+    // 单文件上限（`storage.maxFileSizeKB`，默认 512KB）。
+    //
+    // ── 为什么要在读取前用 metadata 挡，而不是读完再判长度 ───────
+    // 这个上限保护的场景是「用户把手写的巨型日志 / 导出文件扔进记忆根」。
+    // 读进内存再判断，那几 MB 已经花掉了；而且 `load_all()` 在每次检索前
+    // 都会跑一遍，一次读 100MB 的代价是整页卡死。`metadata()` 一次 syscall
+    // 就能挡掉，成本可以忽略。
+    //
+    // ── 为什么 0 当作「不限制」而不是「全跳过」───────────────
+    // `usize_of` 对非正数返回 0。若把 0 解释成「上限 0」，配置写坏一次就会
+    // 让记忆库读取变成空白 —— 那是灾难级副作用。0 代表「没限制」，
+    // 与 `search.timeDecayHalfLife=0` / `auto.dailyTokenLimit=0` 的既有
+    // 「0 = 关闭」语义一致。
+    //
+    // ── 为什么跳过时记日志 ──────────────────────────────────
+    // 静默跳过最难排查：用户会看到「我明明写了这条，为什么搜不到」。
+    let limit_kb = super::config::usize_of("storage.maxFileSizeKB");
+    let limit_bytes = limit_kb.saturating_mul(1024);
     for path in items {
         if path.is_dir() {
             read_dir_entries(&path, out);
@@ -976,6 +994,23 @@ fn read_dir_entries(dir: &Path, out: &mut Vec<MemoryEntry>) {
         }
         if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;
+        }
+        if limit_bytes > 0 {
+            match fs::metadata(&path) {
+                Ok(meta) if meta.len() > limit_bytes as u64 => {
+                    crate::server::logging::log(
+                        "[Memory]",
+                        &format!(
+                            "⏭️ 跳过超大记忆文件（{} KB > 上限 {} KB）：{}",
+                            meta.len() / 1024,
+                            limit_kb,
+                            path.display()
+                        ),
+                    );
+                    continue;
+                }
+                _ => {}
+            }
         }
         let Ok(text) = fs::read_to_string(&path) else {
             crate::server::logging::log("[Memory]", &format!("⚠️ 记忆文件读取失败：{}", path.display()));

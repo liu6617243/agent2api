@@ -67,6 +67,11 @@ pub struct Query {
     pub created_from: Option<i64>,
     /// 写入时间上界（不含）
     pub created_to: Option<i64>,
+    /// 打分前的最多候选条数。`None` = 不截断（界面的分页要真实总数，不能截）。
+    ///
+    /// 只有 `memory_search` 那种「一次给模型一屏」的调用方才该设它 ——
+    /// 它对应配置项 `search.recallTopK`。
+    pub recall: Option<usize>,
 }
 
 fn now_ms() -> i64 {
@@ -96,20 +101,45 @@ pub fn search(query: &Query) -> Vec<IndexRow> {
 /// ── 热度只记当前页 ──────────────────────────────────────────
 /// `hit()` 表示「用户真的看到了这几条」，翻到第 5 页不该把第 1 页也算一次曝光。
 pub fn search_page(query: &Query) -> (Vec<IndexRow>, usize) {
-    let mut rows = if query.text.trim().is_empty() {
-        index::global().rows(query.include_deleted)
-    } else {
+    let keyword = !query.text.trim().is_empty();
+    let mut rows = if keyword {
         index::global().search(&query.text)
+    } else {
+        index::global().rows(query.include_deleted)
     };
     rows.retain(|row| keep(row, query));
-    score_and_sort(&mut rows, query);
     let total = rows.len();
+    // 候选召回上限（`search.recallTopK`）。**只给「一次给模型一屏」的调用方**
+    // 用（MCP `memory_search`），界面列表不设上限 —— 界面的 `total` 要拿去算
+    // 页数，在打分前截断会让第 N 页之后永远为空，那是对用户说谎。
+    //
+    // 为什么要在打分**之前**截断：七项混排每项都要过一次全行（图扩散还要连
+    // SQLite），候选越多这一步越贵。FTS 已按 bm25 排好前 200 条，再按相关度
+    // 收一轮是纯收益 —— 被收掉的都是 bm25 最差的那批，加权后几乎不可能翻盘
+    //（时间 / 重要度 / 亲和三项权重加起来只有 0.4 左右）。
+    if keyword {
+        if let Some(recall) = query.recall {
+            if rows.len() > recall {
+                // 排序口径与下面 `score_and_sort` 的 relevance 一致：
+                // FTS 给的是负 bm25（越小越相关），退化模式给的是命中词数
+                rows.sort_by(|a, b| {
+                    let left = if a.rank != 0.0 { -a.rank } else { a.hits as f64 };
+                    let right = if b.rank != 0.0 { -b.rank } else { b.hits as f64 };
+                    right
+                        .partial_cmp(&left)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                rows.truncate(recall);
+            }
+        }
+    }
+    score_and_sort(&mut rows, query);
     let limit = if query.limit == 0 { 30 } else { query.limit.min(500) };
-    let start = query.offset.min(total);
-    let end = (start + limit).min(total);
+    let start = query.offset.min(total.min(rows.len()));
+    let end = (start + limit).min(rows.len());
     let mut rows = rows[start..end].to_vec();
     // 热度只记「关键词检索」的命中：无关键词的列表浏览不算「用户要看这条」
-    if !query.text.trim().is_empty() {
+    if keyword {
         let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
         index::global().hit(&ids);
     }

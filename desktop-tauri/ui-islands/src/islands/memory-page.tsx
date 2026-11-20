@@ -71,13 +71,77 @@ const TABS = [
 
 type Tab = typeof TABS[number]['key']
 
+/**
+ * 「配置」页签永远可见，不受 `ui.tabs` 约束。
+ *
+ * ── 为什么这条保护是必须的 ──────────────────────────────────
+ * `ui.tabs` 是用户可以自己关掉页签的旋钮，而改这个旋钮的唯一入口就在「配置」
+ * 页签里。允许把「配置」也关掉，就等于给用户一个**一次性按钮**：点一下，
+ * 出口消失，只能去改 config.json 手工救回来。任何「关闭自己的开关」都要
+ * 有这条硬保护。
+ */
+const PINNED_TABS: Tab[] = ['settings']
+
 /** 当前页签（组件外也能读：壳切页时判断要不要刷新） */
 let activeTab: Tab = 'dashboard'
+
+/**
+ * 把 `config.values` 里的界面旋钮解析成可用形状。
+ *
+ * ── 三条兜底都必须存在 ──────────────────────────────────────
+ * 1. `ui.tabs` 里没有一个合法值（用户手改 config.json 写错了）→ 全显示；
+ * 2. `ui.defaultTab` 指向一个已被 `ui.tabs` 关掉的页签 → 回落到第一个可见页；
+ * 3. `ui.pageSize` 不是正整数 → 50。
+ *
+ * 任何一条不兜底都会出现「打开页面空白」或「首屏停在一个不存在的页签」，
+ * 而这两种都不是用户能自己想明白的状态。
+ */
+function resolveUi(values: Record<string, unknown>): { tabs: Tab[]; defaultTab: Tab; pageSize: number } {
+  // 键名写字面量而不是拼 `ui.${name}`：后端单测 `wired_knobs_have_a_reader`
+  // 靠扫 `"ui.tabs"` 这样的完整串确认「这个旋钮真的有人读」。拼出来的键
+  // 在源码里找不到，那条旋钮就会被判成死键 —— 扫描口径反过来约束了写法，
+  // 这是有意的：宁可多写两遍字面量，也不要让「有没有接上」变成靠人记。
+  const rawTabs = values['ui.tabs']
+  const picked = Array.isArray(rawTabs)
+    ? rawTabs.filter((value): value is Tab => TABS.some(item => item.key === value))
+    : []
+  // `ui.tabs` 少了什么都不能少「配置」（见 `PINNED_TABS`）
+  const visible = TABS.map(item => item.key).filter(
+    key => picked.includes(key) || PINNED_TABS.includes(key),
+  )
+  const tabs = picked.length ? visible : TABS.map(item => item.key)
+  const wanted = values['ui.defaultTab']
+  const defaultTab: Tab =
+    typeof wanted === 'string' && tabs.includes(wanted as Tab) ? (wanted as Tab) : tabs[0]
+  const rawSize = values['ui.pageSize']
+  const pageSize = typeof rawSize === 'number' && rawSize >= 10 ? Math.floor(rawSize) : 50
+  return { tabs, defaultTab, pageSize }
+}
 
 function MemoryPage(): React.ReactElement {
   const [tab, setTab] = React.useState<Tab>(activeTab)
   const [status, setStatus] = React.useState<m.MemoryStatus | null>(null)
   const [kinds, setKinds] = React.useState<m.MemoryKindOption[]>([])
+  /**
+   * 界面相关旋钮的生效值（`ui.tabs` / `ui.defaultTab` / `ui.pageSize`）。
+   *
+   * ── 为什么放在壳这一层 ────────────────────────────────────
+   * 这三条同时被「顶栏」与「浏览页」读，放在任一子页里都会让另一个拿不到；
+   * 而 `loadShell()` 本来就在首屏拉过一次 `loadConfig()`，顺手取出来零额外请求。
+   *
+   * `null` = 还没读到。此时按「全显示 / 默认仪表盘 / 50 条」的最保守组合渲染，
+   * 不让首屏因为一个配置读取失败就空白。
+   */
+  const [ui, setUi] = React.useState<{ tabs: Tab[]; defaultTab: Tab; pageSize: number } | null>(null)
+  /**
+   * `ui` 的镜像 ref。
+   *
+   * `mm:tab` 的监听器刻意只挂一次（依赖为空，否则每帧重挂会漏事件），
+   * 而它的回调里要读「哪些页签可见」。直接读 `ui` 会永远拿到首次渲染的
+   * `null` —— 于是「关掉的页签不可外部跳转」这条保护形同虚设。用 ref 让
+   * 回调拿到最新值，同时保持监听器只挂一次。
+   */
+  const uiRef = React.useRef<{ tabs: Tab[]; defaultTab: Tab; pageSize: number } | null>(null)
   const [projects, setProjects] = React.useState<m.MemoryProject[]>([])
   const [general, setGeneral] = React.useState<m.MemoryGeneral | null>(null)
   const [projectsLoading, setProjectsLoading] = React.useState(true)
@@ -99,6 +163,11 @@ function MemoryPage(): React.ReactElement {
       const [config, projectList] = await Promise.all([m.loadConfig(), m.loadProjects()])
       setStatus(config.status)
       setKinds(config.kinds)
+      // 界面旋钮：`ui.tabs` 决定顶栏显示哪些页签，`ui.defaultTab` 决定首屏落在
+      // 哪一页，`ui.pageSize` 决定浏览页每页条数。三条都在这里一次读出来。
+      const resolved = resolveUi(config.values)
+      uiRef.current = resolved
+      setUi(resolved)
       setProjects(projectList.items)
       setGeneral(projectList.general ?? null)
       setProjectsError('')
@@ -113,6 +182,24 @@ function MemoryPage(): React.ReactElement {
   React.useEffect(() => {
     void loadShell()
   }, [loadShell])
+
+  /**
+   * 配置读回来后把首屏落到 `ui.defaultTab`（只做一次）。
+   *
+   * ── 为什么要一个 `applied` 标记 ─────────────────────────────
+   * `loadShell()` 会被「刷新」按钮再次调用。没有这个标记，用户手动切到「浏览」
+   * 之后点一次刷新，页面就会被弹回默认页签 —— 那是一次纯粹的骚扰。
+   * 所以只在**第一次**读到配置时对齐一次，之后完全交给用户。
+   */
+  const defaultTabApplied = React.useRef(false)
+  React.useEffect(() => {
+    if (!ui || defaultTabApplied.current) return
+    defaultTabApplied.current = true
+    if (ui.defaultTab !== activeTab) {
+      activeTab = ui.defaultTab
+      setTab(ui.defaultTab)
+    }
+  }, [ui])
 
   const refreshProjects = React.useCallback(async () => {
     setProjectsLoading(true)
@@ -154,6 +241,9 @@ function MemoryPage(): React.ReactElement {
       const detail = (event as CustomEvent<{ tab?: string; focusId?: string }>).detail
       const next = detail?.tab
       if (!next || !TABS.some(item => item.key === next)) return
+      // `ui.tabs` 关掉的页签不接受外部跳转：否则「导入页里点某条 → 跳浏览」
+      // 会切到一个顶栏上根本不存在的高亮项，用户看到的是一张没有选中态的页面。
+      if (uiRef.current && !uiRef.current.tabs.includes(next as Tab)) return
       // `focusId`：「在浏览页打开这一条」。画像页的证据 chip 走的就是这条路 ——
       // 它比 `switchTab` 多带一个目标，否则切过去只会看到列表第一屏，
       // 用户还得自己再搜一遍刚才点的那条 id。
@@ -197,7 +287,8 @@ function MemoryPage(): React.ReactElement {
       <div className='mm-head'>
         <div className='mm-tabs'>
           <SegmentedControl
-            options={TABS.map(item => ({ value: item.key, label: t(item.label) }))}
+            options={TABS.filter(item => !ui || ui.tabs.includes(item.key))
+              .map(item => ({ value: item.key, label: t(item.label) }))}
             value={tab}
             onValueChange={value => switchTab(value as Tab)}
             aria-label={t('记忆中枢功能分类')}
@@ -250,6 +341,7 @@ function MemoryPage(): React.ReactElement {
                 onFocusConsumed={() => setFocusId(null)}
                 focusProject={focusProject}
                 onFocusProjectConsumed={() => setFocusProject(null)}
+                pageSize={ui?.pageSize}
               />
             </TabBoundary>
           ) : null}

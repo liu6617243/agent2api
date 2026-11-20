@@ -317,6 +317,39 @@ fn bool_arg(args: &Value, key: &str) -> Option<bool> {
     args.get(key).and_then(Value::as_bool)
 }
 
+/// 按 token 预算从尾部丢行（配置项 `agents.searchMaxTokens`）。
+///
+/// ── 为什么按「整行」而不是按字符截断 ────────────────────────
+/// `memory_search` 返回的是索引行（`[决策] 标题 · 项目 · 3 天前 · \`id\``）。
+/// 把某一行砍一半，模型拿到的 id 就成了残串，`memory_get` 直接找不到 ——
+/// 那比不给它更糟。所以宁可少给几行，每行都必须是完整可用的。
+///
+/// ── 为什么至少留一行 ──────────────────────────────────────
+/// 预算配得过小（例如 200）时，第一行就可能超。返回空数组等于「没搜到」，
+/// 模型会去重试别的查询；留最相关的那一行，它至少知道该 `memory_get` 哪条。
+fn trim_to_budget(lines: Vec<Value>, budget: usize) -> (Vec<Value>, usize) {
+    let total = lines.len();
+    if budget == 0 || total == 0 {
+        return (lines, 0);
+    }
+    let mut used = 0usize;
+    let mut kept = 0usize;
+    for line in &lines {
+        let text = line.as_str().unwrap_or("");
+        // +1 是行尾换行：拼成整块文本时每行都带一个分隔符，不记进去会低估
+        let cost = memory::model::estimate_tokens(text) + 1;
+        if kept > 0 && used + cost > budget {
+            break;
+        }
+        used += cost;
+        kept += 1;
+    }
+    if kept == total {
+        return (lines, 0);
+    }
+    (lines.into_iter().take(kept).collect(), total - kept)
+}
+
 fn list_arg(args: &Value, key: &str) -> Vec<String> {
     args.get(key)
         .and_then(Value::as_array)
@@ -399,12 +432,20 @@ fn dispatch(name: &str, args: &Value, agent: Option<&str>) -> Result<Value, Call
             let budget = number_arg(args, "maxTokens").unwrap_or_else(|| memory::config().core_max_tokens);
             Ok(memory::core_text(project.as_deref(), budget))
         }
-        "memory_digest" => Ok(memory::digest_text(number_arg(args, "maxLines").unwrap_or(200))),
+        "memory_digest" => {
+            // 不传 `maxLines` 时用配置项 `agents.digestMaxLines`（默认 200）。
+            // 以前这里写死 200，设置页那条旋钮改了没有任何效果 —— 界面承诺与
+            // 行为必须同源，否则用户会以为自己调过、其实没生效。
+            let lines = number_arg(args, "maxLines")
+                .unwrap_or_else(|| memory::config().digest_max_lines);
+            Ok(memory::digest_text(lines))
+        }
         "memory_search" => {
             let query = text_arg(args, "query").unwrap_or_default();
             if query.is_empty() {
                 return Err(CallError::Failed("query 不能为空".into()));
             }
+            let settings = memory::config();
             let request = MemoryQuery {
                 text: query,
                 project: text_arg(args, "project"),
@@ -417,23 +458,38 @@ fn dispatch(name: &str, args: &Value, agent: Option<&str>) -> Result<Value, Call
                 include_superseded: bool_arg(args, "includeSuperseded").unwrap_or(false),
                 include_deleted: false,
                 include_expired: bool_arg(args, "includeExpired").unwrap_or(false),
-                limit: number_arg(args, "limit").unwrap_or(30),
+                // 不传 limit 时用 `search.finalTopK`（默认 8）。以前写死 30，
+                // 那条「最终返回条数」旋钮同样是死键。
+                limit: number_arg(args, "limit").unwrap_or(settings.final_top_k),
                 // MCP 侧不分页：`memory_search` 一次给模型一屏最相关的就够，
                 // 让它翻页只会多烧几轮上下文。
                 offset: 0,
                 // 时间窗是界面热力图用的（点某天看当天清单），MCP 侧不暴露。
                 created_from: None,
                 created_to: None,
+                // 候选召回上限 `search.recallTopK`：只在这里设，界面列表传 None
+                // （界面要用真实总数算页数）。
+                recall: Some(settings.recall_top_k),
             };
             let page = memory::list(&request);
-            let lines = page.get("lines").cloned().unwrap_or_else(|| json!([]));
+            let all = page
+                .get("lines")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             let count = page.get("total").and_then(Value::as_u64).unwrap_or(0);
+            let (lines, dropped) = trim_to_budget(all, settings.search_max_tokens);
             Ok(json!({
                 "count": count,
                 "lines": lines,
+                // 因为 token 预算被砍掉的条数。模型看到这个数就知道
+                // 「还有东西没给你」，该收窄条件或改调 memory_get，
+                // 而不是以为这就是全部。
+                "dropped": dropped,
+                "budget": settings.search_max_tokens,
                 // 空结果是正常状态，不是错误：告诉模型「没有记忆」，
                 // 比让它以为自己调错参数再重试三次要好
-                "note": if count == 0 { "没有匹配的记忆；可用 memory_digest 看看有哪些项目。" } else { "" },
+                "note": if count == 0 { "没有匹配的记忆；可用 memory_digest 看看有哪些项目。" } else if dropped > 0 { "结果超出 token 预算，已从尾部丢弃；收窄条件或对具体 id 调 memory_get。" } else { "" },
             }))
         }
         "memory_get" => {
@@ -635,5 +691,43 @@ mod tests {
         // 纯符号同样不给造目录的机会
         assert_eq!(agent_slug(Some("---")), "mcp");
         assert_eq!(agent_slug(Some("___")), "mcp");
+    }
+
+    /// 超预算时按**整行**丢尾部，且至少留一行。
+    ///
+    /// ── 为什么「至少留一行」要单独钉住 ──────────────────────────
+    /// 它是这条逻辑里唯一一个会让返回值看起来「不守预算」的分支：预算 200、
+    /// 首行就要 300 token 时，我们仍然返回那一行。看起来像 bug，其实是
+    /// 刻意的 —— 返回空数组等于告诉模型「没搜到」，它会换个词重试，白烧一轮
+    /// 上下文；留一行，它至少知道该对哪条 id 调 `memory_get`。
+    #[test]
+    fn trim_to_budget_drops_whole_lines_and_keeps_at_least_one() {
+        let long = "长".repeat(400); // 400 个 CJK 字符 ≈ 400 token
+        let lines = vec![json!(long.clone()), json!(long.clone()), json!(long)];
+        // 预算足够：原样返回，不报丢弃
+        let (kept, dropped) = trim_to_budget(lines.clone(), 100_000);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(dropped, 0);
+        // 预算只够一行：留第一行，其余算丢弃（而不是全部丢掉）
+        let (kept, dropped) = trim_to_budget(lines, 500);
+        assert_eq!(kept.len(), 1, "至少保留最相关的一行");
+        assert_eq!(dropped, 2);
+        // 预算极小（连一行都放不下）：仍然留一行
+        let (kept, dropped) = trim_to_budget(vec![json!(long)], 10);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(dropped, 0);
+    }
+
+    /// 预算为 0 表示「不限制」，不是「全部丢掉」。
+    ///
+    /// 配置项被写成 0 时 `usize_of` 返回 0；若把它当成「上限 0」，
+    /// 一次误配置就会让 `memory_search` 永远返回空 —— 而模型无法区分
+    /// 「库里没有」和「配置坏了」。
+    #[test]
+    fn trim_to_budget_treats_zero_as_unlimited() {
+        let lines = vec![json!("a"), json!("b")];
+        let (kept, dropped) = trim_to_budget(lines, 0);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(dropped, 0);
     }
 }

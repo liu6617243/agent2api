@@ -171,6 +171,10 @@ pub async fn get_list(State(_state): State<ServerState>, Query(params): Query<Ha
         // 免得跨零点那条被切到错的一天。
         created_from: signed(&params, "from"),
         created_to: signed(&params, "to"),
+        // 界面列表**不**截候选：`total` 要拿去算页数，在打分前截断会让第 N 页
+        // 之后永远空着。配置项 `search.recallTopK` 只作用于 MCP 的
+        // `memory_search`（一次给模型一屏，没有翻页概念）。
+        recall: None,
     };
     ok_json(memory::list(&query))
 }
@@ -210,7 +214,11 @@ pub async fn get_core(State(_state): State<ServerState>, Query(params): Query<Ha
 }
 
 pub async fn get_digest(State(_state): State<ServerState>, Query(params): Query<HashMap<String, String>>) -> Response {
-    ok_json(memory::digest_text(number(&params, "maxLines").unwrap_or(200)))
+    // 与 MCP `memory_digest` 同一个默认值来源（`agents.digestMaxLines`）。
+    // 两条入口口径不一致时，同一台机器上「界面导出的概览」和「Agent 拿到的
+    // 概览」会长短不同，用户很难理解为什么。
+    let lines = number(&params, "maxLines").unwrap_or_else(|| memory::config().digest_max_lines);
+    ok_json(memory::digest_text(lines))
 }
 
 pub async fn get_timeline(State(_state): State<ServerState>, Query(params): Query<HashMap<String, String>>) -> Response {

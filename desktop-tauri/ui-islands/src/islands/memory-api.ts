@@ -210,6 +210,17 @@ export type Knob = {
   options?: string[]
   hot?: boolean
   /**
+   * 这个旋钮在**本仓**有没有真实读取点。
+   *
+   * `false` = 值照样落盘、照样能导入导出（跨实现共用同一份 `config.json`），
+   * 但本仓没有任何运行时代码读它 —— 改了不会有任何行为变化。设置页因此把它
+   * 置灰并标「本仓未接入」，而不是让人调完发现没用、再回来怀疑是自己没保存。
+   *
+   * 后端每条 `wired=false` 的说明里都必须写清楚「为什么没有」和「等价操作是
+   * 什么」，由单测 `unwired_knobs_explain_themselves` 钉住。
+   */
+  wired?: boolean
+  /**
    * 只有 `secret` 类有：库里**有没有值**。
    *
    * 秘密字段下发的 `value` 恒为空串（后端 `flat()` 脱敏），所以「空输入框」

@@ -951,6 +951,34 @@ impl MemoryIndex {
         .unwrap_or(0)
     }
 
+    /// 按天清理 `llm_call` / `task_run`（`auto.logKeepDays`）。
+    ///
+    /// ── 为什么除了条数上限还要有天数上限 ──────────────────────
+    /// `auto.logKeepCount` 是「滚动保留最近 N 条」：一周不看，N 条里可能全挤在
+    /// 同一天 —— 半年前那次失败的调用还在，昨天之前的历史却已经被挤掉了。
+    /// 这两个上限管的是两件不同的事：条数防「表无限长」，天数防「老记录赖着」。
+    ///
+    /// 返回删掉的行数（两张表合计），调用方拿它决定要不要在日志里提一句。
+    pub fn purge_logs_by_age(&self, days: usize) -> usize {
+        if days == 0 {
+            return 0;
+        }
+        let Ok(conn) = self.conn.lock() else { return 0 };
+        let now = crate::server::logging::now_ms();
+        let cutoff = now - (days as i64) * 86_400_000;
+        let mut removed = 0usize;
+        for table in ["llm_call", "task_run"] {
+            match conn.execute(&format!("DELETE FROM {table} WHERE at < ?1"), params![cutoff]) {
+                Ok(count) => removed += count,
+                Err(error) => crate::server::logging::log(
+                    "[Memory]",
+                    &format!("⚠️ 按天清理 {table} 失败：{error}"),
+                ),
+            }
+        }
+        removed
+    }
+
     /// 最近若干条调用台账（自动化页面的「运行统计」）。
     pub fn recent_llm(&self, limit: usize) -> Vec<Value> {
         let Ok(conn) = self.conn.lock() else { return Vec::new() };

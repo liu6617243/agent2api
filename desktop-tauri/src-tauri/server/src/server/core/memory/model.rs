@@ -335,9 +335,21 @@ impl MemoryEntry {
     /// FTS5 的 bm25 按词频与文档长度打分，重复一次让「标题命中」比「正文深处
     /// 命中」更容易排到前面，等价于一个廉价的位置加权。
     pub fn search_text(&self) -> String {
+        // 标题重复 `index.titleBoost` 次（默认 3）。
+        //
+        // ── 为什么要靠「重复」而不是加权字段 ─────────────────────
+        // FTS5 的 `bm25()` 支持按列权重，但那张表是一列 `text` 大杂烩（标题 /
+        // 摘要 / 标签 / 正文拼在一起）。拆成多列要迁移整张表 + 改所有查询；
+        // 而「重复标题」是 FTS5 里代价相同、效果等价的手工加权 —— 标题命中
+        // 一次等于命中 N 次，bm25 自然把它往前提。
+        //
+        // 上限 10 由 schema 的 range 兜住；配置读坏时回落 3，不让检索退化成
+        // 「标题完全不重要」。改动这个值需要重建索引才会反映到已有条目上。
+        let boost = super::config::usize_of("index.titleBoost").clamp(1, 10);
+        let title = self.title.repeat(boost);
         format!(
             "{}\n{}\n{}\n{}",
-            self.title,
+            title,
             self.summary(240),
             self.tags_text(),
             self.body
@@ -401,19 +413,43 @@ impl MemoryEntry {
 /// 归一化做三件事：CRLF → LF、每行去尾部空白、整体去首尾空白。**不做**大小写
 /// 折叠 —— 「不要用 rm」与「不要用 RM」在中文语境里是两条记忆，折叠会误合并。
 pub fn content_hash(text: &str) -> String {
-    let normalized = text
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .lines()
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string();
+    let normalized = normalize_for_hash(text);
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
     let digest = hasher.finalize();
     digest.iter().take(16).map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// 算哈希前的归一化强度（`dedup.l1.normalizeLevel`）。
+///
+/// ── 三档的差别是什么 ────────────────────────────────────────
+/// `none`：原样算。同一段话换个换行符（`\r\n` vs `\n`）就是两条不同记忆 ——
+///         只有在「我要精确到字节」时才该选它。
+/// `trim`：只去整体首尾空白。中间的行尾空格、换行风格差异仍然算不同。
+/// `full`（默认）：统一换行风格 + 去掉每行行尾空白 + 整体 trim。三档里最接近
+///         「这两条讲的是同一件事」的判据 —— 编辑器/剪贴板带来的不可见差异
+///         不该制造重复条目。
+///
+/// ── 为什么读配置而不是写死 ──────────────────────────────────
+/// 这张表里这个键一直存在（与 AgentHub 共用 config.json），早先没接线等于
+/// 「界面能调、行为不变」。接上之后必须提醒：**改这一档会换掉整库哈希**，
+/// 存量条目的 `hash` 与新算法算出的值不再相等，精确去重会失效到重建索引为止。
+pub fn normalize_for_hash(text: &str) -> String {
+    let level = super::config::text_of("dedup.l1.normalizeLevel");
+    match level.trim() {
+        "none" => text.to_string(),
+        "trim" => text.trim().to_string(),
+        // 未知值也走 full：坏配置不该让去重退化成「按字节比」
+        _ => text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string(),
+    }
 }
 
 fn now_ms() -> i64 {

@@ -27,8 +27,8 @@ import { agentText, Empty, num, Panel, Section, stamp, StateBadge, timeText, ful
  * 被建议的那条记忆。放在列表上方折叠区时，一屏里既挤列表又挤队列，两边都不好用。
  */
 
-/** 每页条数。50 是「一屏能滚完、翻页又不至于太频繁」的折中。 */
-const PAGE_SIZE = 50
+/** 每页条数兜底值。真实值由配置项 `ui.pageSize` 下发（见 `BrowseProps.pageSize`）。 */
+const PAGE_SIZE_FALLBACK = 50
 /** 回收站一次最多画多少行。回收站没有分页（文件是按删除时间排的一串），
  *  但也不能把上千行全铺进 DOM。 */
 const TRASH_ROWS = 200
@@ -68,6 +68,8 @@ type BrowseProps = {
   /** 外部要求按某个项目筛选（项目页「查看记忆」跳过来） */
   focusProject?: string | null
   onFocusProjectConsumed?: () => void
+  /** 每页条数（配置项 `ui.pageSize`）。缺省按 50 —— 老后端不下发这个值时照样能用。 */
+  pageSize?: number
 }
 
 function Browse({
@@ -78,6 +80,7 @@ function Browse({
   onFocusConsumed,
   focusProject,
   onFocusProjectConsumed,
+  pageSize = PAGE_SIZE_FALLBACK,
 }: BrowseProps): React.ReactElement {
   const [view, setView] = React.useState<View>('list')
   const [level, setLevel] = React.useState<'' | 'l1' | 'l2'>('')
@@ -114,14 +117,14 @@ function Browse({
       starred: starred || undefined,
       pinned: pinned || undefined,
       includeSuperseded: includeSuperseded || undefined,
-      limit: PAGE_SIZE,
-      offset: page * PAGE_SIZE,
+      limit: pageSize,
+      offset: page * pageSize,
     }),
-    [submitted, kind, project, agent, level, tag, starred, pinned, includeSuperseded, page],
+    [submitted, kind, project, agent, level, tag, starred, pinned, includeSuperseded, page, pageSize],
   )
 
   const total = list.data?.total ?? 0
-  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const pages = Math.max(1, Math.ceil(total / pageSize))
 
   const review = useLoad(() => m.loadReview('pending', undefined, 50), [])
 
