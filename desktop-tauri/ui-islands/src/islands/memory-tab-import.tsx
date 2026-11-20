@@ -325,6 +325,16 @@ function useImportJob(handlers: {
 
 function Import(): React.ReactElement {
   const registry = useLoad(() => m.loadImportRegistry(), [])
+  /**
+   * 来源体量 / 上次导入 / 自动入库状态。
+   *
+   * ── 为什么提到这一层只读一次 ────────────────────────────────
+   * `view()` 后端要 `scan(None)`：递归列一遍十二个来源的目录。原来「上次导入」
+   * 和「自动入库」两个小组件各调一次 `loadImport()`，加上本组件自己一次，同一屏
+   * 就列了三遍目录 —— 在几千个 jsonl 的机器上是肉眼可见的卡顿。提到顶层读一次，
+   * 下面两个区块只接收数据。
+   */
+  const view = useLoad(() => m.loadImport(), [])
   const [preview, setPreview] = React.useState<m.ImportPreview | null>(null)
   const [summary, setSummary] = React.useState<m.ImportSummary | null>(null)
   const [scan, setScan] = React.useState<m.DedupScan | null>(null)
@@ -477,6 +487,11 @@ function Import(): React.ReactElement {
   return (
     <div className='mm-import'>
       {actionError ? <div className='mm-error'>{actionError}</div> : null}
+
+      {/* ── 自动入库状态条 ──────────────────────────────────────
+          放在最上面：用户真正在问的是「日常对话会不会自己进来」，
+          而不是「我该怎么手动导」。手动导入是补救，自动入库才是常态。 */}
+      <AutoIngest view={view.data} />
 
       {/* ── 后台导入进行中 ──────────────────────────────────────
           这一条是「切页签不丢」的可视证据：它读的是**后端状态**，不是本地
@@ -688,7 +703,7 @@ function Import(): React.ReactElement {
         </Section>
       ) : null}
 
-      <LastRun />
+      <LastRun view={view.data} />
     </div>
   )
 }
@@ -754,9 +769,8 @@ function CustomSources({ onAdded }: { onAdded: () => void }): React.ReactElement
 }
 
 /** 上次导入的完整结果。水位在卡片上，整次统计在这儿。 */
-function LastRun(): React.ReactElement | null {
-  const view = useLoad(() => m.loadImport(), [])
-  const last = view.data?.lastRun ?? null
+function LastRun({ view }: { view: m.ImportView | null }): React.ReactElement | null {
+  const last = view?.lastRun ?? null
   if (!last) return null
   return (
     <Section title={t('上次导入')} hint={t('时间：{when}', { when: last.atText || timeText(last.at) })}>
@@ -766,6 +780,62 @@ function LastRun(): React.ReactElement | null {
         <Badge variant='outline' shape='tag'>{t('跳过 {n}', { n: last.skipped })}</Badge>
         {last.failed ? <Badge variant='destructive' shape='tag'>{t('失败 {n}', { n: last.failed })}</Badge> : null}
       </div>
+    </Section>
+  )
+}
+
+/**
+ * 日常会话自动入库的状态条。
+ *
+ * ── 为什么这条要放在导入页最上面 ────────────────────────────
+ * 「MCP 连上了、但记忆一直是空的」这个问题的真正答案就在这两行：日常对话靠
+ * 后台的增量入库进库，不靠模型主动调 `memory_write`。把开关、水位、上次结果
+ * 摆出来，用户不必再猜「它到底有没有在收」。
+ *
+ * ── 为什么数据由外面传进来 ──────────────────────────────────
+ * `loadImport()` 在后端会递归列一遍全部来源目录。这个条、上次导入、来源网格
+ * 若各自拉一次，同一屏就列三遍目录。数据在 `Import` 里读一次，这里只负责画。
+ */
+function AutoIngest({ view }: { view: m.ImportView | null }): React.ReactElement | null {
+  if (!view) return null
+  const last = view.lastAuto
+  const mark = view.watermark
+  const on = view.autoIngest
+  return (
+    <Section
+      title={t('日常会话自动入库')}
+      hint={t('按文件修改时间增量读，走与手动导入同一条解析与去重链路；不调模型、不额外花 token。')}
+      action={<Badge variant={on ? 'success' : 'outline'} shape='tag'>{on ? t('已开启') : t('已关闭')}</Badge>}
+    >
+      <div className='mm-inline-meta'>
+        <span className='mm-muted'>{mark.text || t('还没跑过增量入库')}</span>
+        {on && !mark.at ? (
+          <span className='mm-muted'>{t('首次运行只读最近 {n} 天改过的会话', { n: view.autoSinceDays })}</span>
+        ) : null}
+      </div>
+      {last ? (
+        <div className='mm-inline-meta'>
+          <Badge variant='brand' shape='tag'>{t('上次写入 {n}', { n: num(last.written) })}</Badge>
+          <Badge variant='outline' shape='tag'>{t('重复 {n}', { n: last.duplicated })}</Badge>
+          {last.unchanged ? (
+            <Badge variant='outline' shape='tag'>{t('未变动 {n}', { n: last.unchanged })}</Badge>
+          ) : null}
+          {last.failed ? <Badge variant='destructive' shape='tag'>{t('失败 {n}', { n: last.failed })}</Badge> : null}
+          {last.deferred ? (
+            <Badge variant='warning' shape='tag'>{t('积压 {n}', { n: last.deferred })}</Badge>
+          ) : null}
+          <span className='mm-muted'>{last.atText || timeText(last.at)}</span>
+        </div>
+      ) : (
+        <p className='mm-muted'>{t('还没有跑过。开启「自动化 → 会话增量入库」后，每半小时检查一次本机新会话。')}</p>
+      )}
+      {last?.deferred ? (
+        <p className='mm-hint'>
+          {t('单来源每次最多读 800 个文件。这次有 {n} 个有变动但没轮到，下一轮会接着读（从最旧的开始，保证积压一定清得掉）—— 不需要你做什么。', {
+            n: last.deferred,
+          })}
+        </p>
+      ) : null}
     </Section>
   )
 }

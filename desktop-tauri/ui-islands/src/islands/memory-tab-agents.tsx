@@ -61,10 +61,29 @@ function DetectState({ card }: { card: m.AgentCard }): React.ReactElement {
   )
 }
 
-/** 「最近调用」那一行的人话。 */
+/**
+ * 「最近调用」那一行的人话。
+ *
+ * ── 为什么「没有调用」要解释到三行 ──────────────────────────
+ * 「已接入」和「真实调用」是两件事：接入只证明客户端启动时握手成功、能发现
+ * 工具列表；`agent_beat` 只有在模型**真的发起一次 `memory_*` 调用**时才写。
+ * 只写「尚未观察到真实调用」，用户唯一的推论就是「坏了」，然后反复重启客户端、
+ * 重装配置 —— 全都不会改变结果。所以这里必须把三种可能分开：
+ *   · 还没重启 → 配置只在启动时读一次；
+ *   · 重启了但模型没调 → 工具是 deferred 的，得靠指令文件让它主动用；
+ *   · 调了但没归因 → 旧配置缺 `X-Agent`，记到了共用的 `mcp` 名下。
+ */
 function callText(card: m.AgentCard): React.ReactNode {
   const beat = card.heartbeat
-  if (!beat || beat.calls <= 0) return <span className='mm-muted'>{t('尚未观察到真实调用')}</span>
+  if (!beat || beat.calls <= 0) {
+    return (
+      <span className='mm-muted'>
+        {card.mcp.installed
+          ? t('还没有真实调用 —— 连接成功只代表客户端能发现工具，调一次 memory_core 才会记在这里')
+          : t('尚未观察到真实调用')}
+      </span>
+    )
+  }
   const parts = [
     t('写 {n}', { n: num(beat.writes ?? 0) }),
     t('检索 {n}', { n: num(beat.reads ?? 0) }),
@@ -372,7 +391,9 @@ function Agents(): React.ReactElement {
                 ) : null}
                 {!card.heartbeat || card.heartbeat.calls === 0 ? (
                   <p className='mm-agent-hint'>
-                    {t('一直没有调用？确认客户端重启过 —— 配置只在启动时读一次。')}
+                    {card.mcp.installed
+                      ? t('一直没调用？三件事按顺序看：① 客户端重启过没有（配置只在启动时读一次）；② 指令文件写没写（模型要靠它才会主动调 memory_core）；③ 就算不主动调，日常会话也会被「导入 → 会话增量入库」搬进库里。')
+                      : t('一直没有调用？确认客户端重启过 —— 配置只在启动时读一次。')}
                   </p>
                 ) : null}
                 {!card.supported && card.note ? (

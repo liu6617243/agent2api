@@ -251,7 +251,8 @@ static SCHEMA: &[Knob] = &[
           \"profile\":{\"enabled\":false,\"weekly\":1,\"weeklyTime\":\"11:10\"},\
           \"index-scan\":{\"enabled\":true,\"intervalMin\":360},\
           \"cleanup\":{\"enabled\":true,\"daily\":\"11:20\"},\
-          \"health\":{\"enabled\":true,\"daily\":\"11:30\"}}"),
+          \"health\":{\"enabled\":true,\"daily\":\"11:30\"},\
+          \"ingest\":{\"enabled\":true,\"intervalMin\":30}}"),
 
     // ===== 去重 =====
     //
@@ -339,6 +340,11 @@ static SCHEMA: &[Knob] = &[
     knob_d("import.dryRunFirst", Kind::Bool, Tier::Advanced, "导入", "导入前必须干跑预览", "", "true"),
     range(knob("import.batchSize", Kind::Number, Tier::Internal, "导入", "每批写入条数", "1000"), 20.0, 2000.0),
     knob_d("import.sensitiveSkip", Kind::Bool, Tier::Advanced, "导入", "疑似敏感内容默认跳过", "", "true"),
+    knob_d("import.autoIngest", Kind::Bool, Tier::Basic, "导入", "日常会话自动入库",
+        "开着时「会话增量入库」任务会定期把本机客户端新产生的会话搬进记忆；关掉就只剩手动导入",
+        "true"),
+    range(knob_d("import.autoSinceDays", Kind::Number, Tier::Advanced, "导入", "首次自动入库回溯天数",
+        "还没有水位时，只读最近 N 天改过的会话文件；之后按水位增量读", "7"), 1.0, 365.0),
     knob_d("import.sources", Kind::List, Tier::Advanced, "导入", "导入来源清单",
         "路径/格式/启用/优先级；Markdown 笔记目录默认关，选好路径再开", "[]"),
     knob_d("import.overrides", Kind::Map, Tier::Internal, "导入", "来源路径覆盖",

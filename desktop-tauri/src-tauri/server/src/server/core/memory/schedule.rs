@@ -51,7 +51,7 @@ const TICK: Duration = Duration::from_secs(60);
 /// 动作有两个入口、两套开关、两份统计 —— 用户关掉卡片上的开关以为停了，
 /// 同步页点一下还是照跑。所以调度器只认这 11 个，`sync` 模块本身照旧
 /// 供同步页使用。
-pub const TASKS: [&str; 11] = [
+pub const TASKS: [&str; 12] = [
     "extract",
     "summarize",
     "tag",
@@ -60,6 +60,7 @@ pub const TASKS: [&str; 11] = [
     "distill",
     "consolidate",
     "profile",
+    "ingest",
     "index-scan",
     "cleanup",
     "health",
@@ -88,6 +89,9 @@ pub const EXPANDED_RUNS: usize = 50;
 fn default_interval(task: &str) -> i64 {
     match task {
         "classify" => 60,
+        // 日常会话入库：半小时一轮，只读 mtime 变过的文件，没新会话时开销是
+        // 「列一遍目录 + stat」，比它跑一次模型便宜五个数量级。
+        "ingest" => 30,
         "index-scan" => 360,
         // 按天跑的任务用 24h 表达；具体时刻由 `auto.tasks` 里的 `daily` 字段给，
         // 这里只是「两次之间至少隔多久」的兜底
@@ -108,7 +112,10 @@ fn task_enabled(task: &str) -> bool {
     // 这里仍然显式写白名单、而不是跟 `task_uses_model` 取补集：万一将来加
     // 一个「不烧 token 但很吵」的任务（早先 `sync` 就是 —— 没配 WebDAV 时
     // 每分钟往日志里写一条「没配远端」），它不该因为免费就自动默认开启。
-    matches!(task, "classify" | "index-scan" | "cleanup" | "health")
+    //
+    // `ingest` 在名单里：它不调模型（解析 + 写盘而已），而它的**存在意义**就是
+    // 「不用人管」—— 默认关掉等于这个功能没发布。
+    matches!(task, "classify" | "ingest" | "index-scan" | "cleanup" | "health")
 }
 
 /// 这个任务会不会调模型（即：开它会不会烧 token）。
@@ -119,7 +126,8 @@ fn task_enabled(task: &str) -> bool {
 /// 前端抄一份必然漂移 —— 漂移的后果是界面写着「零成本」而它在扣额度。
 ///
 /// 口径是**当前实现**：`extract` / `summarize` / `tag` / `distill` /
-/// `consolidate` / `profile` / `supersede` 会调 `llm`；其余五个纯本地。
+/// `consolidate` / `profile` / `supersede` 会调 `llm`；其余五个纯本地
+/// （`classify` / `ingest` / `index-scan` / `cleanup` / `health`）。
 /// `task_enabled` 的「没配就默认关」用的也是这条线，两边同一份事实。
 fn task_uses_model(task: &str) -> bool {
     matches!(
@@ -650,6 +658,7 @@ fn run_inner(task: &str, project: Option<&str>, manual: bool) -> Outcome {
     }
     match task {
         "index-scan" => index_scan(),
+        "ingest" => ingest(),
         "classify" => classify_pending(project),
         "cleanup" => cleanup(manual),
         "health" => health_check(),
@@ -674,6 +683,57 @@ fn index_scan() -> Outcome {
     match index::global().rebuild(&entries) {
         Ok(count) => Outcome::Done(json!({ "indexed": count })),
         Err(error) => Outcome::Failed(format!("重建索引失败：{error}")),
+    }
+}
+
+/// 日常会话增量入库：把客户端新写的会话搬进记忆。
+///
+/// ── 这个任务补的是什么洞 ────────────────────────────────────
+/// 记忆中枢原来只有两条写入路径：模型主动调 `memory_write`、用户手动点「导入」。
+/// 两条都要求**有人主动做**，于是「用了一周，库里还是几十条」成了默认结局 ——
+/// 用户看到的是「已接入、没有调用记录、也没有记忆」，而事实是日常对话全躺在
+/// `~/.workbuddy/projects/*.jsonl` 里没人搬。
+///
+/// 这项任务把它变成后台常态：按文件 mtime 增量读，走与手动导入完全相同的解析
+/// 与写入链路（窗口切条、原始时间透传、hash 去重），所以「手动导过的」不会被
+/// 再写一遍。
+///
+/// ── 为什么开关放在 `import.autoIngest` 而不是只靠任务开关 ────
+/// 任务卡上那个开关是「这个任务跑不跑」，而 `import.autoIngest` 是「自动入库
+/// 这件事允不允许」。两个开关的意义不同：前者用于「最近先别跑」，后者是隐私
+/// 层面的总闸 —— 用户说「别自动收集我的对话」时要关的是后者，而且关了之后
+/// 即使有人在任务卡上把 `ingest` 打开也不该开始搬。
+fn ingest() -> Outcome {
+    if !config::bool_of("import.autoIngest") {
+        return Outcome::Skipped("自动入库已关闭（import.autoIngest）".into());
+    }
+    // 与手动导入互斥：两条路同时写同一个 l1 容器会丢更新（`store` 的写锁只保证
+    // 单次 save 原子，不保证「读-改-写」整段互斥）。
+    if super::import::is_running() {
+        return Outcome::Skipped("手动导入正在进行，本轮跳过".into());
+    }
+    match super::import::run_auto(&|_, _| {}) {
+        Ok(summary) => {
+            let written = summary.get("written").and_then(Value::as_i64).unwrap_or(0);
+            let deferred = summary.get("deferred").and_then(Value::as_i64).unwrap_or(0);
+            // ── 有积压时不能说「没有新会话」 ────────────────────────
+            // 积压意味着「确实有新文件，但这轮没轮到」，而且水位被故意冻住了。
+            // 若这里仍报 `Skipped("没有新会话")`，审计里就只剩「一切正常」，
+            // 而积压会一轮一轮地重复 —— 用户永远看不到「还有东西没进来」。
+            if written == 0 && deferred == 0 {
+                // 「一条没写」是常态（没新会话），不该在审计里刷成一次成功 ——
+                // 半小时一条「写入 0 条」会把真正有内容的轮次埋掉。
+                return Outcome::Skipped("没有新会话".into());
+            }
+            Outcome::Done(json!({
+                "written": written,
+                "duplicated": summary.get("duplicated").and_then(Value::as_i64).unwrap_or(0),
+                "unchanged": summary.get("unchanged").and_then(Value::as_i64).unwrap_or(0),
+                "scanned": summary.get("scanned").and_then(Value::as_i64).unwrap_or(0),
+                "deferred": deferred,
+            }))
+        }
+        Err(error) => Outcome::Failed(format!("会话入库失败：{error}")),
     }
 }
 
@@ -721,6 +781,22 @@ fn detail_of(task: &str, outcome: &Outcome) -> String {
                     }
                 }
                 "index-scan" => format!("重建索引 {} 条", n("indexed")),
+                "ingest" => {
+                    // 有积压时把「还有多少没进来」写进审计，否则那一轮看起来
+                    // 与「真的没有新会话」完全一样。
+                    let backlog = n("deferred");
+                    if backlog > 0 {
+                        format!(
+                            "写入 {} 条新记忆（扫描 {} 条候选，重复 {} 条，积压 {backlog} 个文件下轮继续）",
+                            n("written"), n("scanned"), n("duplicated")
+                        )
+                    } else {
+                        format!(
+                            "写入 {} 条新记忆（扫描 {} 条候选，重复 {} 条）",
+                            n("written"), n("scanned"), n("duplicated")
+                        )
+                    }
+                }
                 "cleanup" => format!("清回收站 {} 条，失效入回收站 {} 条", n("trashPurged"), n("supersededTrashed")),
                 "health" => format!("陈旧 {} 条，待确认 {} 条", n("stale"), n("pending")),
                 // 将来加了任务但这里没跟上：不编措辞，把载荷压成一行即可，
@@ -1445,6 +1521,7 @@ fn task_summary(task: &str) -> &'static str {
         "distill" => "将项目原始碎片深度蒸馏为架构决策与取舍手册",
         "consolidate" => "全库记忆查重：自动合并雷同、存储换入队列",
         "profile" => "跨项目深度归纳人格、沟通、技术栈与工作习惯",
+        "ingest" => "把客户端新产生的会话增量搬进记忆（零成本）",
         "index-scan" => "全库文件与索引一致性自检及修复（零成本）",
         "cleanup" => "清理回收站与异常无用记录（零成本）",
         "health" => "",
@@ -1617,6 +1694,8 @@ mod tests {
     fn zero_token_tasks_default_on() {
         assert!(task_enabled("index-scan"));
         assert!(task_enabled("cleanup"));
+        // 会话增量入库不调模型，而它的价值全在「不用人管」：默认关掉等于没发布
+        assert!(task_enabled("ingest"));
     }
 
     #[test]
@@ -1721,9 +1800,9 @@ mod tests {
             }
             assert!(!task_summary(task).is_empty(), "{task} 没有说明文案");
         }
-        // 零 token 的四个必须标成零成本：界面据此写「零成本」，写错就等于
+        // 零 token 的五个必须标成零成本：界面据此写「零成本」，写错就等于
         // 让用户以为一个后台任务在烧钱。
-        for task in ["classify", "index-scan", "cleanup", "health"] {
+        for task in ["classify", "ingest", "index-scan", "cleanup", "health"] {
             assert!(!task_uses_model(task), "{task} 不该被标成调用模型");
         }
         for task in ["extract", "summarize", "tag", "distill", "consolidate", "profile", "supersede"] {

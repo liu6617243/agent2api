@@ -143,7 +143,7 @@ pub const PROFILE_PIN_TAG: &str = "pin";
 ///
 /// 条目数必须与 `schedule::TASKS` 一致 —— `status()` 是按 `TASKS` 遍历、
 /// 用这张表取名字的，少一条就会出现「有卡没名」或「有名没卡」。
-pub const TASK_LABELS: [(&str, &str); 11] = [
+pub const TASK_LABELS: [(&str, &str); 12] = [
     ("extract", "抽取结构化信息"),
     ("summarize", "生成摘要"),
     ("tag", "自动打标签"),
@@ -152,6 +152,7 @@ pub const TASK_LABELS: [(&str, &str); 11] = [
     ("distill", "L2 蒸馏"),
     ("consolidate", "去重合并"),
     ("profile", "人格 / 偏好画像"),
+    ("ingest", "会话增量入库"),
     ("index-scan", "索引自愈扫描"),
     ("cleanup", "异常记忆清理"),
     ("health", "记忆体检"),
@@ -395,6 +396,19 @@ pub fn rebuild() -> Result<usize, String> {
 // ── 读 ───────────────────────────────────────────────────────
 
 pub fn list(query: &Query) -> Value {
+    list_for(query, None)
+}
+
+/// 带调用方身份的检索（MCP `memory_search` / `memory_recent` 走这条）。
+///
+/// ── 为什么身份要单独传，不能塞进 `query.agent` ──────────────
+/// `query.agent` 是**过滤条件**（「只看某个客户端写过的记忆」），`caller` 是
+/// **归因**（「这次是谁在查」）。两者混用会出现两种事故：
+/// ① 客户端只在 `X-Agent` 头里带身份、参数里不写 `agent`，`recall_log` 的
+///    `agent` 全成 NULL —— 检索日志明明有几十行，接入页却看不出是谁；
+/// ② 反过来拿 `X-Agent` 兜底填过滤条件，等于把「搜全部」悄悄改成「只搜我自己
+///    写的」，导入来的历史记忆一条都搜不到，而且失败得很安静。
+pub fn list_for(query: &Query, caller: Option<&str>) -> Value {
     ensure_index_once();
     let now = crate::server::logging::now_ms();
     let (rows, total) = search::search_page(query);
@@ -404,7 +418,7 @@ pub fn list(query: &Query) -> Value {
         &query.text,
         items.len(),
         0,
-        query.agent.as_deref(),
+        caller,
         query.project.as_deref(),
     );
     json!({
@@ -462,6 +476,16 @@ pub fn heat(days: usize, tz_minutes: i64) -> Value {
 /// 按 id 取全文（可一次取多条）。顺带给出 3 条相关记忆
 /// ——「读一条时看到旁边那条」是最常见的发现路径。
 pub fn get(ids: &[String], body_limit: usize) -> Value {
+    get_for(ids, body_limit, None)
+}
+
+/// 带客户端身份的按 id 取全文（MCP `memory_get` 走这条）。
+///
+/// 早先这里写死 `None`，`recall_log` 里 `tool=get` 的行永远归不到客户端，
+/// 接入页的「最近有没有在读记忆」就只剩 `agent_beat` 一份证据 —— 一旦
+/// 心跳统计口径变了，整条链路看起来就像没被用过。归因和 `core_text_for()`
+/// 保持同一套：谁调的，就记谁。
+pub fn get_for(ids: &[String], body_limit: usize, agent: Option<&str>) -> Value {
     ensure_index_once();
     let all = store::load_all();
     let now = crate::server::logging::now_ms();
@@ -521,7 +545,7 @@ pub fn get(ids: &[String], body_limit: usize) -> Value {
     }
     if !ids.is_empty() {
         index::global().hit(ids);
-        index::global().log_recall("get", &ids.join(","), items.len(), 0, None, None);
+        index::global().log_recall("get", &ids.join(","), items.len(), 0, agent, None);
     }
     json!({ "items": items })
 }
@@ -598,6 +622,16 @@ pub fn timeline(id: &str) -> Value {
 /// 走索引而不是扫文件：这里要的是「时间段 + 排序」，索引本来就按 `updated_at`
 /// 建了索引列；扫文件要全量解析 frontmatter，只为丢掉大部分行。
 pub fn recent(project: Option<&str>, agent: Option<&str>, days: usize) -> Value {
+    recent_for(project, agent, days, None)
+}
+
+/// 带调用方身份的「最近 N 天」（MCP `memory_recent` 走这条）。
+pub fn recent_for(
+    project: Option<&str>,
+    agent: Option<&str>,
+    days: usize,
+    caller: Option<&str>,
+) -> Value {
     ensure_index_once();
     let now = crate::server::logging::now_ms();
     let days = days.clamp(1, 3650) as i64;
@@ -608,7 +642,7 @@ pub fn recent(project: Option<&str>, agent: Option<&str>, days: usize) -> Value 
         limit: 200,
         ..Default::default()
     };
-    let page = list(&query);
+    let page = list_for(&query, caller);
     let items: Vec<Value> = page
         .get("items")
         .and_then(Value::as_array)
@@ -2121,12 +2155,24 @@ pub fn mark_superseded(old_id: &str, new_id: &str) -> Result<(), String> {
 
 // ── 三级披露的对外入口 ───────────────────────────────────────
 
-/// 核心记忆文本（MCP `memory_core` 的产出；也供页面预览）
+/// 核心记忆文本（MCP `memory_core` 的产出；也供页面预览）。
+///
+/// ── 为什么 `agent` 必须透传 ────────────────────────────────
+/// 早先这里写死 `None`，于是 `recall_log` 里 `memory_core` / `memory_search`
+/// 的调用全都归不到具体客户端：接入页按 `agent_beat` 显示「尚未观察到真实
+/// 调用」，而检索日志里明明有几十条记录却看不出是谁 —— 两处口径互相矛盾，
+/// 排查时只能靠猜。`agent_beat` 由 MCP 分发层统一记，这里的 `agent` 是给
+/// 「按客户端看检索历史」用的第二份证据。
 pub fn core_text(project: Option<&str>, max_tokens: usize) -> Value {
+    core_text_for(project, max_tokens, None)
+}
+
+/// 带客户端身份的核心记忆读取（MCP `memory_core` 走这条）。
+pub fn core_text_for(project: Option<&str>, max_tokens: usize, agent: Option<&str>) -> Value {
     ensure_index_once();
     let entries = store::load_all();
     let (text, used, truncated) = search::core_text(&entries, project, max_tokens);
-    index::global().log_recall("core", project.unwrap_or(""), entries.len(), used, None, project);
+    index::global().log_recall("core", project.unwrap_or(""), entries.len(), used, agent, project);
     json!({
         "text": text,
         "tokens": used,

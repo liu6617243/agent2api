@@ -671,6 +671,14 @@ export type ImportPreviewRow = {
 export type ImportView = {
   sources: ImportSource[]
   lastRun: ImportSummary | null
+  /** 自动增量入库总闸（`import.autoIngest`）。关掉后只剩手动导入。 */
+  autoIngest: boolean
+  /** 首次自动入库回溯天数（没有水位时用） */
+  autoSinceDays: number
+  /** 增量水位：下次从哪个时刻之后的文件读起 */
+  watermark: ImportWatermark
+  /** 上一次自动增量入库的结果（没跑过是 null） */
+  lastAuto: ImportSummary | null
   scanned: number
   /** 本次会读的文件数（单个来源有上限，`scanned` 是总数） */
   take?: number
@@ -678,6 +686,11 @@ export type ImportView = {
   sensitiveSkip: boolean
   batchSize: number
   note: string
+}
+
+export type ImportWatermark = {
+  at: number
+  text: string
 }
 
 export type ImportPreview = {
@@ -700,6 +713,15 @@ export type ImportSummary = {
   written: number
   duplicated: number
   skipped: number
+  /** 增量模式下载「文件上次已读过、这次没变」的条数；手动导入恒为 0 */
+  unchanged?: number
+  /**
+   * 有变动但超出单来源上限、这轮没轮到的文件数。
+   *
+   * 大于 0 时后端**故意不推进水位** —— 否则这批文件会被永久标成「已读」，
+   * 表现为「某些项目的记忆从来没出现过」，且没有任何报错。
+   */
+  deferred?: number
   failed: number
   scanned: number
   reasons: string[]

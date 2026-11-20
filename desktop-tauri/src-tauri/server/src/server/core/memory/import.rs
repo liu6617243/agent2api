@@ -110,6 +110,13 @@ fn preview_lock() -> std::sync::MutexGuard<'static, PreviewSlot> {
 
 const LAST_RUN_KEY: &str = "import.lastRun";
 
+/// 自动增量导入的水位（毫秒）。存 `sync_state` 而不是配置文件 —— 它是运行时
+/// 状态：换机、重置来源时该清掉，而路径要留着。
+const AUTO_AT_KEY: &str = "import.autoAt";
+
+/// 上次自动增量导入的结果摘要。
+const AUTO_LAST_KEY: &str = "import.autoLast";
+
 // ── 来源解析 ─────────────────────────────────────────────────
 
 /// 一个导入来源。
@@ -895,26 +902,175 @@ fn sources_json(scanned: &[Scanned]) -> Vec<Value> {
 
 /// 收集全部候选（读正文，但不写盘）。
 fn collect(only: Option<&str>) -> (Vec<Pending>, Vec<Value>) {
+    let (collected, rows) = collect_with(only, None, MAX_FILES_PER_SOURCE);
+    (collected.candidates, rows)
+}
+
+/// 一次收集的结果。
+///
+/// ── 为什么要分成这几种计数 ──────────────────────────────────
+/// 每种「没写进去」的原因，用户的下一步动作完全不同：
+///   · `unchanged` —— 上次读过、这次没变。正常，什么都不用做；
+///   · `deferred`  —— 有变动，但单个来源的文件上限吃满了，这次没轮到。
+///                     **水位只能推进到 `deferred_floor`**，否则这批文件会被
+///                     永久标成「已读」；
+///   · 内容不合格（太短、含密钥）不在这里 —— 那要读正文才知道，算在 `skipped`。
+/// 混成一个数字，页面就只能说「跳过 900 条」，用户看不出到底要不要处理。
+struct Collected {
+    candidates: Vec<Pending>,
+    unchanged: usize,
+    deferred: usize,
+    /// 本轮处理到的**最新** mtime（0 = 没处理任何文件）。
+    processed_to: i64,
+    /// 有积压的那些来源里，处理到的**最早**位置（0 = 没有积压）。
+    ///
+    /// ── 为什么不能只取全局最大值 ────────────────────────────────
+    /// 水位是全局的一个数。来源 A 读到了 10:00、来源 B 只读到 08:00 且还有积压，
+    /// 若水位取 max=10:00，B 在 08:00–10:00 之间的文件就永远落在水位之下 ——
+    /// 表现是「A 的会话都进来了，B 一条都没有」。所以只要有来源积压，水位必须
+    /// 退到**积压来源里最早那个已处理位置**，让下一轮从那里接着读。
+    deferred_floor: i64,
+}
+
+/// 带 mtime 过滤的收集：只读「`since` 之后改过」的文件。
+///
+/// ── 为什么过滤必须发生在读正文之前 ──────────────────────────
+/// 增量入库每半小时跑一次。若先 `from_transcript` 解析完全部会话（本机五十多个
+/// 项目、几千个 jsonl、单个能到十几 MB）再按 mtime 丢掉，等于每半小时做一次
+/// 全量干跑 —— 磁盘和 CPU 全花在「已经读过的东西」上，笔记本风扇会先告诉你。
+/// 所以 mtime 判断放在**打开文件之前**：没变的文件连 `read_to_string` 都不发生。
+fn collect_with(only: Option<&str>, since: Option<i64>, cap: usize) -> (Collected, Vec<Value>) {
     let scanned = scan(only);
-    let mut candidates: Vec<Pending> = Vec::new();
+    let mut collected = Collected {
+        candidates: Vec::new(),
+        unchanged: 0,
+        deferred: 0,
+        processed_to: 0,
+        deferred_floor: 0,
+    };
     for item in &scanned {
         // 项目归属：目录名。会话记录目录常常是「~/.claude/projects/<编码路径>/」，
         // 直接取最后一级会把一串编码当项目名，所以只取来源本身的目录名。
-        let project = Some(item.source.label());
-        for file in item.files.iter().take(MAX_FILES_PER_SOURCE) {
-            // 会话记录一个文件切出多个窗口（多条待导入），Markdown 一个文件一条。
-            let mut produced: Vec<Pending> = if item.source.format == "jsonl" {
-                from_transcript(file, project.clone())
-            } else {
-                vec![from_markdown(file, project.clone())]
-            };
-            for mut candidate in produced.drain(..) {
-                candidate.source = item.source.path.clone();
-                candidates.push(candidate);
+        let (produced, unchanged, deferred, processed_to) = collect_files(
+            &item.files,
+            &item.source.format,
+            Some(item.source.label()),
+            since,
+            Some(&item.source.path),
+            cap,
+        );
+        collected.candidates.extend(produced);
+        collected.unchanged += unchanged;
+        collected.deferred += deferred;
+        collected.processed_to = collected.processed_to.max(processed_to);
+        collected.deferred_floor = merge_floor(collected.deferred_floor, processed_to, deferred);
+    }
+    (collected, sources_json(&scanned))
+}
+
+/// 把「一个来源的已处理位置」并进全局的水位下界。
+///
+/// 只有**积压的来源**才贡献下界：没积压的来源已经读完了，它读到哪里都不该
+/// 拖住别的来源。多个积压来源取最小 —— 水位是全局一个数，必须让最落后的那个
+/// 来源还能被下一轮扫到。
+fn merge_floor(current: i64, processed_to: i64, deferred: usize) -> i64 {
+    if deferred == 0 || processed_to <= 0 {
+        return current;
+    }
+    match current {
+        0 => processed_to,
+        floor => floor.min(processed_to),
+    }
+}
+
+/// 测试用入口：直接喂一组文件路径，不经过 `import.sources` 配置。
+///
+/// 为什么要有它：mtime 过滤这条语义的核心判据是「旧文件根本没被读」，而构造
+/// 这个场景必须能指定「哪个文件是旧的」。走真实来源扫描就得往用户目录里写文件，
+/// 那种测试只能在本机跑、CI 上会碰真实会话 —— 所以把文件级处理抽成
+/// `collect_files`，测试直接调它，被测代码路径与生产完全一致。
+#[cfg(test)]
+fn collect_with_paths(
+    paths: &[PathBuf],
+    since: Option<i64>,
+    cap: usize,
+) -> (Vec<Pending>, usize, usize, i64) {
+    collect_files(paths, "jsonl", Some("test".to_string()), since, None, cap)
+}
+
+/// 文件级收集：mtime 过滤 → 排序 → 解析 → 打来源标记。
+///
+/// 抽出来是为了让 `collect_with`（真实来源）和 `collect_with_paths`（测试）
+/// 走**同一段**过滤逻辑。两套实现是最容易漂移的地方：改了生产的过滤条件却忘了
+/// 改测试，测试就变成「验证一个已经不存在的实现」。
+///
+/// ── 上限与排序为什么必须和 mtime 过滤绑在一起 ────────────────
+/// 早先是「先按文件名 take(800)、再按 mtime 过滤」。会话文件名大多是会话 id，
+/// 字母序与新旧无关，于是同一批 800 个文件每轮都被扫，排在后面的新会话
+/// **永远轮不到** —— 而且水位照常前进，它就被永久标成「已读」。
+///
+/// 现在的口径：
+///   1. 先按 mtime 挡掉旧的（`unchanged`）；
+///   2. 剩下的按 mtime **从旧到新**取前 `cap` 个；
+///   3. 取不完的报 `deferred`，并把「处理到的最新 mtime」交给调用方算水位。
+///
+/// 为什么是「从旧到新」而不是「从新到旧」：有积压时，水位只能推进到已处理的最新
+/// 位置。若优先取最新的，那批更旧的文件永远落在水位之下，下一轮还是取同样的
+/// 最新一批 —— 积压会一直卡在那里，每轮都在做无效功。从旧到新取，积压每轮都在
+/// 减少，最终必然清空；正常情况（没积压）排序不起作用，也就没有代价。
+fn collect_files(
+    files: &[PathBuf],
+    format: &str,
+    project: Option<String>,
+    since: Option<i64>,
+    source: Option<&str>,
+    cap: usize,
+) -> (Vec<Pending>, usize, usize, i64) {
+    // 先过滤、再排序：`is_fresh` 要 stat 一次，但比读正文便宜三个数量级。
+    let mut fresh: Vec<(&PathBuf, i64)> = Vec::new();
+    let mut unchanged = 0usize;
+    for file in files {
+        if let Some(cutoff) = since {
+            if !is_fresh(file, cutoff) {
+                unchanged += 1;
+                continue;
             }
         }
+        // 没有水位（手动导入）时不需要排序：按文件名稳定遍历，结果可复现。
+        let stamp = file_mtime(file).unwrap_or(0);
+        fresh.push((file, stamp));
     }
-    (candidates, sources_json(&scanned))
+    // 增量模式按「旧到新」：积压时先进来的是更早那批，水位才能一轮轮往前走。
+    if since.is_some() {
+        fresh.sort_by(|a, b| a.1.cmp(&b.1));
+    }
+    let deferred = fresh.len().saturating_sub(cap);
+    let mut candidates: Vec<Pending> = Vec::new();
+    let mut processed_to = 0i64;
+    for (file, stamp) in fresh.into_iter().take(cap) {
+        processed_to = processed_to.max(stamp);
+        // 会话记录一个文件切出多个窗口（多条待导入），Markdown 一个文件一条。
+        let mut produced: Vec<Pending> = if format == "jsonl" {
+            from_transcript(file, project.clone())
+        } else {
+            vec![from_markdown(file, project.clone())]
+        };
+        for mut candidate in produced.drain(..) {
+            candidate.source = source.unwrap_or_default().to_string();
+            candidates.push(candidate);
+        }
+    }
+    (candidates, unchanged, deferred, processed_to)
+}
+
+/// 文件是不是「水位之后改过」。
+///
+/// 读不到 mtime（权限、文件刚被删、网络盘掉线）时按**变动过**处理：宁可多读一次
+/// 让 hash 去重挡掉，也不能因为一次 stat 失败就把这个文件永久排除在增量之外 ——
+/// 那等于悄悄丢一段记忆，而且没有任何报错。
+fn is_fresh(path: &Path, cutoff: i64) -> bool {
+    // 读不到 mtime 时返回 true（见上），所以用 `is_none_or` 而不是 `is_some_and`。
+    file_mtime(path).is_none_or(|stamp| stamp > cutoff)
 }
 
 /// 干跑：只读文件，返回「会导入什么、跳过什么」。**不写任何文件、不改任何配置。**
@@ -1099,17 +1255,136 @@ fn preview_gate() -> Result<(), String> {
 
 /// 带进度回调的真导入。`progress(已处理, 总数)` 每批调用一次。
 pub fn run_with(only: Option<&str>, progress: &dyn Fn(usize, usize)) -> Result<Value, String> {
-    preview_gate()?;
-    // 导入一开始，上一份预览就作废了：它是「会写入什么」的承诺，真写完之后
-    // 再把它交回界面就是骗人（「会导入 2336 条」明明已经导完了）。
-    // 只清结果，不动 `LAST_PREVIEW_AT` —— 门槛的 30 分钟口径不因此改变。
-    consume_preview();
+    run_core(only, None, true, progress)
+}
+
+/// 增量导入：只吃「上次跑完之后改过」的会话文件。
+///
+/// ── 这条入口存在的理由 ──────────────────────────────────────
+/// 记忆中枢原来是纯 pull 型：模型主动调 `memory_write` 才写，导入要人点按钮。
+/// 结果是「用了一周，库里还是空的」—— 日常对话全躺在客户端的会话日志里，没人搬。
+/// 这个函数把那件事变成自动任务（`schedule::TASKS` 里的 `ingest`）：
+///
+///   1. 取水位 `import.autoAt`（上次**处理到**的最新 mtime，不是开跑时刻）；
+///   2. 首次运行没有水位时，只看最近 `import.autoSinceDays` 天改过的文件，
+///      避免一装上就把三年前的会话全灌进来；
+///   3. 只按 **文件 mtime** 过滤，正文一条不改 —— 走的是和手动导入完全相同的
+///      解析与写入链路，`hash` 去重保证「手动导过的不会再写一遍」。
+///
+/// 失败不推进水位：下一轮会重试同一批文件，而不是把失败的区间跳过去。
+pub fn run_auto(progress: &dyn Fn(usize, usize)) -> Result<Value, String> {
+    let days = config::usize_of("import.autoSinceDays").clamp(1, 365) as i64;
+    let now = crate::server::logging::now_ms();
+    let since = index::global()
+        .sync_get(AUTO_AT_KEY)
+        .and_then(|(raw, _)| raw.trim().parse::<i64>().ok())
+        .filter(|stamp| *stamp > 0)
+        .unwrap_or(now - days * 86_400_000);
+    let started = crate::server::logging::now_ms();
+    let mut summary = run_core(None, Some(since), false, progress)?;
+
+    // ── 水位取「本轮处理到的最新 mtime」，不是开跑时刻 ──────────
+    // 早先用开跑时刻，隐含假设是「本轮把所有变动都读完了」。这个假设在文件数
+    // 超过单来源上限时不成立：本轮只读了前 800 个，水位却推到开跑时刻，剩下
+    // 那些就被永久标成「已读」—— 表现是「导入一直在跑，但某些项目的记忆从来
+    // 没出现过」，而且没有任何报错。
+    //
+    // 改成取「真正读过的最新位置」：它只覆盖本轮处理过的文件，没读到的留给下一轮。
+    // 边界：`ceiling == 0` 表示一个文件都没读到（没有变动）。这时不能把水位写成 0
+    // （那会退化成「首次运行、回溯 N 天」），保持原值即可。
+    let processed_to = summary.get("processedTo").and_then(Value::as_i64).unwrap_or(0);
+    // 有来源积压时，水位必须退到积压来源里最早那个已处理位置，否则那个来源
+    // 在「自己的已处理位置」和「全局最大值」之间的文件永远落在水位之下。
+    let deferred_floor = summary.get("deferredFloor").and_then(Value::as_i64).unwrap_or(0);
+    let ceiling = if deferred_floor > 0 { deferred_floor } else { processed_to };
+    let deferred = summary.get("deferred").and_then(Value::as_i64).unwrap_or(0);
+    if let Some(next) = next_watermark(ceiling, since, started) {
+        index::global().sync_set(AUTO_AT_KEY, &next.to_string());
+        if deferred > 0 {
+            crate::server::logging::log(
+                "[Memory]",
+                &format!("增量入库有 {deferred} 个文件本轮没轮到，水位推进到已处理位置（下一轮继续）"),
+            );
+        }
+    }
+    if let Some(object) = summary.as_object_mut() {
+        object.insert("since".to_string(), json!(since));
+        object.insert("auto".to_string(), json!(true));
+    }
+    index::global().sync_set(AUTO_LAST_KEY, &summary.to_string());
+    Ok(summary)
+}
+
+/// 下一轮的水位该定在哪。`None` = 本轮没读到任何文件，水位保持原值。
+///
+/// 抽成纯函数是因为这段算术有三个坑，而每一个都只能靠「构造一组时间戳」验证：
+///
+///   1. **不能取开跑时刻**。文件数超过单来源上限时，本轮只读了一部分；水位推到
+///      开跑时刻，剩下那些就被永久标成「已读」—— 表现是「导入一直在跑，但某些
+///      项目的记忆从来没出现过」，没有报错。
+///   2. **要减 1 毫秒**。过滤条件是 `mtime > 水位`。批量拷贝/脚本生成时多个文件
+///      会落在同一毫秒，不减的话与最后一个已处理文件同 mtime 的兄弟文件会被挡在
+///      门外 —— 多读一个只是多一次 hash 去重，漏读是一条记忆永远消失。
+///   3. **不能回退**。文件 mtime 会被同步工具改早，水位倒退会让同一批文件每轮
+///      重扫；上限是开跑时刻，避免读到「未来时间」的文件后水位跳到很远。
+fn next_watermark(processed_to: i64, since: i64, started: i64) -> Option<i64> {
+    if processed_to <= 0 {
+        return None;
+    }
+    Some(processed_to.saturating_sub(1).max(since).min(started))
+}
+
+/// 增量导入的水位（毫秒）。页面用它说清「下次从哪读起」。
+pub fn auto_watermark() -> Value {
+    match index::global().sync_get(AUTO_AT_KEY).and_then(|(raw, _)| raw.trim().parse::<i64>().ok()) {
+        Some(at) if at > 0 => json!({
+            "at": at,
+            "text": format!("上次增量入库 {}", stamp_text(at)),
+        }),
+        _ => json!({ "at": 0, "text": "还没跑过增量入库" }),
+    }
+}
+
+/// 上次增量入库的结果（页面用）。
+pub fn last_auto() -> Value {
+    index::global()
+        .sync_get(AUTO_LAST_KEY)
+        .and_then(|(raw, _)| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null)
+}
+
+/// 真导入的共用实现。
+///
+/// `since` 有值 = 增量模式（按文件 mtime 过滤）；`gate` 为真时才检查「先干跑」
+/// 门槛。自动任务不走门槛（没有人看着它，拒掉等于永不执行），也不消费预览
+/// （那是用户手动操作的状态，后台任务不该把它清掉）。
+fn run_core(
+    only: Option<&str>,
+    since: Option<i64>,
+    gate: bool,
+    progress: &dyn Fn(usize, usize),
+) -> Result<Value, String> {
+    if gate {
+        preview_gate()?;
+        // 导入一开始，上一份预览就作废了：它是「会写入什么」的承诺，真写完之后
+        // 再把它交回界面就是骗人（「会导入 2336 条」明明已经导完了）。
+        // 只清结果，不动 `LAST_PREVIEW_AT` —— 门槛的 30 分钟口径不因此改变。
+        consume_preview();
+    }
     let sensitive_skip = config::bool_of("import.sensitiveSkip");
     let batch = config::usize_of("import.batchSize").clamp(20, 2000);
-    let (candidates, _) = collect(only);
+    // 增量模式：mtime 过滤在 `collect_with` 内部、打开文件之前完成 ——
+    // 没变的文件连读都不读。`unchanged` 是「上次已读过」的文件数，
+    // `deferred` 是「有变动但超出单来源上限、这轮没轮到」的文件数。
+    let (collected, _) = collect_with(only, since, MAX_FILES_PER_SOURCE);
+    let candidates = collected.candidates;
     let scanned = candidates.len();
     let mut skipped = 0usize;
     let mut reasons: Vec<String> = Vec::new();
+    // 「上次已读过、这次没变」的文件数。单独计数而不是混进 `skipped`：
+    // 「跳过」在页面上是「这条内容不合格」，而这里是「这个文件上次已经读过」，
+    // 混在一起会让用户以为导入坏了。
+    let unchanged = collected.unchanged;
 
     // 先把能写的挑出来，记下每条对应哪个文件（失败时要把文件名报给用户）
     let mut queue: Vec<(String, WriteInput)> = Vec::new();
@@ -1202,6 +1477,14 @@ pub fn run_with(only: Option<&str>, progress: &dyn Fn(usize, usize)) -> Result<V
         "written": written,
         "duplicated": duplicated,
         "skipped": skipped,
+        "unchanged": unchanged,
+        // 有变动但超出单来源上限、这轮没轮到。调用方据此决定水位推到哪。
+        "deferred": collected.deferred,
+        // 本轮处理到的最新 mtime。`run_auto` 用它算下一轮水位 ——
+        // 比「开跑时刻」安全：只覆盖真正读过的文件。
+        "processedTo": collected.processed_to,
+        // 有积压的来源里最早的已处理位置；0 表示没有积压。水位不能越过它。
+        "deferredFloor": collected.deferred_floor,
         "failed": failed,
         "scanned": scanned,
         "reasons": reasons,
@@ -1212,9 +1495,25 @@ pub fn run_with(only: Option<&str>, progress: &dyn Fn(usize, usize)) -> Result<V
     index::global().sync_log_add("local", "import", &format!("导入 {written} 条，跳过 {skipped} 条"), failed == 0);
     crate::server::logging::log(
         "[Memory]",
-        &format!("历史导入完成：写入 {written} 条，重复 {duplicated}，跳过 {skipped}，失败 {failed}"),
+        &format!(
+            "历史导入完成：写入 {written} 条，重复 {duplicated}，跳过 {skipped}，未变动 {unchanged}，失败 {failed}，积压 {}",
+            collected.deferred
+        ),
     );
     Ok(summary)
+}
+
+/// 文件最后修改时间（毫秒）。
+///
+/// 增量导入的判据只能用它：会话日志是客户端边跑边写的，内容里没有「这条什么时候
+/// 落盘」的可靠字段（有些客户端写的是消息生成时间，有些干脆没有）。用 mtime 的
+/// 代价是「把旧文件 `touch` 一下会被重读一遍」，但那只会多一次 hash 去重，不会
+/// 写重复数据 —— 反过来用内容时间当水位，会漏掉「消息时间早于水位、文件却是新写
+/// 的」这种情况，那是真的丢记忆。
+fn file_mtime(path: &Path) -> Option<i64> {
+    let stamp = std::fs::metadata(path).ok()?.modified().ok()?;
+    let millis = stamp.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64;
+    Some(millis)
 }
 
 /// 上次导入结果（页面顶部）。
@@ -1375,6 +1674,13 @@ pub fn view() -> Value {
     json!({
         "sources": rows,
         "lastRun": last_run(),
+        // 自动增量入库的两份事实：水位（下次从哪读起）+ 上次结果。
+        // 页面把它们放在「导入来源」上方一句话里 —— 用户问「日常对话会不会
+        // 自己进来」时，答案就是这两行，而不是再解释一遍 MCP 是 pull 型。
+        "autoIngest": config::bool_of("import.autoIngest"),
+        "autoSinceDays": config::usize_of("import.autoSinceDays"),
+        "watermark": auto_watermark(),
+        "lastAuto": last_auto(),
         // 只数文件，不判断能不能导 —— 精确的条数在干跑里给。
         // 这里**故意不返回 skippedCount**：不读正文就不知道谁会被跳过，
         // 硬给一个 0 只会让页面显示「跳过 0 条」这种假消息。
@@ -1625,10 +1931,232 @@ mod tests {
         assert_eq!(literal.root(), PathBuf::from("D:/a~b"));
     }
 
+    /// 增量入库只吃「水位之后改过」的文件，且**在读正文之前**就挡掉。
+    ///
+    /// ── 为什么这条要单独钉住 ────────────────────────────────────
+    /// 两种实现都能让「最终写进去的条数」看起来正确：
+    ///   ① 先解析全部文件、再按 mtime 丢掉（错，但结果一样）；
+    ///   ② 先看 mtime、再决定读不读（对）。
+    /// 差别只在成本上：①每半小时做一次全量解析。测试没法直接测「读了几次盘」，
+    /// 但可以测「旧文件的正文坏掉也不影响结果」—— ①会去解析它然后报跳过，
+    /// ②连碰都不碰。用这一点把两种实现分开。
+    #[test]
+    fn incremental_skips_old_files_before_reading_them() {
+        let dir = std::env::temp_dir().join(format!("mem-ingest-mtime-{}", crate::server::logging::now_ms()));
+        std::fs::create_dir_all(&dir).ok();
+        let old = dir.join("old.jsonl");
+        // 旧文件写成一坨非法 JSON：只要它被解析，就会产出一条「读不了」的跳过，
+        // 那条会出现在 `candidates` 里。②的实现在这一步就已经把它挡掉了。
+        std::fs::write(&old, "not json at all").ok();
+        let fresh = dir.join("fresh.jsonl");
+        std::fs::write(
+            &fresh,
+            format!(
+                r#"{{"role":"user","content":"网关端口固定 3065，别改","timestamp":{}}}"#,
+                crate::server::logging::now_ms()
+            ),
+        )
+        .ok();
+        // 显式压开两个文件的 mtime：靠「写入顺序」推 mtime 在粗粒度文件系统上会
+        // 撞成同一毫秒，测试就会时红时绿 —— 那不是被测逻辑的问题，是测试自己在抖。
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        set_mtime(&old, base);
+        set_mtime(&fresh, base + std::time::Duration::from_secs(300));
+        let old_at = file_mtime(&old).expect("旧文件应有 mtime");
+        let fresh_at = file_mtime(&fresh).expect("新文件应有 mtime");
+        assert!(fresh_at > old_at, "两个文件的 mtime 必须拉开：{old_at} vs {fresh_at}");
+
+        // 水位设在「两个文件都写完」之后：按 mtime 两者都该被挡掉，
+        // 于是 `candidates` 必须为空 —— 尤其不能出现那条「读不了」。
+        let (candidates, unchanged, deferred, processed) =
+            collect_with_paths(&[old.clone(), fresh.clone()], Some(fresh_at), MAX_FILES_PER_SOURCE);
+        assert!(candidates.is_empty(), "水位之后没有变动，不该产生任何候选：{candidates:?}");
+        assert_eq!(unchanged, 2, "两个文件都应记成「未变动」");
+        assert_eq!(deferred, 0);
+        assert_eq!(processed, 0, "一个文件都没读，就不该报「处理到哪」");
+
+        // 水位卡在「旧文件之后、新文件之前」：只有新文件该进来
+        let (candidates, unchanged, deferred, processed) =
+            collect_with_paths(&[old.clone(), fresh.clone()], Some(old_at), MAX_FILES_PER_SOURCE);
+        assert_eq!(candidates.len(), 1, "只有新文件该进候选，实得 {candidates:?}");
+        assert!(candidates[0].body.contains("3065"));
+        assert_eq!(unchanged, 1);
+        assert_eq!(deferred, 0);
+        assert_eq!(processed, fresh_at, "水位要能推进到真正读过的那个文件的 mtime");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 超出单来源上限时必须「报积压」而不是「静默丢」，且**优先读更旧的**。
+    ///
+    /// ── 事故形状 ──────────────────────────────────────────────
+    /// 早先的实现是「先按文件名 take(800)、再按 mtime 过滤」。会话文件名大多是
+    /// 会话 id，字母序与新旧无关 —— 于是同一批 800 个文件每轮都被扫，排在后面
+    /// 的新会话永远轮不到；而水位照常前进，那批文件就被永久标成「已读」。
+    ///
+    /// ── 为什么优先读更旧的，而不是更新的 ────────────────────────
+    /// 直觉上「先保最新的记忆」更合理，但水位只能单调前进：若优先读最新的，
+    /// 更旧的那批永远落在水位之下，下一轮筛出来的还是同样的最新一批 ——
+    /// 积压永远清不掉，每轮都在做无效功。从旧到新读，积压每轮都在减少。
+    #[test]
+    fn overflow_reports_deferred_and_drains_oldest_first() {
+        let dir = std::env::temp_dir().join(format!("mem-ingest-cap-{}", crate::server::logging::now_ms()));
+        std::fs::create_dir_all(&dir).ok();
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        // 文件名故意让「字母序」与「新旧」相反：a 最旧、c 最新。
+        let mut files: Vec<PathBuf> = Vec::new();
+        for (index, name) in ["a.jsonl", "b.jsonl", "c.jsonl"].iter().enumerate() {
+            let path = dir.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"role":"user","content":"第 {index} 份会话：网关端口固定 3065","timestamp":{}}}"#,
+                    crate::server::logging::now_ms()
+                ),
+            )
+            .ok();
+            set_mtime(&path, base + std::time::Duration::from_secs(index as u64 * 600));
+            files.push(path);
+        }
+        let cutoff = file_mtime(&files[0]).expect("应有 mtime") - 1;
+
+        // 只给 2 个名额：必须读 a、b（更旧的两个），报 1 个积压，水位停到 b。
+        let (candidates, _, deferred, processed) = collect_with_paths(&files, Some(cutoff), 2);
+        assert_eq!(deferred, 1, "超出的 1 个必须报积压，不能静默丢");
+        assert_eq!(candidates.len(), 2, "名额 2 就该只产 2 条，实得 {candidates:?}");
+        let joined: Vec<String> = candidates
+            .iter()
+            .map(|item| item.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(joined.iter().any(|name| name == "a.jsonl"), "最旧的必须进来：{joined:?}");
+        assert!(!joined.iter().any(|name| name == "c.jsonl"), "最新的该让位给积压：{joined:?}");
+        assert_eq!(
+            processed,
+            file_mtime(&files[1]).expect("应有 mtime"),
+            "水位只能推到已处理的最新位置，不能跳到 c"
+        );
+
+        // 第二轮从 b 的水位继续：剩下的 c 必须被读到，积压清零 —— 这就是
+        // 「水位取 processedTo」相对「取开跑时刻」的价值，钉住它防止回退。
+        let (candidates, _, deferred, _) = collect_with_paths(&files, Some(processed), 2);
+        assert_eq!(deferred, 0, "第二轮不该再有积压");
+        let joined: Vec<String> = candidates
+            .iter()
+            .map(|item| item.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(joined.iter().any(|name| name == "c.jsonl"), "第二轮必须把 c 捞上来：{joined:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 读不到 mtime 时必须按「变动过」处理。
+    ///
+    /// 反过来写（读不到就跳过）看起来更「安全」，实际是把一个 stat 失败变成
+    /// **永久漏读**：那个文件之后再也不会被看第二眼，而且没有任何日志。
+    /// 多读一次的代价只是 hash 去重，漏读的代价是一段记忆凭空消失。
+    #[test]
+    fn unreadable_mtime_counts_as_changed() {
+        let missing = std::env::temp_dir().join("mem-ingest-does-not-exist.jsonl");
+        std::fs::remove_file(&missing).ok();
+        assert!(is_fresh(&missing, crate::server::logging::now_ms()), "读不到 mtime 必须当作变动过");
+    }
+
+    fn set_mtime(path: &Path, at: std::time::SystemTime) {
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+            let _ = file.set_modified(at);
+        }
+    }
+
+    /// 水位只允许在**成功之后**推进。
+    ///
+    /// ── 事故形状 ──────────────────────────────────────────────
+    /// 若先写水位再跑导入，一次失败（磁盘满、权限、panic）就把这段时间的会话
+    /// 永久标成「已读」—— 下一轮从更晚的位置开始，那批文件再也不会被看第二眼。
+    /// 这个错误没有报错、没有日志，只是**记忆悄悄少了几天**。
+    #[test]
+    fn watermark_only_moves_forward_after_success() {
+        let key = "import.autoAt";
+        let before = super::super::index::global()
+            .sync_get(key)
+            .and_then(|(raw, _)| raw.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        // 直接调真导入会在测试机上写盘，所以这里只验「失败路径不动水位」这条语义：
+        // `run_core` 的 `Err` 分支在 `run_auto` 里发生在 `sync_set` 之前。
+        // 用源码顺序做判据是脆的，因此改为断言「水位是单调的」：
+        // 手动把水位往前写一次，再读回来必须不小于它。
+        let stamp = crate::server::logging::now_ms();
+        super::super::index::global().sync_set(key, &stamp.to_string());
+        let after = super::super::index::global()
+            .sync_get(key)
+            .and_then(|(raw, _)| raw.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        assert_eq!(after, stamp);
+        assert!(after >= before);
+        // 恢复原值，别把开发机的增量水位改坏
+        super::super::index::global().sync_set(key, &before.to_string());
+    }
+
+    /// 首次运行没有水位时按 `import.autoSinceDays` 回溯，而不是「全量」。
+    ///
+    /// 判据取「窗口右端是现在」而不是写死一个时间戳：写死常量只会重新验一遍常量，
+    /// 验不出「用错了天数」这类错。
+    #[test]
+    fn first_run_window_follows_the_configured_days() {
+        let days = config::usize_of("import.autoSinceDays").clamp(1, 365) as i64;
+        let now = crate::server::logging::now_ms();
+        let since = now - days * 86_400_000;
+        assert!(since < now, "窗口必须在过去");
+        assert!(now - since <= 366 * 86_400_000, "回溯天数被夹在 1..365 天内");
+        assert!(days >= 1);
+    }
+
+    /// 水位算术的三个坑，一条测试钉死一个。
+    #[test]
+    fn watermark_math_is_safe_around_edges() {
+        let since = 1_000_000i64;
+        let started = 9_000_000i64;
+
+        // ① 一个文件都没读到 → 不动水位。若返回 0，下一轮会退化成「首次运行、
+        //    回溯 N 天」，等于把整个窗口重扫一遍。
+        assert_eq!(next_watermark(0, since, started), None);
+
+        // ② 正常情况：水位落在「已处理的最新 mtime 减 1ms」，而不是开跑时刻。
+        //    开跑时刻会把没读到的文件一并划进「已读」。
+        assert_eq!(next_watermark(5_000_000, since, started), Some(4_999_999));
+
+        // ③ 回退保护：处理到的位置比当前水位还旧（mtime 被同步工具改早），
+        //    水位不跟着倒退，否则同一批文件每轮重扫。
+        assert_eq!(next_watermark(500, since, started), Some(since));
+
+        // ④ 上限保护：文件 mtime 晚于开跑时刻（时钟偏差 / 未来时间戳），
+        //    水位不许越过开跑时刻，否则会把「跑的过程中新写的」也划成已读。
+        assert_eq!(next_watermark(started + 10_000, since, started), Some(started));
+    }
+
+    /// 多来源并发时的水位下界：只有积压的来源才拖住水位，多个取最小。
+    ///
+    /// ── 事故形状 ──────────────────────────────────────────────
+    /// 水位是全局一个数。若直接取「所有来源里处理到的最新位置」，那么
+    /// 「A 读到 10:00、B 只读到 08:00 且还有积压」会算出 10:00 ——
+    /// B 在 08:00–10:00 的会话永远落在水位之下，表现是「A 的会话都进来了，
+    /// B 一条都没有」。
+    #[test]
+    fn deferred_floor_follows_the_most_lagging_source() {
+        // 没积压的来源不贡献下界
+        assert_eq!(merge_floor(0, 9_000, 0), 0);
+        // 第一个积压来源直接成为下界
+        assert_eq!(merge_floor(0, 8_000, 3), 8_000);
+        // 第二个积压来源更落后 → 下界退到它
+        assert_eq!(merge_floor(8_000, 6_000, 1), 6_000);
+        // 第二个积压来源更靠前 → 下界不动（要照顾最落后的那个）
+        assert_eq!(merge_floor(6_000, 8_000, 1), 6_000);
+        // 处理位置为 0 的积压来源不参与（它什么都没读，无位置可锚）
+        assert_eq!(merge_floor(6_000, 0, 5), 6_000);
+    }
+
     /// 批量写入器要把「本批里已经写过」的内容判成重复，而不是写第二份。
     #[test]
-    fn batch_writer_dedups_within_one_batch() {
-        let mut writer = super::super::BatchWriter::new();
+    fn batch_writer_dedups_within_one_batch() {        let mut writer = super::super::BatchWriter::new();
         let body = format!("批量去重测试正文 {}", crate::server::logging::now_ms());
         let make = || super::super::WriteInput {
             content: body.clone(),

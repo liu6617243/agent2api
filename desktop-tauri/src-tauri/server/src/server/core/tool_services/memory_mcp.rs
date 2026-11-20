@@ -430,7 +430,9 @@ fn dispatch(name: &str, args: &Value, agent: Option<&str>) -> Result<Value, Call
         "memory_core" => {
             let project = text_arg(args, "project");
             let budget = number_arg(args, "maxTokens").unwrap_or_else(|| memory::config().core_max_tokens);
-            Ok(memory::core_text(project.as_deref(), budget))
+            // 带上客户端身份：`recall_log` 里能按 agent 归因，接入页的
+            // 「最近有没有在读记忆」才有第二份独立证据（第一份是 agent_beat）。
+            Ok(memory::core_text_for(project.as_deref(), budget, Some(&agent_slug(agent))))
         }
         "memory_digest" => {
             // 不传 `maxLines` 时用配置项 `agents.digestMaxLines`（默认 200）。
@@ -449,6 +451,9 @@ fn dispatch(name: &str, args: &Value, agent: Option<&str>) -> Result<Value, Call
             let request = MemoryQuery {
                 text: query,
                 project: text_arg(args, "project"),
+                // `agent` 是**过滤条件**（只看某个客户端写过的记忆），不是调用方身份。
+                // 归因走 `list_for()` 的第二个参数 —— 早先想在这里兜底成 `X-Agent`，
+                // 那会把「搜全部」悄悄改成「只搜我自己写的」，导入来的记忆直接搜不到。
                 agent: text_arg(args, "agent"),
                 kind: text_arg(args, "type"),
                 layer: text_arg(args, "layer"),
@@ -471,7 +476,7 @@ fn dispatch(name: &str, args: &Value, agent: Option<&str>) -> Result<Value, Call
                 // （界面要用真实总数算页数）。
                 recall: Some(settings.recall_top_k),
             };
-            let page = memory::list(&request);
+            let page = memory::list_for(&request, Some(&agent_slug(agent)));
             let all = page
                 .get("lines")
                 .and_then(Value::as_array)
@@ -502,7 +507,7 @@ fn dispatch(name: &str, args: &Value, agent: Option<&str>) -> Result<Value, Call
             if ids.is_empty() {
                 return Err(CallError::Failed("缺少 id".into()));
             }
-            Ok(memory::get(&ids, MAX_BODY_CHARS))
+            Ok(memory::get_for(&ids, MAX_BODY_CHARS, Some(&agent_slug(agent))))
         }
         "memory_timeline" => {
             let mut id = text_arg(args, "id");
@@ -568,10 +573,11 @@ fn dispatch(name: &str, args: &Value, agent: Option<&str>) -> Result<Value, Call
             let id = text_arg(args, "id").ok_or_else(|| CallError::Failed("缺少 id".into()))?;
             memory::update(&id, args).map_err(CallError::Failed)
         }
-        "memory_recent" => Ok(memory::recent(
+        "memory_recent" => Ok(memory::recent_for(
             text_arg(args, "project").as_deref(),
             text_arg(args, "agent").as_deref(),
             number_arg(args, "days").unwrap_or(7),
+            Some(&agent_slug(agent)),
         )),
         "memory_projects" => Ok(memory::projects()),
         "memory_forget" => {
