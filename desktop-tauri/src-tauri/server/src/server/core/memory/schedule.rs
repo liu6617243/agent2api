@@ -1168,6 +1168,7 @@ fn extract(project: Option<&str>) -> Outcome {
             starred: Some(false),
             cwd: None,
             session: None,
+            created_at: None,
             valid_to: None,
             evidence: recent.iter().map(|entry| entry.id.clone()).take(5).collect(),
         };

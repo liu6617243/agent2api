@@ -108,6 +108,130 @@ fn now_ms() -> i64 {
     crate::server::logging::now_ms()
 }
 
+// ── 延迟落盘（deferred write）────────────────────────────────
+//
+// ── 为什么需要这一层 ────────────────────────────────────────
+// l1 是「一天一文件、多节」的容器。`save_section_locked` 每写一条都要把整份
+// 容器读进来、摘旧节、追加新节、再整份写回。单条没问题；但批量导入把成千上万
+// 条塞进同一天（历史数据的 created 全落在导入日附近，或本就同一天几十条），
+// 每条都整份读改写就是 O(n²) 写放大：文件涨到 MB 级后，60 秒只能写一两百条，
+// 而且越写越慢。
+//
+// 解法抄 AgentHub 的 `beginDeferred` / `endDeferred`：批内对同一容器的多次追加
+// 先在内存里攒成「该文件的最终文本」，批次结束统一写一次盘。对外语义不变
+// （窗口内读者读到的是「已经加上这一条」的最新文本），只是把 N 次整份写盘压成
+// 一次。
+//
+// ── 为什么是 thread_local 而不是全局状态 ────────────────────
+// 写锁是全局的，但延迟窗口天然属于「某一个调用方的一次批量操作」。放进全局会
+// 让别的并发写者也被卷进这个窗口、攒在别人的内存里最后被别人 flush 掉。绑定到
+// 线程后，只有发起批量写入的那个线程看得到自己攒下的内容，互不干扰。
+thread_local! {
+    static OVERLAY: std::cell::RefCell<Overlay> = std::cell::RefCell::new(Overlay::default());
+}
+
+#[derive(Default)]
+struct Overlay {
+    /// 窗口是否打开。关着的时候所有读写都直透磁盘，行为与不引入本层完全一致。
+    active: bool,
+    /// 窗口内被改写文件的「待落盘文本」。key 是路径串；`None` 表示这个文件
+    /// 在窗口内被删掉了（批末统一真删）。
+    files: std::collections::HashMap<String, Option<String>>,
+}
+
+fn overlay_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// 窗口内读容器：有攒下的文本读攒下的，否则直读磁盘。窗口关着等价于直读。
+fn overlay_read(path: &Path) -> String {
+    OVERLAY.with(|cell| {
+        let overlay = cell.borrow();
+        match overlay.files.get(&overlay_key(path)) {
+            Some(Some(text)) => text.clone(),
+            Some(None) => String::new(),
+            None => fs::read_to_string(path).unwrap_or_default(),
+        }
+    })
+}
+
+/// 窗口内写容器：窗口开着只记内存，关着直接落盘。
+fn overlay_write(path: &Path, text: &str) -> Result<(), String> {
+    let deferred = OVERLAY.with(|cell| {
+        let mut overlay = cell.borrow_mut();
+        if overlay.active {
+            overlay.files.insert(overlay_key(path), Some(text.to_string()));
+        }
+        overlay.active
+    });
+    if deferred {
+        Ok(())
+    } else {
+        write_atomic(path, text)
+    }
+}
+
+/// 窗口内删容器：窗口开着只记「待删」，关着立即删。
+fn overlay_remove(path: &Path) {
+    let deferred = OVERLAY.with(|cell| {
+        let mut overlay = cell.borrow_mut();
+        if overlay.active {
+            overlay.files.insert(overlay_key(path), None);
+        }
+        overlay.active
+    });
+    if !deferred {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// 打开一段延迟落盘窗口。**不可嵌套**，且必须与 [`end_deferred`] 成对。
+///
+/// 只给批量导入这类「同线程连续写同一个容器」的场景用；普通单条写入不要碰它。
+pub fn begin_deferred() {
+    OVERLAY.with(|cell| {
+        let mut overlay = cell.borrow_mut();
+        overlay.active = true;
+        overlay.files.clear();
+    });
+}
+
+/// 关闭延迟落盘窗口，把攒下的容器文本统一写盘。返回写失败的文件（路径 + 原因）。
+///
+/// 即便有文件写失败，也会把窗口状态清干净（`active = false`、清空攒下的表），
+/// 绝不让一次失败的批量导入把线程永久卡在「所有写入只在内存」的状态 ——
+/// 那会让后续所有写入都看不到已落盘的结果。
+pub fn end_deferred() -> Vec<String> {
+    let files = OVERLAY.with(|cell| {
+        let mut overlay = cell.borrow_mut();
+        overlay.active = false;
+        std::mem::take(&mut overlay.files)
+    });
+    if files.is_empty() {
+        return Vec::new();
+    }
+    // 落盘这一段必须持写锁：本批攒下的是「基于首次读取时的快照」的最终文本，
+    // 批末一次性写回。其它线程的单条写入（`store::save` → `save_locked`）也走
+    // 这把锁，持锁落盘保证「批末这一写」不会和别人的一次整份写互相覆盖。
+    // 注意这里直接调 `write_atomic`（它自己不加锁），不会与已持有的锁重入死锁。
+    let _guard = lock_writes();
+    let mut errors: Vec<String> = Vec::new();
+    for (path, content) in files {
+        match content {
+            Some(text) => {
+                if let Err(error) = write_atomic(Path::new(&path), &text) {
+                    errors.push(format!("{path}：{error}"));
+                }
+            }
+            // 窗口内被删掉的容器：批末真删（`overlay_remove` 在窗口里只记待删）
+            None => {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+    errors
+}
+
 /// memory 根目录。默认与网关统一库同源（`config::config_dir()`），
 /// `storage.root` 配了就按配置走（换盘、放同步盘）。
 pub fn root() -> PathBuf {
@@ -584,7 +708,7 @@ fn save_section_locked(entry: &MemoryEntry) -> Result<(), String> {
         .next_back()
         .map(|name| name.trim_end_matches(".md").to_string())
         .unwrap_or_else(|| super::search::format_date(entry.created_at));
-    let existing = fs::read_to_string(&target).unwrap_or_default();
+    let existing = overlay_read(&target);
     // 先摘掉同 id 的旧 section：这是「更新一条 l1」的唯一正确做法 ——
     // 追加而不摘会得到两份同 id 的条目，重建索引时后者覆盖前者、删除时只删掉一份
     let (cleaned, had_old) = strip_section(&existing, &entry.id);
@@ -603,7 +727,7 @@ fn save_section_locked(entry: &MemoryEntry) -> Result<(), String> {
         text.push('\n');
     }
     text.push_str(&section_text(entry));
-    write_atomic(&target, &text)
+    overlay_write(&target, &text)
 }
 
 // ── 读写 ─────────────────────────────────────────────────────
@@ -678,9 +802,9 @@ fn detach_live_locked(entry: &MemoryEntry) -> Result<(), String> {
     if looks_like_daily_container_path(&live) {
         return strip_section_at(&live, &entry.id);
     }
-    if live.exists() {
-        let _ = fs::remove_file(&live);
-    }
+    // 走 overlay：延迟窗口内「搬走一条单文件」也要能被批末统一处理，
+    // 免得窗口里写的和窗口里删的互相看不见。窗口关着时等价于立即删。
+    overlay_remove(&live);
     Ok(())
 }
 
@@ -707,10 +831,13 @@ fn remove_section_locked(entry: &MemoryEntry) -> Result<(), String> {
 /// 让它复用 `remove_section_locked` 就只能靠临时改 `path` 再算一遍，既绕又容易
 /// 在 `storage.root` 大小写不一致时算出不存在的路径。这里直接收绝对路径。
 fn strip_section_at(target: &Path, id: &str) -> Result<(), String> {
-    if !target.exists() || !looks_like_daily_container_path(target) {
+    if !looks_like_daily_container_path(target) {
         return Ok(());
     }
-    let text = fs::read_to_string(target).map_err(|error| error.to_string())?;
+    let text = overlay_read(target);
+    if text.is_empty() {
+        return Ok(());
+    }
     let (cleaned, removed) = strip_section(&text, id);
     if !removed {
         return Ok(());
@@ -719,10 +846,10 @@ fn strip_section_at(target: &Path, id: &str) -> Result<(), String> {
     // 攒一堆「只有 frontmatter 的日期文件」
     let has_section = cleaned.lines().any(|line| parse_marker(line).is_some());
     if !has_section {
-        let _ = fs::remove_file(target);
+        overlay_remove(target);
         return Ok(());
     }
-    write_atomic(target, &cleaned)
+    overlay_write(target, &cleaned)
 }
 
 /// 绝对路径版的「是不是一天一文件的 l1 容器」。
@@ -1422,11 +1549,9 @@ mod tests {
                 let mut probe = MemoryEntry::draft("probe", "探针", MemoryKind::Daily, "x");
                 probe.agent = Some(agent.clone());
                 probe.created_at = stamp;
-                // `updated_at` 必须一起钉住：`entry_path` 用的是
-                // `created_at.max(updated_at)`，而 `draft` 会把 updated_at 设成
-                // 「现在」。只钉 created_at 的话，20 条写入落在 stamp 那天（2023），
-                // 探针却指向今天 —— 断言「容器文件存在」永远失败，且看上去像
-                // 并发写把文件写没了。
+                // `entry_path` 按 `created_at` 定 l1 容器日期（历史条目按原始日期
+                // 分布），所以只钉 created_at 就够定位到 stamp 那天；updated_at 一并
+                // 设上是为了让探针与真实写入的条目形态一致，不依赖顺序。
                 probe.updated_at = stamp;
                 let path = entry_path(&probe, false);
                 let text = fs::read_to_string(&path).expect("容器文件应当存在");

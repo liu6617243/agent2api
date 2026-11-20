@@ -501,6 +501,8 @@ fn dispatch(name: &str, args: &Value, agent: Option<&str>) -> Result<Value, Call
                 // Agent 知道自己在哪个目录，让它自己给 slug 比网关猜更准。
                 cwd: None,
                 session: text_arg(args, "session"),
+                // 历史导入/补录场景：允许 MCP 调用方带原始发生时刻
+                created_at: args.get("createdAt").and_then(Value::as_i64).filter(|stamp| *stamp > 0),
                 valid_to: args.get("validTo").and_then(Value::as_i64).filter(|stamp| *stamp > 0),
                 evidence: list_arg(args, "evidence"),
             };

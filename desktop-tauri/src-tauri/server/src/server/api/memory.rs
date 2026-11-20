@@ -539,6 +539,12 @@ pub async fn post_write(State(_state): State<ServerState>, body: Bytes) -> Respo
         starred: payload.get("starred").and_then(Value::as_bool),
         cwd: payload.get("cwd").and_then(Value::as_str).map(str::to_string),
         session: payload.get("session").and_then(Value::as_str).map(str::to_string),
+        // 允许补录历史条目时带上原始发生时刻（毫秒）
+        created_at: payload
+            .get("createdAt")
+            .and_then(Value::as_i64)
+            .filter(|stamp| *stamp > 0)
+            .or_else(|| payload.get("created_at").and_then(Value::as_i64).filter(|stamp| *stamp > 0)),
         valid_to: payload.get("validTo").and_then(Value::as_i64).filter(|stamp| *stamp > 0),
         evidence: strings(payload.get("evidence")),
     };

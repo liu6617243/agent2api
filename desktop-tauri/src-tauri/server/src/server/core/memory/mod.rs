@@ -959,6 +959,13 @@ pub struct WriteInput {
     pub cwd: Option<String>,
     /// 会话标识（同一次对话的多条 l1 共享）
     pub session: Option<String>,
+    /// 这条记忆**原始发生**的时间（毫秒）。不传时用写入时刻。
+    ///
+    /// ── 为什么必须能透传 ────────────────────────────────────
+    /// 历史导入把「三年前那次会话」搬进来时，如果这里一律填写入时刻，所有导入
+    /// 条目都会堆在导入当天：时间衰减排序失效、热力图缩成一个点、l1 容器全挤进
+    /// 同一天。原始时间必须由导入链路带进来，写路径只负责照收不误。
+    pub created_at: Option<i64>,
     /// 事实失效时间（「这条只在某时点前成立」）
     pub valid_to: Option<i64>,
     /// 证据链锚点（画像条目用）
@@ -970,17 +977,22 @@ pub struct WriteInput {
 /// 为什么不用递增序号：记忆要能跟着仓库走、能在两台机器之间合并，序号必然撞。
 /// 时间 + 内容哈希既人类可读，又不需要协调。
 ///
+/// ── 时间前缀为什么用「原始发生时间」而不是「此刻」──────────────
+/// 历史导入会把三年前的会话搬进来。若 id 前缀一律用导入时刻，那批条目 id 全挤在
+/// 导入日、与「按原始日期分布」的容器对不上，扫 id 时也分不清先后。传进来的
+/// `stamp` 是内容原始时间（缺省才用此刻），id 前缀跟着它走，与容器日期一致。
+///
 /// ── 为什么还要掺一个进程内的自增序号 ────────────────────────
 /// 只用「毫秒时间 + 内容哈希」时，**同一毫秒内两次写入相同内容**会得到同一个
 /// id，而 id 就是文件名 —— 第二次 `save` 会把第一条整个覆盖掉，是静默的数据
 /// 丢失（CI 的 `id_is_time_prefixed_and_unique` 用两条相同内容把它逼出来过）。
 /// 掺一个自增序数就把「同毫秒 + 同内容」拆开了，而时间与内容仍是主成分，
 /// id 依旧人类可读。
-fn make_id(content: &str) -> String {
+fn make_id(content: &str, stamp: i64) -> String {
     use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let now = crate::server::logging::now_ms();
+    let now = stamp;
     let date = search::format_date(now).replace('-', "");
     let minutes = (now / 60_000).rem_euclid(24 * 60);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1035,6 +1047,15 @@ impl BatchWriter {
     pub fn write(&mut self, input: WriteInput) -> Result<Value, String> {
         write_inner(input, self.seen.as_mut())
     }
+
+    /// 关闭延迟落盘窗口并把攒下的容器统一写盘。返回写失败的文件说明。
+    ///
+    /// 调用方（批量导入）必须在所有 `write` 之后调一次；漏调会让这一批里对
+    /// 同一 l1 容器的追加**全部留在内存**里丢掉。与 `store::begin_deferred`
+    /// 成对使用。
+    pub fn flush(&mut self) -> Vec<String> {
+        store::end_deferred()
+    }
 }
 
 impl Default for BatchWriter {
@@ -1058,6 +1079,10 @@ fn write_inner(
     }
     store::ensure_layout()?;
     let now = crate::server::logging::now_ms();
+    // 原始发生时间：调用方能给就给（历史导入 / 补录），给不出才是「此刻」。
+    // 只影响 created_at / valid_from 与按日期分的容器落点；updated_at 永远是
+    // 真实写入时刻 —— 它记的是「这条什么时候被改过」，不是「事情什么时候发生」。
+    let created_at = input.created_at.filter(|stamp| *stamp > 0).unwrap_or(now);
 
     // ── 归类：显式项目名 > cwd 的 git 身份 > 模糊建议（进 general + 待确认）──
     let classified: Classified = match (input.project.as_deref(), input.cwd.as_deref()) {
@@ -1145,9 +1170,9 @@ fn write_inner(
         supersedes: dedup(input.supersedes),
         pinned: input.pinned.unwrap_or(false),
         starred: input.starred.unwrap_or(false),
-        created_at: now,
+        created_at,
         updated_at: now,
-        valid_from: now,
+        valid_from: created_at,
         valid_to: input.valid_to,
         superseded_by: None,
         deleted_at: None,
@@ -1940,6 +1965,7 @@ fn apply_derived(payload: &Value) -> Result<(), String> {
         starred: Some(false),
         cwd: None,
         session: None,
+        created_at: None,
         valid_to: None,
         evidence: sources.clone(),
     };
@@ -2068,9 +2094,10 @@ mod tests {
 
     #[test]
     fn id_is_time_prefixed_and_unique() {
-        let a = make_id("同样的内容");
-        let b = make_id("同样的内容");
-        assert!(a.starts_with(&search::format_date(crate::server::logging::now_ms()).replace('-', "")));
+        let now = crate::server::logging::now_ms();
+        let a = make_id("同样的内容", now);
+        let b = make_id("同样的内容", now);
+        assert!(a.starts_with(&search::format_date(now).replace('-', "")));
         assert_ne!(a, b, "同一秒内两次写入也必须拿到不同 id");
     }
 

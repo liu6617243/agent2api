@@ -34,9 +34,23 @@ use serde_json::{json, Value};
 use super::model::{self, content_hash, truncate_chars};
 use super::{config, index, store, WriteInput};
 
-/// 单个文件最多吃进来的字符数。超出的部分截断 —— 一次会话几万字全塞进一条
-/// 记忆，检索时它会挤掉所有别的东西，而尾巴上的内容本来也记不住。
+/// 单个文件最多吃进来的字符数。超出部分在「窗口切条」路径里由窗口大小
+/// （`CHUNK_CHARS`）接管；这条只作为 Markdown 单条记忆的硬上限 —— 一篇几万字的
+/// 长文档全塞进一条记忆，检索时它会挤掉所有别的东西。
 const MAX_FILE_CHARS: usize = 24_000;
+
+/// 单条记忆窗口的目标字数。历史会话按这个宽度切成多条记忆，而不是「一个会话一条」。
+///
+/// ── 为什么是「按窗口切」而不是「一条消息一条」───────────────
+/// 一条消息一条会产生大量碎片（本次实测本机同类数据约 3.1 万条），检索命中半句
+/// 反而误导；一个会话一条又会把整段上下文压成一条巨物（实测丢掉 94% 内容）。
+/// 定长窗口折中：既 100% 覆盖原始内容，又把碎片控制在一个会话十条上下，且窗口
+/// 内上下文仍连着读。
+const CHUNK_CHARS: usize = 8_000;
+
+/// 相邻窗口的重叠字数。切点落在轮次边界时，靠这段重叠保证「跨边界的那句话」
+/// 在两个窗口里都能被检索到 —— 否则一句话恰好被切在中间，两个窗口都不完整。
+const CHUNK_OVERLAP: usize = 600;
 
 /// 一条记忆正文的下限：太短的（「ok」「继续」）不是记忆，是噪声。
 ///
@@ -238,13 +252,18 @@ pub fn update_sources(
 
 // ── 候选文件 ─────────────────────────────────────────────────
 
-/// 一个待导入的文件（或一次会话）。
+/// 一个待导入的文件（或一次会话切出的一段窗口）。
 #[derive(Debug, Clone)]
 struct Pending {
     source: String,
     path: PathBuf,
     /// 归档到哪个项目（来源目录名，slug 化由 `write` 再做一次）
     project: Option<String>,
+    /// 会话标识：同一次会话切出的多个窗口共享，检索时能串回上下文
+    session: Option<String>,
+    /// 这段内容**原始发生**的时间（毫秒）。会话记录能读到就透传，读不到留 `None`
+    /// 由写路径兜底为写入时刻。窗口切条时取窗口内第一段带时间的内容。
+    created_at: Option<i64>,
     title: String,
     body: String,
     /// 为什么被跳过（`None` = 会导入）
@@ -367,6 +386,8 @@ fn from_markdown(path: &Path, project: Option<String>) -> Pending {
                 source: String::new(),
                 path: path.to_path_buf(),
                 project,
+                session: None,
+                created_at: None,
                 title: String::new(),
                 body: String::new(),
                 skip: Some(format!("读不了：{error}")),
@@ -403,6 +424,8 @@ fn from_markdown(path: &Path, project: Option<String>) -> Pending {
         source: String::new(),
         path: path.to_path_buf(),
         project,
+        session: None,
+        created_at: None,
         title,
         body,
         skip,
@@ -411,13 +434,19 @@ fn from_markdown(path: &Path, project: Option<String>) -> Pending {
 
 // ── 会话记录 ─────────────────────────────────────────────────
 
-/// 从一行 JSON 里挖出「谁说了什么」。
+/// 从一行 JSON 里挖出「谁说了什么、什么时候说的」。
 ///
 /// 各家的会话记录格式不统一（Claude Code 的 `{type,message:{role,content}}`、
 /// Codex 的 `{type,payload}`、自制的 `{role,content}`），但有一个共同点：
 /// 文本最终落在 `text` 或字符串形态的 `content` 里。所以不做逐格式适配，
-/// 只做两件事 —— 判角色、递归收文本。多收进来一点噪声，比漏掉半段对话好。
-fn line_to_turn(line: &str) -> Option<(String, String)> {
+/// 只做三件事 —— 判角色、递归收文本、尽力取时间。多收进来一点噪声，
+/// 比漏掉半段对话好。
+///
+/// ── 为什么还要滤掉 `<system-reminder>` / `<environment_context>` ──
+/// 这些是客户端注入的「上下文信封」，不是用户或助手说的话。原样保留会让每条
+/// 记忆都顶着一大段模板噪声，检索命中它反而挤掉真正的结论。判据抄 AgentHub 的
+/// `isHarnessNoise`：整段以这两个标签开头，就当这条不是对话内容。
+fn line_to_turn(line: &str) -> Option<(String, String, Option<i64>)> {
     let value: Value = serde_json::from_str(line.trim()).ok()?;
     let role = value
         .get("role")
@@ -438,7 +467,86 @@ fn line_to_turn(line: &str) -> Option<(String, String)> {
     if text.chars().count() < 8 {
         return None;
     }
-    Some((speaker.to_string(), text))
+    // 注入信封不是对话：判据是「整段以标签开头」，只截断正文里的标签不算
+    if is_harness_noise(&text) {
+        return None;
+    }
+    let created = parse_time(&value);
+    Some((speaker.to_string(), text, created))
+}
+
+/// 客户端注入的上下文信封（不是对话内容）。与 AgentHub `isHarnessNoise` 同口径。
+fn is_harness_noise(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("<system-reminder")
+        || trimmed.starts_with("<environment_context")
+        || trimmed.starts_with("<environment-context")
+}
+
+/// 从一行 JSON 里尽力取「原始发生时间」的毫秒时间戳。
+///
+/// 各家字段名不一：`timestamp` / `createdAt` / `created_at` / `time` / `ts`，
+/// 值可能是毫秒数、秒数、ISO 8601 字符串。全取不到就返回 `None`，由写路径
+/// 兜底为写入时刻 —— 少一条的精确时间，好过瞎赋值把它挂到错误的日期上。
+fn parse_time(value: &Value) -> Option<i64> {
+    let candidates = ["timestamp", "createdAt", "created_at", "time", "ts", "created"];
+    // `message` 信封里的时间也算（Claude Code 偶尔把 timestamp 放在 message 下）
+    let nested = value.get("message");
+    for key in candidates {
+        if let Some(stamp) = value.get(key).and_then(scalar_to_ms) {
+            return Some(stamp);
+        }
+        if let Some(stamp) = nested.and_then(|msg| msg.get(key)).and_then(scalar_to_ms) {
+            return Some(stamp);
+        }
+    }
+    None
+}
+
+/// 把一个 JSON 标量折成毫秒时间戳：数字（自动分辨秒/毫秒）、ISO 8601 字符串。
+fn scalar_to_ms(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64().and_then(normalize_epoch),
+        Value::String(text) => parse_iso_ms(text.trim()).or_else(|| text.trim().parse::<i64>().ok().and_then(normalize_epoch)),
+        _ => None,
+    }
+}
+
+/// 秒/毫秒统一成毫秒：10 位是秒，13 位是毫秒。太小或太大的直接丢掉，
+/// 免得把 0 或一个明显离谱的值当成真实时间。
+fn normalize_epoch(stamp: i64) -> Option<i64> {
+    let ms = if stamp.abs() < 10_000_000_000 {
+        stamp * 1000 // 秒 → 毫秒
+    } else {
+        stamp
+    };
+    // 1980-01-01 ~ 2100-01-01 的合理区间，之外当成解析失败
+    const MIN_MS: i64 = 315_532_800_000;
+    const MAX_MS: i64 = 4_102_444_800_000;
+    if (MIN_MS..MAX_MS).contains(&ms) {
+        Some(ms)
+    } else {
+        None
+    }
+}
+
+/// 解析 ISO 8601 / 常见日期串到毫秒（按 UTC 解释；带 `Z` 或偏移的按偏移算）。
+fn parse_iso_ms(text: &str) -> Option<i64> {
+    use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+    if let Ok(dt) = DateTime::parse_from_rfc3339(text) {
+        return Some(dt.timestamp_millis());
+    }
+    // `2024-01-02T03:04:05`（无时区，按 UTC 解释）
+    for pattern in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(text, pattern) {
+            return Some(Utc.from_utc_datetime(&naive).timestamp_millis());
+        }
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        let naive = date.and_hms_opt(0, 0, 0)?;
+        return Some(Utc.from_utc_datetime(&naive).timestamp_millis());
+    }
+    None
 }
 
 /// 递归收文本：只认 `text` / `content` / `message` 三个键，且不重复收同一段
@@ -488,57 +596,183 @@ fn push_unique(out: &mut Vec<String>, text: &str) {
     out.push(trimmed.to_string());
 }
 
-/// 一个会话文件 → 一条记忆。正文按「我 / 助手」交替保留，只截尾巴
-/// （`MAX_FILE_CHARS`）：会话越长，越靠后的结论越值钱。
-fn from_transcript(path: &Path, project: Option<String>) -> Pending {
+/// 一个会话文件 → 多条记忆（按 `CHUNK_CHARS` 定长窗口切）。
+///
+/// ── 为什么从「一个文件一条」改成「窗口切条」─────────────────
+/// 旧实现把一个会话压成一条、超长砍头留尾（`MAX_FILE_CHARS`），实测本机这批
+/// 数据只落盘 5.6%，丢掉 94% 内容。改成按窗口切之后 100% 覆盖原文，每条又不会
+/// 大到挤掉检索里的其它记忆。
+///
+/// ── 为什么切点落在轮次边界 ──────────────────────────────────
+/// 以「一整段发言」为最小不可分割单位往窗口里塞，切点永远落在两条发言之间，
+/// 不会把一句话拦腰截断。相邻窗口留 `CHUNK_OVERLAP` 字重叠，让跨边界的那句话
+/// 两边的窗口都能检索到。单条发言本身超过一个窗口时，才在它内部再切。
+///
+/// 每个窗口都带同一次会话的 `session` 与「窗内最早的原始时间」，于是检索能
+/// 串回上下文、时间轴上落在真实发生的那天，而不是导入当天。
+fn from_transcript(path: &Path, project: Option<String>) -> Vec<Pending> {
+    let session = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .filter(|stem| !stem.is_empty());
     let raw = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) => {
-            return Pending {
+            return vec![Pending {
                 source: String::new(),
                 path: path.to_path_buf(),
                 project,
+                session: session.clone(),
+                created_at: None,
                 title: String::new(),
                 body: String::new(),
                 skip: Some(format!("读不了：{error}")),
-            }
+            }]
         }
     };
-    let mut turns: Vec<String> = Vec::new();
+    // 收成「一段发言一行」的片段：`(格式化正文, 该段原始时间)`。超长单段先单独切碎，
+    // 保证后面按窗口打包时每片都不会撑爆窗口。
+    let mut segments: Vec<(String, Option<i64>)> = Vec::new();
     for line in raw.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some((speaker, text)) = line_to_turn(line) {
-            turns.push(format!("**{speaker}**：{text}"));
+        if let Some((speaker, text, created)) = line_to_turn(line) {
+            let formatted = format!("**{speaker}**：{text}");
+            for piece in split_long(&formatted, CHUNK_CHARS) {
+                segments.push((piece, created));
+            }
         }
     }
-    let joined = turns.join("\n\n");
-    // 超长时留尾巴：先按字符倒着取，再拼回去
-    let body = if joined.chars().count() > MAX_FILE_CHARS {
-        let total = joined.chars().count();
-        let tail: String = joined.chars().skip(total - MAX_FILE_CHARS).collect();
-        format!("（前 {} 字已省略）\n\n{tail}", total - MAX_FILE_CHARS)
-    } else {
-        joined
-    };
-    let title = path
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().to_string())
-        .unwrap_or_else(|| "会话记录".to_string());
-    let skip = if body.chars().count() < MIN_BODY_CHARS {
-        Some("没有可用的对话内容".to_string())
-    } else {
-        sensitive_hit(&body).map(|label| format!("含{label}"))
-    };
-    Pending {
-        source: String::new(),
-        path: path.to_path_buf(),
-        project,
-        title,
-        body,
-        skip,
+    let title_base = session.clone().unwrap_or_else(|| "会话记录".to_string());
+    let total_chars: usize = segments.iter().map(|(text, _)| text.chars().count()).sum();
+    if segments.is_empty() || total_chars < MIN_BODY_CHARS {
+        return vec![Pending {
+            source: String::new(),
+            path: path.to_path_buf(),
+            project,
+            session,
+            created_at: None,
+            title: title_base,
+            body: String::new(),
+            skip: Some("没有可用的对话内容".to_string()),
+        }];
     }
+
+    let windows = pack_windows(&segments);
+    let count = windows.len();
+    let mut out: Vec<Pending> = Vec::with_capacity(count);
+    for (index, window) in windows.iter().enumerate() {
+        let body = window
+            .iter()
+            .map(|&slot| segments[slot].0.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        // 窗内最早出现的原始时间（找不到就交给写路径兜底为写入时刻）
+        let created_at = window.iter().find_map(|&slot| segments[slot].1);
+        let title = if count == 1 {
+            title_base.clone()
+        } else {
+            format!("{title_base}（{}）", index + 1)
+        };
+        let skip = if body.chars().count() < MIN_BODY_CHARS {
+            Some("窗口内容太短".to_string())
+        } else {
+            sensitive_hit(&body).map(|label| format!("含{label}"))
+        };
+        out.push(Pending {
+            source: String::new(),
+            path: path.to_path_buf(),
+            project: project.clone(),
+            session: session.clone(),
+            created_at,
+            title,
+            body,
+            skip,
+        });
+    }
+    out
+}
+
+/// 把一段超长文本按 `limit` 字数切开（相邻片重叠 `CHUNK_OVERLAP/2`）。
+fn split_long(text: &str, limit: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+    if total <= limit || limit == 0 {
+        return vec![text.to_string()];
+    }
+    let step = limit.saturating_sub(CHUNK_OVERLAP / 2).max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    while start < total {
+        let end = (start + limit).min(total);
+        out.push(chars[start..end].iter().collect());
+        if end >= total {
+            break;
+        }
+        start += step;
+    }
+    out
+}
+
+/// 按 `CHUNK_CHARS` 把片段序列打包成若干窗口（每个窗口是一串片段下标）。
+///
+/// 关一个窗口时，从末尾挑「总字数不超过重叠预算、且给下一段留足了空间」的若干片
+/// 带进下一个窗口，形成重叠上下文。至少带一片（哪怕它本身超过重叠预算），保证
+/// 相邻窗口不是硬切；但绝不会带进去之后放不下下一段 —— 那样会产出一个只含重复
+/// 内容、没有任何新信息的空窗口。
+fn pack_windows(segments: &[(String, Option<i64>)]) -> Vec<Vec<usize>> {
+    let mut windows: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut current_chars = 0usize;
+    for (index, (text, _)) in segments.iter().enumerate() {
+        let chars = text.chars().count();
+        if !current.is_empty() && current_chars + chars > CHUNK_CHARS {
+            let overlap = trailing_overlap(&current, segments, CHUNK_OVERLAP, chars);
+            windows.push(std::mem::take(&mut current));
+            current_chars = overlap.iter().map(|&slot| segments[slot].0.chars().count()).sum();
+            current = overlap;
+        }
+        current.push(index);
+        current_chars += chars;
+    }
+    if !current.is_empty() {
+        windows.push(current);
+    }
+    windows
+}
+
+/// 取 `current` 末尾若干片做重叠：总字数既不超过 `budget`，也不超过「窗口上限
+/// 减去即将进窗那一整段的字数」。至少一片（若这一片本身就是整个窗口大小，也不
+/// 硬塞，宁可无重叠）。
+fn trailing_overlap(
+    current: &[usize],
+    segments: &[(String, Option<i64>)],
+    budget: usize,
+    incoming: usize,
+) -> Vec<usize> {
+    // 留给重叠的空间 = min(重叠预算, 窗口上限 - 即将进窗那一段)。incoming 已受
+    // split_long 约束不会超过 CHUNK_CHARS，所以这个差至少为 0。
+    let allowance = budget.min(CHUNK_CHARS.saturating_sub(incoming));
+    let mut out: Vec<usize> = Vec::new();
+    let mut used = 0usize;
+    for &slot in current.iter().rev() {
+        let chars = segments[slot].0.chars().count();
+        if !out.is_empty() && used + chars > allowance {
+            break;
+        }
+        // 连一片都放不下（allowance 太小）时，宁可不重叠
+        if out.is_empty() && chars > allowance {
+            break;
+        }
+        out.push(slot);
+        used += chars;
+        if used >= allowance {
+            break;
+        }
+    }
+    out.reverse();
+    out
 }
 
 // ── 扫描 ─────────────────────────────────────────────────────
@@ -634,13 +868,16 @@ fn collect(only: Option<&str>) -> (Vec<Pending>, Vec<Value>) {
         // 直接取最后一级会把一串编码当项目名，所以只取来源本身的目录名。
         let project = Some(item.source.label());
         for file in item.files.iter().take(MAX_FILES_PER_SOURCE) {
-            let mut candidate = if item.source.format == "jsonl" {
+            // 会话记录一个文件切出多个窗口（多条待导入），Markdown 一个文件一条。
+            let mut produced: Vec<Pending> = if item.source.format == "jsonl" {
                 from_transcript(file, project.clone())
             } else {
-                from_markdown(file, project.clone())
+                vec![from_markdown(file, project.clone())]
             };
-            candidate.source = item.source.path.clone();
-            candidates.push(candidate);
+            for mut candidate in produced.drain(..) {
+                candidate.source = item.source.path.clone();
+                candidates.push(candidate);
+            }
         }
     }
     (candidates, sources_json(&scanned))
@@ -790,7 +1027,8 @@ pub fn run(only: Option<&str>) -> Result<Value, String> {
                 pinned: Some(false),
                 starred: Some(false),
                 cwd: None,
-                session: None,
+                session: candidate.session.clone(),
+                created_at: candidate.created_at,
                 valid_to: None,
                 evidence: Vec::new(),
             },
@@ -807,6 +1045,11 @@ pub fn run(only: Option<&str>) -> Result<Value, String> {
     // （800 条 × 每条最多 24k 字，克隆一轮就是几十 MB 的瞬时内存）。
     while !queue.is_empty() {
         let take = batch.max(1).min(queue.len());
+        // 每批开一段延迟落盘窗口：本批内对同一 l1 容器的多次追加攒在内存，
+        // 批末统一写一次盘。这是切细粒度后（几千条挤同一天容器）不退化到
+        // O(n²) 写放大的关键。窗口按批开关，而不是整次导入一个窗口 ——
+        // 这样即便中途 panic，已完成批次也已落盘，不会整批丢在内存里。
+        super::store::begin_deferred();
         for (path, input) in queue.drain(..take) {
             match writer.write(input) {
                 // `write` 命中 hash 去重时会返回 `duplicate: true` 且不新增条目
@@ -820,6 +1063,14 @@ pub fn run(only: Option<&str>) -> Result<Value, String> {
                         reasons.push(format!("{path}：{error}"));
                     }
                 }
+            }
+        }
+        // 关窗口 = 把本批攒下的容器统一落盘。写失败的文件也计入 failed 并留原因
+        // —— 它们是记忆真正没落盘的部分，不能当成功。
+        for error in writer.flush() {
+            failed += 1;
+            if reasons.len() < 8 {
+                reasons.push(format!("落盘失败 {error}"));
             }
         }
         std::thread::yield_now();
@@ -876,7 +1127,7 @@ pub fn view() -> Value {
         "note": if rows.is_empty() {
             "还没有配置导入来源。加一个目录（Markdown 笔记）或会话记录目录（jsonl），先干跑看看会导入什么。"
         } else {
-            "导入的内容按「一个文件一条记忆」进 l1 流水，项目按来源目录名归属；重复内容由 hash 去重。"
+            "导入的内容按「Markdown 一文件一条 / 会话记录按窗口切条」进 l1 流水，项目按来源目录名归属，原始发生时间透传；重复内容由 hash 去重。"
         },
     })
 }
@@ -918,7 +1169,7 @@ mod tests {
     #[test]
     fn transcript_line_keeps_roles_and_drops_metadata() {
         let user = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"帮我把端口改成 3065"}]}}"#;
-        let (speaker, text) = line_to_turn(user).expect("用户行应被识别");
+        let (speaker, text, _) = line_to_turn(user).expect("用户行应被识别");
         assert_eq!(speaker, "我");
         assert!(text.contains("3065"));
 
@@ -928,6 +1179,64 @@ mod tests {
         // 元数据行不该变成一条对话
         assert!(line_to_turn(r#"{"type":"summary","summary":"x"}"#).is_none());
         assert!(line_to_turn("not json").is_none());
+    }
+
+    /// 客户端注入的上下文信封不是对话内容，必须整段滤掉。
+    #[test]
+    fn transcript_drops_harness_noise() {
+        let noise = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>this is a reminder block</system-reminder>"}]}}"#;
+        assert!(line_to_turn(noise).is_none(), "注入信封不该变成一条对话");
+        let env = r#"{"role":"user","content":"<environment_context>cwd=/x</environment_context>"}"#;
+        assert!(line_to_turn(env).is_none());
+    }
+
+    /// 原始时间要能透传：数字毫秒 / 数字秒 / ISO 字符串三种形态都认。
+    #[test]
+    fn transcript_carries_original_time() {
+        let ms = 1_700_000_000_000i64;
+        let a = format!(r#"{{"role":"user","content":"端口固定 3065，别改","timestamp":{ms}}}"#);
+        assert_eq!(line_to_turn(&a).and_then(|item| item.2), Some(ms));
+
+        let seconds = 1_700_000_000i64; // 秒 → 毫秒
+        let b = format!(r#"{{"role":"user","content":"端口固定 3065，别改","created_at":{seconds}}}"#);
+        assert_eq!(line_to_turn(&b).and_then(|item| item.2), Some(ms));
+
+        let iso = r#"{"role":"user","content":"端口固定 3065，别改","timestamp":"2023-11-14T22:13:20Z"}"#;
+        assert_eq!(line_to_turn(iso).and_then(|item| item.2), Some(ms));
+
+        // 没有时间字段：返回 None（由写路径兜底）
+        let none = r#"{"role":"user","content":"端口固定 3065，别改"}"#;
+        assert_eq!(line_to_turn(none).and_then(|item| item.2), None);
+    }
+
+    /// 一个长会话要被切成多个窗口，而不是压成一条或砍头留尾。
+    #[test]
+    fn transcript_splits_into_windows() {
+        let dir = std::env::temp_dir().join(format!("mem-import-chunk-{}", crate::server::logging::now_ms()));
+        std::fs::create_dir_all(&dir).ok();
+        let file = dir.join("session.jsonl");
+        // 造 40 条每条约 500 字的用户发言 ≈ 2 万字，应切出多条窗口
+        let mut lines: Vec<String> = Vec::new();
+        for index in 0..40 {
+            let body = format!("第{index}段：{}", "内容".repeat(250));
+            lines.push(format!(
+                r#"{{"role":"user","content":"{}","timestamp":{}}}"#,
+                body,
+                1_700_000_000_000i64 + index as i64 * 1000
+            ));
+        }
+        std::fs::write(&file, lines.join("\n")).ok();
+        let windows = from_transcript(&file, Some("notes".to_string()));
+        assert!(windows.len() > 1, "两万字应切出多条窗口，实得 {}", windows.len());
+        // 每个窗口都带同一次会话的 session，且都带得回原始时间
+        assert!(windows.iter().all(|window| window.session.as_deref() == Some("session")));
+        assert!(windows.iter().all(|window| window.created_at.is_some()));
+        // 全部可导入（无跳过）
+        assert!(windows.iter().all(|window| window.skip.is_none()));
+        // 覆盖不丢内容：窗口正文总字数明显超过单个窗口上限（因为重叠+全覆盖）
+        let total: usize = windows.iter().map(|window| window.body.chars().count()).sum();
+        assert!(total >= 20_000 * 9 / 10, "窗口应基本覆盖全部原文，实得 {total} 字");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

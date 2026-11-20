@@ -452,8 +452,8 @@ function Import(): React.ReactElement {
               <div className='mm-muted'>
                 {t('跳过不是错误：太短的是噪声，重复的不必再写，含密钥的不该进记忆库。')}
               </div>
-              {preview.skipped.map(row => (
-                <div key={row.path} className='mm-skipped-row'>
+              {preview.skipped.map((row, index) => (
+                <div key={`${row.path}#${index}`} className='mm-skipped-row'>
                   <span className='mm-preview-title' title={row.path}>{row.title || row.path}</span>
                   <span className='mm-warn'>{row.reason}</span>
                 </div>
@@ -471,7 +471,7 @@ function Import(): React.ReactElement {
             {summary.duplicated ? <Badge variant='outline' shape='tag'>{t('重复 {n}', { n: summary.duplicated })}</Badge> : null}
             {summary.skipped ? <Badge variant='outline' shape='tag'>{t('跳过 {n}', { n: summary.skipped })}</Badge> : null}
             {summary.failed ? <Badge variant='destructive' shape='tag'>{t('失败 {n}', { n: summary.failed })}</Badge> : null}
-            <span className='mm-muted'>{t('扫描 {n} 个文件', { n: summary.scanned })}</span>
+            <span className='mm-muted'>{t('扫描 {n} 条内容', { n: summary.scanned })}</span>
           </div>
           {summary.reasons.length ? (
             <div className='mm-skipped'>

@@ -726,6 +726,21 @@ pub fn add(path: &str, format: &str, priority: i64) -> Result<Value, String> {
     Ok(view())
 }
 
+/// 把来源 `kind` 折成导入链路**已支持**的 `format`；不支持返回 `None`。
+///
+/// 目前导入链路只认两种读法：`md`（Markdown 目录）与 `jsonl`（JSONL 会话记录）。
+/// `sqlite` / `sqlcipher` / `trae` / `antigravity` / `dsh` 等专有读法尚未接入，
+/// 调用方拿到 `None` 必须**明确报错** —— 绝不能像旧实现那样一律当 `jsonl`
+/// 写进配置，那样导入链路会去读一个数据库/加密库，结果是「页面显示已启用、
+/// 实际导 0 条」，最难查。
+fn supported_format(kind: &str) -> Option<&'static str> {
+    match kind {
+        "md" => Some("md"),
+        "jsonl" => Some("jsonl"),
+        _ => None,
+    }
+}
+
 /// 把清册里一个来源「启用」—— 即写进 `import.sources`，让现有导入链路读它。
 ///
 /// 这是清册与老配置的唯一交汇点。返回写回后的清册视图，调用方直接拿它刷新页面。
@@ -742,7 +757,20 @@ pub fn enable(id: &str) -> Result<Value, String> {
     }
     // 存 `~` 形态：配置要能跟着仓库/同步走，绝对路径换台机器就废了
     let text = crate::server::core::system_info::mask_path(&probed.path).replace('\\', "/");
-    let format = if entry.kind == "md" { "md" } else { "jsonl" };
+    // ── kind → format 必须按真实读法落，不能一律当 jsonl ──────────
+    // 旧实现把非 md 的来源（sqlite / trae / antigravity / dsh）统统写成 `jsonl`，
+    // 于是导入链路按 JSONL 去读一个数据库/加密库/专有库，一条都读不出来，页面却
+    // 显示「已启用」。用户看到的是「导入 0 条」而不是报错，最难查。
+    //
+    // 现在分两类：导入链路已支持的读法如实写入；暂不支持的读法**明确报错**，
+    // 告诉用户这个来源的读法还没接，而不是静默写一个错的 format 让它导 0 条。
+    let Some(format) = supported_format(entry.kind) else {
+        return Err(format!(
+            "「{}」的读法（{}）还没接入导入链路，暂时不能启用。\
+             目前支持：Markdown 目录（md）、JSONL 会话记录（jsonl）。",
+            entry.name, entry.kind
+        ));
+    };
     // 「读两个键 → 判断 → 写回」整段放在一个事务里：判断与写入之间不允许别人
     // 插进来（否则那一瞬间的清单和我们要写的这一份不是同一个版本）。
     let id = id.to_string();
@@ -806,7 +834,14 @@ pub fn set_path(id: &str, path: &str) -> Result<Value, String> {
     // 旧路径还在，「页面显示新路径、导入仍然读旧路径」会静默地导错东西；
     // 只改清单不写覆盖表的话，下次探测又会回到候选路径上。一次事务写完。
     let old: Vec<String> = entry.paths.iter().map(|item| item.to_string()).collect();
-    let format = if entry.kind == "md" { "md" } else { "jsonl" };
+    // 与 `enable` 同一口径：不支持读法的来源不该被写进 `import.sources` 冒充已启用。
+    let Some(format) = supported_format(entry.kind) else {
+        return Err(format!(
+            "「{}」的读法（{}）还没接入导入链路，暂时不能设置路径。\
+             目前支持：Markdown 目录（md）、JSONL 会话记录（jsonl）。",
+            entry.name, entry.kind
+        ));
+    };
     let id = id.to_string();
     config::update(|next| {
         // 「是否处于启用状态」也要在事务里读：外面读一次、里面写一次，
