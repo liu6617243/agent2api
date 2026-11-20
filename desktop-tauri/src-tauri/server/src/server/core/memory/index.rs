@@ -203,6 +203,26 @@ fn is_write_tool(tool: &str) -> bool {
     )
 }
 
+/// 本地自然日零点的毫秒时间戳。
+///
+/// ── 为什么不能用 `now - now % 86400000` ─────────────────────
+/// 那是 **UTC** 零点。东八区用户在本地 0:00–8:00 之间看「今日消耗 / 今日预算」，
+/// 读到的是**昨天**的数字：昨天已经烧完的预算，会一直显示「今日已用完」到早上
+/// 8 点才恢复 —— 而他这一整天其实一次模型都没调。`mod.rs::daily_counts` 早就
+/// 因为同一个坑改成按本地自然日切，这里漏了。
+fn local_day_start(now: i64) -> i64 {
+    use chrono::{Local, TimeZone};
+    // 夏令时空档会拿到 None（`and_local_timezone` 的已知行为）；
+    // 那种情况退化成「按 24h 回退」，宁可差一小时也不要整块算错。
+    Local
+        .timestamp_millis_opt(now)
+        .single()
+        .and_then(|moment| moment.date_naive().and_hms_opt(0, 0, 0))
+        .and_then(|at| at.and_local_timezone(Local).single())
+        .map(|at| at.timestamp_millis())
+        .unwrap_or_else(|| now - now.rem_euclid(86_400_000))
+}
+
 impl MemoryIndex {
     fn open() -> Self {
         let path = super::store::index_file();
@@ -941,8 +961,7 @@ impl MemoryIndex {
     /// 当日已消耗的 token（`auto.dailyTokenLimit` 的判据）。
     pub fn tokens_today(&self) -> i64 {
         let Ok(conn) = self.conn.lock() else { return 0 };
-        let now = crate::server::logging::now_ms();
-        let day_start = now - (now.rem_euclid(86_400_000));
+        let day_start = local_day_start(crate::server::logging::now_ms());
         conn.query_row(
             "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0) FROM llm_call WHERE at >= ?1",
             params![day_start],
@@ -1775,5 +1794,109 @@ mod tests {
             .unwrap();
         assert_eq!(payload, "b");
         assert!((confidence - 0.9).abs() < 1e-9);
+    }
+
+    /// 一个只活在内存里的索引：DDL 与 `open()` 同源（`heal_columns` 补齐新增列），
+    /// 但不动磁盘 —— 「重建写了哪些行」这件事不该靠用户的真实索引库来验证。
+    fn scratch_index() -> MemoryIndex {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entries (
+               id TEXT PRIMARY KEY, project TEXT, agent TEXT, kind TEXT,
+               title TEXT, summary TEXT, tags TEXT, importance REAL,
+               pinned INTEGER, starred INTEGER, created_at INTEGER, updated_at INTEGER,
+               superseded_by TEXT, deleted_at INTEGER, body TEXT, path TEXT
+             );
+             CREATE TABLE llm_call (
+               at INTEGER NOT NULL,
+               prompt_tokens INTEGER DEFAULT 0,
+               completion_tokens INTEGER DEFAULT 0
+             );",
+        )
+        .unwrap();
+        heal_columns(&conn);
+        MemoryIndex {
+            conn: Mutex::new(conn),
+            fts: false,
+        }
+    }
+
+    /// 「今日消耗」的窗口跟着**本地自然日**走，不是 UTC 24 小时窗口。
+    ///
+    /// 事故形状（东八区）：本机 0:00–8:00 之间，`now - now % 86400000` 落在**昨天**
+    /// 的 UTC 零点 —— 昨天的调用被算进今天。表现是「今天一次模型都没调，页面上却
+    /// 写着今日预算已用完」，而且每天早上 8 点自己就好了（UTC 零点对齐那一刻）。
+    ///
+    /// 断言不写死时区，判据是「跨本地零点就换窗口」：`midnight` 换成 UTC 后未必是
+    /// 整点，所以只有按本地日切才能让这三条同时成立。UTC 机器上两种实现等价 ——
+    /// 这条测试的价值在 +8 的开发机与非 UTC 的 CI 上。
+    #[test]
+    fn token_window_follows_the_local_calendar_day() {
+        use chrono::{Local, TimeZone, Timelike};
+        let midnight = Local
+            .with_ymd_and_hms(2026, 11, 20, 0, 0, 0)
+            .single()
+            .expect("本地零点")
+            .timestamp_millis();
+        // ① 零点本身
+        assert_eq!(local_day_start(midnight), midnight);
+        // ② 同一天里的任何时刻都在同一个窗口（1 分钟后 / 20 小时后）
+        assert_eq!(local_day_start(midnight + 60_000), midnight);
+        assert_eq!(local_day_start(midnight + 20 * 3_600_000), midnight);
+        // ③ 窗口起点换成当地时间必须是 00:00:00 —— 这是「本地零点」的定义，
+        //    也是 UTC 实现会当场露馅的那一条（它给出的是当地 08:00）。
+        let start = Local.timestamp_millis_opt(local_day_start(midnight + 20 * 3_600_000)).single().unwrap();
+        assert_eq!((start.hour(), start.minute(), start.second()), (0, 0, 0));
+        // ④ 前一天的最后一毫秒属于前一个窗口，绝不能算进今天
+        assert!(local_day_start(midnight - 1) < midnight);
+    }
+
+    /// 索引里要留着回收站条目与「已被取代」条目 —— 它们是浏览页回收站视图的数据源。
+    ///
+    /// 事故形状：`status()/health()` 的 `inSync` 曾经拿索引行数去比 **live 条数**。
+    /// 只要用户删过一条记忆（或蒸馏过一条），索引就必然比 live 多 —— 于是仪表盘
+    /// 永远显示「索引一致性需处理」，而点「重建索引」也没用：`rebuild` 本来就是
+    /// 按事实源**全量**重写，删掉的行照样写回去。
+    #[test]
+    fn rebuild_keeps_trash_and_superseded_rows() {
+        use crate::server::core::memory::model::MemoryKind;
+        let index = scratch_index();
+        let live = MemoryEntry::draft("m1", "今天做了什么", MemoryKind::Daily, "正文");
+        let mut trashed = MemoryEntry::draft("m2", "删掉的", MemoryKind::Daily, "正文");
+        trashed.deleted_at = Some(1);
+        let mut replaced = MemoryEntry::draft("m3", "被取代的", MemoryKind::Daily, "正文");
+        replaced.superseded_by = Some("m1".to_string());
+        let entries = vec![live, trashed, replaced];
+
+        assert_eq!(index.rebuild(&entries).unwrap(), 3);
+        // 「一致」= 索引行数 == 事实源**总条数**（含回收站与已取代）
+        assert_eq!(index.count(), entries.len());
+        // 而 live 只有 1 条：拿 live 当判据就会永远「不一致」
+        assert_eq!(entries.iter().filter(|entry| entry.is_live()).count(), 1);
+    }
+
+    /// `tokens_today` 只累加**今天**的调用，且「今天」与 `budget_exhausted` 同一口径。
+    ///
+    /// 窗口起点从 `local_day_start` 取而不是写死一个时间戳：测试要验的是
+    /// 「台账查询用的是哪个窗口」，把起点抄成常量只会重新验一遍常量。
+    #[test]
+    fn tokens_today_counts_only_the_current_local_day() {
+        let index = scratch_index();
+        let start = local_day_start(crate::server::logging::now_ms());
+        {
+            let conn = index.conn.lock().unwrap();
+            for (at, prompt, completion) in [
+                (start - 1_000, 9_000_i64, 9_000_i64), // 昨天最后一秒：不算
+                (start + 60_000, 120, 30),             // 今天：算
+                (start + 3_600_000, 7, 3),             // 今天、后一小时：算
+            ] {
+                conn.execute(
+                    "INSERT INTO llm_call (at, prompt_tokens, completion_tokens) VALUES (?1,?2,?3)",
+                    params![at, prompt, completion],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(index.tokens_today(), 160);
     }
 }

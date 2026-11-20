@@ -920,7 +920,11 @@ pub fn status() -> Value {
             "pending": index::global().review_count(),
             "warnThreshold": config::usize_of("dedup.pendingWarnThreshold"),
         },
-        "index": { "count": index_count, "fts": index::global().fts_enabled(), "inSync": index_count == live },
+        // 「索引一致」比的是**索引行数 vs 事实源总条数**，不是 vs live。
+        // 索引要留着回收站与已取代的行（浏览页的回收站视图就读这些行），
+        // 拿 `live` 去比，等于只要有回收站条目就永远报「不一致」—— 而
+        // `rebuild` 会把它们原样写回去，用户点十次重建也消不掉这条提示。
+        "index": { "count": index_count, "fts": index::global().fts_enabled(), "inSync": index_count == entries.len() },
         "tables": index::global().table_stats(),
         "config": config(),
         // 内容版本号：每次写入 +1。排障时用来判断「Agent 看到的是不是最新」。
@@ -2133,7 +2137,8 @@ pub fn health(limit: usize) -> Value {
         "review": { "pending": pending, "warnThreshold": warn, "backlogged": pending >= warn },
         "index": {
             "count": index::global().count(),
-            "inSync": index::global().count() == entries.iter().filter(|entry| entry.is_live()).count(),
+            // 与 `status()` 同一口径：索引留回收站/已取代的行，所以比的是总条数。
+            "inSync": index::global().count() == entries.len(),
             "fts": index::global().fts_enabled(),
         },
         "note": if stale.is_empty() {
