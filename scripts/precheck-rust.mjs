@@ -382,6 +382,107 @@ function scanLiterals(files, types) {
   return problems
 }
 
+/// 检查「内联 mod 块（`mod tests { ... }`）里用 `super::X::`，但 X 是**文件模块的兄弟**」这类路径错误。
+///
+/// ── 为什么会犯这个错 ────────────────────────────────────────
+/// `store.rs` 里的代码默认在模块 `memory::store` 里，`super::model` 指
+/// `memory::model`（兄弟模块）—— 这是对的。但一旦这段代码被搬进文件内的
+/// `mod tests { ... }`，它所在的模块变成 `memory::store::tests`，`super::` 就指回
+/// `memory::store` 本身，`super::model` 变成 `memory::store::model`（不存在），
+/// 于是 `E0433`。
+///
+/// 这个错尤其阴：`super::model::content_hash(...)` 写在文件主体里是对的，复制进
+/// 测试块后**看起来一模一样**，只有编译器知道层级变了。2026-11-20 就这么红过
+/// 一轮（`store.rs` 的 `container()` 测试辅助）。
+///
+/// ── 判据（严格限定，宁漏不误）──────────────────────────────
+/// 只报这一种：
+///   1. 文件 F 的**父模块文件** P（同目录 `mod.rs`，或上层 `<目录名>.rs`）里
+///      声明了 `mod X;` —— 即 X 与 F 是兄弟；
+///   2. F 的内联 `mod block { ... }` 里写了 `super::X::`；
+///   3. F 的模块体里**没有** `use ... super::X ...`（这种 `use` 会在 F 下创建
+///      名字 `X`，此时 `super::X::` 其实是合法的，跳过）。
+///
+/// 其余 `super::` 形态一律不碰 —— 宁可漏报。
+function buildModuleTree(files) {
+  // 文件 → 它声明的子模块名集合；以及 模块名 → 子文件的映射（用于找父文件）
+  const declared = new Map() // file -> Set<string>
+  const fileByPath = new Set(files)
+  for (const file of files) {
+    const mask = maskCode(readFileSync(file, 'utf8'))
+    const names = new Set()
+    const declRe = /^[ \t]*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_]\w*)\s*;/gm
+    let decl
+    while ((decl = declRe.exec(mask)) !== null) names.add(decl[1])
+    declared.set(file, names)
+  }
+
+  // 找每个文件的父文件：同目录 mod.rs 优先，其次上层 `<目录名>.rs`
+  const parentOf = new Map()
+  for (const file of files) {
+    const dir = path.dirname(file)
+    const base = path.basename(file, '.rs')
+    const candidates = []
+    if (base !== 'mod') {
+      const modRs = path.join(dir, 'mod.rs')
+      if (fileByPath.has(modRs)) candidates.push(modRs)
+    }
+    if (!candidates.length && (base === 'mod' || base === 'index')) {
+      const parentDir = path.dirname(dir)
+      const sibling = path.join(parentDir, `${path.basename(dir)}.rs`)
+      if (fileByPath.has(sibling)) candidates.push(sibling)
+      const upperMod = path.join(parentDir, 'mod.rs')
+      if (!candidates.length && fileByPath.has(upperMod)) candidates.push(upperMod)
+    }
+    if (candidates.length) parentOf.set(file, candidates[0])
+  }
+  return { declared, parentOf }
+}
+
+function scanModPaths(files) {
+  const { declared, parentOf } = buildModuleTree(files)
+  const problems = []
+  for (const file of files) {
+    const parent = parentOf.get(file)
+    if (!parent) continue
+    const siblings = declared.get(parent)
+    if (!siblings || !siblings.size) continue
+
+    const src = readFileSync(file, 'utf8')
+    const mask = maskCode(src)
+
+    // 文件模块体里若把兄弟**当成模块名本身**导进来，内联 mod 里的 `super::X::` 才可能合法：
+    //   use super::model;            → 在 F 里创建名字 model
+    //   use super::model as m;       → 创建别名 m（不是 X 本身，但保险起见一并放过）
+    // 注意 `use super::model::{A, B};` **不算** —— 它只导入条目，不创建模块名 `model`，
+    // 所以 `super::model::f()` 在内联 mod 里仍然解析不了（这正是 store.rs 那次事故的形态）。
+    const reimported = new Set()
+    const useRe = /\buse\s+[^;]*?\bsuper::([A-Za-z_]\w*)\s*(?:;|as\b)/g
+    let use
+    while ((use = useRe.exec(mask)) !== null) reimported.add(use[1])
+
+    const blockRe = /^[ \t]*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_]\w*)\s*\{/gm
+    let block
+    while ((block = blockRe.exec(mask)) !== null) {
+      const open = block.index + block[0].length - 1
+      const close = matchBrace(mask, open)
+      if (close === -1) continue
+      const inner = mask.slice(open + 1, close)
+      const baseLine = mask.slice(0, open).split('\n').length
+      const innerUseRe = /\bsuper::([A-Za-z_]\w*)::/g
+      let hitInner
+      while ((hitInner = innerUseRe.exec(inner)) !== null) {
+        const target = hitInner[1]
+        if (!siblings.has(target)) continue
+        if (reimported.has(target)) continue
+        const line = baseLine + inner.slice(0, hitInner.index).split('\n').length - 1
+        problems.push({ file, line, module: block[1], target })
+      }
+    }
+  }
+  return problems
+}
+
 const files = scanRoots.flatMap(dir => collectFiles(dir, []))
 if (!files.length) {
   console.error('precheck:rust 找不到 Rust 源码，检查脚本里的 scanRoots。')
@@ -389,11 +490,12 @@ if (!files.length) {
 }
 const types = scanDefinitions(files)
 const problems = scanLiterals(files, types)
+const pathProblems = scanModPaths(files)
 const rel = file => path.relative(root, file).split(path.sep).join('/')
 
-if (!problems.length) {
+if (!problems.length && !pathProblems.length) {
   console.log(
-    `precheck:rust OK — ${files.length} 个文件 / ${types.size} 个类型定义，结构体字面量字段全部有定义。`,
+    `precheck:rust OK — ${files.length} 个文件 / ${types.size} 个类型定义，结构体字面量字段与 mod 路径都没问题。`,
   )
   process.exit(0)
 }
@@ -408,6 +510,24 @@ for (const item of problems) {
       `（定义：${item.definedIn.map(rel).join(', ')}）`,
   )
 }
-console.error(`\nprecheck:rust 失败：${seen.size} 处字面量字段与结构体定义不一致。`)
-console.error('这会在 CI 里以 E0560 编译失败 —— 先把结构体定义补上，或删掉字面量里的多余字段。')
+for (const item of pathProblems) {
+  const stamp = `path|${item.file}|${item.line}`
+  if (seen.has(stamp)) continue
+  seen.add(stamp)
+  console.error(
+    `✗ ${rel(item.file)}:${item.line} — 在 \`mod ${item.module}\` 里写 \`super::${item.target}::\`，但 \`${item.target}\` 与本文件模块是兄弟`,
+  )
+  console.error(
+    `    内联 mod 里的 super:: 指回文件模块本身，碰不到兄弟模块；改成 \`super::super::${item.target}::\` 或 \`crate::...::${item.target}::\` 全路径`,
+  )
+}
+
+if (problems.length) {
+  console.error(`\nprecheck:rust 失败：${problems.length} 处字面量字段与结构体定义不一致。`)
+  console.error('这会在 CI 里以 E0560 编译失败 —— 先把结构体定义补上，或删掉字面量里的多余字段。')
+}
+if (pathProblems.length) {
+  console.error(`\nprecheck:rust 失败：${pathProblems.length} 处 mod 路径解析不了。`)
+  console.error('这会在 CI 里以 E0433 编译失败 —— 把代码搬进内联 mod 之后，super:: 的层级跟着变了。')
+}
 process.exit(1)

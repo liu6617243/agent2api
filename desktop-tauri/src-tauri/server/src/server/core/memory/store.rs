@@ -1453,7 +1453,8 @@ mod tests {
     /// 的 local / remote 两次 `draft()` 之间跨了分钟，`expect("能拼")` 直接炸。
     /// 那不是平台差异，是测试撞上了分钟边界 —— 换成固定时间就彻底确定。
     ///（真实文件里两边共有节的字节来自同一次写入，不存在这个差异。）
-    /// 固定到 2025-11-16T00:00:00Z。节标题只渲染 `HH:MM`（`created_at mod 一天`），
+    ///
+    /// 值取 2025-11-16T00:00:00Z。节标题只渲染 `HH:MM`（`created_at mod 一天`），
     /// 所以具体哪天不影响断言；要的是**每次构造都落在同一分钟**。
     const FIXED_AT: i64 = 1_763_251_200_000;
 
@@ -1463,7 +1464,6 @@ mod tests {
             let mut entry = MemoryEntry::draft(*id, "标题", MemoryKind::Daily, *body);
             entry.created_at = FIXED_AT;
             entry.updated_at = FIXED_AT;
-            entry.hash = super::model::content_hash(body);
             text.push_str(&section_text(&entry));
         }
         text
