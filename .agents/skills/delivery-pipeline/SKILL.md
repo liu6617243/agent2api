@@ -67,7 +67,8 @@ refusing to allow a Personal Access Token to create or update workflow
 | 结论 | 含义 | 是否放行 |
 |---|---|---|
 | `passed` | run 结论 success | 放行 |
-| `failed` | run 结论 failure / timed_out | **拦下**，不产出 artifact |
+| `failed` | run 结论 failure / timed_out，**且 job 里有失败步骤** | **拦下**，不产出 artifact |
+| `infra` | run 结论 failure / timed_out，但没有任何失败步骤（某平台 job 一步都没执行） | 放行，但必须打印「这不是已通过」 |
 | `superseded` | run 结论 cancelled —— 被更新的提交顶掉，本提交已作废 | 放行（作废的提交不该再出包） |
 | `not-applicable` | 该提交未触及这道闸的 paths，或 run skipped | 放行（这道闸对它不适用） |
 | `pending` | run 没出现或还在跑 | 继续等（有上限） |
@@ -142,6 +143,23 @@ A2A_DELIVER=1 git push origin HEAD:main-patched
 
 单平台 `cancelled` 且 `steps: []`、job 日志 `BlobNotFound`、开始到结束恰好整数分钟，
 是 runner 没跑起来的基础设施问题，不是测试失败；先重跑失败任务。测试失败必有失败步骤与日志。
+
+**这条判断已经不用你手动做了。** 判据收敛在 `scripts/lib/run-verdict.mjs`，
+三处共用（`deliver` / `ci-gate` / `ci-watch --gate`）：
+
+| state | 判据 | 处置 |
+|---|---|---|
+| `code` | 任一 job 有 `conclusion=failure` 的 step | 真失败，**绝不重跑** |
+| `infra` | 非成功 job 里 `steps.length === 0` | 自动重跑（`deliver` 最多 3 次） |
+| `soft` | 非成功 job 跑过步骤但被 cancelled | 自动重跑 |
+| `ok` | 全绿（含 skipped / neutral） | 放行 |
+
+`run.conclusion` 只回答「有没有东西不是绿的」；`job.steps` 才回答「红在哪」。
+凡是拿 `conclusion` 判失败的地方，都要再问一句「失败的 step 叫什么」——
+答不出来就是平台的问题，不是代码的问题。真失败不会因为重跑变绿，所以 `code` 一律不重跑。
+
+`deliver.mjs` 的 `settle()` 在重跑前还会做两件事：等「同工作流 + 同分支」空档、
+确认提交仍是分支头（`/git/ref/heads/<ref>`）。已被顶掉的提交不重跑，直接判作废。
 
 **重跑也受 concurrency 约束。** `rust-tests` 对同一 workflow/ref 设置了
 `cancel-in-progress: true`：旧提交的 run 仍 queued / in_progress 时再点 rerun，

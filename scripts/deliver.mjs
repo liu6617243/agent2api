@@ -26,6 +26,17 @@
 //
 // 任一闸门失败 → 不派发出包，退出码 1。
 //
+// ── 假红自动重跑（2026-11 补）──────────────────────────────────
+// 只看 run.conclusion 会把「平台没把 job 跑起来」当成代码失败：本仓反复
+// 出现某个平台 job 分到 runner 后一步都没执行（steps 为空），15 分钟被平台
+// 判 cancelled，run 结论于是 failure。真有断言失败时一定留下失败步骤，
+// 所以这里下钻到 job 级别（scripts/lib/run-verdict.mjs）：
+//   code  有失败步骤        → 直接判失败，绝不重跑
+//   infra 0 个步骤          → 自动重跑，最多 --infra-retries 次（默认 3）
+//   soft  跑过步骤但被取消  → 同上
+// 重跑前先等「同工作流 + 同分支」空档（concurrency 是 cancel-in-progress，
+// 重跑会顶掉在跑的 run），并且要求提交仍是分支头 —— 已被顶掉的提交不重跑。
+//
 // ── 用法 ─────────────────────────────────────────────────────────
 //   node scripts/deliver.mjs                # 推 HEAD 并跑完整链路
 //   node scripts/deliver.mjs --no-push      # 已推过，只跑闸门与出包
@@ -35,6 +46,7 @@
 
 import fs from 'node:fs'
 import { execFileSync } from 'node:child_process'
+import { jobVerdict, describeVerdict } from './lib/run-verdict.mjs'
 
 const REPO = process.env.A2A_REPO || 'liu6617243/agent2api'
 const API = `https://api.github.com/repos/${REPO}`
@@ -51,6 +63,11 @@ const NO_PUSH = has('--no-push')
 const NO_BUILD = has('--no-build')
 const TIMEOUT = Number(val('--timeout', '5400')) * 1000
 const POLL = 15_000
+// 假红（平台没启动 job）自动重跑的次数上限。真失败永远不重跑，见 settle()。
+const MAX_INFRA_RERUN = Number(val('--infra-retries', '3'))
+// 重跑前等「同工作流 + 同分支」空档的上限。rust-tests 的 concurrency 是
+// cancel-in-progress，重跑一个旧 run 会顶掉正在跑的那个。
+const QUIET_TIMEOUT = Number(val('--quiet-timeout', '1200')) * 1000
 
 // ── 凭据 ────────────────────────────────────────────────────────────
 function token() {
@@ -202,7 +219,7 @@ async function findRun(file, after = 0) {
   return runs[0] || null
 }
 
-async function waitRun(file, label, deadline, after = 0) {
+async function waitRun(file, label, deadline, after = 0, minAttempt = 1) {
   let seen = null
   let lastAttempt = null
   while (Date.now() < deadline) {
@@ -214,7 +231,9 @@ async function waitRun(file, label, deadline, after = 0) {
       lastAttempt = run.run_attempt
       console.log(`  ${label}: run ${run.id}（${run.status}，第 ${run.run_attempt || 1} 次）`)
     }
-    if (run && run.status === 'completed') return run
+    // 刚点完 rerun 时 API 还会短暂返回上一轮的 completed 结论；必须等
+    // attempt 涨到目标值，否则会立刻拿旧结论下判断。
+    if (run && run.status === 'completed' && (run.run_attempt || 1) >= minAttempt) return run
     await sleep(POLL)
   }
   return null
@@ -234,7 +253,11 @@ async function ensureRun(file, label, deadline) {
         console.log(`  ${label}: 已有 run ${existing.id} 在跑，等它`)
         return waitRun(file, label, deadline)
       }
-      console.log(`  ${label}: 已有 run ${existing.id}（${existing.conclusion}），重新派发`)
+      // 已完成但不是 success：原样交给 settle() 判真假红。
+      // 这里**不再重新派发** —— 同一个提交重开一个 run 会跟旧 run 抢同一个
+      // concurrency group，且真假红的分辨与重跑策略只应该有一处（settle）。
+      console.log(`  ${label}: 已有 run ${existing.id}（${existing.conclusion}），校验真假红`)
+      return existing
     }
   }
   // 记下派发时刻：重新派发时旧 run 还在列表里，不过滤就会立刻「拿到」那个旧的失败结果。
@@ -252,6 +275,91 @@ const MARK = (s) => {
   if (s === 'success') return 'OK  '
   if (s === 'skipped') return 'SKIP'
   return 'FAIL'
+}
+
+// ── 4. 判真假红 / 自动重跑 ──────────────────────────────────────────
+// ── 为什么必须到 job 级别去判 ────────────────────────────────────
+// run.conclusion 只是「有没有 job 不是 success」的汇总。这个仓库反复出现的
+// 假红是：某个平台的 job 分到 runner 后**一个步骤都没执行**（steps 为空），
+// 15 分钟后被平台判 cancelled，run 结论于是 failure。真有断言失败时，一定
+// 会留下一个 conclusion=failure 的 step —— 这条判据把两者分得干干净净。
+//
+// 判成假红就直接重跑，不再等人来点。重跑前必须等「同工作流 + 同分支」空档：
+// rust-tests 的 concurrency group 是 workflow+ref 且 cancel-in-progress，
+// 重跑旧 run 会把当前在跑的那个顶掉 —— 踩过一次，整轮四个 job 全 cancelled。
+async function jobsOf(runId) {
+  const r = await api(`/actions/runs/${runId}/jobs?per_page=100`)
+  return r.ok ? r.json?.jobs || [] : []
+}
+
+async function branchHead() {
+  const r = await api(`/git/ref/heads/${REF}`)
+  return r.ok ? r.json?.object?.sha || null : null
+}
+
+async function quiet(file, runId, deadline) {
+  for (;;) {
+    const r = await api(`/actions/workflows/${file}/runs?branch=${REF}&per_page=30`)
+    const busy = r.ok
+      ? (r.json?.workflow_runs || []).filter((x) => x.status !== 'completed' && x.id !== runId)
+      : []
+    if (!busy.length) return true
+    if (Date.now() > deadline) {
+      console.log(`  ${file}: 同组还有 ${busy.map((b) => b.id).join(',')} 在跑，等不到空档`)
+      return false
+    }
+    console.log(`  ${file}: 同组 run ${busy.map((b) => `${b.id}(${b.status})`).join(',')} 在跑，等它结束再重跑`)
+    await sleep(POLL)
+  }
+}
+
+async function rerunFailed(runId) {
+  const r = await api(`/actions/runs/${runId}/rerun-failed-jobs`, { method: 'POST' })
+  if (r.status === 201 || r.status === 204 || r.ok) return null
+  return `${r.status} ${r.text.slice(0, 300)}`
+}
+
+/**
+ * 把一个 run 等到「有可信结论」为止：真失败原样返回，假红自动重跑再等。
+ * 返回 { run, note, detail }，run 为空表示超时。
+ */
+async function settle(file, label, deadline) {
+  let run = await ensureRun(file, label, deadline)
+  let retries = 0
+  for (;;) {
+    if (!run) return { run: null, note: '超时未出结果' }
+    if (run.conclusion === 'success') return { run }
+
+    const verdict = jobVerdict(await jobsOf(run.id))
+
+    // 有失败步骤 = 代码问题。绝不重跑，重跑只会把同一个红再跑一遍。
+    if (verdict.state === 'code') {
+      return { run, note: '代码失败', detail: describeVerdict(verdict) }
+    }
+
+    // 提交已经作废时不该再给它出产物，也不该浪费一轮重跑。
+    const head = await branchHead()
+    if (head && head !== SHA) {
+      return { run, note: `提交已被 ${head.slice(0, 8)} 顶掉，不重跑` }
+    }
+
+    if (retries >= MAX_INFRA_RERUN) {
+      return { run, note: `平台连续 ${retries} 次没跑起来，放弃自动重跑`, detail: describeVerdict(verdict) }
+    }
+
+    retries += 1
+    console.log(
+      `  ${label}: 第 ${run.run_attempt || 1} 次非代码失败（${describeVerdict(verdict)}），自动重跑 ${retries}/${MAX_INFRA_RERUN}`,
+    )
+
+    if (!(await quiet(file, run.id, Date.now() + QUIET_TIMEOUT))) {
+      return { run, note: '同组一直不空，无法安全重跑' }
+    }
+    const err = await rerunFailed(run.id)
+    if (err) return { run, note: `重跑请求失败 ${err}` }
+
+    run = await waitRun(file, label, deadline, 0, (run.run_attempt || 1) + 1)
+  }
 }
 
 // ── 主流程 ──────────────────────────────────────────────────────────
@@ -275,9 +383,10 @@ async function main() {
   const deadline = Date.now() + TIMEOUT
   const settled = await Promise.all(
     gates.map(async (g) => {
-      const run = await ensureRun(g.file, g.label, deadline)
-      console.log(`${MARK(run?.conclusion)} ${g.label.padEnd(12)} ${run ? `run ${run.id}` : '超时未出结果'}`)
-      return { ...g, run }
+      const out = await settle(g.file, g.label, deadline)
+      const tail = out.run ? `run ${out.run.id}` : '超时未出结果'
+      console.log(`${MARK(out.run?.conclusion)} ${g.label.padEnd(12)} ${tail}${out.note ? `  ← ${out.note}` : ''}`)
+      return { ...g, ...out }
     }),
   )
 
@@ -285,7 +394,8 @@ async function main() {
   if (bad.length) {
     console.error('')
     for (const b of bad) {
-      console.error(`闸门未通过：${b.label}（${b.run ? b.run.conclusion : '未出结果'}）`)
+      console.error(`闸门未通过：${b.label}（${b.run ? b.run.conclusion : '未出结果'}）${b.note ? ` — ${b.note}` : ''}`)
+      if (b.detail) console.error(`  ${b.detail}`)
       if (b.run) console.error(`  ${b.run.html_url}`)
     }
     console.error('不出安装包。')
@@ -301,15 +411,18 @@ async function main() {
   console.log('')
   console.log('闸门全绿，开始出包 …（首次含依赖下载，约 10~20 分钟）')
 
-  const run = await ensureRun('build-windows.yml', 'Windows 安装包', Date.now() + TIMEOUT)
-  console.log(`${MARK(run?.conclusion)} Windows 安装包 ${run ? `run ${run.id}` : '超时未出结果'}`)
+  const built = await settle('build-windows.yml', 'Windows 安装包', Date.now() + TIMEOUT)
+  const finalRun = built?.run
+  console.log(`${MARK(finalRun?.conclusion)} Windows 安装包 ${finalRun ? `run ${finalRun.id}` : '超时未出结果'}${built?.note ? `  ← ${built.note}` : ''}`)
 
-  if (!run || run.conclusion !== 'success') {
-    if (run) console.error(`  ${run.html_url}`)
+  if (!finalRun || finalRun.conclusion !== 'success') {
+    if (built?.note) console.error(`  ${built.note}`)
+    if (built?.detail) console.error(`  ${built.detail}`)
+    if (finalRun) console.error(`  ${finalRun.html_url}`)
     process.exit(1)
   }
 
-  const arts = await api(`/actions/runs/${run.id}/artifacts`)
+  const arts = await api(`/actions/runs/${finalRun.id}/artifacts`)
   const list = arts.json?.artifacts || []
   if (!list.length) {
     console.log('  （无 artifact）')
@@ -321,7 +434,7 @@ async function main() {
   }
   console.log('')
   console.log('下载：')
-  console.log(`  https://github.com/${REPO}/actions/runs/${run.id}`)
+  console.log(`  https://github.com/${REPO}/actions/runs/${finalRun.id}`)
 }
 
 main().catch((e) => {

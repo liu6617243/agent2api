@@ -25,14 +25,17 @@
 //              有匹配 = 上游一定会跑它，必须等到结论。
 //
 //   结论     passed         run 结论 success
-//            failed         run 结论 failure / timed_out
+//            failed         run 结论 failure / timed_out，且 job 里有失败步骤
+//            infra          run 结论 failure / timed_out，但没有任何失败步骤
+//                           （某个平台 job 一步都没执行就被平台取消）——
+//                           放行，但输出里必须写明，不能悄悄吞掉
 //            superseded     run 结论 cancelled —— 被更新的提交顶掉，不算失败
 //            not-applicable 无匹配路径，或 run skipped
 //            pending        run 还没出现，或还在跑
 //
-// pending 会一直等（有上限）；failed 让脚本非零退出；not-applicable 与
-// superseded 都放行 —— 它们表示「这道闸对这个提交不适用」，而不是
-// 「这道闸没把住」。
+// pending 会一直等（有上限）；failed 让脚本非零退出；infra / not-applicable /
+// superseded 都放行 —— 它们表示「这道闸对这个提交不适用 / 红不是代码的红」，
+// 而不是「这道闸没把住」。
 //
 // ── 用法 ───────────────────────────────────────────────────────────
 //   node scripts/ci-gate.mjs
@@ -48,6 +51,8 @@
 // ── 它不做什么 ─────────────────────────────────────────────────────
 // 不下载任何产物，不改任何文件，只读 API 并输出判定结果。
 // 产物一律不落盘（仓库纪律）。
+
+import { jobVerdict, describeVerdict } from './lib/run-verdict.mjs'
 
 const TOKEN = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || ''
 const REPO = process.env.GITHUB_REPOSITORY || ''
@@ -152,7 +157,13 @@ async function listRuns(file) {
   return list
 }
 
-function classify(runs) {
+// ── run 结论 → 闸门状态 ────────────────────────────────────────────
+// 光看 run.conclusion 会把「平台没把 job 跑起来」当成代码失败：
+// 这个仓库反复出现过某个平台 job 分到 runner 后一步都没执行（steps 为空），
+// 15 分钟被平台判 cancelled，run 结论于是 failure。真有断言失败时一定会留下
+// 一个 conclusion=failure 的 step。所以 failure / timed_out 还要再下钻到 job
+// 级别，没有失败步骤的一律按 infra 处理（放行，但必须大声说明）。
+async function classify(runs) {
   if (!runs.length) return { state: 'pending', why: 'run 尚未出现' }
   const last = runs[runs.length - 1]
   if (last.status !== 'completed') return { state: 'pending', why: `run 进行中（${last.status}）` }
@@ -161,8 +172,14 @@ function classify(runs) {
     case 'cancelled': return { state: 'superseded', why: `run ${last.id} 被更新的提交顶掉` }
     case 'skipped': return { state: 'not-applicable', why: `run ${last.id} skipped` }
     case 'failure':
-    case 'timed_out':
-      return { state: 'failed', why: `run ${last.id} ${last.conclusion}` }
+    case 'timed_out': {
+      const jobsData = await json(`${API}/actions/runs/${last.id}/jobs?per_page=100`)
+      const verdict = jobVerdict(jobsData.jobs ?? [])
+      if (verdict.state === 'code') {
+        return { state: 'failed', why: `run ${last.id} ${last.conclusion} —— ${describeVerdict(verdict)}` }
+      }
+      return { state: 'infra', why: `run ${last.id} ${last.conclusion} 但无失败步骤（${describeVerdict(verdict)}）` }
+    }
     default:
       return { state: 'pending', why: `run ${last.id} 结论 ${last.conclusion}` }
   }
@@ -230,6 +247,12 @@ for (;;) {
   if (!pending.length) {
     console.log('\n[ci-gate] 全部闸门已决：')
     for (const r of results) console.log(`  ${r.state.padEnd(16)} ${r.label}（${r.file}）：${r.why}`)
+    const infra = results.filter((r) => r.state === 'infra')
+    if (infra.length) {
+      console.log('\n[ci-gate] 注意：以下闸门是「平台没把 job 跑起来」，不是代码失败 ——')
+      for (const r of infra) console.log(`  - ${r.label}：${r.why}`)
+      console.log('  想拿到干净的测试结论，请重跑这几个 job（rerun-failed-jobs），不要当成已通过。')
+    }
     console.log('\n[ci-gate] 放行。')
     process.exit(0)
   }

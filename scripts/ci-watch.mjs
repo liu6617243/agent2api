@@ -29,6 +29,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
+import { jobVerdict, describeVerdict } from './lib/run-verdict.mjs'
 
 const REPO = process.env.A2A_REPO || 'liu6617243/agent2api'
 const API = `https://api.github.com/repos/${REPO}`
@@ -190,15 +191,39 @@ if (has('--artifact') || has('--gate')) {
 }
 
 // ── 交付自检 ────────────────────────────────────────────────────────
+// 判定口径与 deliver.mjs 必须一致：run.conclusion 不是 success 时再下钻到
+// job 级别。某个平台 job 一步都没跑就被平台取消，不是代码的红；把它当成
+// 失败会让人反复手动重跑，把它当成通过则会丢测试覆盖 —— 所以这里判成
+// 「假红」并明确要求重跑，而不是简单二分。
 if (has('--gate')) {
   const bad = []
+  const infra = []
+  const lastOf = (file) => {
+    const list = state[file]
+    return list.length ? list[list.length - 1] : null
+  }
   for (const wf of TRACKED) {
     const { state: st, conclusion } = statusOf(state[wf.file])
-    if (st !== 'completed') bad.push(`${wf.file} 未完成（${st}）`)
-    else if (conclusion !== 'success') bad.push(`${wf.file} 结论为 ${conclusion}`)
+    if (st === 'missing') { bad.push(`${wf.file} 未触发`); continue }
+    if (st !== 'completed') { bad.push(`${wf.file} 未完成（${st}）`); continue }
+    if (conclusion === 'success') continue
+    const run = lastOf(wf.file)
+    const jobsData = run ? await api(`/actions/runs/${run.id}/jobs?per_page=100`) : null
+    const verdict = jobVerdict(jobsData?.jobs ?? [])
+    if (verdict.state === 'code') bad.push(`${wf.file} 结论为 ${conclusion} —— ${describeVerdict(verdict)}`)
+    else infra.push(`${wf.file} run ${run?.id} 结论 ${conclusion}，但无失败步骤（${describeVerdict(verdict)}）`)
+  }
+  if (infra.length) {
+    console.log('\n假红（平台没把 job 跑起来，不是代码失败）：')
+    for (const i of infra) console.log(`  - ${i}`)
+    console.log('  retry：node scripts/deliver.mjs --sha <完整 SHA> --no-push 会自动重跑')
   }
   if (bad.length) {
     console.error(`\n交付自检未通过：\n  - ${bad.join('\n  - ')}`)
+    process.exit(1)
+  }
+  if (infra.length) {
+    console.error('\n交付自检未通过：存在假红，测试覆盖不全，先重跑再出包。')
     process.exit(1)
   }
   console.log('\n交付自检通过：测试绿 + 产物同源 + 安装包已出。')
