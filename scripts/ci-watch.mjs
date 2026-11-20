@@ -83,7 +83,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 // ── 当前提交 ────────────────────────────────────────────────────────
 function headSha() {
   const s = val('--sha', '')
-  if (s) return s
+  // GitHub 的 head_sha 过滤器只认完整 40 位 SHA：短 SHA 会安静地返回
+  // total_count=0，看起来像「这个提交没跑过」。无论用户传短 SHA 还是分支名，
+  // 都先交给本地 git 解析成完整对象名，不能把 CLI 输入直接拼进 URL。
+  if (s) return execFileSync('git', ['rev-parse', `${s}^{commit}`], { encoding: 'utf8' }).trim()
   return execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
 }
 

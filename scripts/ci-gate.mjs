@@ -135,6 +135,12 @@ function gateApplies(gate, files) {
 
 // ── 取该工作流在这个提交上的 run ───────────────────────────────────
 async function listRuns(file) {
+  // head_sha 必须完整。GitHub 对短 SHA 不报错，而是返回空列表；CI 里 GITHUB_SHA
+  // 本来就是 40 位，本地手工复用时也要传完整对象名。
+  if (!/^[0-9a-f]{40}$/i.test(SHA)) {
+    console.error('GITHUB_SHA 必须是完整 40 位提交 SHA（短 SHA 会被 Actions API 当成无结果）')
+    process.exit(2)
+  }
   const data = await json(`${API}/actions/workflows/${file}/runs?head_sha=${SHA}&per_page=20`)
   const list = data.workflow_runs ?? []
   // 同一个提交可能有多次 run（重跑 / 并发取消后的残留），取最新一次为准。

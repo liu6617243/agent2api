@@ -148,6 +148,10 @@ A2A_DELIVER=1 git push origin HEAD:main-patched
 会把当前 HEAD 的整组测试顶掉。先等同组在途 run 结束，再重跑当前 HEAD；
 「只重跑失败 job」不等于「不取消其他 run」。
 
+**Actions API 的 `head_sha` 只认完整 40 位 SHA。** 短 SHA 返回 HTTP 200 + 空列表，
+不是参数错误。`ci-watch --sha <短SHA>` 会先 `git rev-parse <输入>^{commit}`；
+手工跑 `ci-gate` 时也必须传完整 SHA，否则直接拒绝，不让「查不到」冒充「未触发」。
+
 ### 单平台单条红：先怀疑测试时钟，别先怀疑实现
 
 真实案例（run `44720265261`）：Linux / Windows 全绿，只有 macOS 挂一条：
