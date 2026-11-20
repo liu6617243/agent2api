@@ -130,6 +130,26 @@ A2A_DELIVER=1 git push origin HEAD:main-patched
   `/actions/workflows/rust-tests.yml/dispatches` 才对，`rust-tests` 是 404。
 - `403` —— 凭据没有 actions 写权限，或 ref 上的工作流没有 `workflow_dispatch` 入口。
 - `422` —— `ref` 上不存在该工作流文件（分支名写错，或文件在别的分支）。
+- `fetch failed` —— 网络抖动，不是业务失败。`api()` 已自带 4 次指数退避（网络异常 / 429 / 5xx 才重试），
+  仍然断掉时直接**原地重跑 `node scripts/deliver.mjs`**：它按 `head_sha` 复用已存在的 run，
+  推过的不会再推、绿了的不会再等。
+
+### 单平台单条红：先怀疑测试时钟，别先怀疑实现
+
+真实案例（run `44720265261`）：Linux / Windows 全绿，只有 macOS 挂一条：
+
+```text
+server::core::providers::readiness::local_gates::a_gate_expires_rather_than_waiting_for_a_release
+panicked: 寿命内仍然挡着 —— 比令牌 TTL 还短就放行是白挡
+test result: FAILED. 577 passed; 1 failed
+```
+
+根因是**测试自己**：`hold()` 用真实时钟记时刻，之后才取 `base = now_ms()` 当基准；
+两行之间过了 1 毫秒，`base + TTL - 1` 就已经越过 TTL，边界断言随机翻车。
+
+判据：`577 passed / 1 failed` + 单平台 + 断言落在 TTL / 分钟 / 毫秒边界上 → 先看用例怎么取时间。
+修法统一为**注入固定时刻**（`hold_at(..., SINCE)` / `const FIXED_AT: i64 = ...`），
+不要靠「这两行之间不该耗时」。
 
 ### 闸门卡住不动
 

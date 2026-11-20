@@ -84,16 +84,41 @@ const H = {
   'Content-Type': 'application/json',
 }
 
+/**
+ * 一次 API 调用，带网络级重试。
+ *
+ * ── 为什么必须重试 ─────────────────────────────────────────
+ * 整条链路要跑十几分钟、几十次请求。只要其中一次撞上 `fetch failed`
+ * （DNS 抖动、连接被 reset —— 本机直连 GitHub 经常这样），链路就断在半路，
+ * 人得手动再跑一遍。已经真踩过：推送成功后第一次轮询就 `fetch failed`，
+ * 出包闸门还没等到。重试 + 指数退避，把「偶发网络」和「真失败」分开。
+ *
+ * 只对「可能自己好」的错重试：网络异常、429、5xx。4xx 是请求本身错，
+ * 重试只是把同一个错误问四遍。
+ */
 async function api(path, init) {
-  const r = await fetch(`${API}${path}`, { ...init, headers: H })
-  const text = await r.text()
-  let json = null
-  try {
-    json = text ? JSON.parse(text) : null
-  } catch {
-    /* 204 无体 */
+  let last = { status: 0, ok: false, json: null, text: 'not attempted' }
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    if (attempt > 0) await sleep(800 * 2 ** (attempt - 1))
+    try {
+      const r = await fetch(`${API}${path}`, { ...init, headers: H })
+      const text = await r.text()
+      let json = null
+      try {
+        json = text ? JSON.parse(text) : null
+      } catch {
+        /* 204 无体 */
+      }
+      if (r.status === 429 || r.status >= 500) {
+        last = { status: r.status, ok: false, json, text }
+        continue
+      }
+      return { status: r.status, ok: r.ok, json, text }
+    } catch (error) {
+      last = { status: 0, ok: false, json: null, text: String((error && error.message) || error) }
+    }
   }
-  return { status: r.status, ok: r.ok, json, text }
+  return last
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
