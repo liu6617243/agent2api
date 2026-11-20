@@ -74,6 +74,40 @@ const PREVIEW_TTL_MS: i64 = 30 * 60 * 1000;
 /// 用户确实没有在本次会话里看过预览。
 static LAST_PREVIEW_AT: AtomicI64 = AtomicI64::new(0);
 
+/// 上一次干跑的结果本身（进程内，不落盘）。
+///
+/// ── 为什么结果也要留在后端 ──────────────────────────────────
+/// 页签是条件渲染的，切走就把导入组件卸载了，组件里的 `preview` 跟着消失 ——
+/// 用户看到的是「刚扫出来的清单没了，得重新点一次『导入全部来源』」。
+/// 但干跑结果本来就带 30 分钟有效期（`preview_gate` 就按这个 TTL 放行真导入），
+/// 在有效期内它依然是**这份**预览，不该跟着组件一起消失。
+///
+/// `running` 是同一个道理的另一半：重挂载时如果扫描还在跑，页面应该等这一次，
+/// 而不是立刻再发起一次全盘扫描。
+///
+/// 仍然不落盘：干跑对外的承诺是「一个字都没写」，缓存的是结果不是数据源，
+/// 进程重启后失效也正好 —— 重启之后确实没人在本次会话里看过预览。
+struct PreviewSlot {
+    at: i64,
+    /// 这次预览是针对哪个来源（空 = 全部来源）。恢复了清单却没恢复目标，
+    /// 用户点「开始导入」会把十二家全写进去。
+    only: Option<String>,
+    running: bool,
+    value: Option<Value>,
+}
+
+static LAST_PREVIEW: std::sync::Mutex<PreviewSlot> = std::sync::Mutex::new(PreviewSlot {
+    at: 0,
+    only: None,
+    running: false,
+    value: None,
+});
+
+/// 取锁。中毒不能把干跑功能锁死 —— 里面只是缓存，复用旧值比全部失败好。
+fn preview_lock() -> std::sync::MutexGuard<'static, PreviewSlot> {
+    LAST_PREVIEW.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 const LAST_RUN_KEY: &str = "import.lastRun";
 
 // ── 来源解析 ─────────────────────────────────────────────────
@@ -889,6 +923,63 @@ fn collect(only: Option<&str>) -> (Vec<Pending>, Vec<Value>) {
 /// 多少条。早先拿 `importable.len()` 当 `ready`，页面上就会出现「干跑说 60 条、
 /// 实际写了 800 条」，而这正是干跑最不该错的地方。
 pub fn preview(only: Option<&str>, limit: usize) -> Value {
+    // 先立「正在扫」：重挂载的页面据此选择**等这一次**，而不是再发起一次全盘扫描。
+    preview_lock().running = true;
+    let payload = preview_inner(only, limit);
+    let at = crate::server::logging::now_ms();
+    {
+        let mut slot = preview_lock();
+        slot.running = false;
+        slot.at = at;
+        slot.only = only.map(str::to_string);
+        slot.value = Some(payload.clone());
+    }
+    // 记一次「刚预览过」，供 `run` 判断用户是不是真的看过。进程内变量，不落盘。
+    LAST_PREVIEW_AT.store(at, Ordering::Relaxed);
+    payload
+}
+
+/// 上一次干跑的缓存视图。**不重扫、不读正文**，页面重挂载时用它把清单接回来。
+///
+/// 过期（超过 `PREVIEW_TTL_MS`）就返回 `preview: null`：留着让人点「开始导入」
+/// 反而更糟 —— 门槛会拒，用户还以为是按钮坏了。
+pub fn last_preview() -> Value {
+    preview_view(&preview_lock())
+}
+
+/// 导入一开跑，上一份预览就作废。
+///
+/// 预览的语义是「**将会**写入这些」。真写完之后再把它交回界面，
+/// 用户看到「会导入 2336 条」而库里早就有这 2336 条，只会以为导入没生效。
+/// 只清结果，不动 `LAST_PREVIEW_AT` —— 门槛那条 30 分钟口径不因此改变。
+fn consume_preview() {
+    let mut slot = preview_lock();
+    slot.at = 0;
+    slot.only = None;
+    slot.value = None;
+}
+
+/// 把缓存状态变成对外的 JSON。抽出来是为了能拿构造出来的状态单测 ——
+/// 「过期不返回」这条判据不该只能靠真扫一遍盘来验证。
+fn preview_view(slot: &PreviewSlot) -> Value {
+    let age = if slot.at > 0 {
+        crate::server::logging::now_ms() - slot.at
+    } else {
+        0
+    };
+    let fresh = slot.at > 0 && age >= 0 && age < PREVIEW_TTL_MS;
+    json!({
+        "at": slot.at,
+        "ageMs": if slot.at > 0 { json!(age) } else { Value::Null },
+        "only": slot.only,
+        "running": slot.running,
+        "fresh": fresh,
+        "ttlMs": PREVIEW_TTL_MS,
+        "preview": if fresh { slot.value.clone().unwrap_or(Value::Null) } else { Value::Null },
+    })
+}
+
+fn preview_inner(only: Option<&str>, limit: usize) -> Value {
     let (candidates, rows) = collect(only);
     let limit = limit.clamp(1, 500);
     // 干跑必须和真导入用**同一条跳过规则**，否则「预览说跳过 50 条、导入却写了」
@@ -970,8 +1061,6 @@ pub fn preview(only: Option<&str>, limit: usize) -> Value {
         "sensitiveSkip": sensitive_skip,
         "batchSize": config::usize_of("import.batchSize"),
     });
-    // 记一次「刚预览过」，供 `run` 判断用户是不是真的看过。进程内变量，不落盘。
-    LAST_PREVIEW_AT.store(crate::server::logging::now_ms(), Ordering::Relaxed);
     payload
 }
 
@@ -1011,6 +1100,10 @@ fn preview_gate() -> Result<(), String> {
 /// 带进度回调的真导入。`progress(已处理, 总数)` 每批调用一次。
 pub fn run_with(only: Option<&str>, progress: &dyn Fn(usize, usize)) -> Result<Value, String> {
     preview_gate()?;
+    // 导入一开始，上一份预览就作废了：它是「会写入什么」的承诺，真写完之后
+    // 再把它交回界面就是骗人（「会导入 2336 条」明明已经导完了）。
+    // 只清结果，不动 `LAST_PREVIEW_AT` —— 门槛的 30 分钟口径不因此改变。
+    consume_preview();
     let sensitive_skip = config::bool_of("import.sensitiveSkip");
     let batch = config::usize_of("import.batchSize").clamp(20, 2000);
     let (candidates, _) = collect(only);
@@ -1301,6 +1394,52 @@ pub fn view() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 干跑结果的有效期判据。三条都得钉住：
+    /// 有效期内要能交回去（切页签回来靠它）、过期了必须交白卷（否则点「开始导入」
+    /// 会被门槛拒，看起来是按钮坏了）、只写过一半（`running`）不能被当成结果。
+    #[test]
+    fn preview_cache_only_hands_back_fresh_results() {
+        let now = crate::server::logging::now_ms();
+        let fresh = preview_view(&PreviewSlot {
+            at: now,
+            only: Some("D:/notes".to_string()),
+            running: false,
+            value: Some(json!({ "ready": 7 })),
+        });
+        assert_eq!(fresh.get("fresh").and_then(Value::as_bool), Some(true));
+        assert_eq!(fresh["preview"]["ready"], json!(7), "有效期内要原样交回");
+        assert_eq!(fresh.get("only").and_then(Value::as_str), Some("D:/notes"),
+            "目标来源也要一起交回，否则「开始导入」会变成全部来源");
+
+        let stale = preview_view(&PreviewSlot {
+            at: now - PREVIEW_TTL_MS,
+            only: Some("D:/notes".to_string()),
+            running: false,
+            value: Some(json!({ "ready": 7 })),
+        });
+        assert_eq!(stale.get("fresh").and_then(Value::as_bool), Some(false));
+        assert!(stale["preview"].is_null(), "过期就交白卷，别让人点进门槛");
+
+        let running = preview_view(&PreviewSlot {
+            at: now,
+            only: None,
+            running: true,
+            value: Some(json!({ "ready": 3 })),
+        });
+        assert_eq!(running.get("running").and_then(Value::as_bool), Some(true),
+            "扫描还在跑时要能报出来，页面才知道该等而不是再扫一次");
+
+        let never = preview_view(&PreviewSlot {
+            at: 0,
+            only: None,
+            running: false,
+            value: None,
+        });
+        assert_eq!(never.get("fresh").and_then(Value::as_bool), Some(false),
+            "从没干跑过：不能说有预览");
+        assert!(never.get("ageMs").map(Value::is_null).unwrap_or(false));
+    }
 
     /// 后台导入的状态文案必须稳定：界面按 `running` 判断要不要显示进度条、
     /// 按 `done` / `failed` 认领结果，拼错一个词就整条接不上。

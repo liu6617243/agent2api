@@ -103,22 +103,40 @@ if [ "$need_islands" = 0 ] && [ "$need_mobile" = 0 ] && [ "$need_i18n" = 0 ]; th
   exit 0
 fi
 
-if ! command -v npm > /dev/null 2>&1; then
+if ! command -v npm > /dev/null 2>&1 && ! command -v npm.cmd > /dev/null 2>&1; then
   echo "pre-commit: 检测到前端源码改动，但找不到 npm，无法重建产物。" >&2
   echo "  装好 Node 后重试，或用 git commit --no-verify 跳过（不推荐）。" >&2
   exit 1
 fi
 
+# ── 绕开 npm 的 bash shim ────────────────────────────────────
+# Windows 上 `npm` 是带 `#!/usr/bin/env bash` 的 shim。PATH 里一旦
+# `C:\Windows\system32\bash.exe`（WSL 转发器）排在 Git Bash 前面 —— 本机
+# 正是这个顺序 —— 它就去**启动 WSL**：输出「适用于 Linux 的 Windows 子系统
+# 没有已安装的分发」，构建一行都没跑，而钩子按失败中止提交。2026-11-20 真
+# 踩过，同一台机器上时好时坏，全看 PATH 顺序。
+#
+# 所以直接调 npm 的 CLI 入口，不经过任何 shim。注意要给 node 一个 **Windows
+# 路径**：node.exe 会把 `/c/Users/...` 当成「当前盘符下的 \c\Users\...」。
+NPM_CLI="$(dirname "$(command -v node)")/node_modules/npm/bin/npm-cli.js"
+run_npm() {
+  if [ -f "$NPM_CLI" ]; then
+    node "$(cygpath -w "$NPM_CLI" 2>/dev/null || echo "$NPM_CLI")" "$@"
+  else
+    npm "$@"
+  fi
+}
+
 echo "pre-commit: 检测到前端源码改动，重建入库产物……"
 
 if [ "$need_islands" = 1 ]; then
-  npm --prefix desktop-tauri/ui-islands run build
+  run_npm --prefix desktop-tauri/ui-islands run build
 fi
 if [ "$need_mobile" = 1 ]; then
-  npm --prefix desktop-tauri/mobile run build
+  run_npm --prefix desktop-tauri/mobile run build
 fi
 if [ "$need_i18n" = 1 ]; then
-  npm --prefix desktop-tauri/i18n run build
+  run_npm --prefix desktop-tauri/i18n run build
 fi
 
 # 只 add 产物所在目录：ui/ 根下的 app.js、css/ 等是手写文件，不归钩子管

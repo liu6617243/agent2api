@@ -802,6 +802,17 @@ pub async fn post_import_preview(State(_state): State<ServerState>, body: Bytes)
     }
 }
 
+/// 上一次干跑的结果缓存（30 分钟内有效）。
+///
+/// ── 为什么要有这个端点 ──────────────────────────────────────
+/// 页签是条件渲染：切走就把导入组件连同 `preview` 一起卸载，回来只剩一张空表，
+/// 用户只能再点一次「导入全部来源」重扫全盘。而干跑结果本来就有 30 分钟有效期
+/// （真导入的门槛就按这个 TTL 放行），在有效期内它依然是这份预览。
+/// 所以结果留在后端，页面重挂载时查这里把清单接回来。
+pub async fn get_import_preview_last(State(_state): State<ServerState>) -> Response {
+    ok_json(memory::import::last_preview())
+}
+
 /// 真导入。强制先预览（`import.dryRunFirst`），同步等待结果 ——
 /// 用户点了就想知道「写进去多少条、跳过多少条」。
 ///

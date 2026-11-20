@@ -412,6 +412,9 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/memory/import", get(api::memory::get_import))
         .route("/api/memory/import/sources", post(api::memory::post_import_sources))
         .route("/api/memory/import/preview", post(api::memory::post_import_preview))
+        // 干跑结果缓存：切页签回来靠它把「可以导入的具体数据」接回来，
+        // 不用再点一次「导入全部来源」重扫全盘。
+        .route("/api/memory/import/preview/last", get(api::memory::get_import_preview_last))
         .route("/api/memory/import/run", post(api::memory::post_import_run))
         // 后台导入：start 立刻返回、status 轮询。页面切页签会把导入组件卸载，
         // 同步端点那种「结果只回给那一次请求」的形态必然会丢结果。

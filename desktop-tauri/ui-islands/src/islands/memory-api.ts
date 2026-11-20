@@ -1135,6 +1135,32 @@ export function previewImport(path?: string, limit = 60): Promise<ImportPreview>
   return api('POST', '/api/memory/import/preview', { path, limit })
 }
 
+/**
+ * 上一次干跑的结果缓存。
+ *
+ * ── 为什么要有它 ─────────────────────────────────────────────
+ * 页签是条件渲染，切走就把导入组件连同 `preview` 一起卸载，回来只剩空表，
+ * 用户只能再点一次「导入全部来源」重扫全盘。干跑结果本来就有 30 分钟有效期
+ * （真导入的门槛按这个 TTL 放行），所以结果留在后端，页面重挂载时接回来。
+ */
+export type ImportPreviewSnapshot = {
+  /** 上次干跑的时间戳；0 = 本次会话还没跑过 */
+  at: number
+  ageMs: number | null
+  /** 那次预览针对哪个来源；null = 全部来源 */
+  only: string | null
+  /** 正在扫（重挂载时该等这一次，而不是再扫一遍） */
+  running: boolean
+  /** 是否仍在有效期内；false 时 `preview` 一定是 null */
+  fresh: boolean
+  ttlMs: number
+  preview: ImportPreview | null
+}
+
+export function lastPreview(): Promise<ImportPreviewSnapshot> {
+  return api('GET', '/api/memory/import/preview/last')
+}
+
 export function runImport(path?: string): Promise<{ summary: ImportSummary; view: ImportView }> {
   return api('POST', '/api/memory/import/run', { path })
 }

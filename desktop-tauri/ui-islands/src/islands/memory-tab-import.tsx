@@ -2,7 +2,7 @@ import * as React from 'react'
 import { Badge, Button, Input, Popover, PopoverContent, PopoverTrigger } from '@ui'
 import { t } from '../i18n'
 import * as m from './memory-api'
-import { Empty, Panel, Section, num, timeText, useLoad } from './memory-shared'
+import { Empty, Panel, Section, num, stamp, timeText, useLoad } from './memory-shared'
 
 /**
  * 导入页：来源清册（一屏卡片）+ 干跑预览 + 真导入 + 全库去重巡检。
@@ -337,8 +337,20 @@ function Import(): React.ReactElement {
    * **全部来源**都写进去 —— 用户以为在确认「这一家」，实际导了十二家。
    */
   const [target, setTarget] = React.useState('')
+  /**
+   * 这份干跑结果是什么时候扫的（0 = 刚在本地扫的）。
+   *
+   * 从后端接回来的清单必须标出处：扫描是一次快照，文件随时会变。用户切回来
+   * 看到十几分钟前的清单，至少要能判断「要不要再扫一遍」。
+   */
+  const [restoredAt, setRestoredAt] = React.useState(0)
   /** 「添加来源」表单是否展开。低频动作，默认折叠着。 */
   const [addOpen, setAddOpen] = React.useState(false)
+  /**
+   * 本地发起了几次干跑。用来让「挂载时恢复缓存」让位给用户自己点的那一次 ——
+   * 否则两者会互相覆盖，界面上看到的是哪一次全凭网络快慢。
+   */
+  const scanSeq = React.useRef(0)
 
   const { job, refresh } = useImportJob({
     onDone: (result, fresh) => {
@@ -356,6 +368,52 @@ function Import(): React.ReactElement {
   })
   const running = job?.running ?? false
 
+  /**
+   * 把上一次干跑的结果接回来。
+   *
+   * ── 为什么要做这件事 ────────────────────────────────────────
+   * 页签是条件渲染，切走就把这个组件连同 `preview` 一起卸载。回来只剩一张空表，
+   * 用户只能再点一次「导入全部来源」重扫全盘 —— 可干跑结果本来就有 30 分钟
+   * 有效期（真导入的门槛就按这个 TTL 放行），在有效期内它依然是这份预览。
+   *
+   * ── 为什么要处理 `running` ──────────────────────────────────
+   * 切走时那次扫描可能还在跑（POST 请求不会因为组件卸载而中断）。回来立刻再扫
+   * 一遍等于全盘读两次；查到「正在扫」就原地等，扫完直接取结果。
+   */
+  React.useEffect(() => {
+    let alive = true
+    let timer = 0
+    let tries = 0
+    // 用户可能在这个 effect 落地前就自己点了「导入全部来源」—— 以本地那次为准。
+    const seq = scanSeq.current
+
+    const load = async () => {
+      try {
+        const snapshot = await m.lastPreview()
+        if (!alive || scanSeq.current !== seq) return
+        if (snapshot.running && tries < 60) {
+          tries += 1
+          timer = window.setTimeout(() => void load(), 800)
+          return
+        }
+        if (!snapshot.fresh || !snapshot.preview) return
+        setPreview(current => current ?? snapshot.preview)
+        if (snapshot.at) setRestoredAt(snapshot.at)
+        // 目标来源必须一起恢复：只恢复清单不恢复目标，「开始导入」会把全部来源
+        // 都写进去，而用户以为自己只确认了那一家。
+        setTarget(current => current || (snapshot.only ?? ''))
+      } catch {
+        // 后端还没起来 / 暂时不可用：保持空白，用户点按钮就行
+      }
+    }
+    void load()
+
+    return () => {
+      alive = false
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [])
+
   const act = async (key: string, task: () => Promise<unknown>) => {
     setBusy(key)
     setActionError('')
@@ -371,10 +429,24 @@ function Import(): React.ReactElement {
 
   /** 干跑。`path` 为空 = 全部来源；否则只预览这一条（后端按路径规范化后匹配）。 */
   const dryRun = async (path: string) => {
+    scanSeq.current += 1
     setTarget(path)
+    setRestoredAt(0)
     await act('preview', async () => {
       setSummary(null)
-      setPreview(await m.previewImport(path || undefined, 80))
+      try {
+        setPreview(await m.previewImport(path || undefined, 80))
+      } catch (caught) {
+        // 桌面壳 60 秒超时 / 连接被 reset 时，后端可能已经把这次扫完了 ——
+        // 先看缓存，别让用户白等一轮再手动点一次。缓存也没有才把错抛给用户。
+        const snapshot = await m.lastPreview().catch(() => null)
+        if (snapshot?.fresh && snapshot.preview) {
+          setPreview(snapshot.preview)
+          if (snapshot.at) setRestoredAt(snapshot.at)
+          return
+        }
+        throw caught
+      }
     })
   }
 
@@ -388,6 +460,7 @@ function Import(): React.ReactElement {
     await act('import', async () => {
       await m.startImport(target || undefined)
       setPreview(null)
+      setRestoredAt(0)
       // 起点就催一次：轮询在 idle 时是停着的，不催就一直不动。
       refresh()
     })
@@ -527,7 +600,11 @@ function Import(): React.ReactElement {
       {preview ? (
         <Section
           title={t('干跑结果')}
-          hint={t('这一屏只读文件，一个字都没写。确认之后再点「开始导入」。')}
+          hint={restoredAt
+            ? t('这一屏只读文件，一个字都没写。这份结果是 {time} 扫的，30 分钟内有效（切页签回来还在）；要重扫就再点一次「导入全部来源」。', {
+              time: stamp(restoredAt),
+            })
+            : t('这一屏只读文件，一个字都没写。确认之后再点「开始导入」。')}
           action={(
             <Button
               type='button'

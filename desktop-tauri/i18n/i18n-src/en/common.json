@@ -968,5 +968,6 @@
   "忽略（这条不再同步）": "Ignore (stop syncing this)",
   "导入进行中：{done} / {total} 条（切到别的页签也不会中断，回来再看这里）": "Importing: {done} of {total} items (switching tabs will not interrupt it — come back here to check)",
   "导入进行中（正在扫描来源，切到别的页签也不会中断）": "Importing (scanning sources — switching tabs will not interrupt it)",
-  "导入失败": "Import failed"
+  "导入失败": "Import failed",
+  "这一屏只读文件，一个字都没写。这份结果是 {time} 扫的，30 分钟内有效（切页签回来还在）；要重扫就再点一次「导入全部来源」。": "This screen only reads files — nothing has been written. This rundown was scanned at {time} and stays valid for 30 minutes (switching tabs keeps it); click \"Import all sources\" again to rescan."
 }
