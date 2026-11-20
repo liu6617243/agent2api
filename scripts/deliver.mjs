@@ -153,18 +153,20 @@ async function dispatch(file) {
 // 重复跑不会重复出包，已经绿过的直接复用。
 const REUSE_WINDOW = 6 * 3600 * 1000
 
-async function findRun(file) {
+async function findRun(file, after = 0) {
   const r = await api(`/actions/workflows/${file}/runs?branch=${REF}&per_page=30`)
   if (!r.ok) return null
-  const runs = (r.json?.workflow_runs || []).filter((x) => x.head_sha === SHA)
+  const runs = (r.json?.workflow_runs || []).filter(
+    (x) => x.head_sha === SHA && new Date(x.created_at).getTime() >= after,
+  )
   runs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
   return runs[0] || null
 }
 
-async function waitRun(file, label, deadline) {
+async function waitRun(file, label, deadline, after = 0) {
   let seen = null
   while (Date.now() < deadline) {
-    const run = await findRun(file)
+    const run = await findRun(file, after)
     if (run && run.id !== seen) {
       seen = run.id
       console.log(`  ${label}: run ${run.id}（${run.status}）`)
@@ -192,12 +194,14 @@ async function ensureRun(file, label, deadline) {
       console.log(`  ${label}: 已有 run ${existing.id}（${existing.conclusion}），重新派发`)
     }
   }
+  // 记下派发时刻：重新派发时旧 run 还在列表里，不过滤就会立刻「拿到」那个旧的失败结果。
+  const base = Date.now() - 60_000
   const err = await dispatch(file)
   if (err) {
     console.error(err)
     process.exit(1)
   }
-  return waitRun(file, label, deadline)
+  return waitRun(file, label, deadline, base)
 }
 
 const MARK = (s) => {

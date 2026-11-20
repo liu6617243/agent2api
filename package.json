@@ -6,6 +6,9 @@
   "private": true,
   "scripts": {
     "prepare": "git config core.hooksPath .githooks || exit 0",
+    "deliver": "node scripts/deliver.mjs",
+    "ci": "node scripts/ci-watch.mjs",
+    "precheck": "node scripts/precheck-rust.mjs && node scripts/precheck-knobs.mjs && node scripts/precheck-workflows.mjs",
     "test:rust": "node scripts/cargo-test.mjs",
     "test:rust:plugins": "node scripts/cargo-test.mjs --plugins",
     "test:rust:coverage": "node scripts/cargo-test.mjs --coverage",

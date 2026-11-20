@@ -35,7 +35,7 @@
 推 `main-patched` **不要裸 `git push`**（`.githooks/pre-push` 会拦下来并报错）。交付入口只有一条：
 
 ```bash
-node scripts/deliver.mjs          # 推代码 + 跑测试 + 等绿 + 出安装包
+node scripts/deliver.mjs          # 推代码 + 跑测试 + 等绿 + 出安装包（= npm run deliver）
 node scripts/deliver.mjs --no-push    # 已推过，只补跑链路
 node scripts/deliver.mjs --no-build   # 只跑测试与产物同源，不出包
 ```
