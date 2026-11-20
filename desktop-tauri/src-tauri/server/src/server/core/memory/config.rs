@@ -227,9 +227,14 @@ static SCHEMA: &[Knob] = &[
 
     // ===== 自动化 =====
     knob("auto.enabled", Kind::Bool, Tier::Basic, "自动化", "自动化总开关", "true"),
-    range(knob_d("auto.dailyTokenLimit", Kind::Number, Tier::Basic, "自动化", "日 token 预算",
-        "0 = 不限", "200000"), 0.0, 100_000_000.0),
-    opts(knob("auto.overBudgetAction", Kind::Enum, Tier::Advanced, "自动化", "超预算行为", "\"pause\""),
+    // ── 默认「不限」是刻意的 ────────────────────────────────
+    // 原来默认 200000，结果每一个跑过自动化的人都收到一枚「今日预算已用完」，
+    // 而他从来没要求过这个限制、界面上也没有一处说「这能关掉」。预算是**可选**
+    // 项：想要上限的人自己填数字（填了才有 `auto.overBudgetAction` 这回事）。
+    range(knob_d("auto.dailyTokenLimit", Kind::Number, Tier::Basic, "自动化", "日 token 上限",
+        "0 = 不限（默认）；填了才在超限时按 overBudgetAction 处理", "0"), 0.0, 100_000_000.0),
+    opts(knob_d("auto.overBudgetAction", Kind::Enum, Tier::Advanced, "自动化", "超预算行为",
+        "仅当「日 token 上限」填了数字才生效；0 = 不限时永不触发", "\"pause\""),
         &["pause", "ignore"]),
     range(knob_d("auto.logKeepDays", Kind::Number, Tier::Internal, "自动化", "任务日志保留天数",
         "每天清理任务按它删掉过期的 llm_call / task_run 行；条数上限另见 logKeepCount", "30"), 1.0, 365.0),
@@ -1120,6 +1125,21 @@ mod tests {
         let knob = find("auto.overBudgetAction").expect("存在");
         assert!(coerce(knob, &json!("nope")).is_err());
         assert_eq!(coerce(knob, &json!("pause")).unwrap(), json!("pause"));
+    }
+
+    /// 日 token 上限默认 **0 = 不限**：预算必须是可选项，不能是默认行为。
+    ///
+    /// 原来默认 200000，于是每个跑过自动化的人在仪表盘上都会看到一枚
+    /// 「今日预算已用完」—— 他没要求过这个限制，界面上也看不出能关。
+    /// 默认值就是「产品替用户做的那个决定」：既然没人要求，就别默认拦。
+    #[test]
+    fn daily_token_budget_defaults_to_unlimited() {
+        let knob = find("auto.dailyTokenLimit").expect("存在");
+        assert_eq!(knob.default_json, "0");
+        // 0 必须仍在允许范围内：否则用户填 0 会被 `coerce` 夹回下限，
+        // 「不限」就成了一个填不进去的值 —— 而这是这个旋钮唯一该有的用法之一。
+        assert_eq!(knob.min, Some(0.0));
+        assert_eq!(coerce(knob, &json!(0)).unwrap(), json!(0));
     }
 
     #[test]

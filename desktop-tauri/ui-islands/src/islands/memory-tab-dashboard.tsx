@@ -214,10 +214,10 @@ function Dashboard({ status, onGo, onChanged }: DashboardProps): React.ReactElem
                     : t('已关闭')}
                 />
                 {auto.data.privacyPaused ? <Badge variant='warning' shape='tag'>{t('隐私暂停')}</Badge> : null}
-                {/* 这句说的是**自动化任务自己的日 token 预算**（`auto.dailyTokenLimit`），
-                    不是上游账号余额 —— 只印「已用完」，用户第一反应是「是不是该充值了」。
-                    所以把当天实际用量一起印出来：看得出是「真烧完了（21 万 / 20 万）」
-                    还是「才用了几千就报满」（那才是日界算错，本轮的修复就为这个）。
+                {/* 这枚徽标只在**用户自己填了上限**之后才可能出现
+                    （`auto.dailyTokenLimit` 默认 0 = 不限，`budgetExhausted` 恒为 false）。
+                    它说的是自动化任务自己的日 token 用量，不是上游账号余额 ——
+                    只印「已用完」，第一反应是「是不是该充值了」，所以连用量一起印。
                     改哪里在「配置 → 自动化」；本卡下面的「查看全部任务」通到那一页。 */}
                 {auto.data.budgetExhausted ? (
                   <Badge variant='destructive' shape='tag'>
