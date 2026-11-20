@@ -100,4 +100,115 @@ if (problems) {
   process.exit(1)
 }
 
-console.log(`precheck:knobs OK — ${checked} 处构造调用，参数个数与默认值都合法。`)
+// ── 第二项：`unwired(...)` 的说明必须自带出口 ─────────────────
+//
+// 对应 Rust 单测 `unwired_knobs_explain_themselves`：标了 wired=false 的旋钮，
+// desc 必须含「本仓未接入」且不少于 24 字。
+//
+// ── 为什么要在本地镜像这条 ───────────────────────────────────
+// 那条 Rust 单测在 `for` 里 `assert!`，**第一条不合格就 panic**，CI 一次只报一条。
+// 2026-11-20 就因此连烧三轮：改一条、推一次、等十分钟、发现下一条又不行。
+// 这里一次列全。
+function unwiredBlocks(text) {
+  const out = []
+  const re = /\bunwired\s*\(/g
+  let m
+  while ((m = re.exec(text)) !== null) {
+    let depth = 1
+    let i = re.lastIndex
+    while (i < text.length && depth > 0) {
+      if (text[i] === '(') depth += 1
+      else if (text[i] === ')') depth -= 1
+      i += 1
+    }
+    out.push({ text: text.slice(re.lastIndex, i - 1), at: m.index })
+  }
+  return out
+}
+
+function unquote(raw) {
+  const trimmed = raw.trim()
+  if (!trimmed.startsWith('"') || !trimmed.endsWith('"')) return null
+  try {
+    return JSON.parse(trimmed)
+  } catch {
+    return null
+  }
+}
+
+let unwiredTotal = 0
+let unwiredBad = 0
+for (const block of unwiredBlocks(src)) {
+  const body = block.text
+  const k = /\bknob(?:_d)?\s*\(/.exec(body)
+  if (!k) continue
+  let depth = 1
+  let i = k.index + k[0].length
+  while (i < body.length && depth > 0) {
+    if (body[i] === '(') depth += 1
+    else if (body[i] === ')') depth -= 1
+    i += 1
+  }
+  const inner = body.slice(k.index + k[0].length, i - 1)
+  // 按顶层逗号切实参
+  const args = []
+  let d = 0
+  let cur = ''
+  let inString = false
+  for (let x = 0; x < inner.length; x += 1) {
+    const c = inner[x]
+    if (inString) {
+      cur += c
+      if (c === '\\') {
+        cur += inner[x + 1] ?? ''
+        x += 1
+        continue
+      }
+      if (c === '"') inString = false
+      continue
+    }
+    if (c === '"') {
+      inString = true
+      cur += c
+      continue
+    }
+    if (c === '(' || c === '[' || c === '{') d += 1
+    if (c === ')' || c === ']' || c === '}') d -= 1
+    if (c === ',' && d === 0) {
+      args.push(cur.trim())
+      cur = ''
+      continue
+    }
+    cur += c
+  }
+  if (cur.trim()) args.push(cur.trim())
+  const key = unquote(args[0]) ?? args[0] ?? '(?)'
+  const desc = args.length >= 6 ? unquote(args[5]) : null
+  unwiredTotal += 1
+  const line = src.slice(0, block.at).split('\n').length
+  if (desc === null) {
+    unwiredBad += 1
+    console.error(`✗ ${path.relative(root, file)}:${line} — unwired(${key}) 取不到 desc`)
+    continue
+  }
+  const hasPhrase = desc.includes('本仓未接入')
+  const long = [...desc].length >= 24
+  if (!hasPhrase || !long) {
+    unwiredBad += 1
+    console.error(
+      `✗ ${path.relative(root, file)}:${line} — ${key} 标了 wired=false 但说明不合格` +
+        `（含「本仓未接入」=${hasPhrase}，长度=${[...desc].length}）`,
+    )
+    console.error(`    desc=${desc.slice(0, 100)}`)
+  }
+}
+
+if (unwiredBad) {
+  console.error(`\nprecheck:knobs 失败：${unwiredTotal} 条 unwired 里 ${unwiredBad} 条说明不合格。`)
+  console.error('这会在 CI 的 unwired_knobs_explain_themselves 单测里失败 —— 用户需要的是原因和出口，不是一句「暂不支持」。')
+  process.exit(1)
+}
+
+console.log(
+  `precheck:knobs OK — ${checked} 处构造调用参数合法，${unwiredTotal} 条 unwired 说明齐全。`,
+)

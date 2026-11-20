@@ -400,7 +400,8 @@ static SCHEMA: &[Knob] = &[
     unwired(knob_d("sync.modules.pool", Kind::Text, Tier::Advanced, "同步目录", "号池管家号池根目录",
         "本仓未接入号池同步：这里只决定同步页上显示的目录名，不会真的传", "\"/agenthub-proxy\"")),
     unwired(knob_d("sync.modules.memory", Kind::Text, Tier::Advanced, "同步目录", "记忆中枢根目录",
-        "只作展示：记忆的上传目录由 sync.remoteDir 决定，改这里不会换目录", "\"/agenthub-memory\"")),
+        "本仓未接入路径自定义：记忆上传目录由 `sync.remoteDir` 决定，改这里不会换目录（只影响同步页显示的目录名）",
+        "\"/agenthub-memory\"")),
     unwired(knob_d("sync.modules.prompts", Kind::Text, Tier::Advanced, "同步目录", "提示词库根目录",
         "本仓未接入提示词库同步：这里只决定同步页上显示的目录名，不会真的传", "\"/agenthub-prompts\"")),
 
