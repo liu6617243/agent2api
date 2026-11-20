@@ -95,9 +95,11 @@ async function runsFor(sha) {
     const list = data.workflow_runs ?? []
     // 同一工作流可能对同一提交跑多次（重跑 / workflow_run 链），
     // 取最新的一次作为当前态；全部记录留给 --artifact 汇总。
+    // rerun-failed-jobs 复用 run id 与 created_at，只增加 run_attempt，
+    // 所以「这次尝试」的优先级必须高于记录的创建时间。
     list.sort((a, b) =>
-      String(a.created_at).localeCompare(String(b.created_at)) ||
-      (a.run_attempt ?? 0) - (b.run_attempt ?? 0))
+      (a.run_attempt ?? 1) - (b.run_attempt ?? 1) ||
+      String(a.created_at).localeCompare(String(b.created_at)))
     out[wf.file] = list
   }
   return out

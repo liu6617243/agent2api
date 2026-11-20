@@ -134,6 +134,15 @@ A2A_DELIVER=1 git push origin HEAD:main-patched
   仍然断掉时直接**原地重跑 `node scripts/deliver.mjs`**：它按 `head_sha` 复用已存在的 run，
   推过的不会再推、绿了的不会再等。
 
+### GitHub「重跑失败任务」不是新 run
+
+`rerun-failed-jobs` 会**复用 run id 与 `created_at`**，只把 `run_attempt` +1。
+因此 `deliver.mjs` / `ci-watch.mjs` / `ci-gate.mjs` 找当前尝试时，排序必须先比
+`run_attempt`，再比 `created_at`；只看创建时间会在重跑期间读到上一轮的失败结论。
+
+单平台 `cancelled` 且 `steps: []`、job 日志 `BlobNotFound`、开始到结束恰好整数分钟，
+是 runner 没跑起来的基础设施问题，不是测试失败；先重跑失败任务。测试失败必有失败步骤与日志。
+
 ### 单平台单条红：先怀疑测试时钟，别先怀疑实现
 
 真实案例（run `44720265261`）：Linux / Windows 全绿，只有 macOS 挂一条：

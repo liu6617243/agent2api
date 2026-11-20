@@ -138,9 +138,11 @@ async function listRuns(file) {
   const data = await json(`${API}/actions/workflows/${file}/runs?head_sha=${SHA}&per_page=20`)
   const list = data.workflow_runs ?? []
   // 同一个提交可能有多次 run（重跑 / 并发取消后的残留），取最新一次为准。
+  // rerun-failed-jobs 复用 run id 与 created_at，只增加 run_attempt；
+  // 先比创建时间会让闸门在重跑期间仍读上一轮的 failure / cancelled。
   list.sort((a, b) =>
-    String(a.created_at).localeCompare(String(b.created_at)) ||
-    (a.run_attempt ?? 0) - (b.run_attempt ?? 0))
+    (a.run_attempt ?? 1) - (b.run_attempt ?? 1) ||
+    String(a.created_at).localeCompare(String(b.created_at)))
   return list
 }
 
