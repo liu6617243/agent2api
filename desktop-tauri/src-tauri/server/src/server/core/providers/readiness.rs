@@ -322,10 +322,15 @@ mod local_gates {
     fn a_gate_expires_rather_than_waiting_for_a_release() {
         let _slot = lock_for_tests();
         clear_for_tests();
-        assert!(hold("zcode", "令牌池为空"));
+        // 起点必须注入：`hold()` 记的是真实时钟，之后再取 `now_ms()` 当基准，
+        // 两行之间只要过了 1 毫秒，`base + GATE_TTL_MS - 1` 就已经越过 TTL，
+        // 边界断言会随机翻车（macOS runner 上真踩过：577 passed / 1 failed）。
+        // 注入固定起点，边界才有确定含义。
+        const SINCE: i64 = 1_763_251_200_000;
+        assert!(hold_at("zcode", "令牌池为空", SINCE));
         // 全程用注入时钟做 TTL 判定：真实时钟下这条只能靠睡眠验证，而睡眠要么
         // 睡满两分钟、要么睡不到 TTL（后者等于什么都没测）。
-        let base = logging::now_ms();
+        let base = SINCE;
         assert!(
             gated_at("zcode", base + GATE_TTL_MS - 1),
             "寿命内仍然挡着 —— 比令牌 TTL 还短就放行是白挡"
