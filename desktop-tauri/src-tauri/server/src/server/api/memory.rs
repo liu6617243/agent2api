@@ -804,7 +804,15 @@ pub async fn post_import_preview(State(_state): State<ServerState>, body: Bytes)
 
 /// 真导入。强制先预览（`import.dryRunFirst`），同步等待结果 ——
 /// 用户点了就想知道「写进去多少条、跳过多少条」。
+///
+/// ⚠️ 这是**同步**端点，页面已经不用它了（改走 `start` + `status`）。
+/// 保留它是因为脚本 / curl 直接调很方便；但它有两个固有毛病：请求挂着不返回
+/// 就没有进度，且桌面壳 60 秒超时之后界面会报错而后台还在写。
+/// 所以这里拒绝与后台任务并发：两份导入同时写 l1 容器会互相覆盖。
 pub async fn post_import_run(State(_state): State<ServerState>, body: Bytes) -> Response {
+    if memory::import::is_running() {
+        return errors::management_error(409, "已有导入在进行中，去导入页看进度".to_string());
+    }
     let payload = parse_body(&body).unwrap_or(Value::Null);
     let only = payload.get("path").and_then(Value::as_str).map(str::to_string);
     let result = crate::server::core::blocking::run(move || memory::import::run(only.as_deref())).await;
@@ -813,6 +821,27 @@ pub async fn post_import_run(State(_state): State<ServerState>, body: Bytes) -> 
         Ok(Err(message)) => errors::management_error(400, message),
         Err(error) => errors::management_error(500, error.message),
     }
+}
+
+/// 启动后台导入。**立刻返回**，真跑在独立线程里。
+///
+/// ── 为什么必须有这个端点 ────────────────────────────────────
+/// 页面切页签会把导入组件卸载掉，同步请求的结果就没人接收了；而几千条的导入
+/// 一定超过桌面壳 60 秒的请求超时。两件事叠加，用户看到的就是「切换到别的
+/// 页签，导入好像被中断了」。改成后台任务之后，界面切走再回来只要再查一次
+/// `status` 就能接上，进度与结果都不会丢。
+pub async fn post_import_start(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let only = payload.get("path").and_then(Value::as_str).map(str::to_string);
+    match memory::import::start(only) {
+        Ok(status) => ok_json(status),
+        Err(message) => errors::management_error(400, message),
+    }
+}
+
+/// 后台导入的当前状态。不读盘，界面轮询用。
+pub async fn get_import_status(State(_state): State<ServerState>) -> Response {
+    ok_json(memory::import::status())
 }
 
 /// 增删改导入来源。整体替换而不是逐条增删：来源只有几条，整体替换让

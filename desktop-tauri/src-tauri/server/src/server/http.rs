@@ -413,6 +413,10 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/memory/import/sources", post(api::memory::post_import_sources))
         .route("/api/memory/import/preview", post(api::memory::post_import_preview))
         .route("/api/memory/import/run", post(api::memory::post_import_run))
+        // 后台导入：start 立刻返回、status 轮询。页面切页签会把导入组件卸载，
+        // 同步端点那种「结果只回给那一次请求」的形态必然会丢结果。
+        .route("/api/memory/import/start", post(api::memory::post_import_start))
+        .route("/api/memory/import/status", get(api::memory::get_import_status))
         // 来源清册：12 个内置来源的探测结果（路径 / 体量 / 水位 / 是否已找到）。
         // 与 `/import` 的区别是「有没有真的去读盘」—— view 只数文件，
         // registry 还会去开 sqlite 列表、数 dsh 的 session 目录。

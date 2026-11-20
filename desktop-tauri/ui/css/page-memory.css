@@ -2520,6 +2520,39 @@
   color: var(--text-2);
 }
 
+/* 后台导入进行中：读的是后端状态，切页签回来还在，所以它必须看起来像
+   「有个东西在跑」而不是一条普通提示 —— 左侧一颗呼吸点负责这件事。 */
+.mm-import-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-2);
+}
+
+.mm-import-pulse {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--primary);
+  animation: mm-import-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes mm-import-pulse {
+  0%, 100% { opacity: .28; transform: scale(.82); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mm-import-pulse { animation: none; opacity: 1; }
+}
+
 @media (max-width: 1180px) {
   .mm-src-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

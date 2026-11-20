@@ -237,6 +237,92 @@ function SourceCard({
   )
 }
 
+/**
+ * 已经「认领」过的那次后台导入结果。
+ *
+ * ── 为什么必须是模块级而不是组件 state ──────────────────────
+ * 页签是条件渲染，切走就把这个组件卸载了。后端的状态还在，回来时会重新查到
+ * 「已完成」—— 如果只看状态就弹结果、就 reload 清册，那每切一次页签都会
+ * 重放一次「导入完成」，像刚导完一样。记一下 `finishedAt` 就够了。
+ */
+let appliedResult = 0
+
+/**
+ * 订阅后台导入状态。
+ *
+ * ── 为什么要有这一层 ────────────────────────────────────────
+ * 导入不是「一次请求」而是「一台在后台跑着的活」：用户可能点完就切去别的页签，
+ * 几分钟后回来。状态必须能从后端重新取，而不是存在组件里 —— 组件会被卸载。
+ * 所以：挂载即查一次，跑着就每 1.2 秒续一次。
+ *
+ * ── 为什么「显示结果」和「只处理一次」要分开 ────────────────
+ * 切走再回来，用户应该**还看得见上次导了多少条**（否则又是一片空白，等于没做）；
+ * 但清册刷新、弹一次结果这类副作用只能发生一次，否则每切一次页签都像刚导完。
+ * 所以回调带 `fresh`：false 表示「同一批结果，已经认领过了」。
+ */
+function useImportJob(handlers: {
+  onDone: (summary: m.ImportSummary, fresh: boolean) => void
+  onFail: (error: string, fresh: boolean) => void
+}): { job: m.ImportJob | null; refresh: () => void } {
+  const [job, setJob] = React.useState<m.ImportJob | null>(null)
+  // 回调放进 ref：effect 只跑一次（不重建轮询），但每次 tick 都要用最新的回调
+  // —— 否则 `registry.reload` 这类每次渲染都会换引用的函数会一直用第一版。
+  const latest = React.useRef(handlers)
+  latest.current = handlers
+  /**
+   * 手动催一次。
+   *
+   * ── 为什么必须有它 ──────────────────────────────────────────
+   * 状态机是「跑着才续查」：idle / done 之后轮询就停了（不空转是本意）。
+   * 那用户刚点完「开始导入」时，轮询已经停了 —— 不催一下，进度条永远不出现。
+   */
+  const kick = React.useRef<() => void>(() => {})
+
+  React.useEffect(() => {
+    let alive = true
+    let timer = 0
+    let busy = false
+
+    const tick = async () => {
+      if (!alive || busy) return
+      busy = true
+      let wait = 0
+      try {
+        const next = await m.importStatus()
+        if (!alive) return
+        setJob(next)
+        if (next.state === 'running') {
+          wait = 1200
+        } else if (next.finishedAt) {
+          const fresh = next.finishedAt !== appliedResult
+          if (fresh) appliedResult = next.finishedAt
+          if (next.state === 'done' && next.summary) latest.current.onDone(next.summary, fresh)
+          if (next.state === 'failed') latest.current.onFail(next.error || t('导入失败'), fresh)
+        }
+      } catch {
+        // 后端重启 / 暂时不可用时退避重试，不要把一次抖动变成「状态丢了」
+        wait = 3000
+      } finally {
+        busy = false
+        if (alive && wait) timer = window.setTimeout(() => void tick(), wait)
+      }
+    }
+
+    kick.current = () => {
+      if (timer) window.clearTimeout(timer)
+      void tick()
+    }
+    void tick()
+
+    return () => {
+      alive = false
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [])
+
+  return { job, refresh: () => kick.current() }
+}
+
 function Import(): React.ReactElement {
   const registry = useLoad(() => m.loadImportRegistry(), [])
   const [preview, setPreview] = React.useState<m.ImportPreview | null>(null)
@@ -253,6 +339,22 @@ function Import(): React.ReactElement {
   const [target, setTarget] = React.useState('')
   /** 「添加来源」表单是否展开。低频动作，默认折叠着。 */
   const [addOpen, setAddOpen] = React.useState(false)
+
+  const { job, refresh } = useImportJob({
+    onDone: (result, fresh) => {
+      // 结果一律显示（切回来也要看得见「上次导了多少」）；
+      // 清册只刷一次（刷清册很贵：要开 sqlite、递归数文件）。
+      setSummary(result)
+      if (fresh) {
+        setPreview(null)
+        registry.reload()
+      }
+    },
+    // 失败提示**故意不看 `fresh`**：上一次导入失败了、之后什么也没发生，
+    // 那切回来还应该看见这条错。丢掉的报错比重复的报错更贵 —— 用户会以为写进去了。
+    onFail: message => setActionError(message),
+  })
+  const running = job?.running ?? false
 
   const act = async (key: string, task: () => Promise<unknown>) => {
     setBusy(key)
@@ -276,13 +378,18 @@ function Import(): React.ReactElement {
     })
   }
 
-  /** 真导入。沿用上次干跑的目标 —— 后端 30 分钟内有效。 */
+  /**
+   * 真导入。**只发一个「开始」**，不等写完。
+   *
+   * 后面的事都交给 `useImportJob` 轮询：写了几千条要几分钟，期间用户会切页签，
+   * 组件会被卸载 —— 结果只能从后端取，不能挂在这条请求上。
+   */
   const commit = async () => {
     await act('import', async () => {
-      const result = await m.runImport(target || undefined)
-      setSummary(result.summary)
+      await m.startImport(target || undefined)
       setPreview(null)
-      registry.reload()
+      // 起点就催一次：轮询在 idle 时是停着的，不催就一直不动。
+      refresh()
     })
   }
 
@@ -298,6 +405,23 @@ function Import(): React.ReactElement {
     <div className='mm-import'>
       {actionError ? <div className='mm-error'>{actionError}</div> : null}
 
+      {/* ── 后台导入进行中 ──────────────────────────────────────
+          这一条是「切页签不丢」的可视证据：它读的是**后端状态**，不是本地
+          的一次性 state，所以切走再回来还在，进度也接着走。 */}
+      {running ? (
+        <div className='mm-import-progress'>
+          <span className='mm-import-pulse' aria-hidden />
+          <span>
+            {job && job.total > 0
+              ? t('导入进行中：{done} / {total} 条（切到别的页签也不会中断，回来再看这里）', {
+                done: num(job.processed),
+                total: num(job.total),
+              })
+              : t('导入进行中（正在扫描来源，切到别的页签也不会中断）')}
+          </span>
+        </div>
+      ) : null}
+
       {/* ── 顶栏：说明 + 两个「整批」动作 ────────────────────────
           与卡片上的「单家」动作分开摆，否则用户分不清
           「导入该来源」和「导入全部来源」哪个是哪个。 */}
@@ -310,7 +434,7 @@ function Import(): React.ReactElement {
             type='button'
             size='sm'
             variant='outline'
-            disabled={busy !== ''}
+            disabled={busy !== '' || running}
             onClick={() => void act('scan', async () => {
               setScan(await m.dedupScan())
             })}
@@ -320,7 +444,7 @@ function Import(): React.ReactElement {
           <Button
             type='button'
             size='sm'
-            disabled={busy !== '' || importable.length === 0}
+            disabled={busy !== '' || running || importable.length === 0}
             onClick={() => void dryRun('')}
           >
             {busy === 'preview' && !target ? t('预览中…') : t('导入全部来源')}
@@ -370,7 +494,7 @@ function Import(): React.ReactElement {
                 <SourceCard
                   key={row.id}
                   row={row}
-                  busy={busy !== ''}
+                  busy={busy !== '' || running}
                   onImport={() => void dryRun(row.path)}
                   onEnable={() => void act('toggle', () => apply(m.enableImportSource(row.id)))}
                   onDisable={() => void act('toggle', () => apply(m.disableImportSource(row.id)))}
@@ -408,10 +532,10 @@ function Import(): React.ReactElement {
             <Button
               type='button'
               size='sm'
-              disabled={busy !== '' || preview.ready === 0}
+              disabled={busy !== '' || running || preview.ready === 0}
               onClick={() => void commit()}
             >
-              {busy === 'import' ? t('导入中…') : t('开始导入 {n} 条', { n: preview.ready })}
+              {running ? t('导入中…') : t('开始导入 {n} 条', { n: preview.ready })}
             </Button>
           )}
         >

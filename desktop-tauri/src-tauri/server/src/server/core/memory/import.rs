@@ -981,14 +981,36 @@ pub fn preview(only: Option<&str>, limit: usize) -> Value {
 /// `write` 每条的精确去重要全盘读一次记忆库。单条没问题，但一次导入几千条时
 /// 就是 O(n²)：几百条存量记忆 × 几千条导入 = 上百万次文件读，请求会挂住。
 /// `write_batch` 把「现存 l1 的 hash」收成集合只读一次，语义不变。
+///
+/// ── 为什么真跑在 `run_with` 里而不是这里 ────────────────────
+/// 后台任务要报进度（第几百条 / 共几千条），所以真正的循环接受一个进度回调；
+/// 同步调用点不关心进度，给个空闭包就行。**别把进度塞进全局变量再由循环去读**
+/// —— 那样循环和状态就耦上了，测试里也没法观察中间态。
 pub fn run(only: Option<&str>) -> Result<Value, String> {
-    if config::bool_of("import.dryRunFirst") {
-        let previewed = LAST_PREVIEW_AT.load(Ordering::Relaxed);
-        let fresh = previewed > 0 && crate::server::logging::now_ms() - previewed < PREVIEW_TTL_MS;
-        if !fresh {
-            return Err("请先干跑预览（30 分钟内有效），确认要导入哪些内容".into());
-        }
+    run_with(only, &|_, _| {})
+}
+
+/// 干跑门槛：`import.dryRunFirst` 为真时，没在 30 分钟内预览过就不许导。
+///
+/// 单独抽出来是因为**同步与后台两条入口都要在「开始之前」就拒掉**：
+/// 后台任务如果先启动再失败，用户看到的是「跑了一下然后报错」，
+/// 而正确的反馈是「压根没开始」。
+fn preview_gate() -> Result<(), String> {
+    if !config::bool_of("import.dryRunFirst") {
+        return Ok(());
     }
+    let previewed = LAST_PREVIEW_AT.load(Ordering::Relaxed);
+    let fresh = previewed > 0 && crate::server::logging::now_ms() - previewed < PREVIEW_TTL_MS;
+    if fresh {
+        Ok(())
+    } else {
+        Err("请先干跑预览（30 分钟内有效），确认要导入哪些内容".into())
+    }
+}
+
+/// 带进度回调的真导入。`progress(已处理, 总数)` 每批调用一次。
+pub fn run_with(only: Option<&str>, progress: &dyn Fn(usize, usize)) -> Result<Value, String> {
+    preview_gate()?;
     let sensitive_skip = config::bool_of("import.sensitiveSkip");
     let batch = config::usize_of("import.batchSize").clamp(20, 2000);
     let (candidates, _) = collect(only);
@@ -1041,6 +1063,9 @@ pub fn run(only: Option<&str>) -> Result<Value, String> {
     // 一个写入器贯穿整次导入：hash 集合只建一次，之后每批都复用它。
     // 分批只是为了在批与批之间让出线程，不该让去重退回 O(n²)。
     let mut writer = super::BatchWriter::new();
+    // 开头先报一次总数：后台任务的进度条要在第一批写完之前就有分母，
+    // 否则「0 / 0」会让人以为卡住了。
+    progress(skipped, scanned);
     // 分批写：`drain` 而不是 `chunks`，避免把每条正文再克隆一遍
     // （800 条 × 每条最多 24k 字，克隆一轮就是几十 MB 的瞬时内存）。
     while !queue.is_empty() {
@@ -1073,6 +1098,9 @@ pub fn run(only: Option<&str>) -> Result<Value, String> {
                 reasons.push(format!("落盘失败 {error}"));
             }
         }
+        // 批末报进度。已处理 = 写完 + 重复 + 失败 + 开头跳过的，
+        // 与 `scanned` 同口径，进度条不会超过 100%。
+        progress(written + duplicated + failed + skipped, scanned);
         std::thread::yield_now();
     }
 
@@ -1102,6 +1130,144 @@ pub fn last_run() -> Value {
         .sync_get(LAST_RUN_KEY)
         .and_then(|(raw, _)| serde_json::from_str::<Value>(&raw).ok())
         .unwrap_or(Value::Null)
+}
+
+// ── 后台导入任务 ─────────────────────────────────────────────
+//
+// ── 为什么导入必须改成后台任务 ──────────────────────────────
+// 原来导入是一次「同步 HTTP 请求」：页面点「开始导入」，请求一直挂着直到写
+// 完几千条。这有两个必然后果，而且都是用户能直接撞上的：
+//
+//   1. **切页签就看不见了**。页签是条件渲染（`{tab === 'import' ? <Import/> : null}`），
+//      切走就把组件连同 `busy` / 结果状态一起卸载。后端其实还在写（它在
+//      `spawn_blocking` 里，请求断开也不会被杀），但界面回来后一片空白 ——
+//      用户看到的结论必然是「导入被中断了」。事实是**看不见**，不是**没做**，
+//      但这种区别对用户毫无意义。
+//   2. **60 秒硬超时**。桌面壳的 `api_request` 用 `REQUEST_TIMEOUT_MS = 60_000`，
+//      几千条导入轻易就超了。超时之后请求被 abort，界面报错，而后台还在写 ——
+//      用户于是会再点一次「开始导入」，两份写任务并行，谁也说不清结果。
+//
+// 所以改成：`start` 立刻返回、真跑在独立线程里、状态由 `status` 查。
+// 界面切走再回来按 `status` 重新接上，进度和结果都不会丢。
+//
+// ── 为什么是独立 `std::thread` 而不是 `spawn_blocking` ──────
+// 导入是纯阻塞 IO（读文件、写文件、SQLite），本来就不该占 tokio 的阻塞池；
+// 更重要的是它**不能和请求生命周期有任何关系** —— 用独立线程，谁来问、
+// 问不问，都不影响它跑完。
+
+const STATE_IDLE: u8 = 0;
+const STATE_RUNNING: u8 = 1;
+const STATE_DONE: u8 = 2;
+const STATE_FAILED: u8 = 3;
+
+/// 一次导入的运行状态。进程内单例：同一时刻只允许一个导入。
+///
+/// ── 为什么必须互斥 ──────────────────────────────────────────
+/// 两个导入并行会同时往同一个 l1 容器（`YYYY-MM-DD.md`）追加，落盘时后写的
+/// 覆盖先写的；而且 hash 去重集合各自建一份，重复条目会写两遍。
+/// 这不是「性能问题」，是会**悄悄丢数据**的问题，所以宁可拒绝第二次请求。
+struct Job {
+    state: u8,
+    started_at: i64,
+    finished_at: i64,
+    /// 本次只导哪个来源（空 = 全部）
+    only: Option<String>,
+    processed: usize,
+    total: usize,
+    summary: Value,
+    error: String,
+}
+
+static JOB: std::sync::Mutex<Job> = std::sync::Mutex::new(Job {
+    state: STATE_IDLE,
+    started_at: 0,
+    finished_at: 0,
+    only: None,
+    processed: 0,
+    total: 0,
+    summary: Value::Null,
+    error: String::new(),
+});
+
+/// 取锁。中毒（持锁期间 panic）不能把整个导入功能锁死 ——
+/// 状态只是几个数字，直接复用里面的值比让后续请求全部失败好。
+fn job_lock() -> std::sync::MutexGuard<'static, Job> {
+    JOB.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn state_text(state: u8) -> &'static str {
+    match state {
+        STATE_RUNNING => "running",
+        STATE_DONE => "done",
+        STATE_FAILED => "failed",
+        _ => "idle",
+    }
+}
+
+fn job_json(job: &Job) -> Value {
+    json!({
+        "state": state_text(job.state),
+        "running": job.state == STATE_RUNNING,
+        "startedAt": job.started_at,
+        "finishedAt": job.finished_at,
+        "only": job.only,
+        "processed": job.processed,
+        "total": job.total,
+        "summary": if job.summary.is_null() { Value::Null } else { job.summary.clone() },
+        "error": job.error,
+    })
+}
+
+/// 当前是否正在导入。同步入口用它拒绝并发请求。
+pub fn is_running() -> bool {
+    job_lock().state == STATE_RUNNING
+}
+
+/// 后台导入的当前状态。**不读盘**，界面可以随便轮询。
+pub fn status() -> Value {
+    job_json(&job_lock())
+}
+
+/// 启动一次后台导入，立刻返回状态。
+pub fn start(only: Option<String>) -> Result<Value, String> {
+    // 干跑门槛先过：要在「开始之前」拒绝，而不是启动后再失败。
+    preview_gate()?;
+    {
+        let mut job = job_lock();
+        if job.state == STATE_RUNNING {
+            return Err("已有导入在进行中，等它跑完再开始".into());
+        }
+        job.state = STATE_RUNNING;
+        job.started_at = crate::server::logging::now_ms();
+        job.finished_at = 0;
+        job.only = only.clone();
+        job.processed = 0;
+        job.total = 0;
+        job.summary = Value::Null;
+        job.error.clear();
+    }
+
+    std::thread::spawn(move || {
+        let result = run_with(only.as_deref(), &|processed, total| {
+            let mut job = job_lock();
+            job.processed = processed;
+            job.total = total;
+        });
+        let mut job = job_lock();
+        job.finished_at = crate::server::logging::now_ms();
+        match result {
+            Ok(summary) => {
+                job.state = STATE_DONE;
+                job.summary = summary;
+            }
+            Err(error) => {
+                job.state = STATE_FAILED;
+                job.error = error;
+            }
+        }
+    });
+
+    Ok(status())
 }
 
 /// 页面用的完整视图：来源清单 + 上次结果 + 关键开关。
@@ -1135,6 +1301,39 @@ pub fn view() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 后台导入的状态文案必须稳定：界面按 `running` 判断要不要显示进度条、
+    /// 按 `done` / `failed` 认领结果，拼错一个词就整条接不上。
+    #[test]
+    fn job_state_texts_are_stable() {
+        assert_eq!(state_text(STATE_IDLE), "idle");
+        assert_eq!(state_text(STATE_RUNNING), "running");
+        assert_eq!(state_text(STATE_DONE), "done");
+        assert_eq!(state_text(STATE_FAILED), "failed");
+    }
+
+    /// `running` 只能由 `STATE_RUNNING` 推出来 —— 不能用「有没有 summary」
+    /// 之类的间接判断，否则「跑完但一条没写」会被当成还在跑。
+    #[test]
+    fn job_json_flags_running_only_while_running() {
+        let mut job = Job {
+            state: STATE_RUNNING,
+            started_at: 1,
+            finished_at: 0,
+            only: None,
+            processed: 3,
+            total: 9,
+            summary: Value::Null,
+            error: String::new(),
+        };
+        assert_eq!(job_json(&job).get("running").and_then(Value::as_bool), Some(true));
+        assert_eq!(job_json(&job).get("state").and_then(Value::as_str), Some("running"));
+        job.state = STATE_DONE;
+        job.finished_at = 2;
+        job.summary = json!({ "written": 0 });
+        assert_eq!(job_json(&job).get("running").and_then(Value::as_bool), Some(false));
+        assert_eq!(job_json(&job).get("state").and_then(Value::as_str), Some("done"));
+    }
 
     #[test]
     fn source_parses_all_four_fields() {

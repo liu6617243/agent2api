@@ -954,5 +954,8 @@
   "拼接 {n} 条": "Juntar {n}",
   "不自动挑边": "sem escolha automática de lado",
   "两边都改且内容不同时进队列，等人裁决 —— 自动挑一边必然丢掉另一边的工作。同一天的日志能按节拼起来的会先拼平，拼不平的才进这里。": "Os dois lados mudaram de formas diferentes → entra na fila para decisão humana. Escolher um lado automaticamente sempre perde o trabalho do outro. Logs do mesmo dia que podem ser unidos seção a seção são unidos primeiro; só o que não pode ser unido aparece aqui.",
-  "忽略（这条不再同步）": "Ignorar (não sincronizar este item)"
+  "忽略（这条不再同步）": "Ignorar (não sincronizar este item)",
+  "导入进行中：{done} / {total} 条（切到别的页签也不会中断，回来再看这里）": "Importando: {done} de {total} itens (trocar de aba não interrompe — volte aqui para acompanhar)",
+  "导入进行中（正在扫描来源，切到别的页签也不会中断）": "Importando (lendo as origens — trocar de aba não interrompe)",
+  "导入失败": "Falha na importação"
 }

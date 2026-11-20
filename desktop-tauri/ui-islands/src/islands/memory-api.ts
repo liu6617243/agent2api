@@ -1139,6 +1139,36 @@ export function runImport(path?: string): Promise<{ summary: ImportSummary; view
   return api('POST', '/api/memory/import/run', { path })
 }
 
+/**
+ * 后台导入的运行状态（`import::status`）。
+ *
+ * ── 为什么导入要拆成 start + status ─────────────────────────
+ * 页签是条件渲染，切走就把导入组件卸载了；而一次几千条的导入必然超过桌面壳
+ * 60 秒的请求超时。同步端点在这两件事上都会让用户看到「导入被中断」。
+ * 换成后台任务之后，界面切回来只要再查一次状态就能接上进度与结果。
+ */
+export type ImportJob = {
+  state: 'idle' | 'running' | 'done' | 'failed'
+  running: boolean
+  startedAt: number
+  finishedAt: number
+  only: string | null
+  processed: number
+  total: number
+  summary: ImportSummary | null
+  error: string
+}
+
+/** 启动后台导入，立刻返回（不等写完）。 */
+export function startImport(path?: string): Promise<ImportJob> {
+  return api('POST', '/api/memory/import/start', { path })
+}
+
+/** 查后台导入状态。不读盘，可以高频轮询。 */
+export function importStatus(): Promise<ImportJob> {
+  return api('GET', '/api/memory/import/status')
+}
+
 export function saveImportSources(sources: { path: string; format: string; enabled: boolean; priority: number }[]): Promise<{ view: ImportView }> {
   return api('POST', '/api/memory/import/sources', { sources })
 }
