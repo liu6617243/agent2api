@@ -176,6 +176,16 @@ async function dispatch(file) {
 // ── 3. 找 run / 等 run ──────────────────────────────────────────────
 // 认「同一个 head_sha」的 run，不看它是不是刚刚派发的 —— 这样本脚本**幂等**：
 // 重复跑不会重复出包，已经绿过的直接复用。
+//
+// ── 为什么复用要看 attempt 而不是 created_at ────────────────────
+// GitHub 的「rerun failed jobs」**复用同一个 run id、保留 created_at**，只把
+// `run_attempt` +1。按 created_at 找「最新的那次」会在重跑期间拿到上一轮的
+// failure 结论，于是刚点完 rerun、再跑一次本脚本就立刻被判「闸门未通过」——
+// 用户只能干等 CI 跑完再重跑，而 CI 往往十几分钟。
+//
+// 所以这里先按 attempt 降序、再按 created_at 降序：attempt 是 GitHub 给
+// 「同一个 run 的第几次尝试」的编号，它才是真正的时间序。字段不存在的旧数据
+// 视为 1（API 文档里 run_attempt 从 1 开始）。
 const REUSE_WINDOW = 6 * 3600 * 1000
 
 async function findRun(file, after = 0) {
@@ -184,17 +194,25 @@ async function findRun(file, after = 0) {
   const runs = (r.json?.workflow_runs || []).filter(
     (x) => x.head_sha === SHA && new Date(x.created_at).getTime() >= after,
   )
-  runs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+  runs.sort((a, b) => {
+    const attempt = (b.run_attempt || 1) - (a.run_attempt || 1)
+    if (attempt !== 0) return attempt
+    return new Date(b.created_at) - new Date(a.created_at)
+  })
   return runs[0] || null
 }
 
 async function waitRun(file, label, deadline, after = 0) {
   let seen = null
+  let lastAttempt = null
   while (Date.now() < deadline) {
     const run = await findRun(file, after)
-    if (run && run.id !== seen) {
+    // attempt 变了（有人在 GitHub 上点了 rerun）要当成新的一次重新打印 ——
+    // 否则日志里只有一行「run xxx」，用户看不出它已经被重跑过。
+    if (run && (run.id !== seen || run.run_attempt !== lastAttempt)) {
       seen = run.id
-      console.log(`  ${label}: run ${run.id}（${run.status}）`)
+      lastAttempt = run.run_attempt
+      console.log(`  ${label}: run ${run.id}（${run.status}，第 ${run.run_attempt || 1} 次）`)
     }
     if (run && run.status === 'completed') return run
     await sleep(POLL)
