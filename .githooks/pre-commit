@@ -32,6 +32,31 @@ staged="$(mktemp)"
 trap 'rm -f "$staged"' EXIT
 git diff --cached --name-only --diff-filter=ACMR > "$staged"
 
+# ── Rust 静态预检（不需要 cargo）──────────────────────────────
+# 本机通常没有 Rust 工具链，「改了结构体定义忘了同步字面量」这类错误只能
+# 推上去等 CI 红灯。2026-11-20 连着踩了两次（make_id 参数、MemoryConfig 字段），
+# 每次都烧一轮 CI。这道检查在提交前把它挡下来。
+#
+# 只有动了 Rust 源码时才跑；脚本本身不做编译，纯文本解析，几十毫秒。
+if grep -q '^desktop-tauri/src-tauri/.*\.rs$' "$staged"; then
+  if command -v node > /dev/null 2>&1; then
+    echo "pre-commit: 检测到 Rust 源码改动，跑静态预检……"
+    if ! node scripts/precheck-rust.mjs; then
+      echo "" >&2
+      echo "pre-commit: Rust 静态预检不通过，已中止提交。" >&2
+      echo "  修好上面的字段不一致再提交；确有特殊情况可 git commit --no-verify 跳过。" >&2
+      exit 1
+    fi
+    if ! node scripts/precheck-knobs.mjs; then
+      echo "" >&2
+      echo "pre-commit: 旋钮 schema 预检不通过，已中止提交。" >&2
+      exit 1
+    fi
+  else
+    echo "pre-commit: 找不到 node，跳过 Rust 静态预检（CI 仍会拦）。" >&2
+  fi
+fi
+
 need_islands=0
 need_mobile=0
 need_i18n=0

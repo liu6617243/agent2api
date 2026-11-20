@@ -311,11 +311,13 @@ static SCHEMA: &[Knob] = &[
     // 留一个改完没反应的输入框。
     unwired(knob_d("models.sourceOrder", Kind::List, Tier::Advanced, "模型与网关", "模型来源优先级",
         "本仓未接入：模型只从本机网关目录里取，没有「网关 / 自定义供应商」两个来源可排序", "[\"gateway\",\"custom\"]")),
-    unwired(knob("models.providers", Kind::List, Tier::Advanced, "模型与网关", "自定义供应商", "[]")),
+    unwired(knob_d("models.providers", Kind::List, Tier::Advanced, "模型与网关", "自定义供应商",
+        "本仓未接入：模型只从本机网关目录读取，这组自定义供应商（名称 / 基址 / 密钥）没有解析器", "[]")),
     knob("models.models", Kind::List, Tier::Advanced, "模型与网关", "模型池", "[]"),
     knob_d("models.routing", Kind::List, Tier::Internal, "模型与网关", "按标签降级链",
         "每项 {\"task\":\"extract\",\"tags\":[\"light\"],\"model\":\"...\"}", "[]"),
-    unwired(knob("models.tagDefs", Kind::List, Tier::Internal, "模型与网关", "用途标签集",
+    unwired(knob_d("models.tagDefs", Kind::List, Tier::Internal, "模型与网关", "用途标签集",
+        "本仓未接入：自动化任务的用途标签写在代码里的路由表，这组标签集没有解析器",
         "[\"light\",\"heavy\",\"dedup\",\"classify\",\"distill\",\"extract\",\"tag\",\"summarize\",\"profile\",\"supersede\",\"consolidate\",\"insight\"]")),
     range(knob("models.timeout", Kind::Number, Tier::Advanced, "模型与网关", "请求超时（秒）", "60"), 5.0, 600.0),
     unwired(range(knob_d("models.maxRetries", Kind::Number, Tier::Advanced, "模型与网关", "失败重试次数",
@@ -408,8 +410,8 @@ static SCHEMA: &[Knob] = &[
     // `ui.realtimeRefresh` 前端根本不读。现在前三条由 `memory-page.tsx` 真读
     //（`ui.tabs` 还带一条硬保护：配置页签永远可见，否则用户把「配置」关掉之后
     // 就再也改不回来了）；`ui.realtimeRefresh` 本仓没有轮询，标 unwired。
-    range(knob("ui.pageSize", Kind::Number, Tier::Basic, "界面", "列表每页条数",
-        "浏览页每页条数；后端在 `limit` 缺省时也用这个值"), 10.0, 500.0),
+    range(knob_d("ui.pageSize", Kind::Number, Tier::Basic, "界面", "列表每页条数",
+        "浏览页每页条数；后端在 `limit` 缺省时也用这个值", "50"), 10.0, 500.0),
     opts(knob("ui.defaultTab", Kind::Enum, Tier::Advanced, "界面", "默认页签", "\"dashboard\""),
         &["dashboard", "browse", "projects", "profile", "agents", "auto", "import", "sync", "settings"]),
     opts(knob_d("ui.tabs", Kind::Multi, Tier::Advanced, "界面", "显示的页签",

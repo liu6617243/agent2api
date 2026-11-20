@@ -1442,10 +1442,28 @@ mod tests {
     }
 
     /// 造一份「某一天的 l1 容器」。
+    ///
+    /// ── 为什么时间必须固定 ──────────────────────────────────
+    /// 每节的原始切片里带着 `## HH:MM · 标题` 这一行（取自 `created_at`），
+    /// 以及 marker JSON 里的 `created` / `updated`。`merge_container` 判「同 id
+    /// 两节是否一致」用的就是这段原始切片，于是**测试里两次构造必须落在同一
+    /// 分钟**，否则同一个 id 会因为标题行的时间戳不同被判成冲突。
+    ///
+    /// 2026-11-20 的 Windows CI 就这么红过一次：`container_merge_joins_each_sides_own_sections`
+    /// 的 local / remote 两次 `draft()` 之间跨了分钟，`expect("能拼")` 直接炸。
+    /// 那不是平台差异，是测试撞上了分钟边界 —— 换成固定时间就彻底确定。
+    ///（真实文件里两边共有节的字节来自同一次写入，不存在这个差异。）
+    /// 固定到 2025-11-16T00:00:00Z。节标题只渲染 `HH:MM`（`created_at mod 一天`），
+    /// 所以具体哪天不影响断言；要的是**每次构造都落在同一分钟**。
+    const FIXED_AT: i64 = 1_763_251_200_000;
+
     fn container(day: &str, entries: &[(&str, &str)]) -> String {
         let mut text = container_head(day, "manual", None);
         for (id, body) in entries {
-            let entry = MemoryEntry::draft(*id, "标题", MemoryKind::Daily, *body);
+            let mut entry = MemoryEntry::draft(*id, "标题", MemoryKind::Daily, *body);
+            entry.created_at = FIXED_AT;
+            entry.updated_at = FIXED_AT;
+            entry.hash = super::model::content_hash(body);
             text.push_str(&section_text(&entry));
         }
         text
