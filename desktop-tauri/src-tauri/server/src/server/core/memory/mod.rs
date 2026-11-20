@@ -178,6 +178,23 @@ pub struct MemoryConfig {
     pub enabled: bool,
     /// `memory_core` 的默认 token 预算（工具参数可逐个覆盖）
     pub core_max_tokens: usize,
+    /// `memory_digest` 的默认行数上限（工具参数可逐个覆盖）
+    ///
+    /// 对应 `agents.digestMaxLines`。以前 MCP 与 HTTP 两处都把 200 写死在代码里，
+    /// 设置页那条旋钮改了没反应。
+    pub digest_max_lines: usize,
+    /// `memory_search` 返回行的 token 预算（超了从尾部丢整行）
+    ///
+    /// 对应 `agents.searchMaxTokens`。工具参数里不暴露 —— 模型不该自己决定
+    /// 「这次能占多少上下文」，那是调用方（客户端）该管的事。
+    pub search_max_tokens: usize,
+    /// `memory_search` 不传 `limit` 时的默认返回条数（`search.finalTopK`）
+    pub final_top_k: usize,
+    /// `memory_search` 打分前的候选上限（`search.recallTopK`）。
+    ///
+    /// 只给 MCP 用：界面列表必须拿真实总数算页数，截断候选会让第 N 页之后
+    /// 永远空着。
+    pub recall_top_k: usize,
 }
 
 impl Default for MemoryConfig {
