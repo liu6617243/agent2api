@@ -1134,7 +1134,8 @@ fn write_inner(
         }
     }
 
-    let id = make_id(&content);
+    // id 前缀跟**原始发生时间**走，与 l1 容器日期一致；缺省才是此刻
+    let id = make_id(&content, created_at);
     // 归类建议要用**最终 id** 作 target：早先这里又调了一次 `make_id`，
     // 拿到的 id 与真正落盘的那条不是同一个，于是「批准归类」永远找不到目标
     if categorized_pending(&classified) {

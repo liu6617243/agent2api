@@ -77,6 +77,7 @@ pub const GLOBAL_SLUG: &str = "_global";
 ///            `detach_live` ──► `detach_live_locked`
 ///            `remove_section` / `remove_file` ──► 各自的 `_locked`
 ///            `move_save` / `retire` / `revive` ──► 一次临界区里做两件事
+///            `end_deferred` ──► 批末一次性写回攒下的容器
 /// 一次事务（比如「摘旧节 + 写回收站」）在**同一把锁内**完成，中途不会被插队。
 static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
