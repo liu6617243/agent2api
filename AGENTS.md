@@ -30,26 +30,43 @@
 3. **验证靠代码与数据库，不靠下载产物。** 要确认改动生效，读源码 / 读 `~/.agent2api/agent2api.db`
    里的实际数据，不要去拉构建出来的二进制。
 
-### 交付三件套（推完代码就自动跑，别再靠记性）
+### 交付一条命令：`node scripts/deliver.mjs`
 
-本 fork 的交付链条是三段，**推 `main-patched` 会自动触发全部三段**：
+推 `main-patched` **不要裸 `git push`**（`.githooks/pre-push` 会拦下来并报错）。交付入口只有一条：
+
+```bash
+node scripts/deliver.mjs          # 推代码 + 跑测试 + 等绿 + 出安装包
+node scripts/deliver.mjs --no-push    # 已推过，只补跑链路
+node scripts/deliver.mjs --no-build   # 只跑测试与产物同源，不出包
+```
+
+它做的整条链：
 
 ```
-push main-patched
-   ├─ rust-tests          服务端与插件联调（ubuntu / windows / macos）
-   ├─ frontend-artifacts  入库前端产物必须与源码逐字节同源
-   └─ build-windows       先过闸门 → 出 Windows NSIS 安装包
+git push HEAD:main-patched
+   ├─ 派发 rust-tests          ┐ 并行
+   └─ 派发 frontend-artifacts  ┘
+          ↓ 两个都绿才继续（任一失败 → 不派发出包，退出码 1）
+     派发 build-windows → 打印安装包 artifact 文件名 / 大小 / id
 ```
 
-- **闸门**：`build-windows` 的 `gate` job 跑 `scripts/ci-gate.mjs`，等前两道闸门对**同一个提交**都变绿才放行；
-  任一失败则本条直接失败、**不产出 artifact**。所以「装出来的包」永远对应「测试绿过的代码」。
-- **查状态**：`node scripts/ci-watch.mjs` —— 一条命令看清三件套，带 `--wait` 等结果、`--artifact` 打印 artifact id、
-  `--gate` 做交付自检（任一未绿则退出码 1）。
-- **补出包**：`node scripts/ci-watch.mjs --dispatch build-windows` —— 手动补一次（正常不需要，push 会自动带）。
+- **为什么用派发而不是 push 触发**：三个工作流的 `push.branches` 写的是上游分支名
+  `[main, beta]` / `[v3.3.0-beta.3]`，在本 fork（干活分支 `main-patched`）**从来不会因 push 自动跑**。
+  治本是补触发面，但本机凭据是 classic PAT、scope 只有 `public_repo`，写 `.github/workflows/**`
+  被 GitHub 拒（`without workflow scope`）。`public_repo` 够调 `workflow_dispatch`，所以走派发这条路 ——
+  零新权限、当场可用。
+- **触发面补丁已备好**：`.github/workflows/{rust-tests,frontend-artifacts,build-windows}.yml` 的改动在
+  本地，等凭据补上 `workflow` scope 后跑 `node scripts/push-workflows.mjs --all` 写上去；
+  那之后连派发这一步都不需要，本脚本仍可当闸门用。
+- **闸门**：`build-windows` 的 `gate` job 跑 `scripts/ci-gate.mjs`，等前两道闸门对**同一个提交**都变绿
+  才放行；任一失败则本条直接失败、**不产出 artifact**（该 job 随触发面补丁一起上线，派发路径的闸门由
+  `deliver.mjs` 自己等）。
+- **只看状态**：`node scripts/ci-watch.mjs`（`--wait` / `--artifact` / `--gate`）。
 
 ⚠️ **不要再出现「代码改完了但没出安装包」**。2026-11-20 之前，本 fork 的工作流 push 触发面写的是
 `[main, beta]`（上游分支名），而实际干活的分支是 `main-patched` —— 于是三个流水线**从来不会因为 push 自动跑**，
-历史上每个 run 都是手动 `workflow_dispatch`，每次都要用户提醒才想起出包。触发面已补齐，这条路走不通了。
+历史上每个 run 都是手动 `workflow_dispatch`，每次都要用户提醒才想起出包。现在这条路已经堵死：
+裸推会被钩子拦下，唯一入口会顺手把包出完。
 
 ## 反代提供商问题排查
 

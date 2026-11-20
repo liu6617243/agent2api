@@ -1,0 +1,123 @@
+diff --git a/.github/workflows/build-windows.yml b/.github/workflows/build-windows.yml
+index 0ba27d0f..9e05c828 100644
+--- a/.github/workflows/build-windows.yml
++++ b/.github/workflows/build-windows.yml
+@@ -10,9 +10,19 @@ name: build-windows
+ # 那条流水线在本 fork 里永远出不了包。这里补一条自建流水线，让本仓库自己
+ # 就能产出可安装的 exe。
+ #
+-# ── 触发面 ───────────────────────────────────────────────────
+-# 只在本分支被推送、或手动触发时跑；主仓原有的 build.yml / docker.yml
+-# 只认 tag 与手动触发，互不干扰。
++# ── 触发面 ────────────────────────────────────────────────────
++# · push 到 main-patched：本 fork 的默认分支与实际交付分支。
++#   上游写的 push 触发面是 `[v3.3.0-beta.3]`，那个分支在本 fork 里
++#   根本不是干活的地方 —— 于是出包从来没跟过 push，全靠人手动触发。
++# · workflow_dispatch：手动补发。
++#
++# ── 出包前必须先过闸门 ────────────────────────────────────────
++# 交付链条是三段：rust-tests → frontend-artifacts → build-windows。
++# 前两段现在会被 push 自动触发（触发面已补 main-patched），
++# 但它们与本条是**并行**的 —— 不设闸门的话，本条会在测试还没跑完时
++# 就开始编译，装出一个「测试没过但包已经出了」的安装包。
++# `scripts/ci-gate.mjs` 负责这件事：等前两道闸门对这个提交都变绿
++# 才放行；任一失败则本条直接失败，不产出 artifact。
+ #
+ # ── 与旧 fork（v3.1.0 线）的关系 ──────────────────────────────
+ # 步骤逐条对齐那边跑通过的那份：Node 22 + stable Rust + `npm ci` +
+@@ -20,7 +30,7 @@ name: build-windows
+ 
+ on:
+   push:
+-    branches: [v3.3.0-beta.3]
++    branches: [v3.3.0-beta.3, main-patched]
+     paths-ignore:
+       - 'docs/**'
+       - '**.md'
+@@ -28,13 +38,38 @@ on:
+ 
+ permissions:
+   contents: write
++  actions: read
+ 
+ jobs:
++  gate:
++    # 交付闸门：等 rust-tests 与 frontend-artifacts 对本提交都变绿。
++    # 任一失败 → 本 job 失败 → 下面的 windows job 不会跑 → 不出 artifact。
++    name: 交付闸门（测试 + 产物同源）
++    runs-on: ubuntu-latest
++    timeout-minutes: 70
++    steps:
++      - uses: actions/checkout@v7
++        with:
++          persist-credentials: false
++
++      - name: 等上游闸门放行
++        env:
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++          GITHUB_REPOSITORY: ${{ github.repository }}
++          GITHUB_SHA: ${{ github.sha }}
++          CI_GATE_TIMEOUT: '3600'
++        run: node scripts/ci-gate.mjs
++
+   windows:
++    name: Windows 安装包
++    needs: gate
+     runs-on: windows-latest
++    timeout-minutes: 60
+     steps:
+       - name: 取源码
+         uses: actions/checkout@v4
++        with:
++          persist-credentials: false
+ 
+       - name: 安装 Node
+         uses: actions/setup-node@v4
+diff --git a/.github/workflows/frontend-artifacts.yml b/.github/workflows/frontend-artifacts.yml
+index e7a207c7..f135cb2a 100644
+--- a/.github/workflows/frontend-artifacts.yml
++++ b/.github/workflows/frontend-artifacts.yml
+@@ -27,9 +27,12 @@ name: frontend-artifacts
+ 
+ on:
+   push:
+-    branches: [main, beta]
++    # main-patched：本 fork 的默认分支与实际交付分支。上游的 [main, beta]
++    # 在这个 fork 里不存在，导致这条闸从来没因为 push 自动跑过 ——
++    # 手工 dispatch 会漏，于是「入库产物与源码不同源」只能靠人记得查。
++    branches: [main, beta, main-patched]
+   pull_request:
+-    branches: [main, beta]
++    branches: [main, beta, main-patched]
+   workflow_dispatch:
+ 
+ permissions:
+diff --git a/.github/workflows/rust-tests.yml b/.github/workflows/rust-tests.yml
+index 40b511a2..9354b08f 100644
+--- a/.github/workflows/rust-tests.yml
++++ b/.github/workflows/rust-tests.yml
+@@ -1,15 +1,22 @@
+ name: rust-tests
+ 
++# ── 触发面为什么带 main-patched ──────────────────────────────────
++# 本 fork 的默认分支是 `main-patched`，日常开发与交付都发生在它上面。
++# 上游写的 `[main, beta]` 是主仓的分支名 —— 在这个 fork 里这两个分支不存在，
++# 于是这条流水线**从来不会因为 push 自动跑**，历史上每一个 run 都是手动
++# `workflow_dispatch`。那等于把「要不要跑测试」变成靠人记得的事，
++# 而实际结果是既漏跑、又漏出包。
++# 这里把 `main-patched` 补进来：推代码 = 自动跑测试，不再依赖记性。
+ on:
+   push:
+-    branches: [main, beta]
++    branches: [main, beta, main-patched]
+     paths:
+       - 'desktop-tauri/src-tauri/**'
+       - 'scripts/cargo-test.mjs'
+       - '.github/workflows/rust-tests.yml'
+       - 'package.json'
+   pull_request:
+-    branches: [main, beta]
++    branches: [main, beta, main-patched]
+     paths:
+       - 'desktop-tauri/src-tauri/**'
+       - 'scripts/cargo-test.mjs'
