@@ -5,6 +5,10 @@
 >
 > 覆盖范围：切分支 / 给 PR 选 base / 合并 PR / 回复 Issue、PR / 改版本号 / 写更新日志 /
 > 打 tag / 挂 GitHub Release / 发 beta 预发布版 / 发版验收 / 排查发版失败。
+>
+> **涉及推代码后的 CI / 出包 / 交付自检，按 Skill `delivery-pipeline` 执行：**
+> **`.agents/skills/delivery-pipeline/SKILL.md`** —— 交付三件套、闸门、状态查询、排错都在那里。
+> 覆盖范围：推完代码 CI 跑没跑 / 安装包出没出 / artifact id 怎么拿 / workflow 触发面对不对。
 
 ## 两条红线（先问人，不得自行推进）
 
@@ -25,6 +29,27 @@
    只有用户**明确要产物文件**时才下。
 3. **验证靠代码与数据库，不靠下载产物。** 要确认改动生效，读源码 / 读 `~/.agent2api/agent2api.db`
    里的实际数据，不要去拉构建出来的二进制。
+
+### 交付三件套（推完代码就自动跑，别再靠记性）
+
+本 fork 的交付链条是三段，**推 `main-patched` 会自动触发全部三段**：
+
+```
+push main-patched
+   ├─ rust-tests          服务端与插件联调（ubuntu / windows / macos）
+   ├─ frontend-artifacts  入库前端产物必须与源码逐字节同源
+   └─ build-windows       先过闸门 → 出 Windows NSIS 安装包
+```
+
+- **闸门**：`build-windows` 的 `gate` job 跑 `scripts/ci-gate.mjs`，等前两道闸门对**同一个提交**都变绿才放行；
+  任一失败则本条直接失败、**不产出 artifact**。所以「装出来的包」永远对应「测试绿过的代码」。
+- **查状态**：`node scripts/ci-watch.mjs` —— 一条命令看清三件套，带 `--wait` 等结果、`--artifact` 打印 artifact id、
+  `--gate` 做交付自检（任一未绿则退出码 1）。
+- **补出包**：`node scripts/ci-watch.mjs --dispatch build-windows` —— 手动补一次（正常不需要，push 会自动带）。
+
+⚠️ **不要再出现「代码改完了但没出安装包」**。2026-11-20 之前，本 fork 的工作流 push 触发面写的是
+`[main, beta]`（上游分支名），而实际干活的分支是 `main-patched` —— 于是三个流水线**从来不会因为 push 自动跑**，
+历史上每个 run 都是手动 `workflow_dispatch`，每次都要用户提醒才想起出包。触发面已补齐，这条路走不通了。
 
 ## 反代提供商问题排查
 

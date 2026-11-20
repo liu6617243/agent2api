@@ -1,0 +1,55 @@
+#!/bin/sh
+#
+# pre-push：推代码后，提醒交付三件套并把状态查清楚。
+#
+# ── 为什么需要它 ──────────────────────────────────────────────
+# 2026-11-20 用户问了一句「又没构建安装包吗？」——
+# 那天代码、测试都做完了，安装包却没出。根因不是疏忽，是机制缺失：
+#
+#   本 fork 的默认分支是 `main-patched`，而三个工作流的 push 触发面
+#   写的是上游分支名 `[main, beta]` —— 在这个 fork 里 push 从来不会
+#   自动触发任何一条流水线，历史上每个 run 都是手动 workflow_dispatch。
+#   也就是说「推完代码之后要跑测试、要出包」这件事，**从来就没人负责**，
+#   只能靠人记得，而人记得的那几次之外就漏了。
+#
+# 触发面已补齐（见 .github/workflows/*.yml），链条现在自动串起来。
+# 这道钩子做的是最后一件事：**推完当场把状态看清楚**，
+# 免得「推完就以为完了」——那正是漏出包的最后一道缝。
+#
+# ── 行为 ──────────────────────────────────────────────────────
+# 推 main-patched 时：
+#   1. 查三件套当前状态（scripts/ci-watch.mjs）
+#   2. 打印 run 链接与 artifact id
+#   3. 提示 --wait / --gate 的用法
+# 不阻塞推送（CI 还在跑，钩子阶段它必然还没绿），
+# 也不下载任何产物 —— 产物一律不落盘。
+#
+# 其它分支、或找不到 node / 令牌时静默跳过，不给日常推送添堵。
+
+set -e
+
+# 只关心交付分支
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+case "$branch" in
+  main-patched) ;;
+  *) exit 0 ;;
+esac
+
+command -v node > /dev/null 2>&1 || exit 0
+[ -f scripts/ci-watch.mjs ] || exit 0
+
+echo ""
+echo "pre-push: 交付三件套状态（本次提交 $(git rev-parse --short HEAD)）"
+
+if node scripts/ci-watch.mjs --artifact; then
+  echo ""
+  echo "  三件套会在 push 后自动跑；用下面这条等结果并打印 artifact id："
+  echo "    node scripts/ci-watch.mjs --wait --artifact"
+  echo "  交付前自检（任一未绿则退出码 1）："
+  echo "    node scripts/ci-watch.mjs --gate"
+else
+  echo "pre-push: 查状态失败，不阻塞推送（CI 里会再查一遍）。" >&2
+fi
+
+echo ""
+exit 0

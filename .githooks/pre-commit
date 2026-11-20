@@ -57,6 +57,24 @@ if grep -q '^desktop-tauri/src-tauri/.*\.rs$' "$staged"; then
   fi
 fi
 
+# ── 工作流 YAML 预检（不需要 actionlint）────────────────────────
+# 改了 .github/workflows/** 就得保证 YAML 还能被 GitHub 解析。
+# 本机没有 actionlint，GitHub 解析失败的表现是「整条工作流静默不跑」——
+# 连报错都没有：闸门不生效、出包不发生，而且看不出原因。
+# 这道检查把最常见的几类写坏提前到提交前。
+if grep -q '^\.github/workflows/.*\.ya\?ml$' "$staged"; then
+  if command -v node > /dev/null 2>&1; then
+    echo "pre-commit: 检测到工作流改动，跑 YAML 预检……"
+    if ! node scripts/precheck-workflows.mjs; then
+      echo "" >&2
+      echo "pre-commit: 工作流 YAML 预检不通过，已中止提交。" >&2
+      exit 1
+    fi
+  else
+    echo "pre-commit: 找不到 node，跳过工作流 YAML 预检（CI 仍会拦）。" >&2
+  fi
+fi
+
 need_islands=0
 need_mobile=0
 need_i18n=0
