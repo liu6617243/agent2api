@@ -368,7 +368,21 @@ pub fn entry_path(entry: &MemoryEntry, deleted: bool) -> PathBuf {
     }
     let slug = entry.project.as_deref().map(slugify).filter(|slug| slug != GLOBAL_SLUG);
     let agent = entry.agent.as_deref().unwrap_or("manual");
-    let date = super::search::format_date(entry.created_at.max(entry.updated_at));
+    // ── 日期跟「事情发生时间」走，不跟「写入时刻」走 ──────────────
+    //
+    // 这里原来是 `created_at.max(updated_at)`，等于永远取 `updated_at`（它必然
+    // ≥ created_at）。后果：**历史导入全部挤进「今天」那个容器**。补录九月
+    // 二十号的会话，`created_at` 是九月二十号、`updated_at` 是此刻，
+    // 取最大值就落进 `2026-11-20.md`。
+    //
+    // 一次导入 2341 条窗口切条 → 53 个不同日期的内容全写进同一个文件 →
+    // 那个文件涨到 55 MB → 又被单文件上限整份跳过 → 「普通记忆 0 条」。
+    // 两个 bug 串成一条链，这一处是源头。
+    //
+    // 只影响**新建条目**的落点；已有 `entry.path` 的条目在上面那个分支里
+    // 直接沿用原路径，不会被搬走（搬动已有记忆另有 `split_misplaced_containers`）。
+    let stamp = if entry.created_at > 0 { entry.created_at } else { entry.updated_at };
+    let date = super::search::format_date(stamp);
     let relative = layout::memory_rel_path(
         slug.as_deref(),
         entry.layer,
@@ -426,9 +440,18 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
         file.flush().map_err(|error| format!("刷盘失败 {}：{error}", tmp.display()))?;
         file.sync_all().map_err(|error| format!("刷盘失败 {}：{error}", tmp.display()))?;
     }
-    // Windows 上 rename 到已存在文件会失败，先删目标
+    // Windows 上 rename 到已存在文件会失败，先删目标。
+    //
+    // ── 失败必须顺手清掉 tmp ────────────────────────────────────
+    // 早先只有 rename 失败那条分支会删 tmp，`remove_file` 失败就直接返回 ——
+    // 于是记忆目录里留下 `2026-09-20.tmp.1234` 这类残骸。它的扩展名不是 `.md`，
+    // `load_all` 读不到它（不会污染索引），但用户在自己目录里会看到一堆莫名
+    // 文件，而且磁盘上真的要清也不是我们该让他们手动做的事。
     if path.exists() {
-        fs::remove_file(path).map_err(|error| format!("替换失败 {}：{error}", path.display()))?;
+        if let Err(error) = fs::remove_file(path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("替换失败 {}：{error}", path.display()));
+        }
     }
     fs::rename(&tmp, path).map_err(|error| {
         let _ = fs::remove_file(&tmp);
@@ -995,6 +1018,28 @@ fn read_dir_entries(dir: &Path, out: &mut Vec<MemoryEntry>) {
         if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;
         }
+        // ── 容器不吃体积上限，只吃「是容器」这件事 ────────────────
+        //
+        // 这个上限本意是挡「用户手扔进来的巨型文本」，但 l1 容器
+        // （`.../l1/<agent>/YYYY-MM-DD.md`）的体积**不是单条记忆的体积** ——
+        // 它是一天里所有记忆拼起来的。历史导入把几千条窗口切条全落到同一个
+        // 「今天」的容器里，一天就能到几十 MB；一条都没超，整份文件超了。
+        //
+        // 后果是灾难级的：整个容器被跳过后，那几千条**全部消失**，
+        // 索引里一条都不剩、页面上「普通记忆 0 条」，而磁盘上文件好好地躺着
+        // —— 用户看到的是「导入了 2341 条，但库里没有」。
+        //
+        // 所以判据改成「形状」：容器一定读，读的时候由 `read_container`
+        // 逐节解析；体积保护只对**非容器**的单条 `.md` 生效。
+        let relative = rel(&path);
+        if is_daily_container(&relative) {
+            let Ok(text) = fs::read_to_string(&path) else {
+                crate::server::logging::log("[Memory]", &format!("⚠️ 记忆文件读取失败：{}", path.display()));
+                continue;
+            };
+            read_container(&text, &relative, &path, out);
+            continue;
+        }
         if limit_bytes > 0 {
             match fs::metadata(&path) {
                 Ok(meta) if meta.len() > limit_bytes as u64 => {
@@ -1016,11 +1061,6 @@ fn read_dir_entries(dir: &Path, out: &mut Vec<MemoryEntry>) {
             crate::server::logging::log("[Memory]", &format!("⚠️ 记忆文件读取失败：{}", path.display()));
             continue;
         };
-        let relative = rel(&path);
-        if is_daily_container(&relative) {
-            read_container(&text, &relative, &path, out);
-            continue;
-        }
         let stem = path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -1117,6 +1157,281 @@ pub fn load_all() -> Vec<MemoryEntry> {
         }
     }
     out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    out
+}
+
+/// 把「容器里节的日期」与「容器文件名上的日期」不一致的容器拆开，各自归位。
+///
+/// ── 这是给已经写错的存量数据做的一次性修复 ────────────────────
+/// `entry_path` 曾经用 `created_at.max(updated_at)` 算落点，等于永远取
+/// `updated_at`。历史导入补录九月的会话时，`created_at` 是九月、
+/// `updated_at` 是此刻 —— 于是 53 个不同日期的几千条全挤进「今天」那个容器，
+/// 文件涨到几十 MB，再被单文件上限整份跳过，索引里一条不剩。
+///
+/// 只改计算逻辑救不了这些数据：文件已经写在那儿了，`entry.path` 也指着它。
+/// 所以这里主动拆一次：按每节的 `created` 重新分组，写回各自日期的容器。
+///
+/// ── 为什么不直接改 `entry.path` 了事 ────────────────────────
+/// 改了也没用：事实源还是那个几十 MB 的文件，「同一天」的定义仍然是错的，
+/// 下次重建索引依旧从同一个文件里读出错日期。必须真的把内容搬到新文件，
+/// 并把老容器里搬走的那几节摘掉（摘空了就删文件）。
+///
+/// 返回 `(搬走的节数, 涉及的容器数, 写失败数)`。前两个为 0 表示没有需要修的
+/// 历史数据。
+///
+/// ── 为什么失败数要单独返回 ──────────────────────────────────
+/// 这个函数是**破坏性**的：它会把节从老容器里摘掉。摘的判据必须是「目标文件
+/// 已经真的写成功了」，而不是「我已经打算写了」。写失败还照摘，等于把记忆从
+/// 磁盘上抹掉一次 —— 而且因为源文件里本来就错，用户连「少了一条」都发现不了。
+/// 所以流程固定为：**先写目标 → 确认成功 → 才从源里摘**。失败数 > 0 说明还有
+/// 数据没归位，迁移标记不能落，下次启动会重试。
+pub fn split_misplaced_containers() -> (usize, usize, usize) {
+    let mut moved = 0usize;
+    let mut files = 0usize;
+    let mut failed = 0usize;
+    let mut containers: Vec<PathBuf> = Vec::new();
+    collect_containers(&general_root(), &mut containers);
+    collect_containers(&projects_root(), &mut containers);
+    for path in containers {
+        // ── 读 + 算 + 写 全在一个临界区里 ──────────────────────
+        // 「读老容器 → 摘节 → 回写」中间插进一次并发 `save` 的话，那一节会被
+        // 这一份整份写回覆盖掉（正是 `lock_writes` 存在的原因）。逐文件加锁
+        // 而不是整个函数一把：几千个文件逐个处理，锁的持有时间是一次的量级。
+        let _guard = lock_writes();
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        let relative = rel(&path);
+        let Some(file_date) = relative
+            .split('/')
+            .next_back()
+            .map(|name| name.trim_end_matches(".md").to_string())
+        else {
+            continue;
+        };
+        let (head, sections) = match container_sections(&text) {
+            Some(parts) => parts,
+            None => continue,
+        };
+        // 按节的 `created` 分组；同一天的全留在原处，不同日期的搬走。
+        //
+        // ── 三种「不搬」的情况 ──────────────────────────────────
+        // 1. 没有 marker / marker 里没有 `created`：不知道它属于哪天，猜就是
+        //    制造第二份错数据；
+        // 2. `id` 为空（用户手写段落 / 早期格式）：搬过去无法按 id 判重，
+        //    搬一半失败会造出重复段落；
+        // 3. 日期本来就等于文件名日期。
+        // 这三种一律原地不动 —— 迁移的收益是「让能归位的归位」，不是「一条都
+        // 不许留在原地」。
+        let mut keep: Vec<(String, String)> = Vec::new();
+        let mut relocate: std::collections::BTreeMap<String, Vec<(String, String)>> =
+            std::collections::BTreeMap::new();
+        for (id, body) in sections {
+            let created = body
+                .lines()
+                .next()
+                .and_then(parse_marker)
+                .and_then(|meta| meta.get("created").and_then(Value::as_i64));
+            match created {
+                Some(stamp) if !id.is_empty() && super::search::format_date(stamp) != file_date => {
+                    let day = super::search::format_date(stamp);
+                    relocate.entry(day).or_default().push((id, body));
+                }
+                _ => keep.push((id, body)),
+            }
+        }
+        if relocate.is_empty() {
+            continue;
+        }
+        files += 1;
+        // 目标容器 = 同目录下的 `<该日期>.md`（agent 目录不变，只换日期）。
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.clone());
+        for (day, items) in relocate {
+            let target = dir.join(format!("{day}.md"));
+            let existing = fs::read_to_string(&target).unwrap_or_default();
+            let mut out = if existing.trim().is_empty() {
+                // 目标还没有文件：沿用老容器的头（agent / project 一致），
+                // 但**日期必须换成目标那天的** —— frontmatter 里的 `date:` 是
+                // 人读这个文件时的第一行，写着 11-20 的文件摆在 09-21.md 里
+                // 只会让下一次排查再错一遍。
+                redate_head(&head, &day)
+            } else {
+                // 已经有文件：原样保留它的头与内容，只在末尾追加
+                let mut text = existing;
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                if !text.ends_with("\n\n") {
+                    text.push('\n');
+                }
+                text
+            };
+            let known: std::collections::HashSet<String> = container_sections(&out)
+                .map(|(_, sections)| sections.into_iter().map(|(id, _)| id).collect())
+                .unwrap_or_default();
+            let mut written: Vec<String> = Vec::new();
+            let mut pending: Vec<(String, String)> = Vec::new();
+            for (id, body) in items.iter() {
+                // 目标里已有同 id（之前搬过一次 / 本来就在）就不再写第二份。
+                // 它不算「搬走」（moved 不计），但源里那一节可以放心摘掉 ——
+                // 内容在目标里确实存在。
+                if known.contains(id) {
+                    continue;
+                }
+                out.push_str(body.trim_end());
+                out.push('\n');
+                out.push('\n');
+                written.push(id.clone());
+                pending.push((id.clone(), body.clone()));
+            }
+            if written.is_empty() {
+                // 全部已在目标里：目标不需要重写，源里那几节可以放心摘
+                continue;
+            }
+            match write_atomic(&target, &out) {
+                Ok(()) => moved += written.len(),
+                Err(error) => {
+                    // 写失败 → 这一天的节**留在老容器里**，下次再试。
+                    // 绝不「先摘后写」：那等于把记忆从磁盘上抹掉一次。
+                    //
+                    // 只退回 `pending`（本次真要写的那些），不退回 `items` 全部：
+                    // 已经存在于目标的那几节如果也留在源里，同一个 id 会同时存在
+                    // 于两个容器，`load_all` 读出来是两条、索引按 id 只留一条 ——
+                    // 检索能命中但列表会闪一次，属于自己造出来的脏数据。
+                    failed += 1;
+                    crate::server::logging::log(
+                        "[Memory]",
+                        &format!("⚠️ 拆分历史容器失败 {}：{error}", target.display()),
+                    );
+                    keep.extend(pending);
+                }
+            }
+        }
+        // 老容器只留 keep：上面的搬走节已确认落到目标，没落的已退回 keep。
+        let mut out = head.clone();
+        for (_, body) in &keep {
+            out.push_str(body.trim_end());
+            out.push('\n');
+            out.push('\n');
+        }
+        if keep.is_empty() {
+            // 一节点都没留下 → 删掉这个空壳容器（只剩头的文件没有意义，
+            // 而且它会一直作为「一天」出现在浏览页里）。
+            //
+            // ── 删之前必须留一份原始字节 ──────────────────────────
+            // 这是本模块唯一「没有任何东西可回退」的操作：源文件被删、内容是
+            // 从它里面搬出去的。搬错一次（比如某节的 `created` 本身是脏的）
+            // 就再也拼不回原样。所以先按 `storage.backupBeforeWrite` 的口径
+            // 拷一份 `<文件名>.md.bak`：`.bak` 不是 `.md`，不会被 `load_all`
+            // 读成记忆，也不会进同步包。
+            if super::config::bool_of("storage.backupBeforeWrite") {
+                backup(&path);
+            }
+            if let Err(error) = fs::remove_file(&path) {
+                failed += 1;
+                crate::server::logging::log(
+                    "[Memory]",
+                    &format!("⚠️ 删除已清空的历史容器失败 {}：{error}", path.display()),
+                );
+            }
+        } else if out.trim_end() != text.trim_end() {
+            // 没变化就不重写：避免给每个正常容器都刷一次 .bak、动一次 mtime
+            if let Err(error) = write_atomic(&path, &out) {
+                failed += 1;
+                crate::server::logging::log(
+                    "[Memory]",
+                    &format!("⚠️ 回写历史容器失败 {}：{error}", path.display()),
+                );
+            }
+        }
+    }
+    (moved, files, failed)
+}
+
+/// 一次修复只做一次：跑完把标记落盘，下次启动不再扫全量。
+///
+/// ── 为什么需要标记 ──────────────────────────────────────────
+/// [`split_misplaced_containers`] 要遍历并解析全部 l1 容器。正常用户的容器
+/// 数量是几十到几百，扫一遍是毫秒级；但「全部正常」也要走一遍目录树 —— 放在
+/// 每次启动的索引自检里，等于每次启动都多付一份全量解析的成本，换来的收益
+/// 是 0。
+///
+/// 标记落盘 = 「这套数据已经修过了」。写在 `migrations.json`（与记忆根同级），
+/// 不放 `general/` 之类的同步目录：这是**本机数据状态**，不是记忆内容，
+/// 跟着同步包走会让另一台机器误以为自己已经修过。
+///
+/// ── 什么时候会重跑 ──────────────────────────────────────────
+/// - 修复过程中有写失败（`failed > 0`）：不落标记，下次启动重试；
+/// - 用户手动点「重建索引」：`rebuild()` 无条件再拆一次（幂等，代价可接受），
+///   用来兜「有人把旧备份文件又拷回来了」这种外力改动。
+pub fn split_misplaced_once() -> Option<(usize, usize, usize)> {
+    let marker = migrations_file();
+    let done = |text: &str| {
+        serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|value| value.get(MIGRATION_SPLIT).and_then(Value::as_bool))
+            .unwrap_or(false)
+    };
+    if let Ok(text) = fs::read_to_string(&marker) {
+        if done(&text) {
+            return None;
+        }
+    }
+    let result = split_misplaced_containers();
+    // 有写失败就不落标记：说明还有节没归位，下次启动要再试一遍。
+    // 落标记的语义是「这套数据已经修完了」，不是「我试过了」。
+    if result.2 == 0 {
+        let mut payload = fs::read_to_string(&marker)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        if let Some(map) = payload.as_object_mut() {
+            map.insert(MIGRATION_SPLIT.to_string(), json!(true));
+        }
+        let _ = write_atomic(&marker, &payload.to_string());
+    }
+    Some(result)
+}
+
+/// 迁移标记里「容器归位」这一项的键名。改语义就换名字，别改值 —— 换名字等于
+/// 让所有存量机器重跑一次，改值等于悄悄跳过。
+const MIGRATION_SPLIT: &str = "splitMisplacedContainers";
+
+/// 本机一次性修复的完成标记（不同步、不进索引）。
+pub fn migrations_file() -> PathBuf {
+    root().join("migrations.json")
+}
+
+/// 递归收集「一天一文件」的容器路径（只认形状，不看内容）。
+fn collect_containers(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(reader) = fs::read_dir(dir) else { return };
+    let mut items: Vec<PathBuf> = reader.flatten().map(|item| item.path()).collect();
+    items.sort();
+    for path in items {
+        if path.is_dir() {
+            collect_containers(&path, out);
+            continue;
+        }
+        if looks_like_daily_container_path(&path) {
+            out.push(path);
+        }
+    }
+}
+
+/// 把容器头的 `date:` 换成指定日期，其余行原样保留。
+///
+/// 不重新生成整块头：老容器头里可能有用户手写的说明（`container_head` 只写
+/// 五行的那种是新建时的样子，改过的不一定还长那样）。逐行替换一行是最小的
+/// 改动面。
+fn redate_head(head: &str, date: &str) -> String {
+    let mut out = String::with_capacity(head.len());
+    for line in head.lines() {
+        if line.starts_with("date:") {
+            out.push_str(&format!("date: {date}\n"));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
     out
 }
 
@@ -1671,6 +1986,257 @@ mod tests {
                     .collect();
                 assert_eq!(sections, vec!["stays".to_string()], "留下的应当只有 stays：{sections:?}");
                 assert!(entry_path(&moving, false).is_file(), "新位置应当写出来了");
+            },
+        );
+    }
+
+    // ── 以下四组：l1 容器「落错日期 + 被体积上限跳过」那条 bug 链的回归 ──
+    //
+    // 事故现场：用户历史导入 2341 条 → 页面「普通记忆 0 条 / 深层记忆 9 条」。
+    // 根因是两个 bug 串成一条链，任修一个都不够：
+    //   1. `entry_path` 用 `created_at.max(updated_at)` 算日期 → 全部落进「今天」；
+    //   2. `read_dir_entries` 拿「单文件上限」判容器 → 几十 MB 的容器整份跳过。
+    // 下面每条测试都对应链条上的一环，并且都**能反证旧实现**：
+    // 把对应那一行改回去，这条测试就红。
+
+    /// 时间常量：只用来定日期，不参与「现在几点」的判断。
+    /// 2026-09-20T00:00Z / 2026-09-21T12:00Z / 2026-11-20T09:00Z（UTC）。
+    const DAY_0920: i64 = 1_789_862_400_000;
+    const DAY_0921: i64 = 1_789_992_000_000;
+    const DAY_1120: i64 = 1_795_165_200_000;
+
+    /// 回归 1：容器日期跟 `created_at` 走，不跟 `updated_at` 走。
+    ///
+    /// 旧实现 `created_at.max(updated_at)` 必然取 `updated_at`（它恒 ≥
+    /// `created_at`），于是「补录九月」这件事永远落进「今天」。这条测试把
+    /// `updated_at` 设成 11-20、`created_at` 设成 09-20，断言落点是 09-20。
+    #[test]
+    fn container_date_follows_created_at_not_updated_at() {
+        let mut entry = MemoryEntry::draft("h1", "补录的一条", MemoryKind::Daily, "九月那天的正文");
+        entry.agent = Some("import".into());
+        entry.created_at = DAY_0920;
+        entry.updated_at = DAY_1120; // 导入时刻
+        let path = rel(&entry_path(&entry, false));
+        assert_eq!(
+            path, "general/l1/import/2026-09-20.md",
+            "历史条目的容器必须按原始发生日期，实际 {path}"
+        );
+    }
+
+    /// 回归 2：`created_at` 缺失（0）时才退回 `updated_at`。
+    ///
+    /// 迁移过来的老数据可能没有 `created`。这时用 `updated_at` 是「唯一能拿到的
+    /// 时间」，而不是「优先取更新的那个」—— 两者差别在于：前者只在缺值兜底，
+    /// 后者会把所有历史条目都改成今天。
+    #[test]
+    fn container_date_falls_back_to_updated_at_only_when_created_is_missing() {
+        let mut entry = MemoryEntry::draft("h2", "没写 created", MemoryKind::Daily, "正文");
+        entry.agent = Some("import".into());
+        entry.created_at = 0;
+        entry.updated_at = DAY_0921;
+        let path = rel(&entry_path(&entry, false));
+        assert_eq!(path, "general/l1/import/2026-09-21.md", "实际 {path}");
+    }
+
+    /// 回归 3：超大 l1 容器必须照样读出来。
+    ///
+    /// 旧实现先按 `storage.maxFileSizeKB`（默认 512KB）判体积、再判形状，于是
+    /// 一个 55MB 的当天容器被整份跳过 —— 里面每一节都没超限，整份文件超了。
+    /// 页面因此显示「普通记忆 0 条」，而磁盘上文件好好地躺着。
+    ///
+    /// 这条测试真的造一个超限容器（把上限设成 16KB，写 40KB 正文），断言
+    /// `load_all()` 读得到。断言条数而不只是「不 panic」：被跳过时是 0 条。
+    #[test]
+    fn oversized_daily_container_is_still_read() {
+        crate::test_support::isolated(
+            concat!(module_path!(), "::oversized_daily_container_is_still_read"),
+            || {
+                // 把上限压到 16KB，用 40KB 的容器去撞它。不压这个值就要写 512KB+
+                // 的测试数据，既慢又占磁盘；压配置验的是同一个判据。
+                crate::server::core::memory::config::patch(&json!({ "storage.maxFileSizeKB": 16 }))
+                    .expect("配置可写");
+
+                let body = "长".repeat(20_000); // UTF-8 下约 60KB
+                let mut entry = MemoryEntry::draft("big1", "大容器里的一条", MemoryKind::Daily, body);
+                entry.agent = Some("bulk".into());
+                entry.created_at = DAY_0920;
+                entry.updated_at = DAY_0920;
+                save(&entry).expect("写入应当成功");
+
+                let path = entry_path(&entry, false);
+                let size = fs::metadata(&path).expect("容器文件应当存在").len();
+                assert!(
+                    size > 16 * 1024,
+                    "前置条件：容器应当超过上限（实际 {size} 字节）"
+                );
+
+                let loaded = load_all();
+                let hit = loaded.iter().find(|item| item.id == "big1");
+                assert!(
+                    hit.is_some(),
+                    "超过单文件上限的 l1 容器被整份跳过了 —— 容器体积是「一天所有记忆」\
+                     的体积，不是单条记忆的体积，不能用单文件上限判"
+                );
+                assert_eq!(hit.map(|item| item.layer), Some(Layer::L1));
+            },
+        );
+    }
+
+    /// 回归 4：非容器的单条 `.md` 仍然受单文件上限保护。
+    ///
+    /// 修 bug 3 时最容易犯的错是「把上限整个删掉」—— 那会让用户手扔进来的
+    /// 一百兆导出文件每次都进 `load_all()`，检索页直接卡死。上限本身是对的，
+    /// 错的是把它套在容器上。
+    #[test]
+    fn oversized_plain_note_is_still_skipped() {
+        crate::test_support::isolated(
+            concat!(module_path!(), "::oversized_plain_note_is_still_skipped"),
+            || {
+                crate::server::core::memory::config::patch(&json!({ "storage.maxFileSizeKB": 16 }))
+                    .expect("配置可写");
+                ensure_layout().expect("目录可建");
+                // l2 的单条文件：形状不是容器（文件名不是日期），应当被上限挡住
+                let target = root().join("general/l2/knowledge/huge.md");
+                let text = format!(
+                    "---\nid: huge\ntitle: 巨型单条\nkind: knowledge\nlayer: l2\ncreated: {DAY_1120}\n---\n\n{}\n",
+                    "长".repeat(20_000)
+                );
+                write_atomic(&target, &text).expect("写入应当成功");
+
+                let loaded = load_all();
+                assert!(
+                    !loaded.iter().any(|item| item.id == "huge"),
+                    "非容器的巨型单条应当仍然被单文件上限跳过（否则一次检索要读上百兆）"
+                );
+            },
+        );
+    }
+
+    /// 回归 5：落错日期的节能被拆回各自日期，且**拆分是幂等的**。
+    ///
+    /// 造一个「09-20 的容器里塞了 09-20 / 09-21 / 11-20 三条」的现场 ——
+    /// 正是历史导入造成的形状 —— 然后跑一次拆分：应当只有 1 条（09-20 那条）
+    /// 留在原处，另两条各自归位。再跑一次必须什么都不动（幂等），否则每次
+    /// 启动都会把同一批节搬来搬去。
+    #[test]
+    fn split_moves_sections_to_their_own_days_and_is_idempotent() {
+        crate::test_support::isolated(
+            concat!(module_path!(), "::split_moves_sections_to_their_own_days_and_is_idempotent"),
+            || {
+                ensure_layout().expect("目录可建");
+                let dir = general_root().join("l1/import");
+                fs::create_dir_all(&dir).expect("目录可建");
+                let source = dir.join("2026-09-20.md");
+
+                // 三条不同日期的节全写进 09-20 的容器（模拟落错日期的存量）
+                let mut text = container_head("2026-09-20", "import", None);
+                for (id, stamp, body) in [
+                    ("k0920", DAY_0920, "九月二十日那条"),
+                    ("k0921", DAY_0921, "九月二十一日那条"),
+                    ("k1120", DAY_1120, "十一月二十日那条"),
+                ] {
+                    let mut entry = MemoryEntry::draft(id, "标题", MemoryKind::Daily, body);
+                    entry.created_at = stamp;
+                    entry.updated_at = DAY_1120; // 都是「导入时刻」
+                    text.push_str(&section_text(&entry));
+                }
+                write_atomic(&source, &text).expect("写入应当成功");
+
+                let (moved, files, failed) = split_misplaced_containers();
+                assert_eq!(failed, 0, "拆分不应有写失败");
+                assert_eq!(moved, 2, "应当搬走 2 条（09-21 与 11-20）");
+                assert_eq!(files, 1, "涉及 1 个容器");
+
+                let read = |name: &str| fs::read_to_string(dir.join(name)).unwrap_or_default();
+                let day20 = read("2026-09-20.md");
+                assert!(day20.contains("九月二十日那条"), "留在原处的那条不该丢");
+                assert!(!day20.contains("九月二十一日那条"), "落错日期的节应当已摘走");
+                assert!(read("2026-09-21.md").contains("九月二十一日那条"));
+                assert!(read("2026-11-20.md").contains("十一月二十日那条"));
+
+                // 目标容器的头必须是**它自己那天**：写着 09-20 的文件摆在
+                // 11-20.md 里，下一次排查会再被误导一遍
+                assert!(
+                    read("2026-11-20.md").contains("date: 2026-11-20"),
+                    "搬过去的容器头日期没改：{}",
+                    read("2026-11-20.md")
+                );
+
+                // 幂等：再跑一次不能动任何东西
+                let (again_moved, again_files, again_failed) = split_misplaced_containers();
+                assert_eq!(
+                    (again_moved, again_files, again_failed),
+                    (0, 0, 0),
+                    "拆分必须幂等：第二次不应搬动任何节"
+                );
+                assert_eq!(read("2026-09-21.md").matches("九月二十一日那条").count(), 1);
+            },
+        );
+    }
+
+    /// 回归 6：目标写不进去时，**源里的节必须留下**。
+    ///
+    /// 这是本函数唯一会造成数据丢失的路径。早期写法是「先打算搬 → 回写源摘掉
+    /// 那几节 → 再写目标」，写失败就变成「记忆从磁盘上消失」，而且因为源文件
+    /// 里本来就错，用户连「少了一条」都发现不了。
+    ///
+    /// 用「目标位置被一个目录占住」制造写失败：`write_atomic` 会失败，而
+    /// `fs::read_to_string` 读目录也会失败 → 目标侧看起来「不存在」。
+    #[test]
+    fn split_keeps_sections_when_the_target_cannot_be_written() {
+        crate::test_support::isolated(
+            concat!(module_path!(), "::split_keeps_sections_when_the_target_cannot_be_written"),
+            || {
+                ensure_layout().expect("目录可建");
+                let dir = general_root().join("l1/import");
+                fs::create_dir_all(&dir).expect("目录可建");
+                let source = dir.join("2026-09-20.md");
+                let mut text = container_head("2026-09-20", "import", None);
+                let mut entry = MemoryEntry::draft("stay", "必须留下", MemoryKind::Daily, "不能丢的正文");
+                entry.created_at = DAY_0921;
+                entry.updated_at = DAY_1120;
+                text.push_str(&section_text(&entry));
+                write_atomic(&source, &text).expect("写入应当成功");
+
+                // 用目录占住目标路径 → rename 到它必然失败
+                fs::create_dir_all(dir.join("2026-09-21.md")).expect("占位目录可建");
+
+                let (_, _, failed) = split_misplaced_containers();
+                assert!(failed > 0, "目标不可写时应当报失败");
+
+                let kept = fs::read_to_string(&source).expect("源容器应当还在");
+                assert!(
+                    kept.contains("不能丢的正文"),
+                    "目标写失败却把源里的节摘掉了 —— 这条记忆就此从磁盘上消失"
+                );
+            },
+        );
+    }
+
+    /// 回归 7：一次修复只落一次标记，第二次启动不再扫全量。
+    ///
+    /// `split_misplaced_once` 的语义是「这套数据已经修完了」。没有标记的话，
+    /// 每次启动都要遍历并解析全部 l1 容器 —— 正常用户没坏数据，收益是 0。
+    /// 但写失败时**不能**落标记：那说明还有节没归位。
+    #[test]
+    fn split_once_marks_done_and_does_not_rescan() {
+        crate::test_support::isolated(
+            concat!(module_path!(), "::split_once_marks_done_and_does_not_rescan"),
+            || {
+                ensure_layout().expect("目录可建");
+                let first = split_misplaced_once();
+                assert!(first.is_some(), "第一次应当执行（并落标记）");
+                let marker = migrations_file();
+                assert!(marker.is_file(), "标记文件应当落盘");
+                let text = fs::read_to_string(&marker).expect("标记可读");
+                assert!(text.contains(MIGRATION_SPLIT), "标记内容不对：{text}");
+
+                let second = split_misplaced_once();
+                assert!(second.is_none(), "标记已落，第二次不应再扫全量");
+
+                // 标记文件坏了 / 被删了 → 应当重新跑一次（宁可多扫，不可漏修）
+                let _ = fs::remove_file(&marker);
+                assert!(split_misplaced_once().is_some(), "标记丢失后应当重跑");
             },
         );
     }

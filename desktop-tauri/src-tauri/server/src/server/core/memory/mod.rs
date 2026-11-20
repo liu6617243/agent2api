@@ -255,23 +255,63 @@ pub fn bump_revision() {
     REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// 进程内只做一次「事实源 vs 索引」的一致性检查：条数或最新更新时间对不上
-/// 就整表重建。索引是派生的，重建永远安全。
+/// 进程内只做一次「事实源 vs 索引」的一致性检查：条数对不上就整表重建。
+/// 索引是派生的，重建永远安全。
 ///
 /// 为什么不做文件监听：写入都经过本模块（写文件的同时更新索引），外力改动
 /// （用户手编 .md）只需要「下次启动 / 下次点重建」生效，这比一个跨平台的
 /// 文件监听器简单得多，也不会在编辑器保存的瞬间读到半个文件。
+///
+/// ── 启动时先跑一次「容器归位」迁移 ──────────────────────────
+/// 老版本 `entry_path` 按 `created_at.max(updated_at)` 算 l1 容器日期，历史
+/// 导入于是把几十个日期的几千条全写进「今天」那个文件；文件涨到几十 MB 后
+/// 再被单文件上限整份跳过，表现成「导入了 2341 条，普通记忆 0 条」。
+///
+/// 计算逻辑已改成按 `created_at`，但**已经写错的文件不会自己变对**：光让
+/// `read_dir_entries` 读得进超大容器，只能让「条数」恢复，那些记忆的日期
+/// 仍然是错的（热力图把所有历史都记在今天、按日期检索也全落在今天）。
+/// 所以启动自检里补一次拆分。`split_misplaced_once` 自带完成标记，正常机器
+/// 只在升级后的第一次启动付一次全量解析的代价，之后直接返回。
 fn ensure_index_once() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
+        // 拆分会改 `entry.path`（同一节从老容器搬到新容器）。只按条数判要不要
+        // 重建会漏掉这种情况：拆完总数没变（1780 条还是 1780 条），索引里
+        // 的 path 却全指向已经不存在的文件 —— 点开一条记忆会报「正文读不到」，
+        // 而条数上看一切正常。所以拆分真的搬了东西就必须重建。
+        let mut must_rebuild = false;
+        if let Some((moved, files, failed)) = store::split_misplaced_once() {
+            if moved > 0 || failed > 0 {
+                must_rebuild = moved > 0;
+                crate::server::logging::log(
+                    "[Memory]",
+                    &format!(
+                        "l1 容器归位：{moved} 条搬回各自日期（{files} 个文件）{}",
+                        if failed > 0 {
+                            format!("，{failed} 处写失败待下次启动重试")
+                        } else {
+                            String::new()
+                        }
+                    ),
+                );
+            }
+        }
         let entries = store::load_all();
         let index = index::global();
-        let live = entries.iter().filter(|entry| entry.is_live()).count();
-        if index.count() != live {
+        // ── 比的是「索引行数 vs 事实源总条数」 ──────────────────
+        // 索引留着回收站与已取代的行（浏览页的回收站视图就读这些行），拿 `live`
+        // 去比，只要有回收站条目就永远对不上 —— 每次启动都全量重建一遍，
+        // 而重建写入的仍是同一批行，下次启动继续对不上。这是一个自我维持的
+        // 无效重建循环，与 `status()` 里 `inSync` 的口径必须完全一致。
+        if must_rebuild || index.count() != entries.len() {
             match index.rebuild(&entries) {
                 Ok(count) => crate::server::logging::log(
                     "[Memory]",
-                    &format!("记忆索引已重建：{count} 条（事实源 {live} 条有效）"),
+                    &format!(
+                        "记忆索引已重建：{count} 条（事实源 {} 条，其中有效 {} 条）",
+                        entries.len(),
+                        entries.iter().filter(|entry| entry.is_live()).count()
+                    ),
                 ),
                 Err(error) => crate::server::logging::log(
                     "[Memory]",
@@ -311,9 +351,40 @@ fn relink(entries: &[MemoryEntry]) {
     }
 }
 
-/// 全量重建（「重建索引」按钮 / 索引损坏时）
+/// 全量重建（「重建索引」按钮 / 索引损坏 / 同步落盘后）
+///
+/// ── 重建之前先修「容器落错日期」的存量数据 ────────────────────
+/// `entry_path` 早期按 `created_at.max(updated_at)` 算落点（等于永远取
+/// `updated_at`），于是历史导入把几十个不同日期的几千条全写进「今天」那一个
+/// 容器，文件涨到几十 MB 后被单文件上限整份跳过 —— 表现是「导入了 2341 条，
+/// 普通记忆 0 条」。
+///
+/// 计算逻辑已经改成按 `created_at`，但**已经写错的文件不会自己变对**：
+/// `entry.path` 还指着老容器，重建索引只会从老容器里再读一遍错的日期。
+/// 所以重建前先拆一次。
+///
+/// ── 这里为什么用无标记版（每次都拆）────────────────────────
+/// 启动自检走 [`store::split_misplaced_once`]，跑过就记标记。但「重建索引」
+/// 是用户/同步流程主动发起的显式动作，可能发生在别处把旧备份文件拷回来之后
+/// （同步落盘、用户从另一台机器捞文件）。那些文件不会更新迁移标记，标记为
+/// 真的机器就永远不修它们。所以显式重建一律重新扫 —— 拆分本身幂等，
+/// 没有落错日期的节时只是遍历一遍目录，代价在几十毫秒量级。
 pub fn rebuild() -> Result<usize, String> {
     store::ensure_layout()?;
+    let (moved, files, failed) = store::split_misplaced_containers();
+    if moved > 0 || failed > 0 {
+        crate::server::logging::log(
+            "[Memory]",
+            &format!(
+                "已拆分落错日期的 l1 容器：{moved} 条搬回各自日期（涉及 {files} 个文件）{}",
+                if failed > 0 {
+                    format!("，{failed} 处写失败（相关节仍留在原处，下次重建会重试）")
+                } else {
+                    String::new()
+                }
+            ),
+        );
+    }
     let entries = store::load_all();
     let count = index::global().rebuild(&entries)?;
     relink(&entries);
