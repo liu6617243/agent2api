@@ -186,6 +186,25 @@ fn overlay_remove(path: &Path) {
     }
 }
 
+/// 当前是否有线程打开了延迟落盘窗口。
+///
+/// ── 为什么需要一个全局计数 ──────────────────────────────────
+/// 窗口状态本身是 thread_local（每个线程管自己攒的那批），但「此刻有人正攒着
+/// 某个容器的旧快照」这件事必须能被**别的线程**看到：批量导入正在攒
+/// `2026-11-20.md` 的最终文本时，如果另一个线程去跑「容器归位」把几千节搬走并
+/// 回写老容器，导入批末那一写会把**搬走之前的整份文本**盖回去 —— 结果是同一
+/// 批节同时存在于两个容器（老容器复活一份、新容器一份），`load_all` 读出两份、
+/// 索引按 id 只留一份，删一条时另一半还在。
+///
+/// 这个竞态无法靠 `lock_writes` 解：窗口内根本不持锁（就是为了避免批内每次写
+/// 都抢锁）。只能在「拆容器」这一侧退让：有人在攒批，就先不拆。
+static DEFERRED_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 是否有线程正在延迟落盘窗口内（见 [`begin_deferred`]）。
+pub fn deferred_active() -> bool {
+    DEFERRED_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
 /// 打开一段延迟落盘窗口。**不可嵌套**，且必须与 [`end_deferred`] 成对。
 ///
 /// 只给批量导入这类「同线程连续写同一个容器」的场景用；普通单条写入不要碰它。
@@ -195,6 +214,7 @@ pub fn begin_deferred() {
         overlay.active = true;
         overlay.files.clear();
     });
+    DEFERRED_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// 关闭延迟落盘窗口，把攒下的容器文本统一写盘。返回写失败的文件（路径 + 原因）。
@@ -208,6 +228,9 @@ pub fn end_deferred() -> Vec<String> {
         overlay.active = false;
         std::mem::take(&mut overlay.files)
     });
+    // 计数必须在取到 files 之后、写盘之前就减掉：写盘失败也要减，否则一次失败
+    // 会让「容器归位」永久以为有人在攒批，迁移再也不会跑。
+    DEFERRED_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     if files.is_empty() {
         return Vec::new();
     }
@@ -1189,6 +1212,18 @@ pub fn split_misplaced_containers() -> (usize, usize, usize) {
     let mut moved = 0usize;
     let mut files = 0usize;
     let mut failed = 0usize;
+    // ── 有人在攒批就先不拆 ────────────────────────────────────
+    // 批量导入用延迟窗口在内存里攒「某个容器的最终文本」，批末整份写回。这时把
+    // 那几节搬走、老容器摘空，批末那一写会把搬走之前的整份文本盖回去 ——
+    // 同一批节于是同时存在于两个容器。这个竞态不能靠 `lock_writes` 解（窗口内
+    // 根本不持锁），只能在这一侧退让。跳过不算失败：下次启动 / 下次重建会再来。
+    if deferred_active() {
+        crate::server::logging::log(
+            "[Memory]",
+            "⏸️ 有批量写入正在攒批，跳过 l1 容器归位（下次启动或重建索引时再试）",
+        );
+        return (0, 0, 0);
+    }
     let mut containers: Vec<PathBuf> = Vec::new();
     collect_containers(&general_root(), &mut containers);
     collect_containers(&projects_root(), &mut containers);
@@ -1363,6 +1398,11 @@ pub fn split_misplaced_containers() -> (usize, usize, usize) {
 /// - 用户手动点「重建索引」：`rebuild()` 无条件再拆一次（幂等，代价可接受），
 ///   用来兜「有人把旧备份文件又拷回来了」这种外力改动。
 pub fn split_misplaced_once() -> Option<(usize, usize, usize)> {
+    // 有批量写入正在攒批：什么都不做，**也不落标记** —— 这次根本没修，落了标记
+    // 就等于把「还没修」记成「修过了」。返回 None 让调用方当成「没跑」。
+    if deferred_active() {
+        return None;
+    }
     let marker = migrations_file();
     let done = |text: &str| {
         serde_json::from_str::<Value>(text)
@@ -2237,6 +2277,52 @@ mod tests {
                 // 标记文件坏了 / 被删了 → 应当重新跑一次（宁可多扫，不可漏修）
                 let _ = fs::remove_file(&marker);
                 assert!(split_misplaced_once().is_some(), "标记丢失后应当重跑");
+            },
+        );
+    }
+
+    /// 回归 8：有人正在攒批时，拆分必须退让，且**不能落完成标记**。
+    ///
+    /// 批量导入用延迟窗口在内存里攒「某个容器的最终文本」、批末整份写回。这时
+    /// 把节搬走并清空老容器，批末那一写会把搬走之前的整份文本盖回去 —— 同一批
+    /// 节同时存在于两个容器（老容器复活一份、新容器一份）。这个竞态不能靠
+    /// `lock_writes` 解，因为窗口内根本不持锁。
+    ///
+    /// 「不落标记」这一半同样重要：这次根本没修，落了标记等于把「还没修」记成
+    /// 「修过了」，用户重启一百次也不会再试。
+    #[test]
+    fn split_backs_off_while_deferred_window_is_open() {
+        crate::test_support::isolated(
+            concat!(module_path!(), "::split_backs_off_while_deferred_window_is_open"),
+            || {
+                ensure_layout().expect("目录可建");
+                let dir = general_root().join("l1/import");
+                fs::create_dir_all(&dir).expect("目录可建");
+                let source = dir.join("2026-09-20.md");
+                let mut text = container_head("2026-09-20", "import", None);
+                let mut entry = MemoryEntry::draft("later", "晚点再搬", MemoryKind::Daily, "正文");
+                entry.created_at = DAY_0921;
+                entry.updated_at = DAY_1120;
+                text.push_str(&section_text(&entry));
+                write_atomic(&source, &text).expect("写入应当成功");
+
+                // 模拟「导入正在攒批」
+                begin_deferred();
+                assert!(deferred_active(), "前置条件：窗口应当开着");
+                assert!(
+                    split_misplaced_once().is_none(),
+                    "有人在攒批时不该跑迁移，也不该返回「已执行」"
+                );
+                assert!(!migrations_file().is_file(), "没修就不能落完成标记");
+                let untouched = fs::read_to_string(&source).expect("源容器应当还在");
+                assert!(untouched.contains("晚点再搬"), "攒批期间不该动容器");
+                assert!(!dir.join("2026-09-21.md").is_file(), "攒批期间不该写目标");
+                end_deferred();
+
+                // 窗口关了 → 正常搬
+                let (moved, _, failed) = split_misplaced_containers();
+                assert_eq!((moved, failed), (1, 0), "窗口关闭后应当正常归位");
+                assert!(dir.join("2026-09-21.md").is_file());
             },
         );
     }
