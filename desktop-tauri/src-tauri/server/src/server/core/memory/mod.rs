@@ -1128,7 +1128,7 @@ pub fn status_with(with_tables: bool) -> Value {
         .count();
     let l1 = entries.iter().filter(|entry| entry.is_live() && entry.layer == Layer::L1).count();
     let l2 = entries.iter().filter(|entry| entry.is_live() && entry.layer == Layer::L2).count();
-    let index_count = index::global().count();
+    let index_count = index::global().try_count();
     // 「今日新增 / 昨日」按**本地自然日**切：用户看的「今天」是他自己的今天，
     // 按 UTC 切会让东八区早上 8 点前的写入落到前一天（热力图那条注释踩过同一个坑）。
     // 只数 live 条目 —— 已删除的不算「新增」，否则删一条会让数字倒扣。
@@ -1151,14 +1151,24 @@ pub fn status_with(with_tables: bool) -> Value {
         "agents": agents::connectivity(),
         "projects": project_count(&entries),
         "review": {
-            "pending": index::global().review_count(),
+            // `try_` 版本：索引正忙时给 `null` 而不是排队。前端按「未知」渲染
+            // （徽章不出现），页面不会因为这一格挂住。
+            "pending": index::global().try_review_count(),
             "warnThreshold": config::usize_of("dedup.pendingWarnThreshold"),
         },
         // 「索引一致」比的是**索引行数 vs 事实源总条数**，不是 vs live。
         // 索引要留着回收站与已取代的行（浏览页的回收站视图就读这些行），
         // 拿 `live` 去比，等于只要有回收站条目就永远报「不一致」—— 而
         // `rebuild` 会把它们原样写回去，用户点十次重建也消不掉这条提示。
-        "index": { "count": index_count, "fts": index::global().fts_enabled(), "inSync": index_count == entries.len() },
+        //
+        // `count` / `inSync` 可能是 `null`：索引被重建或打开时压缩独占着连接。
+        // 那是「暂时读不到」，不是「不一致」—— 前端必须区分这两种，否则会拿
+        // 一个假的 0 去和总条数比，凭空报一条一致性警告。
+        "index": {
+            "count": index_count,
+            "fts": index::global().fts_enabled(),
+            "inSync": index_count.map(|count| count == entries.len()),
+        },
         "config": config(),
         // 内容版本号：每次写入 +1。排障时用来判断「Agent 看到的是不是最新」。
         "revision": revision(),
@@ -2419,14 +2429,18 @@ pub fn health(limit: usize) -> Value {
     }
     let pending = index::global().review_count();
     let warn = config::usize_of("dedup.pendingWarnThreshold");
+    // 只取一次 `count()`：每次都要抢那条全局连接，取两遍等于把等待时间翻倍
+    // （索引正在重建时它就是几十秒）。这一条走阻塞版是故意的 —— 健康检查问的
+    // 就是「索引现在能不能读」，读不到时宁可让这张卡片报错，也不要给个假数字。
+    let index_count = index::global().count();
     json!({
         "stale": stale,
         "staleCount": stale.len(),
         "review": { "pending": pending, "warnThreshold": warn, "backlogged": pending >= warn },
         "index": {
-            "count": index::global().count(),
+            "count": index_count,
             // 与 `status()` 同一口径：索引留回收站/已取代的行，所以比的是总条数。
-            "inSync": index::global().count() == entries.len(),
+            "inSync": index_count == entries.len(),
             "fts": index::global().fts_enabled(),
         },
         "note": if stale.is_empty() {

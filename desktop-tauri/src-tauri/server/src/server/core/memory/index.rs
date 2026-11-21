@@ -535,10 +535,23 @@ impl MemoryIndex {
 
     /// 库里现有条目数（状态自检用）
     pub fn count(&self) -> usize {
-        let Ok(conn) = self.conn.lock() else { return 0 };
-        conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get::<_, i64>(0))
-            .map(|value| value as usize)
-            .unwrap_or(0)
+        self.try_count().unwrap_or(0)
+    }
+
+    /// 同 [`count`]，但**不排队**：拿不到锁就返回 `None`。
+    ///
+    /// ── 为什么首屏必须用这一版 ──────────────────────────────────
+    /// 全局只有一条连接（`Mutex<Connection>`）。`rebuild()` 与打开时的 `VACUUM`
+    /// 都会独占它几十秒，`lock()` 会让所有读请求排在那条队列后面 —— 那正是
+    /// 「记忆中枢整页打不开、一直等到 60 秒超时」的形状（2026-11-21 实测
+    /// `index.db` 3.0 GB / 94.5% 是空闲页，打开就要压一遍）。
+    /// 首屏宁可少一个数字（页面显示「整理中」），也不能让整页挂住。
+    pub fn try_count(&self) -> Option<usize> {
+        let conn = self.conn.try_lock().ok()?;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .ok()?;
+        Some(count as usize)
     }
 
     /// 把 WAL 收回去（只截断，不做 `VACUUM`）。
@@ -1153,14 +1166,20 @@ impl MemoryIndex {
     }
 
     pub fn review_count(&self) -> usize {
-        let Ok(conn) = self.conn.lock() else { return 0 };
-        conn.query_row(
-            "SELECT COUNT(*) FROM review_queue WHERE status = 'pending'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|value| value as usize)
-        .unwrap_or(0)
+        self.try_review_count().unwrap_or(0)
+    }
+
+    /// 同 [`review_count`]，不排队（首屏自检用，理由见 [`try_count`]）。
+    pub fn try_review_count(&self) -> Option<usize> {
+        let conn = self.conn.try_lock().ok()?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM review_queue WHERE status = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .ok()?;
+        Some(count as usize)
     }
 
     /// 裁决：`approved` / `rejected` / `expired`。返回受影响行数。
@@ -1252,14 +1271,18 @@ impl MemoryIndex {
     }
 
     pub fn beats(&self) -> Vec<Value> {
-        let Ok(conn) = self.conn.lock() else { return Vec::new() };
-        let mut statement = match conn.prepare(
-            "SELECT agent, last_seen, calls, last_tool, version, ok, writes, reads, errors
+        self.try_beats().unwrap_or_default()
+    }
+
+    /// 同 [`beats`]，不排队（首屏自检用，理由见 [`try_count`]）。
+    pub fn try_beats(&self) -> Option<Vec<Value>> {
+        let conn = self.conn.try_lock().ok()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT agent, last_seen, calls, last_tool, version, ok, writes, reads, errors
                FROM agent_beat ORDER BY last_seen DESC",
-        ) {
-            Ok(statement) => statement,
-            Err(_) => return Vec::new(),
-        };
+            )
+            .ok()?;
         let now = crate::server::logging::now_ms();
         statement
             .query_map([], |row| {
@@ -1281,7 +1304,7 @@ impl MemoryIndex {
             })
             // 这里返回 Value 数组而不是切片：调用方直接塞进 JSON 响应
             .map(|rows| rows.flatten().collect())
-            .unwrap_or_default()
+            .ok()
     }
 
     // ── 同步游标 ─────────────────────────────────────────────

@@ -268,7 +268,13 @@ function Dashboard({ status, onGo, onChanged }: DashboardProps): React.ReactElem
             <span>{t('记忆根')}</span>
             <code>{status.root}</code>
             <span>{t('索引')}</span>
-            <code>{status.index.count} {t('条')} · {status.index.fts ? 'FTS5' : t('内存匹配')}</code>
+            {/* `count` 为 null = 索引正在整理（重建/压缩独占着连接），后端特意
+                不排队直接给 null。写成 0 会被读成「索引空了」，所以显式说「整理中」。 */}
+            <code>
+              {status.index.count == null ? t('索引整理中') : t('{n} 条', { n: status.index.count })}
+              {' · '}
+              {status.index.fts ? 'FTS5' : t('内存匹配')}
+            </code>
           </div>
           <div className='mm-inline-actions'>
             <Button type='button' size='sm' variant='ghost' onClick={() => onGo('sync')}>{t('同步设置')}</Button>

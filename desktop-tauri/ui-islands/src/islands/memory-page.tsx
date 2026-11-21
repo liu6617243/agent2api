@@ -317,8 +317,8 @@ function MemoryPage(): React.ReactElement {
                 : t('记忆服务已关闭')}
             </Badge>
           ) : null}
-          {status && status.review.pending > 0 ? (
-            <Badge variant='warning' shape='tag'>{t('{n} 条待确认', { n: status.review.pending })}</Badge>
+          {status && (status.review.pending ?? 0) > 0 ? (
+            <Badge variant='warning' shape='tag'>{t('{n} 条待确认', { n: status.review.pending ?? 0 })}</Badge>
           ) : null}
           <Button
             type='button'

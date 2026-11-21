@@ -202,7 +202,10 @@ pub fn list() -> Value {
 /// `injected`（配置文件里真有 `agent2api-memory` 这一条），分子是这些里
 /// 「心跳 `calls > 0`」的数量。只配置不调用不算连通 —— 那是假绿灯。
 pub fn connectivity() -> Value {
-    let beats = index::global().beats();
+    // 首屏自检链路的一部分：不排队。索引正忙（重建 / 打开时压缩）时这两个数字
+    // 先给 0，页面照常渲染 —— 让请求卡在索引锁后面才是真正的问题（见
+    // `index::try_count`）。
+    let beats = index::global().try_beats().unwrap_or_default();
     let mut injected = 0;
     let mut called = 0;
     for def in hub::CLIENTS {

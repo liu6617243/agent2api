@@ -139,8 +139,13 @@ export type MemoryStatus = {
    */
   agents: { called: number; injected: number }
   projects: number
-  review: { pending: number; warnThreshold: number }
-  index: { count: number; fts: boolean; inSync: boolean }
+  review: { pending: number | null; warnThreshold: number }
+  /**
+   * `count` / `inSync` 可能是 `null`：索引被重建或打开时压缩独占着那条全局
+   * 连接，后端**不会排队**（否则整页会卡到网关 60 秒超时），而是给 `null`。
+   * 前端必须把它渲染成「整理中」而不是 0 —— 0 会被读成「索引空了」。
+   */
+  index: { count: number | null; fts: boolean; inSync: boolean | null }
   tables?: Record<string, number>
   config: MemoryConfig
   revision: number
