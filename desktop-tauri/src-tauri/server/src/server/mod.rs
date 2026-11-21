@@ -917,6 +917,10 @@ impl ServerState {
             .name("memory-warm".to_string())
             .spawn(|| core::memory::store::warm())
             .ok();
+        // 索引库的 WAL 收口与臃肿回收**不在这里**：它要独占那条全局连接几十秒，
+        // 放在服务已开始接请求之后做，会把面板首屏的 `status()` 排在锁后面 ——
+        // 那正是「记忆中枢永远正在获取…」的原因。这件事挪到了
+        // `MemoryIndex::open()` 里，在建表之后、单例发布之前做（见 index.rs）。
         // swap 保证重复调用（桌面壳重启后端时 start 可能被再次调用）只跑一轮。
         if self.startup_maintenance.swap(true, Ordering::SeqCst) {
             return;

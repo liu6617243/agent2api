@@ -243,7 +243,8 @@ impl MemoryIndex {
         let _ = conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
-             PRAGMA busy_timeout=5000;",
+             PRAGMA busy_timeout=5000;
+             PRAGMA wal_autocheckpoint=512;",
         );
         // ── 派生表 ──
         let mut create = String::from("CREATE TABLE IF NOT EXISTS entries (\n");
@@ -467,6 +468,12 @@ impl MemoryIndex {
                 "ℹ️ 未启用 FTS5（SQLite 未编译该扩展），记忆检索退化为内存子串匹配",
             );
         }
+        // 建完表就地自查一次。此刻单例还没发布、除这条连接外没人能碰这个文件，
+        // 所以哪怕 `VACUUM` 要几十秒也不会让任何请求排队 —— 这是唯一安全的时机。
+        // 正常机器上 `freelist_count` 是 0（或很小），这里只是一次 PRAGMA。
+        if let Some(note) = compact_connection(&conn) {
+            crate::server::logging::log("[Memory]", &format!("🧹 {note}"));
+        }
         MemoryIndex {
             conn: Mutex::new(conn),
             fts,
@@ -496,6 +503,11 @@ impl MemoryIndex {
             count += 1;
         }
         tx.commit().map_err(|error| error.to_string())?;
+        // 重建是唯一「先整表清空、再整表写满」的操作，也是空闲页的主要来源。
+        // 写完顺手压一遍：判据在 `compact_connection` 里，正常情况下它什么都不做。
+        if let Some(note) = compact_connection(&conn) {
+            crate::server::logging::log("[Memory]", &format!("🧹 {note}"));
+        }
         Ok(count)
     }
 
@@ -527,6 +539,21 @@ impl MemoryIndex {
         conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get::<_, i64>(0))
             .map(|value| value as usize)
             .unwrap_or(0)
+    }
+
+    /// 把 WAL 收回去（只截断，不做 `VACUUM`）。
+    ///
+    /// ── 为什么需要它 ────────────────────────────────────────────
+    /// 索引是 WAL 模式写的，而 WAL 只会在「没有别的读者」时被自动回收。
+    /// 导入这种「几千条连续写 + 页面同时在读」的场景里，自动 checkpoint
+    /// 经常落不了地，文件就一路长：2026-11-21 实测 `index.db-wal` 到了
+    /// **700 MB**，每次读都要翻这本越来越厚的日志索引。
+    ///
+    /// 所以在一轮批量写**结束时**显式收一次 —— 那时读者刚好是空闲的，
+    /// 截断几乎必然成功。这条很便宜（一次 `PRAGMA`），可以在热路径上调。
+    pub fn checkpoint(&self) {
+        let Ok(conn) = self.conn.lock() else { return };
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
 
     /// 无条件列一批行（列表页 / 概览用）。条件过滤在 Rust 侧做 —— 记忆规模是
@@ -1654,6 +1681,65 @@ fn write_row(conn: &Connection, entry: &MemoryEntry, fts: bool) -> rusqlite::Res
         )?;
     }
     Ok(())
+}
+
+/// WAL 截断 + 空闲页回收。
+///
+/// ── 为什么必须有这一步（2026-11-21 实测）──────────────────────
+/// 这台机器的 `index.db` 长到了 **3.0 GB**，而 `freelist_count` 是 72 万页
+/// （`page_count` 76 万）—— **94.5% 的文件是空的**：`mem_link` 那 754 万行
+/// 删掉之后，页面只是还给了 SQLite，文件一个字节都不会自己缩回去。同目录的
+/// `index.db-wal` 涨到 **700 MB** 且从不截断。于是每一次写都要在这坨空洞里
+/// 翻页、每一轮读都要翻一本 700 MB 的 WAL 索引，配合导入任务反复使快照缓存
+/// 失效，面板首屏的 `GET /api/memory/config` 被拖过桌面壳 60 秒的超时线 ——
+/// 用户看到「等待本地代理响应超时」，记忆中枢整页永远「正在获取…」。
+///
+/// ── 为什么只在两个「没人用这条连接」的时机调 ────────────────
+///   1. `MemoryIndex::open()` 刚建好表、单例还没发布时 —— 除自己外没人能碰
+///      这个文件，`VACUUM` 慢几十秒也不会有请求排在锁后面；
+///   2. `rebuild()` 里、事务提交之后 —— 那本来就是个独占的慢操作。
+///
+/// 反过来，**绝不能**在服务跑起来之后从后台线程随便 VACUUM：那条连接是全局
+/// 唯一的 `Mutex<Connection>`，`VACUUM` 会把它独占几十秒，首屏的 `status()`
+/// 就排在锁后面 —— 那正是要修的症状本身。
+///
+/// ── 为什么两条判据都要满足才 VACUUM ────────────────────────
+/// 比例过半（一半以上是空洞）说明「值得压」；绝对量 ≥ 200 MB 说明「压得回本」。
+/// 只看比例的话，一个小库删掉几条记录就会触发一次全量重写，纯亏。
+/// 返回值是给人看的说明（没做事就是 `None`），由调用方写进日志。
+fn compact_connection(conn: &Connection) -> Option<String> {
+    // WAL 截断很便宜，而且它自己也会随写入再长出来，所以每次都做。
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    let page_count: i64 = conn
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .unwrap_or(0);
+    let free_pages: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .unwrap_or(0);
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .unwrap_or(4096);
+    if page_count <= 0 || free_pages <= 0 {
+        return None;
+    }
+    let wasted = free_pages.saturating_mul(page_size);
+    if free_pages * 2 < page_count || wasted < 200 * 1024 * 1024 {
+        return None;
+    }
+    let before = page_count.saturating_mul(page_size);
+    if let Err(error) = conn.execute_batch("VACUUM;") {
+        return Some(format!("索引整理失败：{error}"));
+    }
+    let after: i64 = conn
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .unwrap_or(page_count);
+    let after = after.saturating_mul(page_size);
+    Some(format!(
+        "索引库整理完成：{} MB → {} MB（回收 {} MB）",
+        before / 1024 / 1024,
+        after / 1024 / 1024,
+        before.saturating_sub(after) / 1024 / 1024
+    ))
 }
 
 /// 全局单例。首次访问时打开索引；事实源与索引不一致由 `rebuild` 修正。

@@ -52,6 +52,26 @@ const CHUNK_CHARS: usize = 8_000;
 /// 在两个窗口里都能被检索到 —— 否则一句话恰好被切在中间，两个窗口都不完整。
 const CHUNK_OVERLAP: usize = 600;
 
+/// 单个会话文件最多读进内存的字节数，而且在**尾部**读。
+///
+/// ── 为什么必须有这条硬上限 ──────────────────────────────────
+/// 会话记录是追加写的：一段聊了一整天的对话，`.jsonl` 能涨到接近 1 GB
+/// （2026-11-21 实测本机正在进行的那个会话就是 955 MB）。早先 `from_transcript`
+/// 用 `read_to_string` 把整份文件读进来再切窗口，于是每轮增量导入都要读 955 MB、
+/// 切出上千个窗口。后果不是「慢一点」，而是**面板整页打不开**：
+///
+///   * 那 955 MB 的读 + 切分把磁盘和 CPU 占满几分钟，同时导入还在不停写索引；
+///   * 写索引会让记忆快照缓存失效，面板首屏的 `GET /api/memory/config`
+///     又要重新解析 55 MB `.md` 才能算出 `status()`；
+///   * 两件事叠在一起，桌面壳 60 秒超时，用户看到的就是
+///     「等待本地代理响应超时」+ 记忆中枢永远「正在获取…」。
+///
+/// ── 为什么读尾部而不是砍掉超长文件 ──────────────────────────
+/// 增量导入只关心**新追加**的内容：老内容上一轮已经入过库，内容 hash 去重本来
+/// 也会把它们判成重复。所以从文件尾部取 8 MB（≈ 二十多万字，够几轮增量）就够了，
+/// 既覆盖新内容，又把单次读盘从 955 MB 压到 8 MB。
+const MAX_TRANSCRIPT_BYTES: u64 = 8 * 1024 * 1024;
+
 /// 一条记忆正文的下限：太短的（「ok」「继续」）不是记忆，是噪声。
 ///
 /// 按**字符**算而不是字节：中文一个字等于三个字节，用字节数当门槛会让
@@ -637,6 +657,41 @@ fn push_unique(out: &mut Vec<String>, text: &str) {
     out.push(trimmed.to_string());
 }
 
+/// 读会话记录：文件不大就整份读，超过 [`MAX_TRANSCRIPT_BYTES`] 只读尾部。
+///
+/// 尾部读必须**按行对齐**：从中间切进去的第一段多半是半截 JSON，`line_to_turn`
+/// 解析不出轮次，留着只是白跑一次正则。所以丢掉第一个换行符之前的所有字节 ——
+/// 那里是唯一可能被切断的地方，后面的每一行都完整。
+///
+/// 用 `from_utf8_lossy` 而不是 `read_to_string`：截断点可能落在一个多字节字符
+/// 中间（虽然按行对齐后不会），而「整个文件读不出来」比「有一个替换符」糟糕得多。
+fn read_transcript(path: &Path) -> std::io::Result<String> {
+    read_tail(path, MAX_TRANSCRIPT_BYTES)
+}
+
+/// [`read_transcript`] 的本体，上限可注入 —— 测试用 64 字节就能覆盖
+/// 「文件远大于上限」这条分支，不必真造一个 9 MB 的文件。
+fn read_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len <= max_bytes {
+        let mut buffer = Vec::with_capacity(len as usize);
+        file.read_to_end(&mut buffer)?;
+        return Ok(String::from_utf8_lossy(&buffer).into_owned());
+    }
+    file.seek(SeekFrom::Start(len - max_bytes))?;
+    let mut buffer = Vec::with_capacity(max_bytes as usize);
+    file.read_to_end(&mut buffer)?;
+    let start = buffer
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|at| at + 1)
+        .unwrap_or(0);
+    Ok(String::from_utf8_lossy(&buffer[start..]).into_owned())
+}
+
 /// 一个会话文件 → 多条记忆（按 `CHUNK_CHARS` 定长窗口切）。
 ///
 /// ── 为什么从「一个文件一条」改成「窗口切条」─────────────────
@@ -656,7 +711,8 @@ fn from_transcript(path: &Path, project: Option<String>) -> Vec<Pending> {
         .file_stem()
         .map(|stem| stem.to_string_lossy().to_string())
         .filter(|stem| !stem.is_empty());
-    let raw = match std::fs::read_to_string(path) {
+    // 只读尾部：见 `MAX_TRANSCRIPT_BYTES` 的说明。整份读 955 MB 会把面板拖死。
+    let raw = match read_transcript(path) {
         Ok(text) => text,
         Err(error) => {
             return vec![Pending {
@@ -736,12 +792,19 @@ fn from_transcript(path: &Path, project: Option<String>) -> Vec<Pending> {
 }
 
 /// 把一段超长文本按 `limit` 字数切开（相邻片重叠 `CHUNK_OVERLAP/2`）。
+///
+/// ── 快路径为什么必须在前 ────────────────────────────────────
+/// 绝大多数发言远短于一个窗口（`CHUNK_CHARS` = 8000 字），它们只需要返回原文。
+/// 早先这里先把整段 `collect::<Vec<char>>()` 再比长度：`char` 是 4 字节，
+/// 等于为每一段按 **4 倍体积** 分配一次再把内容拷一遍 —— 一段 955 MB 的会话
+/// 光这一句就是几个 GB 的分配与拷贝，导入期间整机被拖到换页，面板请求自然
+/// 超时。先 `chars().count()`（只遍历、不分配）就够了。
 fn split_long(text: &str, limit: usize) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let total = chars.len();
-    if total <= limit || limit == 0 {
+    if limit == 0 || text.chars().count() <= limit {
         return vec![text.to_string()];
     }
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
     let step = limit.saturating_sub(CHUNK_OVERLAP / 2).max(1);
     let mut out: Vec<String> = Vec::new();
     let mut start = 0usize;
@@ -1373,6 +1436,9 @@ fn run_core(
     }
     let sensitive_skip = config::bool_of("import.sensitiveSkip");
     let batch = config::usize_of("import.batchSize").clamp(20, 2000);
+    // 记耗时并写进日志。这一条不是装饰：面板「等待本地代理响应超时」那次
+    // 排查，就是因为没有任何一行日志能说出「一轮导入跑了多久」，只能靠猜。
+    let started = std::time::Instant::now();
     // 增量模式：mtime 过滤在 `collect_with` 内部、打开文件之前完成 ——
     // 没变的文件连读都不读。`unchanged` 是「上次已读过」的文件数，
     // `deferred` 是「有变动但超出单来源上限、这轮没轮到」的文件数。
@@ -1471,8 +1537,13 @@ fn run_core(
         progress(written + duplicated + failed + skipped, scanned);
         std::thread::yield_now();
     }
+    // 这一轮写完了：把 WAL 收回去。导入是「长时间连续写 + 页面同时在读」，
+    // 自动 checkpoint 在此期间落不了地，WAL 会一路长到几百 MB（实测 700 MB），
+    // 之后每一次读都要为这本厚日志付代价。收口只在写完之后做一次，很便宜。
+    index::global().checkpoint();
 
     let now = crate::server::logging::now_ms();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
     let summary = json!({
         "written": written,
         "duplicated": duplicated,
@@ -1487,6 +1558,9 @@ fn run_core(
         "deferredFloor": collected.deferred_floor,
         "failed": failed,
         "scanned": scanned,
+        // 这一轮一共花了多少毫秒。面板上不一定要显示，但日志与排障必须能说出
+        // 「是不是又有一轮导入在后台拖着」—— 超过 3 秒就该在日志里看得见。
+        "elapsedMs": elapsed_ms,
         "reasons": reasons,
         "at": now,
         "atText": stamp_text(now),
@@ -1496,8 +1570,8 @@ fn run_core(
     crate::server::logging::log(
         "[Memory]",
         &format!(
-            "历史导入完成：写入 {written} 条，重复 {duplicated}，跳过 {skipped}，未变动 {unchanged}，失败 {failed}，积压 {}",
-            collected.deferred
+            "历史导入完成：写入 {written} 条，重复 {duplicated}，跳过 {skipped}，未变动 {unchanged}，失败 {failed}，积压 {}，用时 {} ms",
+            collected.deferred, elapsed_ms
         ),
     );
     Ok(summary)
@@ -1851,6 +1925,35 @@ mod tests {
         // 没有时间字段：返回 None（由写路径兜底）
         let none = r#"{"role":"user","content":"端口固定 3065，别改"}"#;
         assert_eq!(line_to_turn(none).and_then(|item| item.2), None);
+    }
+
+    /// 超大会话只读尾部，且从**完整的一行**开始。
+    ///
+    /// 这条是「记忆中枢整页打不开」的护栏：955 MB 的会话曾经被整份读进来，
+    /// 每轮导入都要读一遍，面板的 `GET /api/memory/config` 被拖过 60 秒超时。
+    /// 判据只有两条 —— 读到的量不超过上限，且第一行不是被截断的半行。
+    #[test]
+    fn oversized_transcript_reads_only_whole_tail_lines() {
+        let dir = std::env::temp_dir()
+            .join(format!("mem-import-tail-{}", crate::server::logging::now_ms()));
+        std::fs::create_dir_all(&dir).ok();
+        let file = dir.join("session.jsonl");
+        // 每行 20 字节 × 50 行 = 1000 字节，上限给 100 字节 → 必然落在中间
+        let content: Vec<String> = (0..50).map(|index| format!("{{\"n\":{index:03},\"pad\":\"xx\"}}")).collect();
+        std::fs::write(&file, content.join("\n")).ok();
+
+        let tail = read_tail(&file, 100).expect("尾部读应成功");
+        assert!(tail.len() <= 100, "读到的字节数不该超过上限，实得 {}", tail.len());
+        let first = tail.lines().next().unwrap_or_default();
+        assert!(
+            first.starts_with("{\"n\":") && first.ends_with('}'),
+            "第一行必须是完整 JSON 行，实得 {first}"
+        );
+        assert!(tail.contains(&content[49]), "尾行必须在结果里（新内容不能被丢掉）");
+        // 上限大于文件时整份读回来，行为与旧实现一致
+        let whole = read_tail(&file, 4096).expect("整份读应成功");
+        assert_eq!(whole, content.join("\n"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 一个长会话要被切成多个窗口，而不是压成一条或砍头留尾。
