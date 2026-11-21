@@ -103,6 +103,16 @@ impl TurnCapture {
         if start > 0 {
             self.tail.drain(..start);
         }
+        // ── 半行缓冲也要有边界 ──────────────────────────────────
+        // 正常 SSE 单帧是几百字节到几十 KB。尾缓冲超过 CAP_BYTES 还没等到换行，
+        // 说明这不是一条正常的数据行（上游发了巨型 base64 图片帧、或者协议被
+        // 中间设备改坏了）。这里直接丢掉，只保留最后一小段 —— 不丢的话，一条
+        // 坏流能让这个 Vec 长到内存爆掉，而它挂在每个活跃请求上。
+        if self.tail.len() > CAP_BYTES {
+            let keep = 8 * 1024;
+            let drop_to = self.tail.len() - keep;
+            self.tail.drain(..drop_to);
+        }
     }
 
     /// 处理一行下游 SSE（含 `event:` 行与空行）。
@@ -149,7 +159,16 @@ impl TurnCapture {
     /// `Drop`），已经在 async 上下文里了：直接在 worker 上阻塞会让同一线程上
     /// 的其它请求一起排队。`in_place` 在多线程运行时用 `block_in_place` 让出
     /// worker，在没有运行时 / current_thread 时退回直接调用（测试就是这种）。
-    pub fn finish(self, interrupted: bool) {
+    pub fn finish(mut self, interrupted: bool) {
+        // ── 最后一帧可能没有换行 ────────────────────────────────
+        // `push` 只处理到最后一个 `\n`。若上游最后一帧是 `data: {...}` 后面直接
+        // EOF（少数实现不在末尾补换行），那一句会永远留在 `tail` 里丢掉 ——
+        // 而「最后一句」恰恰常常是结论。这里补一次收尾解析。
+        if !self.capped && !self.tail.is_empty() {
+            let line = String::from_utf8_lossy(&self.tail).into_owned();
+            self.absorb(&line);
+            self.tail.clear();
+        }
         if self.text.trim().is_empty() {
             // 流里一帧正文都没取到（工具调用型回答、纯推理回答）：
             // 写下去就是一条只有「用户说了什么」的空记忆，没有价值。
@@ -291,6 +310,51 @@ mod tests {
         turn.push(b": keep-alive\n\n");
         turn.push(b"data: {not json}\n\n");
         assert_eq!(turn.text(), "");
+    }
+
+    #[test]
+    fn last_frame_without_trailing_newline_is_absorbed() {
+        // 少数上游不在最后一帧补换行。`push` 只处理到最后一个 `\n`，
+        // 那一句会留在 tail 里 —— 而「最后一句」常常正是结论。
+        // 这里只验收尾解析这一步（`finish` 会真的去写记忆，不适合在单测里跑）。
+        let mut turn = TurnCapture::new(
+            Dialect::Chat,
+            vec![serde_json::json!({ "role": "user", "content": "改完了吗" })],
+            None,
+        )
+        .expect("有请求就该有捕获");
+        turn.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"根因\"}}]}\n");
+        turn.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"是标记误判\"}}]}");
+        assert_eq!(turn.text(), "根因", "最后一句还在 tail 里等着");
+
+        // finish 的收尾这一段：把 tail 当最后一行吃掉
+        if !turn.capped && !turn.tail.is_empty() {
+            let line = String::from_utf8_lossy(&turn.tail).into_owned();
+            turn.absorb(&line);
+            turn.tail.clear();
+        }
+        assert_eq!(turn.text(), "根因是标记误判");
+        assert!(turn.tail.is_empty());
+    }
+
+    #[test]
+    fn oversized_tail_does_not_grow_without_bound() {
+        // 上游发巨型 base64 帧、或协议被改坏：尾缓冲不能无限长。
+        let mut turn = TurnCapture::new(
+            Dialect::Chat,
+            vec![serde_json::json!({ "role": "user", "content": "看图" })],
+            None,
+        )
+        .expect("有请求就该有捕获");
+        // 喂 300 KB 无换行字节
+        for _ in 0..30 {
+            turn.push(&vec![b'x'; 10 * 1024]);
+        }
+        assert!(
+            turn.tail.len() <= CAP_BYTES,
+            "尾缓冲必须有上限，实际 {} 字节",
+            turn.tail.len()
+        );
     }
 
     #[test]
