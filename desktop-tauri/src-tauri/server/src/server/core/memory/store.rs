@@ -1232,7 +1232,18 @@ pub fn invalidate() {
     if let Ok(mut guard) = snapshot_slot().lock() {
         *guard = None;
     }
+    // 代际 +1：别的缓存（`inject` 的注入结果）靠它判断「记忆变了，我这份该丢了」。
+    // 只清快照不够 —— 注入块是从快照算出来的派生结果，用户钉了一条规则之后
+    // 只清快照，注入缓存里那份旧文本还能再活 60 秒，表现成「我钉了它怎么不用」。
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// 快照代际。每次 [`invalidate`] +1；外部缓存把它拼进自己的键即可。
+pub fn generation() -> u64 {
+    GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 预热快照：后台线程启动时调一次，把「第一次打开记忆页要解析 55 MB」的
 /// 代价从用户身上挪到启动阶段。

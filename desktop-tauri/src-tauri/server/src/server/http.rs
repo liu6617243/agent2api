@@ -366,6 +366,10 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/memory/get", get(api::memory::get_one))
         .route("/api/memory/core", get(api::memory::get_core))
         .route("/api/memory/digest", get(api::memory::get_digest))
+        // 请求级注入预览：把「这次请求会带上哪几条记忆」摊开给用户看。
+        // 没有这个端点，注入开关就是盲开 —— 改了预算、钉了记忆、写了避坑，
+        // 只能靠模型行为变化去猜有没有生效。
+        .route("/api/memory/inject/preview", get(api::memory::get_inject_preview))
         .route("/api/memory/timeline", get(api::memory::get_timeline))
         .route("/api/memory/projects", get(api::memory::get_projects))
         // 项目卡操作：重命名/置顶/归档只改登记表；合并会逐条搬文件（同步等结果）

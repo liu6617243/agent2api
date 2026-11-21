@@ -1750,7 +1750,17 @@ fn run_core(
                 agent: Some("import".to_string()),
                 tags: vec!["导入".to_string()],
                 importance: Some(0.4),
-                files: Vec::new(),
+                // ── 从会话正文里抽仓库路径填 `files` ───────────────
+                //
+                // 导入的流水原来一律 `files: Vec::new()`，于是「按文件命中」这一档
+                // （请求级注入里权重最高的 3.0 分）对全部导入条目永久失效 —— 而
+                // 本机库里绝大多数条目正是导入进来的。用户问过「导了 2341 条，
+                // 为什么注入什么都不出来」，根因就在这一行。
+                //
+                // 这里抽的是**正文里写过的仓库路径**（`src/server/api/chat.rs`
+                // 这种带目录的串），不是会话文件自身的路径：前者才是「这次改动
+                // 涉及哪些文件」，后者只说明这段对话存在哪个 jsonl 里。
+                files: super::inject::harvest_paths(&candidate.body),
                 supersedes: Vec::new(),
                 pinned: Some(false),
                 starred: Some(false),

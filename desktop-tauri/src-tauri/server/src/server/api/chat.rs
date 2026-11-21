@@ -162,6 +162,42 @@ pub async fn chat_completions(
         ),
     );
 
+    // ⑤ 请求级记忆注入：把「必须遵守 + 相关经验」拼成一条 system 消息塞进
+    //    messages。位置在这里（模型已定、转发未开始）而不是更早，是因为：
+    //   · 更早会改到 `dedupe_key`（它取的是**客户端原始体**的哈希）—— 注入
+    //     会让两条一模一样的客户端请求算出不同键，去重直接失效；
+    //   · 更晚会进到转发层的 `send_body`，那里要按家重算一遍，而记忆与上游
+    //     无关，一次注入全链路通用。
+    //
+    // 压缩 / 标题这类特殊路由**不注入**：它们是客户端后台发的便宜调用（生成
+    // 会话标题、压缩上下文），塞 600 token 的记忆等于给每一次标题生成加钱，
+    // 而它们的结果根本不会回到用户眼前。
+    //
+    // 注入失败（没有相关记忆 / 快照读不到 / 关了开关）不产生任何错误：转发
+    // 主链路绝不能因为「这次没记忆」而失败。
+    //
+    // `blocking::in_place`：注入要读记忆快照（冷启动时是 55 MB 的 `.md` 解析），
+    // 直接在 async worker 上做会把 tokio 线程卡住几百毫秒。命中缓存时它只是
+    // 一次哈希查表，`in_place` 在那种情况下也没有额外代价。
+    //
+    // `is_internal_origin`：记忆自己的蒸馏 / 画像任务是打本进程网关跑的
+    // （UA `Agent2API-MemoryBrain/1.0`）。给它们也注入记忆，等于让旧结论去蒸馏
+    // 新结论 —— 蒸馏会自我重复，新信息进不来。视觉分析同理。
+    if !special.is_background()
+        && !crate::server::core::memory::inject::is_internal_origin(&user_agent)
+    {
+        // 返回注入的 token 数（`None` = 没注入）：日志里带上数字，才能一眼看出
+        // 「注入了」和「注入了个空块」的区别，也解释了这次请求贵了多少
+        if let Some(tokens) = crate::server::core::blocking::in_place(|| {
+            crate::server::core::memory::inject::inject_chat(&mut payload)
+        }) {
+            logging::verbose(
+                "[Memory]",
+                &format!("请求级注入：已附加记忆块 {tokens} token（inject.enabled）"),
+            );
+        }
+    }
+
     // 原始请求的去重键已在模型改写前计算。
     let telemetry = Arc::new(RequestTelemetry::with_id());
     // 「进行中」行：模型解析已成功、转发即将开始 —— 先插一条 status=0 的明细，

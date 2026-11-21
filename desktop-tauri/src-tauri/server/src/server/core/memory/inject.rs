@@ -1,0 +1,1285 @@
+//! 记忆中枢 · 请求级注入（把「硬规则 + 相关经验」送进每一次对话）。
+//!
+//! ── 这个文件解决什么问题 ────────────────────────────────────
+//! 记忆存了几千条、检索也能用，但**模型不会主动去查**。原来的设计把「什么时候
+//! 读记忆」完全交给客户端的提示词块（`agents::INSTRUCTION_BLOCK` 里那句「会话
+//! 开始时先调 `memory_core`」），而那句话只是建议：客户端可以不读、模型可以忽略、
+//! 换了客户端就没了。实测结果是 `memory_core` 调用 1 次、真检索 0 次 —— 记忆
+//! 写了等于没写。
+//!
+//! 所以这里换一个位置：**网关在转发前替模型把该看的那几条塞进去**。模型不需要
+//! 自觉，因为它一睁眼就已经看到了。
+//!
+//! ── 为什么不是「把记忆全塞进去」────────────────────────────
+//! 几千条全塞是灾难：烧 token、稀释注意力、还会让模型拿三周前的结论去改刚重构
+//! 的代码。所以注入分两段，各有硬预算：
+//!
+//! | 段 | 内容 | 依据 |
+//! |---|---|---|
+//! | 必须遵守 | `pinned` + `preference` + `profile` | 用户亲手钉的、或者明确是「长期要求」的 |
+//! | 相关经验 | 命中本次请求里的**具体线索**的 pitfall / decision / knowledge | 路径、标识符、命令名 |
+//!
+//! ── 为什么用「线索命中」而不是语义检索 ──────────────────────
+//! 用户的原话是「做一件事时会自然回忆以前是否做过」。人回忆的触发点很具体：
+//! 又是这个文件、又是这条命令、又是这个报错。而向量/泛语义检索给的是「读起来
+//! 差不多」的东西 —— 在记忆这种长尾语料上，噪音远大于信号（一次 `memory_search`
+//! 返回 8 条里能有 2 条相关就算不错）。
+//!
+//! 所以这里只认**字符串级**命中：请求里出现了 `scripts/deliver.mjs`，就去找
+//! `files` 里写着这个路径、或标题里写着这个名字的记忆。命不中就什么都不注入
+//!（宁可不给，也不要给错的 —— 错的记忆比没有记忆更贵）。
+//!
+//! ── 为什么注入点在网关，而不是在 MCP ────────────────────────
+//! MCP 是「模型来问」，本模块是「网关主动给」。前者依赖模型自觉，后者不依赖。
+//! 两条路并存：注入负责「一定会看到的硬约束」，MCP 负责「想深挖时的检索」。
+//!
+//! ── 幂等 ────────────────────────────────────────────────────
+//! 注入块自带 [`MARKER`] 标记。同一份 body 被注入两次（重试、原生转发与 Chat
+//! 转换两条路都走到）时第二次直接跳过 —— 否则一次请求里会出现两段记忆，白烧
+//! token 还让模型以为是两条不同的结论。
+//!
+//! ── 绝不因为注入失败而让请求失败 ────────────────────────────
+//! 这是转发主链路。读快照失败、预算算错、正则写坏 —— 任何一种都只能让「这次
+//! 没有记忆」而不是「这次请求 500」。所以所有函数返回 `Option` / `bool`，
+//! 没有 `Result`，也没有 `unwrap`。
+
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use regex::Regex;
+use serde_json::Value;
+
+use super::config;
+use super::model::{estimate_tokens, truncate_chars, MemoryEntry, MemoryKind, Layer};
+use super::store;
+
+/// 注入块的起止标记。
+///
+/// 用 HTML 注释风格而不是纯文本：万一用户把注入内容贴回聊天里，它也不会被
+/// 当成正常内容渲染出来。同时它也是幂等判据（见模块头）。
+pub const MARKER: &str = "<agent2api-memory>";
+const MARKER_END: &str = "</agent2api-memory>";
+
+/// 一次注入的全部旋钮。
+#[derive(Debug, Clone, Copy)]
+pub struct Settings {
+    pub enabled: bool,
+    /// 整块的总预算（硬上限）
+    pub max_tokens: usize,
+    /// 「必须遵守」那一段的预算
+    pub rules_tokens: usize,
+    /// 「相关经验」那一段的预算
+    pub experience_tokens: usize,
+    /// 经验最多几条
+    pub max_items: usize,
+    /// 是否用 `files` 字段做路径精确命中
+    pub path_match: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_tokens: 600,
+            rules_tokens: 260,
+            experience_tokens: 340,
+            max_items: 6,
+            path_match: true,
+        }
+    }
+}
+
+/// 读当前生效的注入设置。
+pub fn settings() -> Settings {
+    let max_tokens = config::usize_of("inject.maxTokens").min(4000);
+    Settings {
+        enabled: config::bool_of("inject.enabled"),
+        max_tokens,
+        // 两段预算各自夹到总预算内：用户把总预算调到 200 时，两段加起来也不能
+        // 超过它 —— 否则「总预算」就成了一个说了不算的数字。
+        rules_tokens: config::usize_of("inject.rulesTokens").min(max_tokens),
+        experience_tokens: config::usize_of("inject.experienceTokens").min(max_tokens),
+        max_items: config::usize_of("inject.maxItems").clamp(1, 20),
+        path_match: config::bool_of("inject.pathMatch"),
+    }
+}
+
+/// 从请求文本里抽「线索」：路径、反引号片段、标识符。
+///
+/// ── 为什么要抽而不是直接拿整段请求去匹配 ────────────────────
+/// 整段请求里 90% 是自然语言，拿它去 `contains` 只会命中一堆「的」「了」「这个」。
+/// 抽出来的这几类东西有个共同点：**它们几乎只会在讲同一件事时重复出现**。
+/// 一个文件路径不会碰巧出现在无关对话里。
+fn regexes() -> &'static [Regex] {
+    static CACHE: OnceLock<Vec<Regex>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        // 写坏一条只丢那一条，不让整个注入挂掉（这里没有 unwrap：release 是
+        // panic=abort，一次 panic 会带走整个网关进程）
+        [
+            // 反引号里的内容：用户和模型都习惯用它包命令、路径、标识符
+            r"`([^`\n]{2,120})`",
+            // 带扩展名的路径 / 文件名
+            r"(?i)[a-z0-9_.\-/\\]{3,120}\.(?:rs|ts|tsx|js|jsx|mjs|cjs|json|toml|ya?ml|md|py|go|sql|css|html|sh|ps1)",
+            // snake_case 标识符（至少两段）
+            r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b",
+            // camelCase **不在**这里：它必须在原文上匹配，见 `camel()` 与 `probes`
+        ]
+        .iter()
+        .filter_map(|pattern| Regex::new(pattern).ok())
+        .collect()
+    })
+}
+
+/// 从一段请求文本里抽线索（已小写、已去重、上限 24 个）。
+///
+/// ── camelCase 为什么要单独一遍 ──────────────────────────────
+/// 其余三条正则都在小写化之后的文本上跑（大小写不该影响路径与 snake_case 的
+/// 命中）。但 camelCase 的定义就是「小写开头 + 大写转折」—— 小写化之后
+/// `injectChat` 变成 `injectchat`，那条正则永远匹配不到任何东西，等于白写。
+/// 所以它单独在原文上跑一遍，命中的结果再统一小写化（下游匹配一律小写）。
+pub fn probes(text: &str) -> Vec<String> {
+    let lowered = text.to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    for pattern in regexes() {
+        for capture in pattern.captures_iter(&lowered) {
+            let raw = capture
+                .get(1)
+                .or_else(|| capture.get(0))
+                .map(|matched| matched.as_str())
+                .unwrap_or("");
+            push_probe(&mut out, raw);
+            if out.len() >= 24 {
+                return out;
+            }
+        }
+    }
+    if let Some(pattern) = camel() {
+        for capture in pattern.captures_iter(text) {
+            let raw = capture
+                .get(0)
+                .map(|matched| matched.as_str())
+                .unwrap_or("");
+            push_probe(&mut out, &raw.to_lowercase());
+            if out.len() >= 24 {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// camelCase 标识符（在**原文**上匹配，见 [`probes`] 的说明）。
+///
+/// 返回 `Option` 而不是 `Regex`：这条正则和上面那三条一样可能被改坏，而
+/// 「改坏一条正则」绝不能让整条转发链路 panic（release 是 panic=abort，
+/// 一次 panic 带走的是整个网关进程，不是这一次注入）。
+fn camel() -> Option<&'static Regex> {
+    static CACHE: OnceLock<Option<Regex>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| Regex::new(r"\b[a-z][a-z0-9]*(?:[A-Z][a-z0-9]+)+\b").ok())
+        .as_ref()
+}
+
+/// 从**记忆正文**里抽出「像仓库文件路径」的字符串（给 `apply_derived` 继承用）。
+///
+/// ── 为什么需要从正文里抽 ────────────────────────────────────
+/// 注入的路径命中是权重最高的一档，但它读的是记忆的 `files` 字段。而绝大多数
+/// 记忆的 `files` 是空的：
+///
+///   · 导入进来的会话流水（l1）根本没有 files 概念，路径全在正文里；
+///   · 蒸馏 / 合并 / 抽取产出的 l2 原来是 `files: Vec::new()`。
+///
+/// 结果是「按文件命中」这一档对库里九成以上的条目永久失效。这里做一遍确定性
+/// 抽取，把正文里出现过的路径补进新条目的 files。
+///
+/// ── 判据为什么这么严 ────────────────────────────────────────
+/// 只认「带已知扩展名、且至少含一段目录分隔」的串：`chat.rs` 这种光杆文件名
+/// 到处都是（同名的文件可能有十几个），收进来就是「命中一切」；而
+/// `src/server/api/chat.rs` 这种带目录的串在整个仓库里唯一。
+///
+/// 反斜杠路径统一成正斜杠：Windows 上写出来的 `src\server\chat.rs` 与
+/// `src/server/chat.rs` 是同一条路径，不归一化就等于两条都不命中。
+pub fn harvest_paths(text: &str) -> Vec<String> {
+    static CACHE: OnceLock<Option<Regex>> = OnceLock::new();
+    let Some(pattern) = CACHE
+        .get_or_init(|| {
+            Regex::new(
+                r"(?i)[a-z0-9_.\-]+(?:[/\\][a-z0-9_.\-]+)+\.[a-z0-9]{1,6}",
+            )
+            .ok()
+        })
+        .as_ref()
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for matched in pattern.find_iter(text) {
+        let normalized = matched.as_str().replace('\\', "/");
+        let normalized = normalized.trim_matches('/').to_string();
+        // 太短的（`a/b.rs`）与太长的（一整行命令被当成路径）都丢掉
+        let length = normalized.chars().count();
+        if !(6..=200).contains(&length) {
+            continue;
+        }
+        // 必须真的像个代码文件：最后一段要带扩展名且扩展名在名单里
+        let Some(ext) = normalized.rsplit('.').next() else { continue };
+        let ext = ext.to_lowercase();
+        if !matches!(
+            ext.as_str(),
+            "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "json" | "toml"
+                | "yaml" | "yml" | "md" | "py" | "go" | "sql" | "css" | "html" | "sh" | "ps1"
+        ) {
+            continue;
+        }
+        if !out.iter().any(|known| known == &normalized) {
+            out.push(normalized);
+        }
+        if out.len() >= 8 {
+            break;
+        }
+    }
+    out
+}
+
+fn push_probe(out: &mut Vec<String>, raw: &str) {
+    let value = raw.trim().trim_matches(|ch: char| {
+        matches!(ch, '`' | '"' | '\'' | ',' | ';' | ')' | '(' | '[' | ']')
+    });
+    // 太短的（`a` / `ok`）到处都是，太长的多半是一整行命令 —— 两种都不是
+    // 「能定位到某条记忆」的线索
+    let length = value.chars().count();
+    if length < 3 || length > 120 {
+        return;
+    }
+    if out.iter().any(|item| item == value) {
+        return;
+    }
+    out.push(value.to_string());
+}
+
+/// 这条记忆锚定的文件里有没有一条能和线索对上。
+///
+/// ── 为什么要双向比 + 单独比文件名 ────────────────────────────
+/// 记忆里的路径和请求里的路径**很少逐字相同**，而三种写法都很常见：
+///
+/// | 记忆里 | 请求里 | 单向 `contains` 的结果 |
+/// |---|---|---|
+/// | `desktop-tauri/.../chat.rs` | `D:/Personal/.../chat.rs` | 漏（请求更长） |
+/// | `D:/Personal/.../chat.rs` | `desktop-tauri/.../chat.rs` | 漏（记忆更长） |
+/// | `desktop-tauri/.../chat.rs` | `chat.rs` | 漏（线索只有文件名） |
+///
+/// 三种都漏就等于「路径匹配」这个最强信号基本失效 —— 而它是唯一几乎不误报
+/// 的信号（用户亲手锚定的文件）。所以这里三种都认：互相包含、以及文件名
+/// 逐字相等。
+///
+/// ── 长度闸 ──────────────────────────────────────────────────
+/// 线索短于 4 个字符直接不认；「互相包含」那一档要求两侧都 ≥ 8 个字符。
+/// 少这两道闸，线索 `api`（3 个字符，抽得出来）会命中 `src/server/api/chat.rs`，
+/// 拿满 3.0 分直接进注入块 —— 而「请求里出现了 api 这个词」根本不代表它在讲
+/// 那个文件。唯一放宽的是「线索就是完整文件名」（`chat.rs`）：那本身就是精确匹配。
+fn file_hit<'a>(files: impl Iterator<Item = &'a str>, probe: &str) -> bool {
+    let probe_len = probe.chars().count();
+    if probe_len < 4 {
+        return false;
+    }
+    files.any(|file| {
+        let file = file.trim().to_lowercase();
+        if file.is_empty() {
+            return false;
+        }
+        let file_len = file.chars().count();
+        // 取最后一段当文件名：`desktop-tauri/.../chat.rs` 与 `D:\...\chat.rs`
+        // 都要能落成 `chat.rs`（两种分隔符都得认，记忆里两种写法都有）。
+        let name = file.rsplit(|ch| ch == '/' || ch == '\\').next().unwrap_or(&file);
+        // 线索就是这条记忆锚定的文件名（`chat.rs`）—— 精确相等，最可靠的一档
+        if name == probe {
+            return true;
+        }
+        // 互相包含：一侧是绝对路径、另一侧是仓库相对路径，是最常见的形状。
+        // 两侧都要 ≥ 8 个字符 —— 短串的包含关系几乎必然是巧合。
+        probe_len >= 8 && file_len >= 8 && (file.contains(probe) || probe.contains(&file))
+    })
+}
+
+/// 从正文里抽出来的路径，按条目 id 索引（给 `files` 为空的存量条目用）。
+///
+/// ── 为什么不能只改导入侧 ────────────────────────────────────
+/// 导入侧已经改成「写入时从正文抽路径填 `files`」，但那只对**新导入**生效。
+/// 用户库里已有的两千多条导入流水，`files` 是空的，重新导入会被 hash 去重挡掉
+/// —— 于是「按文件命中」这一档对存量数据永久失效，而存量数据正是绝大多数。
+///
+/// 又不能改写用户的 `.md`：`files` 在磁盘格式里是「记忆根相对路径」，往里塞
+/// 仓库相对路径会污染语义（体检会按记忆根 stat 它们）。所以这份索引只活在
+/// 内存里，纯派生物，随时可丢。
+///
+/// ── 代价与触发条件 ──────────────────────────────────────────
+/// 建一次要把全部正文过一遍正则（本机 55 MB，约 0.3-0.5 秒），所以：
+///   · 只在**请求里真的出现路径**时才建（`path_like` 判断），纯文字聊天不付这份钱；
+///   · 结果按 `store::generation()` + 条目数缓存，写一次记忆才重建一次；
+///   · 调用方是 `blocking::in_place`，重建期间占的是阻塞池线程，不是 tokio worker。
+fn derived_paths() -> std::sync::Arc<std::collections::HashMap<String, Vec<String>>> {
+    use std::collections::HashMap;
+    static SLOT: OnceLock<Mutex<Option<(u64, usize, Arc<HashMap<String, Vec<String>>>)>>> =
+        OnceLock::new();
+    let slot = SLOT.get_or_init(|| Mutex::new(None));
+    let generation = store::generation();
+    let entries = store::snapshot();
+    if let Ok(guard) = slot.lock() {
+        if let Some((stamp, count, index)) = guard.as_ref() {
+            if *stamp == generation && *count == entries.len() {
+                return Arc::clone(index);
+            }
+        }
+    }
+    // 只给 `files` 为空的条目抽：已经有 files 的条目用自己那份更准
+    let mut index: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in entries.iter() {
+        if !entry.files.is_empty() {
+            continue;
+        }
+        let paths = harvest_paths(&entry.body);
+        if !paths.is_empty() {
+            index.insert(entry.id.clone(), paths);
+        }
+    }
+    let index = Arc::new(index);
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some((generation, entries.len(), Arc::clone(&index)));
+    }
+    index
+}
+
+/// 请求文本里是否出现了「像路径」的东西。
+///
+/// 这是建 [`derived_paths`] 的闸：没有路径的请求根本用不上那份索引，不值得为它
+/// 扫一遍全库正文。
+fn path_like(probes: &[String]) -> bool {
+    probes.iter().any(|probe| {
+        (probe.contains('/') || probe.contains('\\')) && probe.chars().count() >= 6
+    })
+}
+
+/// 标题 / 摘要 / 标签里有没有这条线索。
+///
+/// 线索短于 4 个字符时**不参与**这一档：`api`、`md`、`v1` 这类碎片在几千条
+/// 记忆里几乎必然出现在某条的标题上，命中一次就是 2.0 分（正好越过门槛），
+/// 结果是一条不相干的记忆被塞进注入块。路径档不受这个限制（路径本身就长）。
+fn head_hit(head: &str, probe: &str) -> bool {
+    probe.chars().count() >= 4 && head.contains(probe)
+}
+
+/// 一条记忆与本次请求的相关度。0 = 无关。
+///
+/// ── 为什么只匹配 title / summary / tags / files，不匹配整段 body ──
+/// body 动辄几百字，几千条 × 24 个线索逐条 `contains` 是几十毫秒起步，而注入
+/// 在**每一条请求**的热路径上。`summary(240)` 是「这条记的是什么、结论是什么」
+/// 的一句话（有模型摘要就用它，没有就取正文第一段），拿它做线索匹配，精度比
+/// 整段正文更高 —— 正文里那些凑巧出现的词反而是噪音。
+///
+/// `extra` 是从正文抽出来的路径（见 [`derived_paths`]），只对 `files` 为空的
+/// 存量条目有值 —— 否则那批数据在「按文件命中」这一档上永久隐形。
+fn relevance(
+    entry: &MemoryEntry,
+    probes: &[String],
+    path_match: bool,
+    extra: Option<&Vec<String>>,
+) -> f64 {
+    if probes.is_empty() {
+        return 0.0;
+    }
+    // ── 为什么用 `summary(240)` 而不是 `summary_text` ────────────
+    // `summary_text` 是模型写过的那一句，绝大多数条目上是**空的**（摘要任务默认
+    // 关着）。只拿它做匹配，等于对九成条目只剩标题可比 —— 而标题往往很短
+    // （「注入点」），几乎不含能定位的字符串。
+    //
+    // `summary(240)` 在 `summary_text` 为空时会回退到正文第一段非空文本，那正是
+    // 「这条记了什么」的原话。用它做匹配，命中率与精度都明显更高。
+    let head = format!(
+        "{} {} {}",
+        entry.title,
+        entry.summary(240),
+        entry.tags.join(" ")
+    )
+    .to_lowercase();
+    let mut score = 0.0f64;
+    for probe in probes {
+        // 路径命中权重最高：`files` 是写入时用户亲手锚定的，几乎不会误报
+        if path_match
+            && (file_hit(entry.files.iter().map(String::as_str), probe)
+                || extra
+                    .map(|paths| file_hit(paths.iter().map(String::as_str), probe))
+                    .unwrap_or(false))
+        {
+            score += 3.0;
+            continue;
+        }
+        if head_hit(&head, probe) {
+            score += 2.0;
+        }
+    }
+    if score <= 0.0 {
+        return 0.0;
+    }
+    // 类型加成：踩坑与决策是「下次做同样的事会踩到」的那一类，比日常流水值钱
+    score += match entry.kind {
+        MemoryKind::Pitfall => 1.5,
+        MemoryKind::Decision => 1.0,
+        MemoryKind::Preference | MemoryKind::Profile => 1.0,
+        MemoryKind::Knowledge | MemoryKind::Insight => 0.5,
+        _ => 0.0,
+    };
+    score += entry.importance;
+    if entry.pinned {
+        score += 0.5;
+    }
+    score
+}
+
+/// 这条记忆进候选池的最低分。`None` = 根本不进池。
+///
+/// ── 为什么是「按层给不同门槛」而不是「只认 l2」───────────────
+/// 只认 l2 曾经是对的：几千条流水里翻出来的「相关」几乎必然是巧合，而它们会把
+/// 预算占满、把真正该看的那两条挤掉（`search::core_text` 早就有同一条取舍）。
+///
+/// 但本机真实数据把这个取舍推翻了：库里绝大多数条目是**导入进来的 l1 会话流水**，
+/// 而 l2 要靠蒸馏任务产出（默认关着，开了也要先攒够素材）。只认 l2 的结果是
+/// 用户导了两千多条、注入一条都命中不了 —— 而「以前做过这件事、踩过这个坑」
+/// 恰恰就写在那批 l1 里。那不是精度高，那是没在用。
+///
+/// 所以改成**分层门槛**：l2 与「天然就是结论」的类别 2.0，普通 l1 流水 3.3。
+/// 3.3 这个数不是拍的，它对应两条真实路径：
+///
+/// | 命中形态 | 得分（普通 l1，importance 0.4） | 结果 |
+/// |---|---|---|
+/// | 单个标题/摘要线索 | 2.0 + 0.4 = 2.4 | 不进（噪音） |
+/// | 一条路径命中 | 3.0 + 0.4 = 3.4 | 进（路径几乎不误报） |
+/// | 两条独立线索 | 4.0 + 0.4 = 4.4 | 进（同一件事被说了两遍） |
+///
+/// 也就是说 l1 流水要靠「路径」或「多个线索互相印证」才能挤进来，一个泛词命中
+/// 进不来 —— 召回上去了，精度还在。
+fn floor_for(entry: &MemoryEntry) -> Option<f64> {
+    if !entry.is_live() {
+        return None;
+    }
+    // 沉淀层本身就是结论，标题/摘要里出现线索就够
+    if entry.layer == Layer::L2 {
+        return Some(2.0);
+    }
+    // l1 里「要求 / 踩坑 / 决策 / 画像」这几类天然是「下次要用」的；加星与高
+    // importance 是有人主动抬过 —— 两种都按结论对待
+    if entry.starred
+        || entry.importance >= 0.8
+        || matches!(
+            entry.kind,
+            MemoryKind::Pitfall
+                | MemoryKind::Preference
+                | MemoryKind::Profile
+                | MemoryKind::Decision
+        )
+    {
+        return Some(2.0);
+    }
+    // 普通 l1 流水（含导入的会话记录）：高置信才进
+    Some(3.3)
+}
+
+fn rule_candidate(entry: &MemoryEntry) -> bool {
+    entry.is_live()
+        && (entry.pinned
+            || matches!(entry.kind, MemoryKind::Preference | MemoryKind::Profile))
+}
+
+/// 渲染一行。
+fn line(entry: &MemoryEntry, width: usize) -> String {
+    let summary = entry.summary(width);
+    if summary.trim().is_empty() {
+        format!("- [{}] {}", entry.kind.label(), truncate_chars(&entry.title, width))
+    } else {
+        format!(
+            "- [{}] {} —— {}",
+            entry.kind.label(),
+            truncate_chars(&entry.title, width),
+            summary
+        )
+    }
+}
+
+/// 这个 User-Agent 是不是本进程自己的内部调用。
+///
+/// ── 为什么必须排除它们 ──────────────────────────────────────
+/// 记忆中枢自己的 `distill` / `profile` / `summarize` 是**打自己的网关**跑的
+/// （见 `llm::complete`，UA 固定 `Agent2API-MemoryBrain/1.0`；视觉分析是
+/// `Agent2API-Vision`）。如果不排除，蒸馏那一次调用会被注入一段记忆块：
+///
+///   · 白烧 token —— 蒸馏的输入本来就长，再加 600 token 是纯浪费；
+///   · 更糟的是**污染**：让模型「参考既有结论」去蒸馏新结论，等于让旧记忆
+///     给自己背书，蒸馏会越来越自我重复，新信息进不来。
+///
+/// 判据用 UA 而不是「请求里有没有 x-agent2api-source 头」：UA 在客户端那一侧
+/// 无法伪造出一个「看起来像内部调用」的值来骗取跳过（跳过注入对调用方是减配，
+/// 不是特权，所以这里也不担心被利用）。
+pub fn is_internal_origin(user_agent: &str) -> bool {
+    // 本仓自己发出的 UA 都以 `Agent2API-` 开头：`Agent2API-MemoryBrain/1.0`
+    // （记忆蒸馏）、`Agent2API-VisionTool/1.0`（视觉分析）、
+    // `Agent2API-VisionCompatibility/1.0`（图片兼容层）。按前缀判一次即可 ——
+    // 逐个列名会在下次新增内部工具时漏掉一个，而漏掉的后果是「那个工具莫名
+    // 变贵、而且结论被旧记忆污染」，很难从现象反推到原因。
+    user_agent.to_ascii_lowercase().starts_with("agent2api-")
+}
+
+/// 注入次数、尝试次数与累计 token。
+///
+/// ── 为什么需要这三个计数器 ──────────────────────────────────
+/// 「注入到底有没有发生」是这套机制唯一说不清的地方：用户看到的是模型行为，
+/// 而模型行为受太多因素影响。计数是唯一客观的证据 —— 显示「本次启动以来注入
+/// 137 次 / 平均 420 token」，用户就能判断「它真的在跑」，而不是又去怀疑配置。
+///
+/// ── 为什么还要记「尝试次数」 ────────────────────────────────
+/// 只有一个 `count` 时，「0 次注入」有两种完全不同的含义：
+///
+///   · 开关关着 / 一条都没命中 → 机制正常，只是没东西可注；
+///   · 注入压根没被调用 → 代码没接上 / 请求走了别的入口。
+///
+/// 两种在界面上长得一模一样，而处理方式完全相反。所以再记一个 `attempts`：
+/// `attempts > 0 && count == 0` 才是「没命中」，`attempts == 0` 才是「没跑」。
+///
+/// 用原子计数而不是往 `recall_log` 写一行：注入挂在每一条转发请求前面，
+/// 一次 SQLite 写入（还要抢索引连接锁）在这个位置太贵。计数够用，细节看
+/// 注入预览。
+static INJECT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INJECT_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INJECT_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_attempt() {
+    INJECT_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn note_injected(tokens: usize) {
+    use std::sync::atomic::Ordering;
+    INJECT_COUNT.fetch_add(1, Ordering::Relaxed);
+    INJECT_TOKENS.fetch_add(tokens as u64, Ordering::Relaxed);
+}
+
+/// 本次启动以来的注入统计（仪表盘用）。
+pub fn stats() -> Value {
+    use std::sync::atomic::Ordering;
+    let count = INJECT_COUNT.load(Ordering::Relaxed);
+    let tokens = INJECT_TOKENS.load(Ordering::Relaxed);
+    let attempts = INJECT_ATTEMPTS.load(Ordering::Relaxed);
+    serde_json::json!({
+        "count": count,
+        "tokens": tokens,
+        // 平均每次注入多少 token —— 判断「预算是不是被吃满」最直接的一个数
+        "avgTokens": if count == 0 { 0 } else { tokens / count },
+        "enabled": settings().enabled,
+        // 走过注入逻辑的请求数。`attempts - count` = 没命中的次数
+        "attempts": attempts,
+        "missed": attempts.saturating_sub(count),
+    })
+}
+
+/// 给一段请求文本产出注入块。没有任何相关内容时返回 `None`。
+///
+/// 纯函数（除了读快照），可以直接单测。
+pub fn compose(request_text: &str) -> Option<String> {
+    let settings = settings();
+    if !settings.enabled || settings.max_tokens == 0 {
+        return None;
+    }
+    let text = request_text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let probes = probes(text);
+    let key = cache_key(&settings, &probes);
+    if let Some(hit) = cache_get(key) {
+        return hit;
+    }
+    let block = build(&settings, &probes);
+    cache_put(key, block.as_deref());
+    block
+}
+
+/// 注入结果缓存。
+///
+/// ── 为什么热路径上必须有一层缓存 ────────────────────────────
+/// `compose` 要对着**全部**记忆条目逐条跑 `contains`（本机实测 5800 条 × 最多
+/// 24 个线索 ≈ 14 万次子串比较），还要走一遍目录指纹。单次十几毫秒，而它挂在
+/// **每一条转发请求**前面 —— 聊天时用户感知不到，但并发一上来这条链路就成了
+/// 串行瓶颈（`spawn_blocking` 线程池被记忆匹配占满，转发反而排队）。
+///
+/// 缓存的键不是「整段请求文本」而是**抽出来的线索集合**：同一件事换个说法
+/// （「改一下 chat.rs」/「chat.rs 那个注入」）抽出来的线索一样，能直接命中。
+/// 这正是我们想要的粒度 —— 注入结果本来就只由线索决定。
+///
+/// TTL 60 秒：用户钉一条记忆、写一条避坑之后，最多一分钟就能在下一轮对话里
+/// 看到效果。比这更长的 TTL 会让「我刚写的规则模型怎么不用」变成一个反复
+/// 出现的问题；比这更短就等于没缓存。
+const CACHE_TTL: Duration = Duration::from_secs(60);
+/// 最多记这么多条。一轮对话里线索组合也就十几种，64 足够且不会无限涨。
+const CACHE_MAX: usize = 64;
+
+fn cache() -> &'static Mutex<Vec<(u64, Instant, Option<Arc<String>>)>> {
+    static CACHE: OnceLock<Mutex<Vec<(u64, Instant, Option<Arc<String>>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn cache_key(settings: &Settings, probes: &[String]) -> u64 {
+    // FNV-1a：只需要「撞了也无所谓」的散列，撞了最多是拿错一次注入结果 ——
+    // 而键里带着全部线索，实际碰撞概率可以忽略。
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    feed(&settings.max_tokens.to_le_bytes());
+    feed(&settings.rules_tokens.to_le_bytes());
+    feed(&settings.experience_tokens.to_le_bytes());
+    feed(&settings.max_items.to_le_bytes());
+    feed(&[settings.path_match as u8]);
+    // 记忆被写过（`store::invalidate` 代际 +1）就换一个键：注入结果是快照的
+    // 派生值，只清快照不清这份缓存，用户钉的规则要多等一个 TTL 才生效。
+    feed(&store::generation().to_le_bytes());
+    for probe in probes {
+        feed(probe.as_bytes());
+        feed(b"\x1f");
+    }
+    hash
+}
+
+fn cache_get(key: u64) -> Option<Option<String>> {
+    let mut guard = cache().lock().ok()?;
+    let now = Instant::now();
+    guard.retain(|(_, stamp, _)| now.duration_since(*stamp) < CACHE_TTL);
+    guard
+        .iter()
+        .find(|(stored, _, _)| *stored == key)
+        .map(|(_, _, value)| value.as_deref().map(|text| text.to_string()))
+}
+
+fn cache_put(key: u64, value: Option<&str>) {
+    let Ok(mut guard) = cache().lock() else { return };
+    if guard.len() >= CACHE_MAX {
+        // 简单淘汰：丢掉最早的那条。不用 LRU —— 缓存的是「同一批线索」，
+        // 命中率对淘汰策略不敏感。
+        guard.remove(0);
+    }
+    guard.push((key, Instant::now(), value.map(|text| Arc::new(text.to_string()))));
+}
+
+fn build(settings: &Settings, probes: &[String]) -> Option<String> {
+    let entries = store::snapshot();
+
+    // ── 第一段：必须遵守 ────────────────────────────────────────
+    let mut rules: Vec<&MemoryEntry> = entries.iter().filter(|entry| rule_candidate(entry)).collect();
+    rules.sort_by(|left, right| {
+        right
+            .pinned
+            .cmp(&left.pinned)
+            .then(
+                right
+                    .importance
+                    .partial_cmp(&left.importance)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(right.updated_at.cmp(&left.updated_at))
+    });
+
+    let mut body = String::new();
+    let mut used = estimate_tokens(&header());
+    let mut rule_ids: Vec<&str> = Vec::new();
+    let mut rules_text = String::new();
+    let mut rules_used = 0usize;
+    for entry in &rules {
+        let rendered = line(entry, 56);
+        let cost = estimate_tokens(&rendered) + 1;
+        if rules_used + cost > settings.rules_tokens {
+            break;
+        }
+        rules_text.push_str(&rendered);
+        rules_text.push('\n');
+        rules_used += cost;
+        rule_ids.push(entry.id.as_str());
+    }
+    if !rules_text.is_empty() {
+        body.push_str("## 必须遵守\n");
+        body.push_str(&rules_text);
+        used += rules_used + 2;
+    }
+
+    // ── 第二段：相关经验 ────────────────────────────────────────
+    //
+    // 门槛按条目分层（`floor_for`）：l2 与「天然是结论」的类别 2.0，普通 l1 流水
+    // 3.3。不设统一门槛的话，两种坏结果必居其一：门槛 2.0 会让导入的流水把预算
+    // 占满，门槛 3.3 会让沉淀结论全部落选。
+    //
+    // `extra` 只在这条请求里真的出现路径时才建（`path_like`）：它是全库正文扫
+    // 一遍的派生索引，纯文字聊天不该付这份钱。
+    let derived = if settings.path_match && path_like(probes) {
+        Some(derived_paths())
+    } else {
+        None
+    };
+    let mut scored: Vec<(f64, &MemoryEntry)> = entries
+        .iter()
+        .filter(|entry| !rule_ids.contains(&entry.id.as_str()))
+        .filter_map(|entry| {
+            let floor = floor_for(entry)?;
+            let extra = derived.as_ref().and_then(|index| index.get(&entry.id));
+            let score = relevance(entry, probes, settings.path_match, extra);
+            (score >= floor).then_some((score, entry))
+        })
+        .collect();
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(right.1.updated_at.cmp(&left.1.updated_at))
+    });
+
+    let mut experience_text = String::new();
+    let mut experience_used = 0usize;
+    let mut picked = 0usize;
+    for (_, entry) in &scored {
+        // `max_items` 在**选中之后**才计数，不在排序之后先截断：先截断的话，
+        // 前 6 条若都是长摘要，预算一满就直接 break，后面那些短而准的条目
+        // 连被看一眼的机会都没有 —— 结果是一条经验都注不进去。
+        if picked >= settings.max_items {
+            break;
+        }
+        let rendered = line(entry, 56);
+        let cost = estimate_tokens(&rendered) + 1;
+        if experience_used + cost > settings.experience_tokens {
+            continue;
+        }
+        if used + experience_used + cost > settings.max_tokens {
+            break;
+        }
+        experience_text.push_str(&rendered);
+        experience_text.push('\n');
+        experience_used += cost;
+        picked += 1;
+    }
+    if !experience_text.is_empty() {
+        body.push_str("\n## 相关经验\n");
+        body.push_str(&experience_text);
+    }
+
+    if body.trim().is_empty() {
+        return None;
+    }
+    Some(format!("{MARKER}\n{}\n{body}{MARKER_END}", header().trim_end()))
+}
+
+/// 注入块的开头说明。
+///
+/// 最后那句「磁盘代码才是唯一现实」是硬约束，不能省：没有它，模型会拿三周前的
+/// 记忆去「修复」刚改对的代码 —— 那比没有记忆糟得多（`agents::INSTRUCTION_BLOCK`
+/// 里同一条，两处必须一致）。
+fn header() -> String {
+    "以下是本机记忆中枢里与本次任务相关的既有结论。\n\
+     它们是历史陈述，不代表当前代码状态；与本次对话冲突时以本次为准，改文件前先读文件。\n\n"
+        .to_string()
+}
+
+// ── 注入到请求体 ─────────────────────────────────────────────
+
+/// 这个 body 里已经注入过了吗。
+fn already_chat(body: &Value) -> bool {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .map(|content| content.to_string().contains(MARKER))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 从 Chat 形态的请求体里取「要拿去做线索的文本」。
+///
+/// 只取最后 4 条 user / tool 消息：最新的一条 user 是本次任务，tool 结果里常有
+/// 文件名与报错。整段历史都拿进来会让线索池被前面几十轮的话题污染。
+fn chat_request_text(body: &Value) -> String {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut picked: Vec<&Value> = Vec::new();
+    for message in messages.iter().rev() {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        if !matches!(role, "user" | "tool") {
+            continue;
+        }
+        picked.push(message);
+        if picked.len() >= 4 {
+            break;
+        }
+    }
+    let mut text = String::new();
+    for message in picked {
+        let content = message.get("content").cloned().unwrap_or(Value::Null);
+        text.push_str(&crate::server::core::protocol::content_text(&content));
+        text.push('\n');
+        if text.chars().count() > 20_000 {
+            break;
+        }
+    }
+    truncate_chars(&text, 20_000)
+}
+
+/// 把注入块插进 Chat 形态的 `messages`。
+///
+/// 位置选「开头连续 system 块之后」而不是最前面：客户端的 system 里常有
+/// 「你是 Claude Code」这类身份声明，把记忆插到它前面会让那段声明变成对记忆的
+/// 补充说明（模型读起来像「记忆里说我是 Claude Code」）。插在后面，记忆是
+/// 附加信息，不是身份。
+fn insert_chat(body: &mut Value, block: &str) -> bool {
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let at = messages
+        .iter()
+        .position(|message| {
+            !matches!(
+                message.get("role").and_then(Value::as_str),
+                Some("system" | "developer")
+            )
+        })
+        .unwrap_or(messages.len());
+    messages.insert(
+        at,
+        serde_json::json!({ "role": "system", "content": block }),
+    );
+    true
+}
+
+/// 给 Chat 形态的请求体注入记忆。返回注入的 token 数（`None` = 没注入）。
+///
+/// ── 为什么返回 token 数而不是 bool ──────────────────────────
+/// 「注入有没有发生」和「注入了多少」是两个问题。只回 bool 时，日志里那行
+/// 「已附加记忆块」既不能证明它带了内容（可能是空块），也不能解释「这次请求
+/// 怎么贵了 600 token」。把数字带回去，日志一行就说清了。
+pub fn inject_chat(body: &mut Value) -> Option<usize> {
+    note_attempt();
+    if already_chat(body) {
+        return None;
+    }
+    let text = chat_request_text(body);
+    let block = compose(&text)?;
+    if !insert_chat(body, &block) {
+        return None;
+    }
+    let tokens = estimate_tokens(&block);
+    note_injected(tokens);
+    Some(tokens)
+}
+
+/// 给原生协议体注入记忆（Responses 的 `instructions`、Anthropic 的 `system`）。
+///
+/// ── 为什么原生体也要注 ──────────────────────────────────────
+/// `/v1/responses` 与 `/v1/messages` 在上游协议相同时走**原生转发**，那条路
+/// 发送的是 `native.routed(projection)` —— 它只从 Chat 投影里取 `model`，其余
+/// 字段全部来自原生体。所以只在 `chat_body` 上注入，原生转发那一支收不到。
+/// 两处都注，靠 [`MARKER`] 保证只生效一次。
+pub fn inject_native(body: &mut Value, protocol: crate::server::core::protocol::native::WireProtocol) -> Option<usize> {
+    use crate::server::core::protocol::native::WireProtocol;
+    let key = match protocol {
+        WireProtocol::Anthropic => "system",
+        WireProtocol::Responses => "instructions",
+        WireProtocol::Chat => return inject_chat(body),
+    };
+    note_attempt();
+    if body
+        .get(key)
+        .map(|value| value.to_string().contains(MARKER))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    // 原生体几 KB 到几百 KB，序列化一次是可接受的（上游请求本来就要序列化它）。
+    // 线索只看后半段：`input` 数组里最新的消息在尾部。
+    let serialized = body.to_string();
+    let tail: String = {
+        let total = serialized.chars().count();
+        if total > 20_000 {
+            serialized
+                .chars()
+                .skip(total.saturating_sub(20_000))
+                .collect()
+        } else {
+            serialized
+        }
+    };
+    let block = compose(&tail)?;
+    if !append_native(body, protocol, key, &block) {
+        return None;
+    }
+    let tokens = estimate_tokens(&block);
+    note_injected(tokens);
+    Some(tokens)
+}
+
+fn append_native(
+    body: &mut Value,
+    protocol: crate::server::core::protocol::native::WireProtocol,
+    key: &str,
+    block: &str,
+) -> bool {
+    use crate::server::core::protocol::native::WireProtocol;
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    match object.get_mut(key) {
+        // Anthropic 的 `system` 既可以是字符串，也可以是内容块数组
+        Some(Value::Array(parts)) if protocol == WireProtocol::Anthropic => {
+            parts.push(serde_json::json!({ "type": "text", "text": block }));
+            true
+        }
+        Some(Value::String(current)) => {
+            current.push_str("\n\n");
+            current.push_str(block);
+            true
+        }
+        Some(_) => false,
+        None => {
+            object.insert(key.to_string(), Value::String(block.to_string()));
+            true
+        }
+    }
+}
+
+/// 排障用：给定一段请求文本，回一份「这次会注入什么」。
+///
+/// 用户抱怨过「改了配置看不出效果」。这个函数让界面能直接把注入结果摊开给他看，
+/// 而不是让他去翻日志猜。
+///
+/// 传空文本时**不**返回空结果，而是只算「必须遵守」那一段（线索为空，所以
+/// 相关经验一定没有）。这是常见用法：用户就想看看「我钉的那几条到底进没进去」。
+///
+/// ── 为什么要额外回一份 `hits` ──────────────────────────────
+/// 只回拼好的 `text` 时，「没命中」和「命中了但被预算挤掉」在界面上长得一样。
+/// `hits` 把每条候选的**得分与门槛**一起摊开：`score >= floor` 却不在 `text`
+/// 里，就是被预算挤掉了（该调 `inject.experienceTokens`）；`score < floor` 才是
+/// 真的没命中（该补记忆或换线索）。这两种情况的处置完全相反。
+pub fn preview(request_text: &str) -> Value {
+    let settings = settings();
+    let query = if request_text.trim().is_empty() {
+        "（未提供请求文本，仅展示「必须遵守」）"
+    } else {
+        request_text
+    };
+    let block = compose(query);
+    // 命中的那几条单独扫一遍：`build` 只回拼好的文本，拿不到「差多少分」。
+    // 这条接口是用户手点的，多扫一遍全库是几十毫秒，可以接受。
+    let probes = probes(request_text);
+    let hits: Vec<Value> = if settings.enabled {
+        let entries = store::snapshot();
+        let derived = if settings.path_match && path_like(&probes) {
+            Some(derived_paths())
+        } else {
+            None
+        };
+        let mut rows: Vec<(f64, f64, &MemoryEntry)> = entries
+            .iter()
+            .filter_map(|entry| {
+                let floor = floor_for(entry)?;
+                let extra = derived.as_ref().and_then(|index| index.get(&entry.id));
+                let score = relevance(entry, &probes, settings.path_match, extra);
+                (score > 0.0).then_some((score, floor, entry))
+            })
+            .collect();
+        rows.sort_by(|left, right| {
+            right
+                .0
+                .partial_cmp(&left.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows.truncate(12);
+        rows.iter()
+            .map(|(score, floor, entry)| {
+                // `score` / `floor` 在这里是引用（`rows.iter()` 给的是借用），
+                // 显式解引用一次，免得读的人以为比较的是指针
+                let (score, floor) = (*score, *floor);
+                serde_json::json!({
+                    "id": entry.id,
+                    "title": entry.title,
+                    "type": entry.kind.as_str(),
+                    "layer": if entry.layer == Layer::L2 { "l2" } else { "l1" },
+                    "score": (score * 100.0).round() / 100.0,
+                    "floor": floor,
+                    "pass": score >= floor,
+                    "files": entry.files.clone(),
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    serde_json::json!({
+        "enabled": settings.enabled,
+        "settings": {
+            "maxTokens": settings.max_tokens,
+            "rulesTokens": settings.rules_tokens,
+            "experienceTokens": settings.experience_tokens,
+            "maxItems": settings.max_items,
+            "pathMatch": settings.path_match,
+        },
+        "probes": probes,
+        "hits": hits,
+        "text": block,
+        "tokens": block.as_deref().map(estimate_tokens).unwrap_or(0),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_origins_skip_injection() {
+        // 记忆自己的蒸馏 / 画像任务是打本进程网关跑的，给它们注入记忆会让旧结论
+        // 给新结论背书 —— 蒸馏会自我复制，新信息再也进不来。
+        assert!(is_internal_origin("Agent2API-MemoryBrain/1.0"));
+        assert!(is_internal_origin("agent2api-vision/2.0"));
+        // 真实客户端不能被误判：误判的后果是「用户装了记忆但永远不注入」，
+        // 而且没有任何报错 —— 那种 bug 只能靠用户报「怎么没生效」才发现。
+        assert!(!is_internal_origin("claude-cli/2.0.1 (external, cli)"));
+        assert!(!is_internal_origin("codex_cli_rs/0.51.0"));
+        assert!(!is_internal_origin(""));
+    }
+
+    #[test]
+    fn probes_pick_paths_and_identifiers() {
+        let text = "改一下 desktop-tauri/src-tauri/server/src/server/api/chat.rs 里的 \
+                    `inject_chat`，然后跑 node scripts/deliver.mjs";
+        let found = probes(text);
+        assert!(
+            found.iter().any(|item| item.contains("chat.rs")),
+            "路径必须被抽出来：{found:?}"
+        );
+        assert!(
+            found.iter().any(|item| item == "inject_chat"),
+            "snake_case 标识符必须被抽出来：{found:?}"
+        );
+        assert!(
+            found.iter().any(|item| item.contains("deliver.mjs")),
+            "命令里的脚本名必须被抽出来：{found:?}"
+        );
+    }
+
+    #[test]
+    fn probes_ignore_noise() {
+        // 纯自然语言不该产出线索 —— 否则「这个」「问题」会命中一切
+        assert!(probes("这个功能还有问题，再看看").is_empty());
+    }
+
+    #[test]
+    fn probes_pick_camel_case() {
+        // camelCase 必须单独在**原文**上匹配：小写化之后 `injectChat` 变成
+        // `injectchat`，那条正则就永远匹配不到 —— 这是第一版真实的 bug。
+        let found = probes("看看 injectChat 和 memoryPage 这两个函数");
+        assert!(
+            found.iter().any(|item| item == "injectchat"),
+            "camelCase 必须被抽出来（小写化后入库）：{found:?}"
+        );
+        assert!(
+            found.iter().any(|item| item == "memorypage"),
+            "第二个 camelCase 也要抽出来：{found:?}"
+        );
+    }
+
+    #[test]
+    fn probe_budget_is_capped() {
+        // 24 个上限：线索池要是被一整段长日志塞满，真正的路径会被挤出去
+        let text = (0..60)
+            .map(|index| format!("foo_bar_{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(probes(&text).len(), 24);
+    }
+
+    #[test]
+    fn header_forbids_trusting_stale_memory() {
+        // 这条文案是硬约束：少了它，模型会拿旧记忆去改刚改对的代码
+        let text = header();
+        assert!(text.contains("不代表当前代码状态"), "{text}");
+        assert!(text.contains("改文件前先读文件"), "{text}");
+    }
+
+    #[test]
+    fn insert_chat_lands_after_leading_system_blocks() {
+        let mut body = serde_json::json!({
+            "model": "x",
+            "messages": [
+                { "role": "system", "content": "你是 Claude Code" },
+                { "role": "system", "content": "项目规范" },
+                { "role": "user", "content": "hi" }
+            ]
+        });
+        assert!(insert_chat(&mut body, "<agent2api-memory>x</agent2api-memory>"));
+        let messages = body.get("messages").and_then(Value::as_array).unwrap();
+        assert_eq!(messages.len(), 4);
+        // 身份声明仍在最前，记忆是第三条
+        assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("system"));
+        assert!(messages[2]
+            .get("content")
+            .map(|value| value.to_string().contains(MARKER))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn already_chat_detects_marker() {
+        let injected = serde_json::json!({
+            "messages": [{ "role": "system", "content": format!("{MARKER}…{MARKER_END}") }]
+        });
+        assert!(already_chat(&injected));
+        let plain = serde_json::json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        assert!(!already_chat(&plain));
+    }
+
+    #[test]
+    fn append_native_handles_string_and_blocks() {
+        use crate::server::core::protocol::native::WireProtocol;
+        let mut responses = serde_json::json!({ "instructions": "原有说明" });
+        assert!(append_native(&mut responses, WireProtocol::Responses, "instructions", "MEM"));
+        let text = responses.get("instructions").and_then(Value::as_str).unwrap();
+        assert!(text.starts_with("原有说明"), "原有内容不能被覆盖：{text}");
+        assert!(text.ends_with("MEM"));
+
+        // Anthropic 的 system 是块数组时，必须 push 一个 text 块而不是拼字符串
+        let mut anthropic = serde_json::json!({ "system": [{ "type": "text", "text": "原有" }] });
+        assert!(append_native(&mut anthropic, WireProtocol::Anthropic, "system", "MEM"));
+        let parts = anthropic.get("system").and_then(Value::as_array).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1].get("text").and_then(Value::as_str), Some("MEM"));
+
+        // 没有 system 字段时直接插一个字符串
+        let mut empty = serde_json::json!({});
+        assert!(append_native(&mut empty, WireProtocol::Anthropic, "system", "MEM"));
+        assert_eq!(empty.get("system").and_then(Value::as_str), Some("MEM"));
+    }
+
+    #[test]
+    fn harvest_paths_requires_a_directory_segment() {
+        // 带目录的路径要抽出来，并且反斜杠统一成正斜杠（Windows 写法与 Unix
+        // 写法是同一条路径，不归一化就等于两条都不命中）
+        let found = harvest_paths("改了 src\\server\\api\\chat.rs 和 desktop-tauri/ui-islands/src/islands/memory-api.ts");
+        assert!(found.iter().any(|item| item == "src/server/api/chat.rs"), "{found:?}");
+        assert!(found.iter().any(|item| item == "desktop-tauri/ui-islands/src/islands/memory-api.ts"), "{found:?}");
+        // 光杆文件名不收：`chat.rs` 在仓库里可能有十几个，收进来就是「命中一切」
+        assert!(
+            !harvest_paths("再看一下 chat.rs 这个文件").iter().any(|item| item == "chat.rs"),
+            "光杆文件名不该被收进 files"
+        );
+        // 非代码扩展名不收
+        assert!(harvest_paths("读一下 C:/Users/me/Desktop/报表.xlsx").is_empty());
+    }
+
+    #[test]
+    fn file_hit_matches_three_shapes() {
+        let mut entry = MemoryEntry::draft("t1", "注入点", MemoryKind::Pitfall, "正文");
+        entry.files = vec!["desktop-tauri/src-tauri/server/src/server/api/chat.rs".to_string()];
+        let anchored = || entry.files.iter().map(String::as_str);
+        // 记忆里的路径比请求里的短：请求带了绝对路径前缀
+        assert!(file_hit(anchored(), "/d/personal/desktop/agent2api-main/desktop-tauri/src-tauri/server/src/server/api/chat.rs"));
+        // 记忆里的路径比请求里的长：请求只给了仓库相对路径的一部分
+        assert!(file_hit(anchored(), "src/server/api/chat.rs"));
+        // 请求里只有文件名
+        assert!(file_hit(anchored(), "chat.rs"));
+        // 完全不相干
+        assert!(!file_hit(anchored(), "deliver.mjs"));
+        // 短线索（3 字符）不该命中路径 —— `api` 会命中 `.../api/chat.rs`
+        assert!(!file_hit(anchored(), "api"));
+    }
+
+    #[test]
+    fn short_probes_do_not_match_head() {
+        // 短线索（`api` / `md`）在几千条记忆里几乎必然出现在某条标题上，
+        // 放行就等于每次注入都掺一条不相干的记忆
+        assert!(!head_hit("api gateway 的说明", "api"));
+        assert!(head_hit("api gateway 的说明", "gateway"));
+    }
+
+    #[test]
+    fn floors_let_imported_l1_in_but_keep_noise_out() {
+        // 导入的会话流水是 l1 / daily / importance 0.4 —— 它们占了本机库的绝大多数。
+        // 门槛必须是「路径命中或两条线索」才进，否则注入对真实数据一条都命中不了。
+        let mut imported = MemoryEntry::draft("i1", "改注入点", MemoryKind::Daily, "正文");
+        imported.layer = Layer::L1;
+        imported.importance = 0.4;
+        imported.files = vec!["desktop-tauri/src-tauri/server/src/server/api/chat.rs".to_string()];
+        let floor = floor_for(&imported).expect("普通 l1 也要有门槛（不是不进池）");
+        assert!(floor > 3.0, "普通流水的门槛必须高于「单条路径命中」：{floor}");
+        // 一条路径命中 = 3.0 + 0.4，刚好过线
+        let one_path = vec!["chat.rs".to_string()];
+        assert!(
+            relevance(&imported, &one_path, true, None) >= floor,
+            "路径命中必须能进：{} vs {floor}",
+            relevance(&imported, &one_path, true, None)
+        );
+        // 一个泛词命中 = 2.0 + 0.4，不该进
+        let mut titled = MemoryEntry::draft("i2", "注入点说明", MemoryKind::Daily, "正文");
+        titled.layer = Layer::L1;
+        titled.importance = 0.4;
+        let noise = vec!["注入点说明".to_string()];
+        assert!(relevance(&titled, &noise, true, None) < floor_for(&titled).unwrap());
+
+        // 沉淀层与「天然是结论」的类别门槛低：它们本来就是结论
+        let mut l2 = MemoryEntry::draft("l2", "注入点", MemoryKind::Knowledge, "正文");
+        l2.layer = Layer::L2;
+        assert_eq!(floor_for(&l2), Some(2.0));
+        let mut pitfall = MemoryEntry::draft("p1", "注入点", MemoryKind::Pitfall, "正文");
+        pitfall.layer = Layer::L1;
+        assert_eq!(floor_for(&pitfall), Some(2.0));
+
+        // 死条目一律不进
+        let mut dead = MemoryEntry::draft("d1", "x", MemoryKind::Knowledge, "正文");
+        dead.deleted_at = Some(1);
+        assert_eq!(floor_for(&dead), None);
+    }
+
+    #[test]
+    fn derived_paths_let_imported_entries_match_by_file() {
+        // 存量导入条目的 `files` 是空的（那时还没抽路径），而它们占了库里绝大多数。
+        // `derived_paths` 从正文补一份内存索引，让这批数据在「按文件命中」这一档
+        // 上不再是隐形的 —— 否则路径命中对存量数据永久失效。
+        let mut legacy = MemoryEntry::draft("legacy", "改网关", MemoryKind::Daily, "正文");
+        legacy.layer = Layer::L1;
+        legacy.importance = 0.4;
+        legacy.files = Vec::new();
+        let body = "今天改了 desktop-tauri/src-tauri/server/src/server/api/chat.rs 里的注入";
+        let extra = harvest_paths(body);
+        assert!(!extra.is_empty(), "正文里的路径必须被抽出来：{extra:?}");
+
+        let probe = vec!["chat.rs".to_string()];
+        let floor = floor_for(&legacy).unwrap();
+        // 没有派生路径：只剩标题可比，进不了
+        assert!(relevance(&legacy, &probe, true, None) < floor);
+        // 有派生路径：3.0 + 0.4 过线
+        assert!(
+            relevance(&legacy, &probe, true, Some(&extra)) >= floor,
+            "派生路径命中必须能进：{} vs {floor}",
+            relevance(&legacy, &probe, true, Some(&extra))
+        );
+        // `files` 非空时不该再走派生路径（自己那份更准）—— 由调用侧保证，
+        // 这里钉住判据：两处都命中不会重复加分，因为 `file_hit` 是短路 `any`
+    }
+
+    #[test]
+    fn path_like_only_fires_on_real_paths() {
+        // 建派生索引要扫全库正文，纯文字请求不该付这份钱
+        assert!(!path_like(&["inject_chat".to_string()]));
+        assert!(!path_like(&["a/b".to_string()]));
+        assert!(path_like(&["src/server/api/chat.rs".to_string()]));
+        assert!(path_like(&["src\\server\\chat.rs".to_string()]));
+    }
+}

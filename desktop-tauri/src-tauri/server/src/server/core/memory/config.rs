@@ -209,6 +209,30 @@ static SCHEMA: &[Knob] = &[
     range(knob_d("agents.searchMaxTokens", Kind::Number, Tier::Internal, "Agent 接入", "memory_search token 上限",
         "检索结果超预算时从尾部丢行，直到估算 token 落回这个数", "1200"), 200.0, 4000.0),
 
+    // ===== 请求级注入 =====
+    //
+    // ── 这一组解决的是什么 ──────────────────────────────────────
+    // 记忆存了几千条、MCP 工具也能用，但模型**不会主动去查** —— 实测
+    // `memory_core` 只被调过 1 次、真检索 0 次。靠提示词块写一句「开局先读记忆」
+    // 是建议，客户端可以不读、模型可以忽略。
+    //
+    // 所以这里改成网关在转发前主动把「必须遵守 + 相关经验」塞进请求。模型不需要
+    // 自觉，因为它一睁眼就看到了。整组默认开、预算小（600 token），关掉即恢复
+    // 改造前的行为。
+    knob_d("inject.enabled", Kind::Bool, Tier::Basic, "请求级注入", "转发前注入记忆",
+        "把「必须遵守」与「相关经验」拼成一段 system 消息塞进每次对话；关掉则只保留 MCP 工具（模型需自己查）",
+        "true"),
+    range(knob_d("inject.maxTokens", Kind::Number, Tier::Basic, "请求级注入", "注入总预算（token）",
+        "整块硬上限，两段加起来不许超过它", "600"), 100.0, 4000.0),
+    range(knob_d("inject.rulesTokens", Kind::Number, Tier::Advanced, "请求级注入", "「必须遵守」预算",
+        "置顶条目 + 偏好 + 画像这几类，用户明确表达过的长期要求", "260"), 0.0, 2000.0),
+    range(knob_d("inject.experienceTokens", Kind::Number, Tier::Advanced, "请求级注入", "「相关经验」预算",
+        "命中本次请求里的路径 / 标识符 / 命令名的避坑与决策", "340"), 0.0, 3000.0),
+    range(knob_d("inject.maxItems", Kind::Number, Tier::Advanced, "请求级注入", "相关经验最多几条",
+        "再多也不会全塞 —— 一次给 6 条以内的精度最高", "6"), 1.0, 20.0),
+    knob_d("inject.pathMatch", Kind::Bool, Tier::Advanced, "请求级注入", "按文件路径精确命中",
+        "记忆的 files 字段与请求里的路径做字符串匹配；权重最高、几乎不误报", "true"),
+
     // ===== 深层记忆 =====
     knob("deep.enabled", Kind::Bool, Tier::Basic, "深层记忆", "深层记忆总开关", "true"),
     knob("deep.personaEnabled", Kind::Bool, Tier::Basic, "深层记忆", "生成人格画像", "true"),
@@ -294,6 +318,21 @@ static SCHEMA: &[Knob] = &[
         "归类建议产生后立即按推荐归入对应项目", "false"),
     knob_d("review.autoConfirmDedup", Kind::Bool, Tier::Advanced, "待确认", "自动确认去重采纳",
         "去重建议产生后立即按推荐采纳新记忆；永不物理删除", "false"),
+    // ── 蒸馏结论默认直接落地（与上面三条相反，故意的）──────────
+    //
+    // 上面三条默认关，因为它们改的是**已有记忆**（搬项目、标失效、合并重复），
+    // 判错的代价是破坏原有数据。蒸馏不一样：它只**新增**一条 l2，来源写在
+    // `supersedes` / `evidence` 里，删掉就回到原样 —— 而且 `deep.evidenceRequired`
+    // 已经挡掉了「说不出出处」的结论。
+    //
+    // 默认开是为了补一个实测出来的死结：导入 2341 条之后，「深度记忆」还是 9 条。
+    // 原因不是蒸馏没跑，而是蒸馏的产物全部停在待确认队列里等人点头，而人不会
+    // 每天去点几百下。于是 l2 永远长不出来，而请求级注入最值钱的那一段
+    // （沉淀结论 + 踩坑/决策）—— 注入看着「开了」，实际没东西可注。
+    // 队列留着当审计，但不再当闸门。
+    knob_d("review.autoConfirmDistill", Kind::Bool, Tier::Basic, "待确认", "蒸馏结论直接落地",
+        "开：蒸馏产出的结论直接写成 l2（仍进队列留档，可随时删）；关：只入队等人工点头。\
+         关掉后 l2 几乎不会自己长出来，请求级注入也就没东西可注", "true"),
 
     // ===== 清理（危险动作，默认全关）=====
     knob_d("cleanup.autoDeleteSuperseded", Kind::Bool, Tier::Advanced, "清理", "自动清理失效记忆",
@@ -335,6 +374,15 @@ static SCHEMA: &[Knob] = &[
     knob("models.taskEffort", Kind::Map, Tier::Internal, "模型与网关", "各任务思考强度覆盖",
         "{\"extract\":\"low\",\"tag\":\"minimal\",\"classify\":\"minimal\",\"summarize\":\"low\",\
           \"distill\":\"medium\",\"profile\":\"high\",\"dedup\":\"low\",\"supersede\":\"low\"}"),
+    // 各任务输出 token 上限。没列到的任务走 `llm::max_tokens_for` 里的默认表。
+    //
+    // 为什么这必须是一个可见的旋钮：`distill` / `profile` 一次要产出 3-8 条带证据
+    // 的结论，1200 token 会被截断，截断后 JSON 解析失败，用户看到的是「深度记忆
+    // 0 条」而不是「预算不够」。留一个能改的键，比让用户去猜 prompt 有用。
+    knob("models.taskMaxTokens", Kind::Map, Tier::Internal, "模型与网关", "各任务输出 token 上限",
+        "{\"extract\":1200,\"tag\":1600,\"classify\":800,\"summarize\":1600,\
+          \"distill\":3000,\"profile\":3000,\"consolidate\":3000,\"supersede\":800,\
+          \"dedup\":800,\"insight\":1600}"),
 
     // ===== 导入 =====
     knob_d("import.dryRunFirst", Kind::Bool, Tier::Advanced, "导入", "导入前必须干跑预览", "", "true"),
@@ -1358,6 +1406,7 @@ mod tests {
             ("schedule.rs", include_str!("schedule.rs")),
             ("enrich.rs", include_str!("enrich.rs")),
             ("llm.rs", include_str!("llm.rs")),
+            ("inject.rs", include_str!("inject.rs")),
             ("agents.rs", include_str!("agents.rs")),
             ("rt.rs", include_str!("rt.rs")),
             ("redact.rs", include_str!("redact.rs")),

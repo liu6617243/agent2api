@@ -146,6 +146,21 @@ export type MemoryStatus = {
    * 前端必须把它渲染成「整理中」而不是 0 —— 0 会被读成「索引空了」。
    */
   index: { count: number | null; fts: boolean; inSync: boolean | null }
+  /**
+   * 请求级注入的「真的在跑吗」证据：本次启动以来的注入次数、累计 token、
+   * 平均每次 token，以及开关状态。注入是用户看不见的动作，没有这三个数
+   * 就只能靠模型行为去猜有没有生效。
+   */
+  inject: {
+    count: number
+    tokens: number
+    avgTokens: number
+    enabled: boolean
+    /** 走过注入逻辑的请求数（`count` 只是真正注入了的那部分） */
+    attempts?: number
+    /** 走了注入但没命中任何记忆的次数 */
+    missed?: number
+  }
   tables?: Record<string, number>
   config: MemoryConfig
   revision: number
@@ -853,6 +868,54 @@ export function loadCore(project?: string, maxTokens?: number): Promise<{ text: 
 
 export function loadDigest(maxLines?: number): Promise<{ text: string; lines: number }> {
   return api('GET', `/api/memory/digest${query({ maxLines })}`)
+}
+
+/**
+ * 请求级注入预览：给一段「像用户会说的话」，回「网关会往里塞什么」。
+ *
+ * 后端 `GET /api/memory/inject/preview` 走的是和真实转发**完全同一条**函数
+ * （`inject::compose`），所以这里看到的就是线上会发生的。不带 `q` 时后端只算
+ * 「必须遵守」那一段 —— 用来确认「我钉的那几条到底进没进去」。
+ */
+export function loadInjectPreview(q?: string): Promise<InjectPreview> {
+  return api('GET', `/api/memory/inject/preview${query({ q })}`)
+}
+
+export type InjectHit = {
+  id: string
+  title: string
+  type: string
+  layer: 'l1' | 'l2'
+  /** 相关度得分（路径命中 3.0 / 线索命中 2.0 + 类型与重要度加成） */
+  score: number
+  /** 这条要过多少分才能进注入块（l2 与结论类 2.0，普通流水 3.3） */
+  floor: number
+  /** `score >= floor` —— 过线了；过线却不在 `text` 里说明被预算挤掉 */
+  pass: boolean
+  files: string[]
+}
+
+export type InjectPreview = {
+  enabled: boolean
+  settings: {
+    maxTokens: number
+    rulesTokens: number
+    experienceTokens: number
+    maxItems: number
+    pathMatch: boolean
+  }
+  /** 从请求文本里抽出来的线索（路径 / 反引号片段 / 标识符） */
+  probes: string[]
+  /**
+   * 候选记忆及其得分。
+   *
+   * 这一项是「为什么没注入」的唯一解释：`pass=false` 是没命中（线索不够具体），
+   * `pass=true` 但不在 `text` 里是被预算挤掉（该调大 experienceTokens）。
+   */
+  hits: InjectHit[]
+  /** 拼出来的注入块；`null` = 这次不会注入（没有命中） */
+  text: string | null
+  tokens: number
 }
 
 export function loadProjects(): Promise<{ items: MemoryProject[]; general: MemoryGeneral }> {

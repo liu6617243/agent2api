@@ -19,10 +19,26 @@
 //! `profile/` / `trash/` 这套布局与 frontmatter 键名和 AgentHub 一致：两边的
 //! 记忆目录可以互相直接读。所以这些名字改动要当成协议变更处理。
 //!
-//! ── 记忆为什么不经由网关注入 system prompt ───────────────────
-//! 网关不知道「这个请求属于哪个项目」，只能在请求体里塞一段与上下文无关的
-//! 文本；而记忆的价值恰恰在「什么时候该读哪一条」。所以记忆只通过 MCP 工具
-//! 暴露，由客户端决定何时读取 —— 这也是 AgentHub 的做法。
+//! ── 记忆怎么进到模型的上下文里（两条路，各管一段）────────────
+//! **1. MCP 工具（`tool_services::memory_mcp`）** —— 模型主动来问。
+//! 深挖、翻历史、按条件筛，都走这条。缺点是依赖模型自觉：实测装了 MCP 好几天，
+//! `memory_core` 被调 1 次、`memory_search` 0 次。只靠这条，记忆写了等于没写。
+//!
+//! **2. 请求级注入（`inject`）** —— 网关在转发前主动塞。只塞两段有硬预算的
+//! 内容：「必须遵守」（`pinned` + 偏好 + 画像）与「相关经验」（命中本次请求里
+//! 的**具体线索**——路径 / 标识符 / 命令名——的避坑与决策）。开关是
+//! `inject.enabled`，默认开。
+//!
+//! 早先本文件这里写的是「记忆不经由网关注入 system prompt」，理由是「网关不知道
+//! 这个请求属于哪个项目」。那个理由只对了一半：网关确实不知道项目，但它知道
+//! **这次请求提到了哪些文件、哪些函数、哪条命令** —— 那比项目名精确得多。所以
+//! 现在的判据不是「猜项目」，而是「只认字符串级命中，命不中就不注入」。宁可不给，
+//! 也不给错的：错的记忆比没有记忆更贵。
+//!
+//! 注入的内容永远是「历史陈述」，块头带一句硬约束（与
+//! `agents::INSTRUCTION_BLOCK` 同一条）：「不代表当前代码状态，与本次对话冲突时
+//! 以本次为准，改文件前先读文件」。没有这句，模型会拿三周前的结论去「修复」
+//! 刚改对的代码。
 
 pub mod agents;
 pub mod config;
@@ -30,6 +46,7 @@ pub mod enrich;
 pub mod import;
 pub mod import_registry;
 pub mod index;
+pub mod inject;
 pub mod layout;
 pub mod llm;
 pub mod model;
@@ -1170,6 +1187,10 @@ pub fn status_with(with_tables: bool) -> Value {
             "inSync": index_count.map(|count| count == entries.len()),
         },
         "config": config(),
+        // 请求级注入的「真的在跑吗」证据：本次启动以来的次数与平均 token。
+        // 光给开关状态没用 —— 用户要的是「它到底注入了没有」，而这件事没有
+        // 计数器就只能靠猜（注入是用户看不见的动作）。
+        "inject": inject::stats(),
         // 内容版本号：每次写入 +1。排障时用来判断「Agent 看到的是不是最新」。
         "revision": revision(),
     });
@@ -2296,6 +2317,77 @@ fn apply_derived(payload: &Value) -> Result<(), String> {
                 .map(|items| items.iter().filter_map(|id| id.as_str().map(str::to_string)).collect())
                 .unwrap_or_default()
         });
+    // 一次快照给下面三处用（继承 files / 判重 / 图边），不重复读盘
+    let snapshot = store::snapshot();
+    // ── 继承来源条目的 `files` ─────────────────────────────────
+    //
+    // 派生条目原来一律 `files: Vec::new()`，后果是**请求级注入的路径命中永远
+    // 打不中 l2**：注入里权重最高的一档是「记忆的 files 与请求里的路径对上」
+    // （+3.0），而 l2 全是蒸馏 / 合并 / 抽取出来的，files 空着就等于这一档对
+    // 它们永久失效 —— 只剩标题 / 摘要里凑巧出现的字符串可比。
+    //
+    // 来源条目的 files 是写入时锚定的真实路径，派生结论本来就建立在这些文件
+    // 之上，继承过来是语义正确的：下次再改同一个文件，这条结论能被命中。
+    // 上限 8 条，避免一条合并结论把二十个文件全挂上、变成「命中一切」。
+    //
+    // 但只继承不够：导入进来的 l1 流水（会话记录）本身没有 `files`，它们的路径
+    // 全在正文里。所以再从来源正文里抽一遍路径 —— 这是确定性字符串抽取，不依赖
+    // 模型输出，也不会把「看起来像路径」的普通词收进来（判据见 `harvest_paths`）。
+    //
+    // ── 这里存的是**仓库相对路径**，与 `files` 原本的「记忆根相对」不同 ──
+    // 体检（`health`）会按记忆根去 stat 这些路径，找不到就跳过那一条 —— 于是
+    // 派生条目不会被误报成「过时」。这是有意的取舍：宁可体检对 l2 少报一次，
+    // 也不要让请求级注入的路径命中对 l2 永久失效（那才是这套机制的主要出口）。
+    let files: Vec<String> = {
+        let mut out: Vec<String> = Vec::new();
+        for source in &sources {
+            let Some(entry) = snapshot.iter().find(|entry| &entry.id == source) else {
+                continue;
+            };
+            for file in &entry.files {
+                if !out.iter().any(|known| known == file) {
+                    out.push(file.clone());
+                }
+            }
+            for file in inject::harvest_paths(&entry.body) {
+                if !out.iter().any(|known| known == &file) {
+                    out.push(file);
+                }
+            }
+            if out.len() >= 8 {
+                break;
+            }
+        }
+        out.truncate(8);
+        out
+    };
+    // ── 同内容不写第二份 ───────────────────────────────────────
+    //
+    // 蒸馏 / 合并现在默认**直接落地**（`review.autoConfirmDistill`），而队列里
+    // 那条仍然留着等审计。于是有两条路会走到这里：自动落地一次、用户之后在
+    // 待确认列表里又点一次「批准」。`write()` 的精确去重只管 l1（l2 允许两条
+    // 一字不差但语境不同），所以第二次会老老实实再写一条 —— 库里出现两条
+    // 一模一样的结论，注入时还会占两个名额。
+    //
+    // 这里按内容哈希挡一次：l2 里已有同内容的活条目就直接返回成功（幂等），
+    // 不写、不报错。判据放在派生入口而不是 `write()` 里，是为了不动 l1/l2
+    // 各自的去重语义 —— 「同一个决定在两个项目里各下一次」仍然允许。
+    //
+    // 哈希要先过一遍脱敏（`write_inner` 里是 `redact::apply` 之后再算），否则
+    // 开了 `privacy.redact` 时两条内容相同但含敏感词的结论会算出不同的哈希，
+    // 这层判重就白设了。
+    let (redacted_body, _) = redact::apply(body);
+    let digest = model::content_hash(redacted_body.trim());
+    if snapshot
+        .iter()
+        .any(|entry| entry.is_live() && entry.layer == Layer::L2 && entry.hash == digest)
+    {
+        crate::server::logging::verbose(
+            "[Memory]",
+            "派生结论已存在（同内容 l2），跳过重复落盘",
+        );
+        return Ok(());
+    }
     let input = WriteInput {
         content: body.to_string(),
         title: payload.get("title").and_then(Value::as_str).map(str::to_string),
@@ -2305,7 +2397,7 @@ fn apply_derived(payload: &Value) -> Result<(), String> {
         agent: Some("review".to_string()),
         tags: Vec::new(),
         importance: payload.get("importance").and_then(Value::as_f64),
-        files: Vec::new(),
+        files,
         supersedes: sources.clone(),
         pinned: Some(false),
         starred: Some(false),

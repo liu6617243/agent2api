@@ -57,9 +57,43 @@ impl Request {
             user: user.into(),
             effort: String::new(),
             model: String::new(),
-            max_tokens: 1200,
+            max_tokens: max_tokens_for(task),
             temperature: 0.2,
         }
+    }
+}
+
+/// 每个任务默认要多少输出 token。
+///
+/// ── 为什么不能所有任务共用一个 1200 ──────────────────────────
+/// 早先这里是写死的 `1200`。而 `distill` 要一次产出 3-8 条、每条正文 100-300 字
+/// 的 JSON，`profile` 要四类各 1-4 条 —— 这些在 1200 token 上必然被截断，截断后
+/// 的 JSON 解析失败，表现成一句「模型返回空内容」。用户看到的是「深度记忆 0 条」，
+/// 而真正的原因是预算不够。
+///
+/// 1200 对 `extract` / `tag` / `summarize` 是够的（一次十来条短句），所以不能
+/// 简单地把全局值调大 —— 那会让每一条小任务都按大任务的额度去预留。
+///
+/// 可按 `models.taskMaxTokens` 覆盖（`{"distill": 4000}`），未列的走这张表。
+fn max_tokens_for(task: &str) -> u32 {
+    let configured = config::object_of("models.taskMaxTokens");
+    if let Some(value) = configured.get(task).and_then(Value::as_u64) {
+        if value >= 128 {
+            return value.min(32_000) as u32;
+        }
+    }
+    match task {
+        // 一次产出 3-8 条结论，每条含标题 + 100-300 字正文 + 证据 id
+        "distill" => 3000,
+        // 四类画像各 1-4 条，每条含标题 + 一句话 + 证据 id
+        "profile" => 3000,
+        "consolidate" => 3000,
+        // 一次给 10-20 条打标签 / 写摘要，输出比 distill 短但仍不止 1200
+        "tag" => 1600,
+        "summarize" => 1600,
+        // 只回答「哪几条被取代」，输出很短
+        "supersede" => 800,
+        _ => 1200,
     }
 }
 
@@ -324,6 +358,23 @@ pub fn complete(request: Request) -> Result<Reply, LlmError> {
         .trim()
         .to_string();
     if reply.is_empty() {
+        // ── 区分「截断」与「真空」────────────────────────────────
+        // 上游把输出预算吃满时会回 `finish_reason: "length"` 且 `content` 为空
+        //（思考型模型尤其常见：token 全花在 reasoning 上，正文一个字没留）。
+        // 早先这里一律报「模型返回空内容」，于是用户调了半天 prompt，真正该调的
+        // 是 `models.taskMaxTokens` 或 `models.taskEffort` —— 错误信息指错了方向。
+        let truncated = data
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason == "length");
+        let message = if truncated {
+            format!(
+                "输出被 max_tokens={} 截断（finish_reason=length）：任务 {} 的预算不够，调大 models.taskMaxTokens.{}",
+                request.max_tokens, request.task, request.task
+            )
+        } else {
+            "模型返回空内容".to_string()
+        };
         index::global().log_llm(
             &request.task,
             &model,
@@ -332,10 +383,10 @@ pub fn complete(request: Request) -> Result<Reply, LlmError> {
             completion_tokens,
             latency,
             false,
-            Some("模型返回空内容"),
+            Some(&message),
             None,
         );
-        return Err(LlmError::Failed("模型返回空内容".into()));
+        return Err(LlmError::Failed(message));
     }
     index::global().log_llm(
         &request.task,

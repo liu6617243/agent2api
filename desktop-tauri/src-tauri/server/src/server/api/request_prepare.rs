@@ -22,6 +22,13 @@ impl SpecialRoute {
     pub(super) fn compact(client: Option<&'static str>) -> Self { Self { compact: client, title: None } }
     pub(super) fn title(client: Option<&'static str>) -> Self { Self { compact: None, title: client } }
     fn any(self) -> bool { self.compact.is_some() || self.title.is_some() }
+    /// 这一趟是不是客户端后台发的便宜调用（标题生成 / 上下文压缩）。
+    ///
+    /// 判据是「命中过特殊路由」而不是「最终换了模型」：规则配了但目标模型正好
+    /// 就是原模型时，`rewrite_*` 会提前返回原模型名 —— 那仍然是标题请求，
+    /// 只是不需要换家。拿返回值判断会漏掉这一类，于是标题请求被注入 600 token
+    /// 的记忆（每一次都加钱，而结果用户根本看不到）。
+    pub(super) fn is_background(self) -> bool { self.any() }
 }
 
 pub(super) async fn resolve_model(

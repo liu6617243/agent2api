@@ -134,6 +134,28 @@ function Dashboard({ status, onGo, onChanged }: DashboardProps): React.ReactElem
           <MetricValue>{num(status.deleted)}</MetricValue>
           <div className='mm-metric-sub'>{t('已取代 {n} 条', { n: num(status.superseded) })}</div>
         </MetricCard>
+        {/* 「注入」这一格回答的是「记忆到底有没有被用上」。
+            只看 MCP 的调用次数是不够的 —— 模型很少主动查（实测装了好几天，
+            真检索 0 次）。请求级注入是网关替它塞的，所以这一格涨了才说明
+            记忆真的进了对话。旧后端没有这个字段，缺了就按 0 渲染。
+
+            副标题要能区分「没命中」和「没跑」：只有 count 时，0 有两种含义 ——
+            机制正常但没东西可注，或者注入根本没被调用（代码没接上）。两种处理
+            方式完全相反，所以用 attempts 一起判。 */}
+        <MetricCard>
+          <MetricLabel>{t('请求级注入')}</MetricLabel>
+          <MetricValue>{num(status.inject?.count ?? 0)}</MetricValue>
+          <div className='mm-metric-sub'>
+            {status.inject?.enabled === false
+              ? t('开关已关')
+              : (status.inject?.attempts ?? 0) === 0
+                ? t('还没有请求走过注入')
+                : t('平均 {n} token / 次 · 未命中 {m} 次', {
+                    n: num(status.inject?.avgTokens ?? 0),
+                    m: num(status.inject?.missed ?? 0),
+                  })}
+          </div>
+        </MetricCard>
       </MetricGrid>
 
       <Section

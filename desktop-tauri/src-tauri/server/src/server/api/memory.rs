@@ -9,6 +9,7 @@
 //! GET  /api/memory/get         按 id 取全文（?ids=a,b 或 ?id=a）
 //! GET  /api/memory/core        核心记忆文本（MCP `memory_core` 的同一份产出）
 //! GET  /api/memory/digest      索引概览（≤200 行）
+//! GET  /api/memory/inject/preview 请求级注入预览（?q= 一段请求文本 → 会注入什么）
 //! GET  /api/memory/timeline    事实演化链（?id=）
 //! GET  /api/memory/projects    项目列表（含 l1/l2 计数与注册表字段）
 //! GET  /api/memory/status      自检（含表行数、队列积压、设备 id）
@@ -219,6 +220,29 @@ pub async fn get_digest(State(_state): State<ServerState>, Query(params): Query<
     // 概览」会长短不同，用户很难理解为什么。
     let lines = number(&params, "maxLines").unwrap_or_else(|| memory::config().digest_max_lines);
     ok_json(memory::digest_text(lines))
+}
+
+/// `GET /api/memory/inject/preview?q=<一段请求文本>` —— 这次会注入什么。
+///
+/// ── 为什么这个端点必须存在 ──────────────────────────────────
+/// 请求级注入是「用户看不见的动作」：他改了 `inject.maxTokens`、钉了一条记忆、
+/// 写下一条避坑，都只能靠「模型行为好像变了」来猜有没有生效。猜不出就会来问，
+/// 而回答「应该生效了」没有任何说服力。
+///
+/// 这个端点把整条链路摊开给他看：抽出了哪些线索、命中了哪几条、拼出来的原文
+/// 长什么样、占多少 token。前端把它挂在注入开关下面当「试一下」用。
+///
+/// 传空 `q` 时用一句占位文本（只为了看到「必须遵守」那一段），不报错 ——
+/// 「看看现在钉了什么」本身就是常见用法。
+pub async fn get_inject_preview(
+    State(_state): State<ServerState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let query = text(&params, "q").unwrap_or_default();
+    // 预览要走一遍全量匹配（冷启动还要解析记忆文件），放到阻塞池里跑 ——
+    // 这条接口是用户在界面上手点的，不值得让它占住一个 async worker。
+    let preview = crate::server::core::blocking::in_place(|| memory::inject::preview(&query));
+    ok_json(preview)
 }
 
 pub async fn get_timeline(State(_state): State<ServerState>, Query(params): Query<HashMap<String, String>>) -> Response {

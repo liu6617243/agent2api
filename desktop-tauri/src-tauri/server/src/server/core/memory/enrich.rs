@@ -10,7 +10,11 @@
 //!   · 模型不可用（没配 Key / 预算用完）→ 返回 [`Outcome::Skipped`]，什么都不写；
 //!   · 模型给的 JSON 解析不了 → 同样跳过。**绝不用正则从自由文本里抠结论** ——
 //!     抠错一条会被当成事实长期留在记忆里，比没生成糟得多；
-//!   · 自动应用与否由 `review.autoConfirm*` 决定，默认全关，只入待确认队列。
+//!   · 自动应用与否由 `review.autoConfirm*` 决定。改**已有**记忆的那几条
+//!     （归类 / 失效 / 去重）默认全关，只入待确认队列；只**新增** l2 的
+//!     蒸馏 / 合并默认直接落地（`review.autoConfirmDistill`，默认开）——
+//!     因为队列留档 + 内容哈希幂等，落地是可撤销的，而「只入队」的实测结果
+//!     是 l2 永远长不出来。
 //!
 //! ── 为什么不覆盖原文 ────────────────────────────────────────
 //! 摘要写进「新增的一条 `l2 / insight`」，原文一个字都不动。记忆是历史陈述，
@@ -64,6 +68,8 @@ fn from_llm(error: LlmError) -> Outcome {
 const SYSTEM_EXTRACT: &str = "You maintain a local project memory store. \
 Summarise raw work logs into durable conclusions. \
 Only state things the log actually supports; never invent file names, APIs or numbers. \
+When the user stated a lasting requirement, preference or prohibition, record it as type=preference verbatim in spirit — \
+those are re-injected into every future request, so they must be phrased as an instruction, not as a report. \
 Answer in the same language as the input. Output strict JSON, no prose around it.";
 
 const SYSTEM_TAG: &str = "You tag engineering notes for retrieval. \
@@ -84,8 +90,14 @@ A different angle or an extra detail is not obsolescence. Output strict JSON, no
 /// 把一批 l1 流水蒸馏成 l2 结论。
 ///
 /// `project` 为空表示「所有项目的流水一起看」——不推荐，但允许（第一次使用时
-/// 用户往往还没分类）。产物是**待确认队列里的建议**，不是直接写入的条目：
-/// 蒸馏是这批任务里唯一会「从原文派生出新结论」的一步，它最需要人看一眼。
+/// 用户往往还没分类）。
+///
+/// ── 产物默认直接落地，但仍然进队列留档 ──────────────────────
+/// 早先这里只入队等人工点头。实测结果是死结：导入 2341 条之后深度记忆还是 9 条，
+/// 而人不会每天点几百下「批准」—— l2 长不出来，请求级注入最值钱的那一段
+/// （沉淀结论 + 踩坑/决策）就永远没东西可注。所以改成「先落地 + 队列留档」
+/// （`review.autoConfirmDistill`，默认开）：批准时 `apply_derived` 靠内容哈希
+/// 幂等，不会写成两条。
 pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
     if !config::bool_of("deep.enabled") {
         return Outcome::Skipped("深层记忆已关闭（deep.enabled）".into());
@@ -128,8 +140,14 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
     let ask = format!(
         "以下是某个项目最近的工作流水，请你把它们蒸馏成 3-8 条长期结论。\n\
          每条结论落在 decision（做过什么选择及理由）/ knowledge（外部事实与约束）/ \
-         insight（可跨项目复用的规律）/ pitfall（踩过的坑）之一。\n\
+         insight（可跨项目复用的规律）/ pitfall（踩过的坑）/ \
+         preference（用户明确提过的长期要求、禁止事项、做法偏好）之一。\n\
          只写仍然成立的东西；被后来推翻的内容不要写。\n\n\
+         ── preference 特别说明 ────────────────────────────────\n\
+         用户说过「不要这样做」「以后都这样」「保持 X 不变」这类话，就是 preference。\n\
+         写成命令句（「版本号保持 3.5.0-beta.1，不要自行 bump」），不要写成汇报\n\
+         （「用户说他不想升版本号」）—— 这条会被原样注入到之后每一次对话里，\n\
+         汇报句读起来像历史，命令句读起来像要求。\n\n\
          输出 JSON：{{\"items\":[{{\"title\":\"不超过 40 字\",\"type\":\"decision\",\"body\":\"100-300 字，含理由与取舍\",\"importance\":0.0-1.0,\"evidence\":[\"引用到的条目 id\"]}}]}}\n\n\
          素材：\n{material}"
     );
@@ -142,6 +160,7 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
     };
     let items = parsed.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut queued = 0usize;
+    let mut applied_count = 0usize;
     for item in items.iter().take(20) {
         let body = item.get("body").and_then(Value::as_str).unwrap_or("").trim();
         if body.chars().count() < 12 {
@@ -166,20 +185,51 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
             project.unwrap_or("general"),
             &model::content_hash(body)[..12]
         );
-        index::global().enqueue(
-            "distill",
-            &target,
-            &json!({
-                "title": title,
-                "type": kind.as_str(),
-                "body": body,
-                "importance": importance,
-                "evidence": evidence,
-                "project": project,
-                "model": reply.model,
-            }),
-            importance,
-        );
+        let payload = json!({
+            "title": title,
+            "type": kind.as_str(),
+            "body": body,
+            "importance": importance,
+            "evidence": evidence,
+            "project": project,
+            "model": reply.model,
+        });
+        let queued_id = index::global().enqueue("distill", &target, &payload, importance);
+        // ── 默认直接落地（`review.autoConfirmDistill`）────────────
+        //
+        // 为什么蒸馏和「归类 / 失效 / 去重」三条自动确认的默认值相反：那三条改的
+        // 是**已有**记忆，判错就破坏原数据；蒸馏只**新增**一条 l2，来源写在
+        // `supersedes` / `evidence` 里，删掉就回到原样。
+        //
+        // 而默认「只入队」的实测结果是死结：导入 2341 条之后深度记忆还是 9 条 ——
+        // 蒸馏产物全躺在待确认队列里等人点头，人不会每天点几百下。l2 长不出来，
+        // 请求级注入最值钱的那一段（沉淀结论 + 踩坑/决策）就永远没东西可注。
+        //
+        // 队列**照样留着**（`enqueue` 已写入），所以这是「先落地 + 可审计」，
+        // 不是「不留痕」。批准后 `apply_derived` 会再跑一遍，靠 `supersedes`
+        // 与内容哈希去重，不会写成两条。
+        let mut applied = false;
+        if config::bool_of("review.autoConfirmDistill") {
+            match super::apply_derived(&payload) {
+                Ok(()) => {
+                    applied = true;
+                    if let Some(id) = queued_id {
+                        index::global().review_resolve(&[id], "approved", Some("auto-distill"));
+                    }
+                }
+                Err(error) => {
+                    // 落地失败不算整体失败：队列里那条还在，人还能点头。
+                    // 这里只记日志，不把已经成功的其它条目一起丢掉。
+                    crate::server::logging::verbose(
+                        "[Memory]",
+                        &format!("蒸馏结论自动落地失败（已留在待确认队列）：{error}"),
+                    );
+                }
+            }
+        }
+        if applied {
+            applied_count += 1;
+        }
         queued += 1;
     }
     if queued == 0 {
@@ -187,6 +237,7 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
     }
     Outcome::Done(json!({
         "queued": queued,
+        "applied": applied_count,
         "material": source.len(),
         "model": reply.model,
         "tokens": reply.prompt_tokens + reply.completion_tokens,

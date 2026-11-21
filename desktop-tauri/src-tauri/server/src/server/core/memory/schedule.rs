@@ -1212,7 +1212,16 @@ fn extract(project: Option<&str>) -> Outcome {
         "下面是最近的若干条工作流水。请挑出**仍然值得长期记住**的内容，最多 3 条。\n\
          只挑有明确结论或明确教训的；进度汇报、寒暄、临时状态全部丢掉。\n\
          一条都没有就输出 {{\"items\":[]}}。\n\n\
-         输出 JSON：{{\"items\":[{{\"title\":\"不超过 40 字\",\"type\":\"decision|knowledge|pitfall\",\"body\":\"100-300 字\",\"importance\":0.0-1.0}}]}}\n\n\
+         ── type 怎么选 ──────────────────────────────────────\n\
+         decision  = 做了选择且说得出理由\n\
+         knowledge = 外部事实、接口形态、平台规矩\n\
+         pitfall   = 踩过的坑、下次要绕开的东西\n\
+         preference= 用户明确提过的长期要求、禁止事项、做法偏好\n\
+         用户说「不要这样」「以后都这样」「保持 X 不变」时一定是 preference，\n\
+         而且**要写成命令句**（「版本号保持 3.5.0-beta.1，不要自行 bump」），\n\
+         不要写成汇报句（「用户不想升版本号」）—— 这条会被原样注入到之后的\n\
+         每一次对话里，汇报句读起来像历史，命令句读起来像要求。\n\n\
+         输出 JSON：{{\"items\":[{{\"title\":\"不超过 40 字\",\"type\":\"decision|knowledge|pitfall|preference\",\"body\":\"100-300 字\",\"importance\":0.0-1.0}}]}}\n\n\
          流水：\n{material}"
     );
     let reply = match super::llm::complete(super::llm::Request::new("extract", SYSTEM_EXTRACT, ask)) {
@@ -1238,6 +1247,29 @@ fn extract(project: Option<&str>) -> Outcome {
         let kind = item.get("type").and_then(Value::as_str).unwrap_or("knowledge");
         let title = item.get("title").and_then(Value::as_str).unwrap_or("").to_string();
         let importance = item.get("importance").and_then(Value::as_f64).unwrap_or(0.6);
+        // 继承素材条目的 `files`：抽取出来的结论建立在同一批文件之上，继承之后
+        // 请求级注入的路径命中（权重最高的一档）才能打到这条 l2 上。早先这里
+        // 写死空数组，等于让所有自动产出的结论对「按文件命中」永久隐形。
+        //
+        // 素材是 l1 会话流水，`files` 通常为空，路径全在正文里 —— 所以还要从
+        // 正文抽一遍（`inject::harvest_paths`，确定性字符串抽取）。
+        let mut files: Vec<String> = Vec::new();
+        for entry in &recent {
+            for file in &entry.files {
+                if !files.iter().any(|known| known == file) {
+                    files.push(file.clone());
+                }
+            }
+            for file in super::inject::harvest_paths(&entry.body) {
+                if !files.iter().any(|known| known == &file) {
+                    files.push(file);
+                }
+            }
+            if files.len() >= 8 {
+                break;
+            }
+        }
+        files.truncate(8);
         let input = super::WriteInput {
             content: body.to_string(),
             title: Some(title),
@@ -1247,7 +1279,7 @@ fn extract(project: Option<&str>) -> Outcome {
             agent: Some("auto-extract".to_string()),
             tags: Vec::new(),
             importance: Some(importance),
-            files: Vec::new(),
+            files,
             supersedes: Vec::new(),
             pinned: Some(false),
             starred: Some(false),
@@ -1374,19 +1406,42 @@ fn consolidate(project: Option<&str>, manual: bool) -> Outcome {
             continue;
         }
         let target = format!("{slug}:{}", &super::model::content_hash(body)[..12]);
-        index::global().enqueue(
+        let payload = json!({
+            "title": group.get("title").and_then(Value::as_str).unwrap_or(""),
+            "type": group.get("type").and_then(Value::as_str).unwrap_or("knowledge"),
+            "body": body,
+            "sources": sources,
+            "project": slug,
+            "model": reply.model,
+        });
+        let queued_id = index::global().enqueue(
             "consolidate",
             &target,
-            &json!({
-                "title": group.get("title").and_then(Value::as_str).unwrap_or(""),
-                "type": group.get("type").and_then(Value::as_str).unwrap_or("knowledge"),
-                "body": body,
-                "sources": sources,
-                "project": slug,
-                "model": reply.model,
-            }),
+            &payload,
             group.get("confidence").and_then(Value::as_f64).unwrap_or(0.7),
         );
+        // 与蒸馏同一条理由（见 `enrich::distill`）：合并只**新增**一条 l2，
+        // 被合并的原条目进回收站、可恢复，所以默认直接落地。
+        //
+        // 但合并比蒸馏多一道闸：来源少于两条的组已经在上面被跳过了，这里再要求
+        // `review.autoConfirmDistill` 打开 —— 合并会动到已有 l2（把原件移进
+        // 回收站），比「纯新增」重一档，用同一个开关是为了不让用户去理解两个
+        // 名字不同的开关其实是一件事。
+        if config::bool_of("review.autoConfirmDistill") {
+            match super::apply_derived(&payload) {
+                Ok(()) => {
+                    if let Some(id) = queued_id {
+                        index::global().review_resolve(&[id], "approved", Some("auto-consolidate"));
+                    }
+                }
+                Err(error) => {
+                    crate::server::logging::verbose(
+                        "[Memory]",
+                        &format!("合并结论自动落地失败（已留在待确认队列）：{error}"),
+                    );
+                }
+            }
+        }
         queued += 1;
     }
     if queued == 0 {

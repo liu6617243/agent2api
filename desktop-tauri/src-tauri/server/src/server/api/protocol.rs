@@ -164,6 +164,31 @@ pub async fn responses_endpoint(
     let client_reasoning = pipeline::client_reasoning_of(&raw);
     let stream = raw.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
+    // ── 请求级记忆注入：注在**原始体**上，不是注在 chat 投影上 ──────
+    // 这条路有两个出口：上游协议相同时走 `native.routed()`（只从投影取 model，
+    // 其余字段全来自原始体），不同时走 chat 投影。只在投影上注入，原生那一支
+    // 收不到 —— 而原生那一支恰恰是 Codex / Claude Code 的常态路径。
+    //
+    // 注在 prepare 之前还有两个好处：翻译逻辑天然把它带进 system 消息；
+    // 而 `dedupe_key` 用的是客户端原始字节（下面才算），去重不受影响。
+    // `original` 是注入前的副本，回程回显仍与客户端发来的一致。
+    let mut raw = raw;
+    if !special.is_background()
+        && !crate::server::core::memory::inject::is_internal_origin(&pipeline::user_agent_of(&headers))
+    {
+        if let Some(tokens) = crate::server::core::blocking::in_place(|| {
+            crate::server::core::memory::inject::inject_native(
+                &mut raw,
+                crate::server::core::protocol::native::WireProtocol::Responses,
+            )
+        }) {
+            logging::verbose(
+                "[Memory]",
+                &format!("请求级注入：已附加记忆块 {tokens} token（/v1/responses）"),
+            );
+        }
+    }
+
     // Chat 投影服务选路与跨协议出口，原生请求另行保留。
     let (native, mut chat_body) = match NativeRequest::prepare(WireProtocol::Responses, raw.clone()) {
         Ok(body) => body,
@@ -376,6 +401,26 @@ pub async fn messages_endpoint(
             &source.behavior_client, &headers, &raw, false))
     };
     // 协议翻译
+    // ── 请求级记忆注入（与 /v1/responses 同一条理由）──────────────
+    // Anthropic 的 `system` 可能是字符串也可能是内容块数组，两种都处理
+    // （见 `inject::append_native`）。注入后再翻译，翻译链会把它带成
+    // 第一条 system 消息。
+    let mut raw = raw;
+    if !special.is_background()
+        && !crate::server::core::memory::inject::is_internal_origin(&pipeline::user_agent_of(&headers))
+    {
+        if let Some(tokens) = crate::server::core::blocking::in_place(|| {
+            crate::server::core::memory::inject::inject_native(
+                &mut raw,
+                crate::server::core::protocol::native::WireProtocol::Anthropic,
+            )
+        }) {
+            logging::verbose(
+                "[Memory]",
+                &format!("请求级注入：已附加记忆块 {tokens} token（/v1/messages）"),
+            );
+        }
+    }
     let (native, mut chat_body) = match NativeRequest::prepare(WireProtocol::Anthropic, raw.clone()) {
         Ok(body) => body,
         Err(message) => {

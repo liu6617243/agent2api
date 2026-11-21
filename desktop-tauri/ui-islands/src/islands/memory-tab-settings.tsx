@@ -94,6 +94,7 @@ const GROUP_ICONS: Record<string, string> = {
   待确认: 'feedback',
   清理: 'refresh',
   模型与网关: 'gateway',
+  请求级注入: 'memory',
   导入: 'download',
   隐私: 'shield',
   同步: 'refresh',
@@ -101,6 +102,9 @@ const GROUP_ICONS: Record<string, string> = {
 }
 
 type RouteRow = { task: string; tags: string[]; model: string }
+
+/** 「请求级注入」那一组。下面要把预览卡片挂到这一组下面。 */
+const INJECT_GROUP = '请求级注入'
 
 function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement {
   const { data, loading, error, reload } = useLoad(() => m.loadConfig(), [])
@@ -491,7 +495,138 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
 
         {items.length === 0 ? <div className='mm-cfg-empty'>{t('这一组还没有旋钮。')}</div> : null}
       </section>
+
+      {/* ── 请求级注入：把「这次会塞什么」摊开给用户看 ──
+          注入是用户看不见的动作。没有这块，他改了预算、钉了记忆、写了避坑，
+          只能靠「模型行为好像变了」去猜有没有生效 —— 猜不出就会来问，而回答
+          「应该生效了」没有任何说服力。 */}
+      {active === INJECT_GROUP ? <InjectPreview /> : null}
     </div>
+  )
+}
+
+/* ─── 请求级注入预览 ─────────────────────────────────────── */
+
+/**
+ * 一个输入框 + 一句「像用户会说的话」→ 网关这次会注入什么。
+ *
+ * 走的接口与真实转发同一条函数（`inject::compose`），所以看到的就是线上会
+ * 发生的，不是另一套演示逻辑。
+ */
+function InjectPreview(): React.ReactElement {
+  const [probe, setProbe] = React.useState('')
+  const [result, setResult] = React.useState<m.InjectPreview | null>(null)
+  const [busy, setBusy] = React.useState(false)
+  const [error, setError] = React.useState('')
+
+  const run = (query: string) => {
+    setBusy(true)
+    setError('')
+    m.loadInjectPreview(query)
+      .then(value => setResult(value))
+      .catch((caught: unknown) => setError(caught instanceof Error ? caught.message : String(caught)))
+      .finally(() => setBusy(false))
+  }
+
+  return (
+    <section className='mm-cfg-card'>
+      <div className='mm-cfg-card-head'>
+        <div className='mm-cfg-card-title'>{t('试一下：这条请求会带上哪些记忆')}</div>
+        <div className='mm-cfg-card-actions'>
+          <Button type='button' size='sm' variant='ghost' disabled={busy} onClick={() => run(probe)}>
+            {busy ? t('正在算…') : t('算一遍')}
+          </Button>
+        </div>
+      </div>
+      <div className='mm-cfg-card-sub'>
+        {t('贴一句你真会说的话（带上文件名、函数名、命令名效果最好）。网关按这些线索去记忆里找命中，命不中就什么都不注入 —— 宁可不给，也不给错的。')}
+      </div>
+      <Input
+        value={probe}
+        placeholder={t('例：改一下 desktop-tauri/src-tauri/server/src/server/api/chat.rs 里的 inject_chat')}
+        onChange={event => setProbe(event.target.value)}
+        onKeyDown={event => { if (event.key === 'Enter') run(probe) }}
+      />
+      {error ? <div className='mm-cfg-card-note' style={{ color: 'var(--danger, #d33)' }}>{error}</div> : null}
+      {result ? (
+        <>
+          <div className='mm-cfg-card-note'>
+            {!result.enabled
+              ? t('注入开关是关的：这段内容现在不会进任何请求。')
+              : result.text
+                ? t('会注入 {n} token（上限 {max}）· 抽出 {k} 个线索', {
+                    n: result.tokens,
+                    max: result.settings.maxTokens,
+                    k: result.probes.length,
+                  })
+                : t('没有命中：这次不会注入任何记忆。')}
+          </div>
+          {result.probes.length > 0 ? (
+            <div className='mm-cfg-card-note'>
+              {t('线索：')}
+              {result.probes.map(item => ` ${item}`).join(' · ')}
+            </div>
+          ) : null}
+          {/* 候选与门槛：解释「为什么没注入」。
+              pass=false → 线索不够具体（该补记忆或换说法）；
+              pass=true 却没出现在下面那段原文里 → 被预算挤掉（该调大经验预算）。
+              没有这块时，「没命中」和「命中了但没塞进去」在界面上长得一模一样。 */}
+          {result.hits.length > 0 ? (
+            <div style={{ display: 'grid', gap: 4 }}>
+              <div className='mm-cfg-card-note'>{t('候选（按得分）')}</div>
+              {result.hits.map(hit => (
+                <div
+                  key={hit.id}
+                  style={{
+                    display: 'flex',
+                    gap: 8,
+                    alignItems: 'baseline',
+                    fontSize: 11.5,
+                    lineHeight: 1.6,
+                    color: hit.pass ? 'var(--text-2)' : 'var(--text-3, var(--text-2))',
+                    opacity: hit.pass ? 1 : 0.62,
+                  }}
+                >
+                  <code style={{ flex: '0 0 auto' }}>{hit.score.toFixed(1)}</code>
+                  <span style={{ flex: '0 0 auto', opacity: 0.7 }}>
+                    /{hit.floor.toFixed(1)} · {hit.layer}
+                  </span>
+                  <span style={{ flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {hit.title}
+                  </span>
+                  <span style={{ flex: '0 0 auto', opacity: 0.7 }}>
+                    {hit.pass ? t('过线') : t('差一点')}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {result.text ? (
+            <pre
+              style={{
+                margin: 0,
+                padding: '10px 12px',
+                maxHeight: 260,
+                overflow: 'auto',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+                fontSize: 11.5,
+                lineHeight: 1.7,
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--r-sm)',
+                background: 'var(--surface-2, transparent)',
+                color: 'var(--text-2)',
+              }}
+            >
+              {result.text}
+            </pre>
+          ) : null}
+        </>
+      ) : null}
+      <div className='mm-cfg-card-sub'>
+        {t('注入内容永远是「历史陈述」：块头写明了「不代表当前代码状态，改文件前先读文件」。模型自己深挖时走 MCP 工具，两条路并存。')}
+      </div>
+    </section>
   )
 }
 
