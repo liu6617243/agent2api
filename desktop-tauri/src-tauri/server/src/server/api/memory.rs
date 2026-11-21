@@ -232,8 +232,13 @@ pub async fn get_projects(State(_state): State<ServerState>) -> Response {
     ok_json(memory::projects())
 }
 
-pub async fn get_status(State(_state): State<ServerState>) -> Response {
-    ok_json(memory::status())
+/// `GET /api/memory/status` —— 自检快照。
+///
+/// `?tables=1` 才会附上各表行数：那一段对 10 张表各跑一次 `COUNT(*)`，其中
+/// `mem_link` 在老库上可达千万行。首屏（`/config` 里嵌的 `status`）与仪表盘
+/// 都不读 `tables`，所以默认不算 —— 需要排障时显式要。
+pub async fn get_status(State(_state): State<ServerState>, Query(params): Query<HashMap<String, String>>) -> Response {
+    ok_json(memory::status_with(flag(&params, "tables").unwrap_or(false)))
 }
 
 pub async fn get_review(State(_state): State<ServerState>, Query(params): Query<HashMap<String, String>>) -> Response {

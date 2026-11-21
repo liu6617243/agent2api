@@ -9,12 +9,14 @@ use super::super::{
     files, paths, ClientDef, Profile,
 };
 
-pub fn config_path(def: &ClientDef) -> Result<PathBuf, String> {
-    let detection = paths::detect(def);
-    if detection.unsupported {
-        return Err(detection
-            .note
-            .unwrap_or_else(|| "DSH 配置目标尚未确定".into()));
+pub fn config_path(_def: &ClientDef) -> Result<PathBuf, String> {
+    // 浅探测：只要路径，不扫 PATH。语义与 `paths::detect(def)` 一致 ——
+    // `error` 仍然由 `dsh_paths::detect` 按「目标是否唯一 / 是否已生成」判，
+    // 只是跳过了 `find_binary` 那一步（它为了版本号扫全盘可执行文件）。
+    // 版本号只在接入页卡片上显示，`resources::snapshot` 不需要它。
+    let detection = paths::dsh_shallow();
+    if let Some(note) = detection.error {
+        return Err(note);
     }
     detection
         .resource_path

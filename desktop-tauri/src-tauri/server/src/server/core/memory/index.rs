@@ -328,6 +328,13 @@ impl MemoryIndex {
                PRIMARY KEY (from_id, to_id, kind)
              );
 
+             -- 反向查邻居必须走索引。`PRIMARY KEY (from_id, to_id, kind)` 只给
+             -- `from_id` 前缀建了索引，`neighbors()` 里那一半
+             -- `SELECT from_id FROM mem_link WHERE to_id = ?1` 是**全表扫**——
+             -- 表小的时候看不出，810 万行时单种子要扫几秒。这条索引让双向查询
+             -- 都走 B 树。
+             CREATE INDEX IF NOT EXISTS mem_link_to ON mem_link(to_id);
+
              CREATE TABLE IF NOT EXISTS sync_state (
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL,
@@ -695,6 +702,33 @@ impl MemoryIndex {
              ON CONFLICT(from_id, to_id, kind) DO UPDATE SET weight = weight + 0.5",
             params![from, to, kind],
         );
+    }
+
+    /// 清空整张关联图。
+    ///
+    /// ── 为什么需要它 ────────────────────────────────────────────
+    /// `mem_link` 是**派生**数据（由 `relink()` 按当前条目重算），但 `rebuild()`
+    /// 只清 `entries` / `entries_fts`，从不清它。于是每次重建都是「在旧图上叠新图」：
+    /// 老实现按「任意共同标签」连线，5818 条带 `导入` 标签的记忆两两相连，重建一次
+    /// 就把 810 万行写进去；再重建一次还要在那个基数上继续 `weight + 0.5`。
+    ///
+    /// 表涨到 810 万行之后，`table_stats()` 的 `SELECT COUNT(*)` 要扫几百毫秒，
+    /// 而它挂在 `status()` 里 —— 每打开一次记忆中枢都要付一次。这就是「读取记忆库
+    /// 有点长」的第二个来源。
+    ///
+    /// 重建前清空是安全的：`relink()` 紧接着会把该有的边全部重算一遍。清空之后
+    /// 图比之前**更小也更准**，因为泛标签已经不再参与连线。
+    pub fn clear_links(&self) {
+        let Ok(conn) = self.conn.lock() else { return };
+        let _ = conn.execute("DELETE FROM mem_link", []);
+    }
+
+    /// 关联图里有多少条边。启动自检用它判断「这张表是不是被撑爆了」。
+    pub fn link_count(&self) -> usize {
+        let Ok(conn) = self.conn.lock() else { return 0 };
+        conn.query_row("SELECT COUNT(*) FROM mem_link", [], |row| row.get::<_, i64>(0))
+            .map(|value| value as usize)
+            .unwrap_or(0)
     }
 
     // ── 去重 ─────────────────────────────────────────────────
@@ -1446,7 +1480,18 @@ impl MemoryIndex {
         }
     }
 
-    /// 全部表与行数（状态页 / 自检）
+    /// 全部表与行数（状态页 / 自检）。
+    ///
+    /// ── `mem_link` 为什么走 `dbstat` 估算 ───────────────────────
+    /// 其余九张表都是「条目量级」（几千行），`COUNT(*)` 是毫秒级。`mem_link`
+    /// 不一样：老版本按「任意共同标签」建边，一度涨到 810 万行，`COUNT(*)` 要
+    /// 扫几百毫秒。虽然新口径已经把边数压回条目量的几倍，但**老库在第一次
+    /// 重建之前仍然是几百万行** —— 而这一栏是排障时看的，不该让排障本身变成
+    /// 一次全表扫。所以这张表用 `dbstat` 的页数估算，误差几个百分点，够用来
+    /// 判断「它是不是被撑爆了」。
+    ///
+    /// `dbstat` 是编译期可选虚表（`SQLITE_ENABLE_DBSTAT_VTAB`），没有就退回
+    /// 精确计数 —— 宁可慢一点，也不要给一个「查不到」的坑。
     pub fn table_stats(&self) -> Value {
         let Ok(conn) = self.conn.lock() else { return json!({}) };
         let mut out = serde_json::Map::new();
@@ -1462,13 +1507,44 @@ impl MemoryIndex {
             "sync_log",
             "task_run",
         ] {
-            let count: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
-                .unwrap_or(0);
+            let count: i64 = if table == "mem_link" {
+                approximate_rows(&conn, table).unwrap_or_else(|| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+                        .unwrap_or(0)
+                })
+            } else {
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+                    .unwrap_or(0)
+            };
             out.insert(table.to_string(), json!(count));
         }
         Value::Object(out)
     }
+}
+
+/// 用 `dbstat` 的字节数估算一张表的行数（不扫表）。
+///
+/// 算法：`dbstat` 给出这张表（含它的索引）每个页的字节数，求和得到总字节；
+/// 再除以「一行大概多少字节」。`mem_link` 一行是 2 个 id（各 36 字节）+ kind
+/// 短串 + weight + B 树开销，实测约 150 字节 —— 估出来的数落在同一个数量级，
+/// 而排障只需要数量级。
+///
+/// 任何一步失败都返回 `None`，由调用方退回精确 `COUNT(*)`。
+fn approximate_rows(conn: &Connection, table: &str) -> Option<i64> {
+    // `dbstat` 的 `pgsize` 是**每页字节数**，不是页数 —— `SUM` 出来直接就是字节。
+    // 名字起成 `bytes` 是为了让下面那行除法不用再解释一次。
+    let bytes: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat
+              WHERE name = ?1
+                 OR name IN (SELECT name FROM sqlite_master WHERE tbl_name = ?1 AND type = 'index')",
+            params![table],
+            |row| row.get(0),
+        )
+        .ok()?;
+    // 空表返回 0 而不是 `None`：`None` 会让调用方退回全表扫，而空表的
+    // `COUNT(*)` 虽然也快，但没必要为它开一条分支。
+    Some(bytes / 150)
 }
 
 /// 老库补列：`PRAGMA table_info` 对一遍 [`ENTRY_COLUMNS`]，缺的 `ALTER TABLE ADD COLUMN`。

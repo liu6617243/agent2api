@@ -14,7 +14,11 @@ fn dir(env: &str, fallback: PathBuf) -> PathBuf {
 
 pub fn for_client(def: &ClientDef) -> ResourcePaths {
     let home = paths::home();
-    let config = paths::detect(def).path;
+    // 走 `config_path()` 的浅通道，不走 `detect()`：这里只用到「配置文件在哪」，
+    // 而 `detect()` 会为了同一个路径把 PATH 上 4.4 万个可执行名 stat 一遍。
+    // 两者算出的路径完全一致（同样的 override 优先级与 opencode 回退），
+    // 见 `paths::config_path` 的说明。
+    let config = paths::config_path(def);
     let parent = config.parent().map(PathBuf::from).unwrap_or_else(|| home.clone());
     let json_mcp = |path, keys| Some((path, ConfigFormat::Json, keys));
     match def.id {
@@ -46,8 +50,19 @@ pub fn for_client(def: &ClientDef) -> ResourcePaths {
             note: "支持用户级 Skill 与 MCP；Cursor 的全局规则未确认可安全修改的文件格式，暂不开放提示词写入。" },
         "dsh" => {
             let dsh_home = super::super::dsh_paths::home_for(&config);
+            // DSH 可能有多套配置（web / desktop / 自定义），`error` 非空表示
+            // 「现在说不清该写哪个文件」。那种情况下**不给路径** —— 给了就会让
+            // 接入页把它画成「可接入」，用户点下去必然失败。这与老代码
+            // `dsh::config_path(def).ok()` 的语义一致。
+            let target = paths::dsh_shallow();
+            let mcp = target
+                .error
+                .is_none()
+                .then(|| target.resource_path.clone())
+                .flatten()
+                .map(|path| (path, ConfigFormat::Yaml, Vec::new()));
             ResourcePaths { prompt: None, skills: vec![dsh_home.join("skills"), dir("DSH_AGENTS_HOME", home.join(".agents")).join("skills")],
-                mcp: super::dsh::config_path(def).ok().map(|path| (path, ConfigFormat::Yaml, Vec::new())),
+                mcp,
                 note: "DSH 的 Skill 使用共享用户目录；MCP 写入所选运行方式的插件配置，保留其他内容。多套配置请先在 Agent 页选择目标。" }
         }
         "kimi-code" => ResourcePaths { prompt: None, skills: vec![home.join(".kimi/skills"), home.join(".config/agents/skills")],

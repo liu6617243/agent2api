@@ -908,6 +908,15 @@ impl ServerState {
         // 记忆中枢的自动化调度。放在这里而不是 `bootstrap`：它要做文件扫描，
         // 不该挡住端口监听；而它自己的第一轮也只在 `auto.enabled` 打开时才动。
         core::memory::schedule::spawn();
+        // 记忆快照预热：`snapshot()` 第一次要把 55 MB `.md` 读进内存、切成几千
+        // 节、每节算一次哈希（实测 300~500 ms）。不预热的话这笔钱由「第一个打开
+        // 记忆中枢的人」付，用户看到的就是「正在读取记忆库…」转半天。
+        // 单独起一条线程而不是塞进调度线程：调度线程要先 `hydrate_last_run()`
+        // 才有节奏，别让它等一次全量解析。
+        std::thread::Builder::new()
+            .name("memory-warm".to_string())
+            .spawn(|| core::memory::store::warm())
+            .ok();
         // swap 保证重复调用（桌面壳重启后端时 start 可能被再次调用）只跑一轮。
         if self.startup_maintenance.swap(true, Ordering::SeqCst) {
             return;

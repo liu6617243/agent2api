@@ -299,12 +299,33 @@ fn ensure_index_once() {
         }
         let entries = store::load_all();
         let index = index::global();
+        // ── 关联图被老口径撑爆时，清一次重算 ────────────────────
+        // 老 `relink()` 是「同项目 + 任意共同标签就连边」：5818 条都带 `导入`
+        // 标签的记忆两两相连，`mem_link` 于是涨到 810 万行、索引库 275 MB。
+        // 这张表是派生的，清空重算永远安全，而带着它跑的代价是每次 `status()`
+        // 都要 `COUNT(*)` 扫一遍（几百毫秒）—— 用户看到的就是首屏转圈。
+        //
+        // 判据用「边数 > 条目数 × 20」：正常口径下每条最多 5 条边（双向即 10），
+        // 20 已经是宽松的上界。超了就是老数据或老逻辑留下的，清掉。
+        let links = index.link_count();
+        let link_ceiling = entries.len().saturating_mul(20).max(2000);
+        let links_bloated = links > link_ceiling;
+        if links_bloated {
+            crate::server::logging::log(
+                "[Memory]",
+                &format!(
+                    "关联图异常膨胀（{links} 条边 / {} 条记忆），清空后按新口径重算",
+                    entries.len()
+                ),
+            );
+            index.clear_links();
+        }
         // ── 比的是「索引行数 vs 事实源总条数」 ──────────────────
         // 索引留着回收站与已取代的行（浏览页的回收站视图就读这些行），拿 `live`
         // 去比，只要有回收站条目就永远对不上 —— 每次启动都全量重建一遍，
         // 而重建写入的仍是同一批行，下次启动继续对不上。这是一个自我维持的
         // 无效重建循环，与 `status()` 里 `inSync` 的口径必须完全一致。
-        if must_rebuild || index.count() != entries.len() {
+        if must_rebuild || links_bloated || index.count() != entries.len() {
             match index.rebuild(&entries) {
                 Ok(count) => crate::server::logging::log(
                     "[Memory]",
@@ -319,31 +340,91 @@ fn ensure_index_once() {
                     &format!("⚠️ 记忆索引重建失败：{error}"),
                 ),
             }
-            // 重建时顺手把 id 之间的关联补齐（同项目 + 共享标签）
+            // 重建时顺手把 id 之间的关联补齐（同项目 + 主题标签，见 `relink`）。
+            // 必须先清空：`rebuild()` 不清 `mem_link`，叠加写会把表撑到千万行。
+            index.clear_links();
             relink(&entries);
         }
     });
 }
 
-/// 补 `mem_link`：同项目且共享标签的活条目之间连线。
+/// 补 `mem_link`：同项目且共享**主题标签**的活条目之间连线。
 ///
 /// 为什么在重建时做而不是每次写入做：连线的成本是 O(同项目条目数)，写入路径
 /// 上做会把「写一条记忆」从毫秒级拖到几十毫秒；而连线不是实时需求 —— 检索时
 /// 差几分钟的关联，用户感知不到。
+///
+/// ── 2026-11-21：这里曾经把索引库撑到 800 万行 ────────────────
+/// 老实现是「同项目 + 任意一个共同标签」就连一条边。看起来合理，实际是 O(n²)
+/// 的完全图：历史导入给每条记忆都打了 `导入` 标签，5818 条同项目记忆于是两两
+/// 相连 —— 5818 × 5817 / 2 ≈ **1692 万条边**，实测表里躺着 810 万行、库文件
+/// 涨到 275 MB。后果不只是占盘：
+///
+///   * `neighbors()` 对每个种子查一次 `from_id` / `to_id` 双向，单种子命中
+///     5779 个邻居；`search.graphExpansionDepth` 默认 1、上限 3，深度一开就是
+///     5779 个种子各查一次 —— 一次检索要几十秒；
+///   * `table_stats()` 里 `SELECT COUNT(*) FROM mem_link` 要扫 810 万行，
+///     而它在 `status()` 里，**每次打开记忆中枢都跑一遍**；
+///   * 图扩散本来要「补充几条相关记忆」，全连通之后它给每条记忆都加分，
+///     等于没有信号 —— 功能还在，效果归零。
+///
+/// 现在的口径：
+///   1. **不连「泛标签」**。`导入` / `daily` 这类标签描述的是「怎么进来的」，
+///      不是「讲什么」，拿它当主题会把不相干的记忆串成一片。判据是「标签出现在
+///      超过 `MEM_LINK_TAG_SHARE` 比例的条目上就当泛标签忽略」。
+///   2. **每条记忆最多连 `MEM_LINK_FANOUT` 条**。关联图是给检索做「一跳提示」
+///      用的，一条记忆有 5 个邻居和 5000 个邻居，对检索的边际价值一样。
+///   3. **只按时间邻近连**（同项目内最近更新的若干条）。真正常被一起想起的记忆
+///      是同一段时间写的，这比「共享一个词」准得多，而且成本是排序不是笛卡尔积。
 fn relink(entries: &[MemoryEntry]) {
     let live: Vec<&MemoryEntry> = entries.iter().filter(|entry| entry.is_live()).collect();
+    if live.is_empty() {
+        return;
+    }
+    // ── 泛标签：出现在超过阈值的条目上就不当主题 ──────────────
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for entry in &live {
+        for tag in &entry.tags {
+            *counts.entry(tag.as_str()).or_insert(0) += 1;
+        }
+    }
+    let generic_floor = (live.len() as f64 * MEM_LINK_TAG_SHARE).ceil() as usize;
+    let is_topic = |tag: &str| counts.get(tag).copied().unwrap_or(0) <= generic_floor;
+
     let mut links = 0usize;
-    for (index, left) in live.iter().enumerate() {
-        for right in live.iter().skip(index + 1) {
-            if left.project != right.project {
-                continue;
-            }
-            if !left.tags.is_empty() && left.tags.iter().any(|tag| right.tags.contains(tag)) {
-                index::global().link(&left.id, &right.id, "same_topic");
-                links += 1;
-            } else if !left.supersedes.is_empty() && left.supersedes.contains(&right.id) {
-                index::global().link(&left.id, &right.id, "relates");
-                links += 1;
+    // 按项目分组（`None` 与 `Some(slug)` 各自一组，不跨项目连线）
+    let mut groups: std::collections::HashMap<Option<&str>, Vec<&MemoryEntry>> =
+        std::collections::HashMap::new();
+    for entry in &live {
+        groups.entry(entry.project.as_deref()).or_default().push(*entry);
+    }
+    for (_, mut group) in groups {
+        // 组内按更新时间倒序：新记忆优先与「最近写的那批」相连
+        group.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        for (index, left) in group.iter().enumerate() {
+            let mut made = 0usize;
+            for right in group.iter().skip(index + 1) {
+                if made >= MEM_LINK_FANOUT {
+                    break;
+                }
+                // 主题标签相交才算「讲同一件事」
+                let shared = left
+                    .tags
+                    .iter()
+                    .filter(|tag| is_topic(tag))
+                    .any(|tag| right.tags.contains(tag) && is_topic(tag));
+                // 取代关系是硬事实，不受标签与条数限制
+                let supersedes = left.supersedes.contains(&right.id)
+                    || right.supersedes.contains(&left.id);
+                if supersedes {
+                    index::global().link(&left.id, &right.id, "relates");
+                    links += 1;
+                    made += 1;
+                } else if shared {
+                    index::global().link(&left.id, &right.id, "same_topic");
+                    links += 1;
+                    made += 1;
+                }
             }
         }
     }
@@ -351,6 +432,19 @@ fn relink(entries: &[MemoryEntry]) {
         crate::server::logging::log("[Memory]", &format!("记忆关联图已更新：{links} 条边"));
     }
 }
+
+/// 一条记忆在关联图里最多连几条边。
+///
+/// 5 是「够用且不会爆炸」的数：图扩散的用途是给检索补几个候选，补 5 个和补 50 个
+/// 对最终 top-k 的影响没有区别，但 50 个邻居 × 20 个种子 = 1000 次 SQL。
+const MEM_LINK_FANOUT: usize = 5;
+
+/// 标签出现在超过这个比例的条目上，就当它是「泛标签」而不是主题。
+///
+/// 0.05 = 5%：一个真正有区分度的主题标签，在几千条记忆里通常只覆盖几十条。
+/// 而 `导入` 这类标签会覆盖 100%。阈值放在 5% 既能放过「rust」这种热门主题，
+/// 又能挡住「导入」「daily」这种全员标签。
+const MEM_LINK_TAG_SHARE: f64 = 0.05;
 
 /// 全量重建（「重建索引」按钮 / 索引损坏 / 同步落盘后）
 ///
@@ -388,6 +482,12 @@ pub fn rebuild() -> Result<usize, String> {
     }
     let entries = store::load_all();
     let count = index::global().rebuild(&entries)?;
+    // ── 先清图再重算 ────────────────────────────────────────────
+    // `rebuild()` 只清 `entries` / `entries_fts`，`mem_link` 是「派生但不在重建
+    // 范围内」的那张表。不清就等于在旧图上叠新图：历史导入那 5818 条带 `导入`
+    // 标签的记忆两两相连，重建一次写 810 万行、重建十次翻十倍。清空后
+    // `relink()` 会按新口径（泛标签不连、每条最多 5 条边）重算一遍。
+    index::global().clear_links();
     relink(&entries);
     bump_revision();
     Ok(count)
@@ -452,7 +552,7 @@ pub fn heat(days: usize, tz_minutes: i64) -> Value {
     let offset = tz_minutes.clamp(-840, 840) * 60_000;
     let since = now - (span as i64) * 86_400_000;
     let mut buckets: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for entry in store::load_all().iter().filter(|item| item.is_live()) {
+    for entry in store::snapshot().iter().filter(|item| item.is_live()) {
         if entry.created_at < since {
             continue;
         }
@@ -487,7 +587,7 @@ pub fn get(ids: &[String], body_limit: usize) -> Value {
 /// 保持同一套：谁调的，就记谁。
 pub fn get_for(ids: &[String], body_limit: usize, agent: Option<&str>) -> Value {
     ensure_index_once();
-    let all = store::load_all();
+    let all = store::snapshot();
     let now = crate::server::logging::now_ms();
     let mut items = Vec::new();
     for id in ids {
@@ -562,7 +662,7 @@ fn search_compact(entry: &MemoryEntry, now: i64) -> String {
 
 /// 事实演化链：以 `supersedes` 为边，向上找根、向下找后继。
 pub fn timeline(id: &str) -> Value {
-    let all = store::load_all();
+    let all = store::snapshot();
     let Some(target) = all.iter().find(|entry| entry.id == id) else {
         return json!({ "items": [] });
     };
@@ -664,9 +764,14 @@ pub fn recent_for(
 /// 通用项目（`_global`）不是一张普通项目卡：它是**没有归属项目**的记忆的落脚点，
 /// 条数往往远大于任何一个具体项目。混在列表里既抢注意力，又让人误以为通用是个
 /// 可以合并/归档的对象。所以单独算一个 `general` 汇总挂在返回体上。
+///
+/// ── 为什么用 `snapshot()` 而不是 `load_all()` ────────────────
+/// `load_all()` 返回的是独立副本：5818 条记忆、55 MB 正文，每次调用都要深拷贝
+/// 一遍。这个函数只读不写，拿 `Arc` 就够了 —— 省掉的那次拷贝在首屏是能感觉到的
+/// 那几百毫秒里的一部分。
 pub fn projects() -> Value {
     ensure_index_once();
-    let all = store::load_all();
+    let all = store::snapshot();
     let now = crate::server::logging::now_ms();
     let mut stored = store::load_projects();
     for entry in all.iter().filter(|entry| entry.is_live()) {
@@ -889,7 +994,7 @@ pub fn merge_project(from: &str, into: &str) -> Result<Value, String> {
 /// 撒一个无害但会让人误判「为什么结论没覆盖到某条记忆」的谎。
 pub fn profile_view() -> Value {
     ensure_index_once();
-    let all = store::load_all();
+    let all = store::snapshot();
     let live: Vec<&MemoryEntry> = all.iter().filter(|entry| entry.is_live()).collect();
     let profiles: Vec<&MemoryEntry> = live
         .iter()
@@ -988,9 +1093,33 @@ pub fn profile_view() -> Value {
     })
 }
 
-/// 自检：文件根、条数、索引状态、回收站、队列积压、表行数
+/// 自检：文件根、条数、索引状态、回收站、队列积压
+///
+/// ── 为什么「项目数」不再走 `projects()` ──────────────────────
+/// `projects()` 会把整库按项目分组、每组算 l1/l2、挑前三条最新 —— 那是「项目页」
+/// 需要的数据。而 `status()` 只要一个数字：有几个项目。早先为了这一个数字调
+/// `projects()`，等于每打一次 `GET /api/memory/config`（首屏必打）就多付一次
+/// 全库遍历 + 一份完整的项目列表序列化。改成直接从条目里数 slug，成本一次
+/// `HashSet` 插入，与 `projects()` 的口径仍然一致（都走 `entry_project_slug`）。
+///
+/// ── 2026-11-21：这里曾经还带一份 `table_stats()` ─────────────
+/// 那段对 10 张表各跑一次 `SELECT COUNT(*)`，其中 `mem_link` 在老库上是
+/// 810 万行 —— 单这一条就是几百毫秒。而**前端根本没有读它**（`memory-api.ts`
+/// 里只有一个可选字段，全仓 `.tables` 零消费）。首屏为此付几百毫秒是纯亏。
+///
+/// 表行数仍然要能查（排障时有用），但它属于「自检详情」而不是「首屏快照」：
+/// 挪到 `GET /api/memory/status?tables=1`，只有明确要的时候才算。
+/// 默认路径不碰这几张表。
 pub fn status() -> Value {
-    let entries = store::load_all();
+    status_with(false)
+}
+
+/// `status()` 的实现，`with_tables` 决定要不要多算一份表行数。
+///
+/// 分成两支而不是「算完再删字段」：`table_stats()` 的开销全在 SQL 上，
+/// 算完再丢等于白算一遍。
+pub fn status_with(with_tables: bool) -> Value {
+    let entries = store::snapshot();
     let live = entries.iter().filter(|entry| entry.is_live()).count();
     let deleted = entries.iter().filter(|entry| entry.deleted_at.is_some()).count();
     let superseded = entries
@@ -1004,7 +1133,7 @@ pub fn status() -> Value {
     // 按 UTC 切会让东八区早上 8 点前的写入落到前一天（热力图那条注释踩过同一个坑）。
     // 只数 live 条目 —— 已删除的不算「新增」，否则删一条会让数字倒扣。
     let (today, yesterday) = daily_counts(&entries);
-    json!({
+    let mut out = json!({
         "root": store::root().to_string_lossy(),
         "indexFile": store::index_file().to_string_lossy(),
         "device": store::device_id(),
@@ -1020,7 +1149,7 @@ pub fn status() -> Value {
         // 一次 `/agents` —— 那个端点会为每张卡探测路径、版本、读两份文件，
         // 而仪表盘只要两个数字。口径说明见 `agents::connectivity`。
         "agents": agents::connectivity(),
-        "projects": projects().get("items").map(|items| items.as_array().map(Vec::len).unwrap_or(0)).unwrap_or(0),
+        "projects": project_count(&entries),
         "review": {
             "pending": index::global().review_count(),
             "warnThreshold": config::usize_of("dedup.pendingWarnThreshold"),
@@ -1030,11 +1159,39 @@ pub fn status() -> Value {
         // 拿 `live` 去比，等于只要有回收站条目就永远报「不一致」—— 而
         // `rebuild` 会把它们原样写回去，用户点十次重建也消不掉这条提示。
         "index": { "count": index_count, "fts": index::global().fts_enabled(), "inSync": index_count == entries.len() },
-        "tables": index::global().table_stats(),
         "config": config(),
         // 内容版本号：每次写入 +1。排障时用来判断「Agent 看到的是不是最新」。
         "revision": revision(),
-    })
+    });
+    // 表行数只在明确要的时候才算：10 张表各一次 `COUNT(*)`，`mem_link` 在老库
+    // 上 810 万行。首屏不读它，就不该为首屏付这笔钱（见 `status()` 的说明）。
+    if with_tables {
+        out["tables"] = index::global().table_stats();
+    }
+    out
+}
+
+/// 项目数（`status()` 用）。
+///
+/// 口径与 [`projects`] 的 `items.len()` 完全一致：同样按 `entry_project_slug`
+/// 归一、同样排除「通用」（`_global` 不是一张可维护的卡）。差别只在**不构造
+/// 项目卡**：不分组、不算 l1/l2、不挑最新三条、不序列化。首屏只要一个数字。
+fn project_count(entries: &[MemoryEntry]) -> usize {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in entries.iter().filter(|entry| entry.is_live()) {
+        let slug = entry_project_slug(entry);
+        if slug != store::GLOBAL_SLUG {
+            seen.insert(slug);
+        }
+    }
+    // 登记表里可能有「还没写过任何记忆」的空项目：`projects()` 会把它列出来，
+    // 这里也必须算进去，否则两处数字对不上（用户点进项目页会看到多一张卡）。
+    for project in store::load_projects() {
+        if project.slug != store::GLOBAL_SLUG {
+            seen.insert(project.slug);
+        }
+    }
+    seen.len()
 }
 
 /// 今天与昨天各新增了多少条（按本地自然日、只算 live）。
@@ -1166,10 +1323,10 @@ impl BatchWriter {
     pub fn new() -> Self {
         let seen = if dedup_on() {
             Some(
-                store::load_all()
-                    .into_iter()
+                store::snapshot()
+                    .iter()
                     .filter(|entry| entry.is_live() && entry.layer == Layer::L1)
-                    .map(|entry| entry.hash)
+                    .map(|entry| entry.hash.clone())
                     .filter(|hash| !hash.is_empty())
                     .collect(),
             )
@@ -1348,7 +1505,7 @@ fn write_inner(
     let mut marked = 0usize;
     if !entry.supersedes.is_empty() {
         // 只在真要标记时才扫全量：绝大多数写入不带 supersedes
-        let all = store::load_all();
+        let all = store::snapshot();
         for previous in &entry.supersedes {
             if let Some(mut old) = all.iter().find(|item| &item.id == previous).cloned() {
                 if old.superseded_by.as_deref() == Some(id.as_str()) {
@@ -1428,13 +1585,17 @@ fn infer_title(content: &str) -> String {
 }
 
 /// 按 hash 找已存在的活条目（读文件确认，不只信索引）。
+///
+/// 返回 owned 值（`cloned`）：调用方要拿它去标记 / 落盘，借一份引用反而要处理
+/// 快照生命周期。命中时只克隆一条，代价可以忽略。
 fn find_hash_duplicate(hash: &str) -> Option<MemoryEntry> {
-    store::load_all()
-        .into_iter()
+    store::snapshot()
+        .iter()
         .filter(|entry| entry.is_live() && entry.hash == hash)
         // 只有 l1 走精确去重：l2 的两条结论可能一字不差但语境不同
         // （例如同一个决定在两个项目里各下了一次），合并会丢掉项目归属
         .find(|entry| entry.layer == Layer::L1)
+        .cloned()
 }
 
 /// L2 近似重复的候选：词面相似度（Dice + 编辑距离）超过 `dedup.l2.candidateThreshold`。
@@ -1448,7 +1609,7 @@ fn near_duplicate(entry: &MemoryEntry) -> Option<(String, f64)> {
     let w_edit = config::number("dedup.l2.wEdit");
     let w_title = config::number("dedup.l2.wTitle");
     let mut best: Option<(String, f64)> = None;
-    for other in store::load_all() {
+    for other in store::snapshot().iter() {
         if other.id == entry.id || !other.is_live() || other.layer != Layer::L2 {
             continue;
         }
@@ -1854,9 +2015,10 @@ pub fn dedup_scan() -> Value {
             "scanned": 0, "exact": 0, "near": 0, "queued": 0,
         });
     }
-    let live: Vec<MemoryEntry> = store::load_all()
-        .into_iter()
+    let live: Vec<MemoryEntry> = store::snapshot()
+        .iter()
         .filter(|entry| entry.is_live())
+        .cloned()
         .collect();
     let scanned = live.len();
 
@@ -2051,9 +2213,10 @@ pub fn review_reject_all(kind: Option<&str>) -> Value {
 }
 
 fn apply_classification(memory_id: &str, slug: &str) -> Result<(), String> {
-    let mut entry = store::load_all()
-        .into_iter()
+    let mut entry = store::snapshot()
+        .iter()
         .find(|entry| entry.id == memory_id)
+        .cloned()
         .ok_or_else(|| format!("找不到记忆 {memory_id}"))?;
     let before = entry.clone();
     let slug = store::slugify(slug);
@@ -2071,7 +2234,7 @@ fn apply_classification(memory_id: &str, slug: &str) -> Result<(), String> {
 }
 
 fn apply_dedup(new_id: &str, old_id: &str) -> Result<(), String> {
-    let all = store::load_all();
+    let all = store::snapshot();
     let mut old = all
         .iter()
         .find(|entry| entry.id == old_id)
@@ -2170,7 +2333,7 @@ pub fn core_text(project: Option<&str>, max_tokens: usize) -> Value {
 /// 带客户端身份的核心记忆读取（MCP `memory_core` 走这条）。
 pub fn core_text_for(project: Option<&str>, max_tokens: usize, agent: Option<&str>) -> Value {
     ensure_index_once();
-    let entries = store::load_all();
+    let entries = store::snapshot();
     let (text, used, truncated) = search::core_text(&entries, project, max_tokens);
     index::global().log_recall("core", project.unwrap_or(""), entries.len(), used, agent, project);
     json!({
@@ -2183,7 +2346,7 @@ pub fn core_text_for(project: Option<&str>, max_tokens: usize, agent: Option<&st
 
 pub fn digest_text(max_lines: usize) -> Value {
     ensure_index_once();
-    let entries = store::load_all();
+    let entries = store::snapshot();
     let text = search::digest_text(&entries, max_lines);
     json!({ "text": text, "lines": text.lines().count() })
 }
@@ -2201,7 +2364,7 @@ pub fn digest_text(max_lines: usize) -> Value {
 /// 而 mtime 检查的目标只是「提个醒」，误报的代价（多看一眼）远低于漏报。
 pub fn health(limit: usize) -> Value {
     ensure_index_once();
-    let entries = store::load_all();
+    let entries = store::snapshot();
     let root = store::root();
     let limit = limit.clamp(1, 200);
     let mut stale: Vec<Value> = Vec::new();

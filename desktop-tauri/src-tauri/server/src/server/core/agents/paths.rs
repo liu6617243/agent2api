@@ -184,7 +184,7 @@ pub struct Detection {
     pub resource_path: Option<PathBuf>,
 }
 
-/// 探测结果的短命缓存（每线程一份）。
+/// 探测结果的短命缓存（**进程级**一份，不是每线程一份）。
 ///
 /// ── 为什么必须有 ────────────────────────────────────────────
 /// `detect()` 里最贵的是 `find_binary`：它把 PATH 上**每个目录 × 每个可执行名
@@ -194,6 +194,17 @@ pub struct Detection {
 /// 自己一次，`for_client` 里再来三次（`mcp_config_path`、提示词路径、MCP 快照
 /// 各一次）。四次里三次纯属重复，页面就卡在那句「正在读取…」上。
 ///
+/// ── 2026-11-21：这层缓存原来是 `thread_local`，等于没有 ────────
+/// 记忆中枢首屏仍然要转好几秒，查下来根因就在这里：`thread_local!` 是**每线程
+/// 一份**，而 axum 是多线程运行时 —— 同一个页面连发的 `/config`、`/projects`、
+/// `/status` 大概率落在三个不同的 worker 线程上，每条线程都各自冷启动，
+/// 缓存命中率接近 0。于是「5 秒 TTL」形同虚设：13 个客户端 × 4.4 万次 stat
+/// 在**每个请求、每条线程**上重付一遍，一次 `connectivity()` 就是 2~3 秒。
+///
+/// 改成进程级 `Mutex<HashMap>`：一次探测的结果所有 worker 共享，命中率从
+/// 「同线程连续调用」变成「所有请求共享 5 秒窗口」，这才是 TTL 本来想做的事。
+/// 代价是跨线程的一把短锁（读一次 clone 一个 `Detection`，微秒级）。
+///
 /// ── 为什么 TTL 只给 5 秒 ────────────────────────────────────
 /// 要盖住的是「同一次请求里的四次调用」，它们相隔微秒；顺手把「切走再切回来」
 /// 也盖成瞬开。5 秒又短到用户去装个客户端、回来时不会看到过期的「未检出」。
@@ -201,40 +212,128 @@ pub struct Detection {
 /// 「已接入」这类会当场变的事实完全不受影响。
 const DETECT_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
-thread_local! {
-    static DETECT_CACHE: std::cell::RefCell<
-        std::collections::HashMap<&'static str, (std::time::Instant, Detection)>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
+type DetectCache = std::sync::Mutex<std::collections::HashMap<&'static str, (std::time::Instant, Detection)>>;
+
+fn detect_cache() -> &'static DetectCache {
+    static CACHE: std::sync::OnceLock<DetectCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// 丢掉探测缓存。改了路径偏好 / 刚写完客户端配置之后要叫一声，
 /// 否则界面会拿着 5 秒内的旧结论说「未检出」。
+///
+/// 浅路径缓存一起清：它比探测缓存更容易过期 —— 改的就是它缓存的那个值。
 pub fn forget_detection() {
-    DETECT_CACHE.with(|cache| cache.borrow_mut().clear());
+    if let Ok(mut cache) = detect_cache().lock() {
+        cache.clear();
+    }
+    if let Ok(mut cache) = shallow_cache().lock() {
+        cache.clear();
+    }
 }
 
 pub fn detect(def: &ClientDef) -> Detection {
-    let cached = DETECT_CACHE.with(|cache| {
-        cache
-            .borrow()
-            .get(def.id)
-            .filter(|(at, _)| at.elapsed() < DETECT_TTL)
-            .map(|(_, hit)| hit.clone())
-    });
-    if let Some(hit) = cached {
-        return hit;
+    if let Ok(cache) = detect_cache().lock() {
+        if let Some((_, hit)) = cache.get(def.id).filter(|(at, _)| at.elapsed() < DETECT_TTL) {
+            return hit.clone();
+        }
     }
     let fresh = detect_uncached(def);
-    DETECT_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
+    if let Ok(mut cache) = detect_cache().lock() {
         // 客户端数量封顶 14 个，这条清理几乎不会触发；写在这里是为了让缓存
         // 在任何情况下都只占常数内存。
         if cache.len() > 64 {
             cache.clear();
         }
         cache.insert(def.id, (std::time::Instant::now(), fresh.clone()));
-    });
+    }
     fresh
+}
+
+/// 只解出「配置文件路径」，不做任何探测。
+///
+/// ── 为什么需要一条浅通道 ────────────────────────────────────
+/// `resources::for_client` 要的只是 `config` 这一个路径（再据此推 parent、
+/// 拼 MCP / 提示词 / Skill 的位置）。它原来调 `detect(def)`，而 `detect` 里
+/// 最贵的一段是 `find_binary`：PATH 上每个目录 × 每个可执行名 × 每个 PATHEXT
+/// 后缀各 stat 一次（本机 58 × 11 ≈ 4.4 万次 / 约 2.9 秒）。为了拿一个路径
+/// 去扫一遍全盘可执行文件，纯属白花 —— 而且这条路径在「仪表盘连通数」「MCP
+/// 配置快照」「提示词路径」上每次首屏都要走 13 遍。
+///
+/// 语义与 `detect(def).path` **完全一致**（同样的 override 优先级、同样的
+/// opencode 回退），差别只是不产出 evidence / version / unsupported。
+/// 需要那三样（接入页卡片、版本徽标）的调用方仍然走 `detect`。
+pub fn config_path(def: &ClientDef) -> PathBuf {
+    // 浅通道也要缓存：`preferences()` 每次都会读一遍 `agent-paths.json`，而
+    // `for_client` 一次请求就要走 13 个客户端、每张卡还调两次 —— 不缓存等于把
+    // 「4.4 万次 stat」换成「几十次 JSON 解析」，只是换个贵法。
+    //
+    // 缓存键是客户端 id。`save_override` 会显式 `forget_detection()`（同时清
+    // 这张表），所以「改完路径 5 秒内还是旧值」只可能发生在用户手编 json 时。
+    if let Ok(cache) = shallow_cache().lock() {
+        if let Some((at, path)) = cache.get(def.id).filter(|(at, _)| at.elapsed() < DETECT_TTL) {
+            return path.clone();
+        }
+    }
+    let path = config_path_uncached(def);
+    if let Ok(mut cache) = shallow_cache().lock() {
+        if cache.len() > 64 {
+            cache.clear();
+        }
+        cache.insert(def.id, (std::time::Instant::now(), path.clone()));
+    }
+    path
+}
+
+/// 浅路径缓存：只存 `id → PathBuf`，与 `DETECT_CACHE` 分开。
+///
+/// 合成一个 `Detection` 塞进探测缓存看起来能省一张表，但那会让 `detect()`
+/// 拿到的是一条「没有 evidence、没有 version」的假记录 —— 接入页卡片会因此
+/// 显示空版本号。两张表各管各的，语义干净。
+type ShallowCache = std::sync::Mutex<std::collections::HashMap<&'static str, (std::time::Instant, PathBuf)>>;
+
+fn shallow_cache() -> &'static ShallowCache {
+    static CACHE: std::sync::OnceLock<ShallowCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn config_path_uncached(def: &ClientDef) -> PathBuf {
+    let override_path = preferences().ok().and_then(|mut items| items.paths.remove(def.id));
+    // DSH 的路径不来自 `candidates()`：它要扫 `~/.dsh/profiles/*` 才能定出
+    // 当前 profile 的补丁文件。走 [`dsh_shallow`]，语义与 `detect(def).path`
+    // 完全一致，省掉的是 `find_binary` 那 4.4 万次 stat。
+    if def.id == "dsh" {
+        // `resource_path` 就是「该写哪个补丁文件」；没有时退回 `path`
+        // （旧版 DSH 只有 `settings.yaml`，`resource_path` 为空）。
+        // 两者在 modern 布局下是同一个值，所以这里与老 `dsh::config_path()`
+        // 的返回值逐字一致。
+        let found = dsh_shallow();
+        return found.resource_path.unwrap_or(found.path);
+    }
+    let paths = candidates(def);
+    override_path
+        .as_ref()
+        .map(PathBuf::from)
+        .or_else(|| paths.iter().find(|path| path.is_file()).cloned())
+        .or_else(|| {
+            if def.id == "opencode" {
+                paths.get(1).cloned()
+            } else {
+                paths.first().cloned()
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// DSH 的浅探测：只定路径，不扫 PATH。
+///
+/// 传 `None` 当 binary —— `installation::cli(None)` 立刻返回默认值（版本空、
+/// 来源空），正好是「只要路径」想要的语义。桌面端探测有 10 秒缓存，代价可控。
+///
+/// 调用方要区分「路径能定」与「用户还没选定运行方式」时看 `.error`：
+/// `Some` 说明 DSH 自己都说不清该写哪个文件，此时不该把它当成可写目标。
+pub fn dsh_shallow() -> super::dsh_paths::Detection {
+    super::dsh_paths::detect(None, path_override("dsh").as_deref().map(Path::new))
 }
 
 fn detect_uncached(def: &ClientDef) -> Detection {

@@ -240,6 +240,7 @@ pub fn end_deferred() -> Vec<String> {
     // 注意这里直接调 `write_atomic`（它自己不加锁），不会与已持有的锁重入死锁。
     let _guard = lock_writes();
     let mut errors: Vec<String> = Vec::new();
+    let mut removed_any = false;
     for (path, content) in files {
         match content {
             Some(text) => {
@@ -249,9 +250,14 @@ pub fn end_deferred() -> Vec<String> {
             }
             // 窗口内被删掉的容器：批末真删（`overlay_remove` 在窗口里只记待删）
             None => {
-                let _ = fs::remove_file(&path);
+                if fs::remove_file(&path).is_ok() {
+                    removed_any = true;
+                }
             }
         }
+    }
+    if removed_any {
+        invalidate();
     }
     errors
 }
@@ -476,10 +482,22 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
             return Err(format!("替换失败 {}：{error}", path.display()));
         }
     }
-    fs::rename(&tmp, path).map_err(|error| {
+    let renamed = fs::rename(&tmp, path).map_err(|error| {
         let _ = fs::remove_file(&tmp);
         format!("落盘失败 {}：{error}", path.display())
-    })
+    });
+    // ── 写成功就丢快照 ────────────────────────────────────────
+    // `write_atomic` 是**所有**记忆落盘的唯一出口（单条、容器、回收站、
+    // `projects.json`、`migrations.json` 都走它），所以在这里丢缓存一处就够，
+    // 不必给十几个调用点各加一行 —— 而漏加任何一处的后果都是「刚写完读不到」，
+    // 那种 bug 只能等用户报「我明明存了」才会被发现。
+    //
+    // 放在 rename 之后而不是之前：指纹校验本身也会抓到变化，但那是「下次读
+    // 才发现」；主动丢缓存让紧接着的那次读直接重算，省掉一次白读。
+    if renamed.is_ok() {
+        invalidate();
+    }
+    renamed
 }
 
 /// `.bak` / `.bak.1` … 滚动。失败不影响主流程（备份是保险，不是流程）。
@@ -939,6 +957,7 @@ pub fn remove_file(entry: &MemoryEntry) -> Result<(), String> {
     if trashed.exists() {
         fs::remove_file(&trashed)
             .map_err(|error| format!("删除失败 {}：{error}", trashed.display()))?;
+        invalidate();
     }
     Ok(())
 }
@@ -1163,7 +1182,143 @@ fn read_container(text: &str, relative: &str, path: &Path, out: &mut Vec<MemoryE
 }
 
 /// 读全部记忆（含回收站）。重建索引与列表页共用这一份事实读取。
-pub fn load_all() -> Vec<MemoryEntry> {
+///
+/// ── 为什么这里有一层进程内快照 ──────────────────────────────
+/// 记忆库是「一天一文件的容器」形态：5818 条记忆压在 65 个 `.md` 里，合计 55 MB。
+/// 一次 `load_all()` 要把 55 MB 全部读进内存、按 `<!-- mem -->` 标记切成 5818 段、
+/// 每段算一次 SHA-256 —— 实测 300 ms 上下。而**一个页面打开就要读三遍**：
+///
+///   `GET /api/memory/config`  → `status()` → `load_all()`
+///                            → `projects()` → `load_all()`（只为数个项目数）
+///   `GET /api/memory/projects` → `projects()` → `load_all()`
+///
+/// 三遍 900 ms 的纯 IO + 解析，全压在同一屏上，用户看到的就是「正在读取记忆库…」
+/// 转半天。AgentHub 那边之所以「很快就出数据」，是因为它读的是 SQLite 索引，
+/// 不碰原始文件。
+///
+/// 所以这里加一层「按目录指纹校验的快照」：
+///   * 命中（指纹没变）→ 只花一次 stat 遍历（65 个文件约 8 ms），零解析；
+///   * 未命中 → 重读一遍，并把新快照换上去；
+///   * 写路径主动 [`invalidate`]（见 `save` / `move_save` / `end_deferred` 等）。
+///
+/// ── 为什么不干脆只读索引 ────────────────────────────────────
+/// 索引是**派生**数据，事实源是 `.md`。用户手编一个记忆文件、同步落盘拷回来一批、
+/// 或者索引库坏了要重建 —— 这些场景下「只信索引」会读出过期内容。快照校验的是
+/// 文件系统本身（文件名 + 体积 + mtime），比任何一层缓存都更接近事实源。
+pub fn snapshot() -> std::sync::Arc<Vec<MemoryEntry>> {
+    let root = root();
+    let stamp = fingerprint(&root);
+    // 先查缓存（持锁时间只有一次 Arc 克隆，微秒级）
+    if let Ok(guard) = snapshot_slot().lock() {
+        if let Some(slot) = guard.as_ref() {
+            if slot.stamp == stamp && slot.root == root {
+                return std::sync::Arc::clone(&slot.entries);
+            }
+        }
+    }
+    // 读盘刻意在锁外：锁内读 55 MB 会让所有并发读者排队等同一份 IO，
+    // 而「两个线程同时发现失效、各读一遍」的代价只是多一次读盘 —— 写路径会
+    // 主动 invalidate，所以这种重复只出现在「刚写完的那一瞬间」。
+    let entries = std::sync::Arc::new(load_all_raw());
+    if let Ok(mut guard) = snapshot_slot().lock() {
+        *guard = Some(Snapshot { stamp, root, entries: std::sync::Arc::clone(&entries) });
+    }
+    entries
+}
+
+/// 丢缓存。所有写路径都要调 —— 少调一处的后果是「写完看不到」，
+/// 而那种 bug 只能靠用户报「我明明存了」才会被发现。
+pub fn invalidate() {
+    if let Ok(mut guard) = snapshot_slot().lock() {
+        *guard = None;
+    }
+}
+
+/// 预热快照：后台线程启动时调一次，把「第一次打开记忆页要解析 55 MB」的
+/// 代价从用户身上挪到启动阶段。
+///
+/// ── 为什么必须预热而不是靠懒加载 ────────────────────────────
+/// `snapshot()` 未命中时要读全部 `.md`（本机 65 个文件 / 55 MB）、切成几千节、
+/// 每节算一次 SHA-256 —— 实测 300~500 ms，冷盘上更久。这段时间原来完全由
+/// **第一个打开记忆中枢的用户**承担，叠加 `status()` 与 `projects()` 就是
+/// 那句「正在读取记忆库…」。
+///
+/// 启动后立刻在后台线程里跑一遍，用户点进页面时命中率接近 100%：指纹没变就
+/// 只花一次 stat 遍历（约 8 ms）。失败无所谓 —— 懒加载那条路还在，只是慢一点，
+/// 所以这里刻意不返回错误、不记 warning，只在日志里留一行耗时。
+pub fn warm() {
+    let started = std::time::Instant::now();
+    let entries = snapshot();
+    crate::server::logging::log(
+        "[Memory]",
+        &format!(
+            "记忆快照预热完成：{} 条 / {} ms（首屏将命中缓存）",
+            entries.len(),
+            started.elapsed().as_millis()
+        ),
+    );
+}
+
+struct Snapshot {
+    /// 目录指纹（见 [`fingerprint`]）
+    stamp: u64,
+    /// 记忆根。`storage.root` 可以被改，换了根必须重读
+    root: PathBuf,
+    entries: std::sync::Arc<Vec<MemoryEntry>>,
+}
+
+fn snapshot_slot() -> &'static std::sync::Mutex<Option<Snapshot>> {
+    static SLOT: std::sync::Mutex<Option<Snapshot>> = std::sync::Mutex::new(None);
+    &SLOT
+}
+
+/// 目录指纹：把「哪些 `.md`、各多大、各什么时候改的」压成一个 u64。
+///
+/// ── 为什么不直接比 mtime 最大值 ────────────────────────────
+/// 同步工具回滚、用户从备份拷回一批旧文件、删除一个容器 —— 这些都会让「最大值」
+/// 变小或不变，但内容已经变了。把每个文件的名字 + 体积 + mtime 都喂进哈希里，
+/// 三种情况都能抓到。
+///
+/// ── 为什么用纳秒级 mtime ───────────────────────────────────
+/// 容器是整份重写的（不是追加），同一秒内连写两次的场景真实存在（导入批末
+/// 落盘 + 紧接着一次手动写入）。秒级精度会把第二次判成「没变」。
+fn fingerprint(root: &Path) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    fn walk<H: Hasher>(dir: &Path, hasher: &mut H) {
+        let Ok(reader) = fs::read_dir(dir) else { return };
+        let mut items: Vec<PathBuf> = reader.flatten().map(|item| item.path()).collect();
+        // 排序：`read_dir` 的枚举顺序不保证稳定，不排序会让同一份目录算出两个指纹
+        items.sort();
+        for path in items {
+            if path.is_dir() {
+                path.file_name().hash(hasher);
+                walk(&path, hasher);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(meta) = fs::metadata(&path) else { continue };
+            path.file_name().hash(hasher);
+            meta.len().hash(hasher);
+            meta.modified()
+                .ok()
+                .and_then(|stamp| stamp.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|age| age.as_nanos() as u64)
+                .hash(hasher);
+        }
+    }
+
+    let mut hasher = DefaultHasher::new();
+    root.to_string_lossy().hash(&mut hasher);
+    walk(root, &mut hasher);
+    hasher.finish()
+}
+
+/// 无缓存的全量读取。只有 [`snapshot`] 在缓存失效时调它。
+fn load_all_raw() -> Vec<MemoryEntry> {
     let mut out = Vec::new();
     read_dir_entries(&general_root(), &mut out);
     read_dir_entries(&projects_root(), &mut out);
@@ -1181,6 +1336,12 @@ pub fn load_all() -> Vec<MemoryEntry> {
     }
     out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     out
+}
+
+/// 读全部记忆（含回收站）。**返回独立副本** —— 需要 `Arc` 共享的调用方用
+/// [`snapshot`]，省掉一次 55 MB 的深拷贝。
+pub fn load_all() -> Vec<MemoryEntry> {
+    (*snapshot()).clone()
 }
 
 /// 把「容器里节的日期」与「容器文件名上的日期」不一致的容器拆开，各自归位。
@@ -1671,6 +1832,9 @@ pub fn purge_expired_trash(days: usize) -> usize {
         if stamp > 0 && stamp < cutoff && fs::remove_file(&path).is_ok() {
             removed += 1;
         }
+    }
+    if removed > 0 {
+        invalidate();
     }
     removed
 }

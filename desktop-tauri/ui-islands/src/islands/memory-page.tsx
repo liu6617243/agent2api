@@ -152,22 +152,14 @@ function MemoryPage(): React.ReactElement {
   const [focusProject, setFocusProject] = React.useState<string | null>(null)
 
   /**
-   * 首屏一次拉全「壳数据」：状态、类别枚举、项目列表。
+   * 项目列表：**不参与首屏**，由 `loadShell()` 在后台触发。
    *
-   * 这三样被多个页签共用（状态在仪表盘与配置页、类别在浏览页、项目在浏览与项目页），
-   * 每个页签各拉一次会得到三份可能不一致的快照 —— 用户刚写完一条记忆，切到仪表盘
-   * 看到旧条数，会以为写入失败了。
+   * 定义在 `loadShell` 之前是为了让依赖关系顺着读：首屏只用它，不依赖它完成。
    */
-  const loadShell = React.useCallback(async () => {
+  const refreshProjects = React.useCallback(async () => {
+    setProjectsLoading(true)
     try {
-      const [config, projectList] = await Promise.all([m.loadConfig(), m.loadProjects()])
-      setStatus(config.status)
-      setKinds(config.kinds)
-      // 界面旋钮：`ui.tabs` 决定顶栏显示哪些页签，`ui.defaultTab` 决定首屏落在
-      // 哪一页，`ui.pageSize` 决定浏览页每页条数。三条都在这里一次读出来。
-      const resolved = resolveUi(config.values)
-      uiRef.current = resolved
-      setUi(resolved)
+      const projectList = await m.loadProjects()
       setProjects(projectList.items)
       setGeneral(projectList.general ?? null)
       setProjectsError('')
@@ -175,9 +167,46 @@ function MemoryPage(): React.ReactElement {
       setProjectsError(caught instanceof Error ? caught.message : String(caught))
     } finally {
       setProjectsLoading(false)
-      setBooted(true)
     }
   }, [])
+
+  /**
+   * 首屏：先让页面能看，再补重数据。
+   *
+   * ── 为什么不能再 `Promise.all([loadConfig, loadProjects])` ──
+   * `loadProjects()` 要把整库按项目分组、每组算 l1/l2、挑前三条最新 —— 记忆多
+   * 的时候这一步比 `loadConfig()` 慢一个数量级。早先两个请求用 `Promise.all`
+   * 一起等，`booted` 卡在慢的那个上，于是用户看到的是「正在读取记忆库…」转
+   * 好几秒，而其实配置早就回来了、顶栏本可以立刻画出来。
+   *
+   * AgentHub 那边「很快就出现数据」，是因为它首屏只查索引里的几个计数。
+   * 这里的口径对齐它：**首屏只等配置**（决定有哪些页签、默认落在哪一页、
+   * 每页几条），项目列表改为后台加载 —— 只有「项目」页签真的用得上它，
+   * 而切到那一页时 `switchTab` 本来就会再刷一次。
+   *
+   * ── 失败也要 booted ─────────────────────────────────────────
+   * `loadConfig()` 挂了（后端刚重启、鉴权过期）时仍然要进页面：卡在 spinner 上
+   * 用户既看不到错误也点不到「刷新」，那是比空白更糟的状态。错误写进 `error`
+   * 条，页面用最保守的默认值渲染（全页签 / 仪表盘 / 50 条）。
+   */
+  const loadShell = React.useCallback(async () => {
+    try {
+      const config = await m.loadConfig()
+      setStatus(config.status)
+      setKinds(config.kinds)
+      // 界面旋钮：`ui.tabs` 决定顶栏显示哪些页签，`ui.defaultTab` 决定首屏落在
+      // 哪一页，`ui.pageSize` 决定浏览页每页条数。三条都在这里一次读出来。
+      const resolved = resolveUi(config.values)
+      uiRef.current = resolved
+      setUi(resolved)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBooted(true)
+    }
+    // 项目列表不参与首屏判定：`void` 是有意的，让它在后台跑完自己更新状态。
+    void refreshProjects()
+  }, [refreshProjects])
 
   React.useEffect(() => {
     void loadShell()
@@ -200,20 +229,6 @@ function MemoryPage(): React.ReactElement {
       setTab(ui.defaultTab)
     }
   }, [ui])
-
-  const refreshProjects = React.useCallback(async () => {
-    setProjectsLoading(true)
-    try {
-      const projectList = await m.loadProjects()
-      setProjects(projectList.items)
-      setGeneral(projectList.general ?? null)
-      setProjectsError('')
-    } catch (caught) {
-      setProjectsError(caught instanceof Error ? caught.message : String(caught))
-    } finally {
-      setProjectsLoading(false)
-    }
-  }, [])
 
   const refreshStatus = React.useCallback(async () => {
     try {
