@@ -758,7 +758,11 @@ fn read_from(path: &Path, from: u64, max_bytes: u64) -> std::io::Result<(String,
     // 起点落在行中间才需要丢第一段：`from` 本身永远是「上一个完整行的末尾 +
     // 1」，也就是行首；只有「首次读尾部」（start 被改成 len - max）才可能切进
     // 半行。这两种情况必须分开 —— 全都丢的话，每次增量都会少掉游标后的第一行。
-    let mid_line = start != from;
+    //
+    // `start == 0` 永远不丢：文件变短（`from > len`）时 start 会被拉回 0，
+    // 那是文件开头而不是半行。CI 上 `cursor_restarts_when_file_shrinks` 就是
+    // 因为漏了这个条件把唯一一行当成残片丢掉的。
+    let mid_line = start > 0 && start != from;
     let body_start = if mid_line {
         buffer
             .iter()
