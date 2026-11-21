@@ -137,6 +137,71 @@ const AUTO_AT_KEY: &str = "import.autoAt";
 /// 上次自动增量导入的结果摘要。
 const AUTO_LAST_KEY: &str = "import.autoLast";
 
+/// 每个会话文件读到第几个字节。键是规范化后的绝对路径，值是偏移 + 读取时的文件长度。
+///
+/// ── 为什么在 mtime 水位之外还要这一张表 ─────────────────────
+/// mtime 只能回答「这个文件变过没有」，回答不了「变的是哪一段」。当前会话是边聊
+/// 边写的：mtime 每几秒变一次，于是每一轮增量任务都要把整个文件（或尾部 8 MB）
+/// 重新解析一遍 —— 实测那个 955 MB 的会话就是靠这一点把面板拖过 60 秒超时的。
+/// 有了字节游标，「变过」只意味着「读 offset 之后那几百 KB」。
+///
+/// 与 AgentHub `import_parsers.cjs` 的 `files[key] = consumed` 同构：它的
+/// `readNewLines(fd, fromByte, maxChunkBytes)` 就是这张表在 JS 里的实现。
+///
+/// ── 为什么不复用 `AUTO_AT_KEY` ──────────────────────────────
+/// 那是「全局一个数」，用来做首次安装时的回溯窗口（`autoSinceDays`）。文件级
+/// 游标是「每个文件一个数」，两者生命周期一致但语义完全不同：把游标塞进一个
+/// 全局时间戳里，等于回到「按 mtime 整份重读」。
+const AUTO_CURSORS_KEY: &str = "import.autoCursors";
+
+/// 游标表的上限。会话文件会越攒越多（删项目、换目录都留旧键），超过这个数就按
+/// 文件名裁剪 —— 键只是路径字符串，1 万条约 1 MB，本身不致命，但不该无界增长。
+const MAX_CURSORS: usize = 10_000;
+
+/// 一个文件的读取位置。
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct FileCursor {
+    /// 下次从这里开始读。
+    offset: u64,
+    /// 记下读取时刻的文件长度：`size == offset` 就是「已读完」，不必再 stat
+    /// 之外的任何判断；文件变短（轮转/清空）则由 `offset > size` 识别。
+    size: u64,
+}
+
+type Cursors = std::collections::BTreeMap<String, FileCursor>;
+
+/// 游标键：绝对路径、统一分隔符。
+///
+/// 不折大小写：同一进程的 `read_dir` 返回的字符串是稳定的，折了反而会让
+/// 「用户手动改过盘符大小写」这种情况对不上。
+fn cursor_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn load_cursors() -> Cursors {
+    index::global()
+        .sync_get(AUTO_CURSORS_KEY)
+        .and_then(|(raw, _)| serde_json::from_str::<Cursors>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_cursors(cursors: &Cursors) {
+    let mut trimmed = cursors.clone();
+    if trimmed.len() > MAX_CURSORS {
+        // BTreeMap 按路径排序，与新旧无关 —— 这里只需要「有界」，不需要「留最新」：
+        // 被裁掉的文件下一轮会按 mtime 水位重新判断，最坏是多读一次。
+        while trimmed.len() > MAX_CURSORS {
+            let Some(first) = trimmed.keys().next().cloned() else {
+                break;
+            };
+            trimmed.remove(&first);
+        }
+    }
+    if let Ok(text) = serde_json::to_string(&trimmed) {
+        index::global().sync_set(AUTO_CURSORS_KEY, &text);
+    }
+}
+
 // ── 来源解析 ─────────────────────────────────────────────────
 
 /// 一个导入来源。
@@ -657,20 +722,71 @@ fn push_unique(out: &mut Vec<String>, text: &str) {
     out.push(trimmed.to_string());
 }
 
-/// 读会话记录：文件不大就整份读，超过 [`MAX_TRANSCRIPT_BYTES`] 只读尾部。
+/// 读会话记录：从 `from` 字节开始，最多读 [`MAX_TRANSCRIPT_BYTES`]，返回正文与
+/// **下一个游标位置**。
 ///
-/// 尾部读必须**按行对齐**：从中间切进去的第一段多半是半截 JSON，`line_to_turn`
-/// 解析不出轮次，留着只是白跑一次正则。所以丢掉第一个换行符之前的所有字节 ——
-/// 那里是唯一可能被切断的地方，后面的每一行都完整。
+/// ── 为什么必须是「从上次的位置接着读」而不是「每轮读尾部」────────────
+/// 尾部读仍然每轮把最后 8 MB 重新解析一遍。当前会话是边聊边写的，mtime 每几秒
+/// 变一次，于是每轮增量任务都要为同一段内容付一次 8 MB 的 IO + 解析 + 上千次
+/// hash 去重。AgentHub 的做法是 per-file 字节游标（`readNewLines(fd, fromByte)`）：
+/// 读过的地方不再读。这里对齐同一口径 —— 游标之前的字节一个都不碰。
+///
+/// ── 三个边界 ────────────────────────────────────────────────
+/// 1. `from == 0` 且文件超过上限：只读尾部。这类文件是「升级前就在的老会话」，
+///    前面几十万行要么早已入库、要么是无关历史；从 0 读只会白付一次整份 IO。
+/// 2. 文件变短（被轮转/截断）：`from > len` → 回到 0 重读，不能原地空转。
+/// 3. 末尾没有换行（正在写的最后一行）：游标停在最后一个完整行的末尾，下一轮
+///    重读这一行。宁可多读一行，不能吞掉半行 JSON。
 ///
 /// 用 `from_utf8_lossy` 而不是 `read_to_string`：截断点可能落在一个多字节字符
-/// 中间（虽然按行对齐后不会），而「整个文件读不出来」比「有一个替换符」糟糕得多。
+/// 中间，而「整个文件读不出来」比「有一个替换符」糟糕得多。
+fn read_from(path: &Path, from: u64, max_bytes: u64) -> std::io::Result<(String, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = if from == 0 || from > len {
+        len.saturating_sub(max_bytes)
+    } else {
+        from
+    };
+    file.seek(SeekFrom::Start(start))?;
+    let want = (len - start).min(max_bytes);
+    let mut buffer = Vec::with_capacity(want as usize);
+    file.take(want).read_to_end(&mut buffer)?;
+
+    // 起点落在行中间才需要丢第一段：`from` 本身永远是「上一个完整行的末尾 +
+    // 1」，也就是行首；只有「首次读尾部」（start 被改成 len - max）才可能切进
+    // 半行。这两种情况必须分开 —— 全都丢的话，每次增量都会少掉游标后的第一行。
+    let mid_line = start != from;
+    let body_start = if mid_line {
+        buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|at| at + 1)
+            .unwrap_or(buffer.len())
+    } else {
+        0
+    };
+    // 只消费到最后一个完整行为止。
+    let last_nl = buffer.iter().rposition(|byte| *byte == b'\n');
+    let (body_end, next) = match last_nl {
+        Some(at) if at + 1 > body_start => (at + 1, start + at as u64 + 1),
+        _ => (buffer.len(), start + buffer.len() as u64),
+    };
+    let text = String::from_utf8_lossy(&buffer[body_start..body_end]).into_owned();
+    Ok((text, next.min(len)))
+}
+
+/// 读会话记录（从 0 开始，兼容旧调用）。见 [`read_from`]。
+#[cfg(test)]
 fn read_transcript(path: &Path) -> std::io::Result<String> {
     read_tail(path, MAX_TRANSCRIPT_BYTES)
 }
 
 /// [`read_transcript`] 的本体，上限可注入 —— 测试用 64 字节就能覆盖
 /// 「文件远大于上限」这条分支，不必真造一个 9 MB 的文件。
+#[cfg(test)]
 fn read_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -706,25 +822,41 @@ fn read_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
 ///
 /// 每个窗口都带同一次会话的 `session` 与「窗内最早的原始时间」，于是检索能
 /// 串回上下文、时间轴上落在真实发生的那天，而不是导入当天。
+#[cfg(test)]
 fn from_transcript(path: &Path, project: Option<String>) -> Vec<Pending> {
+    from_transcript_at(path, project, 0).0
+}
+
+/// [`from_transcript`] 的带游标版本：从 `from` 字节开始解析，返回 `(窗口, 新游标)`。
+///
+/// 读失败时游标**原地不动** —— 下一轮会重试同一段，而不是把读不了的区间悄悄
+/// 跳过。这是「失败不推进水位」在文件级的同一条口径。
+fn from_transcript_at(
+    path: &Path,
+    project: Option<String>,
+    from: u64,
+) -> (Vec<Pending>, u64) {
     let session = path
         .file_stem()
         .map(|stem| stem.to_string_lossy().to_string())
         .filter(|stem| !stem.is_empty());
-    // 只读尾部：见 `MAX_TRANSCRIPT_BYTES` 的说明。整份读 955 MB 会把面板拖死。
-    let raw = match read_transcript(path) {
-        Ok(text) => text,
+    // 只读游标之后的新增部分：见 `read_from` 的说明。
+    let (raw, next) = match read_from(path, from, MAX_TRANSCRIPT_BYTES) {
+        Ok(pair) => pair,
         Err(error) => {
-            return vec![Pending {
-                source: String::new(),
-                path: path.to_path_buf(),
-                project,
-                session: session.clone(),
-                created_at: None,
-                title: String::new(),
-                body: String::new(),
-                skip: Some(format!("读不了：{error}")),
-            }]
+            return (
+                vec![Pending {
+                    source: String::new(),
+                    path: path.to_path_buf(),
+                    project,
+                    session: session.clone(),
+                    created_at: None,
+                    title: String::new(),
+                    body: String::new(),
+                    skip: Some(format!("读不了：{error}")),
+                }],
+                from,
+            )
         }
     };
     // 收成「一段发言一行」的片段：`(格式化正文, 该段原始时间)`。超长单段先单独切碎，
@@ -744,16 +876,19 @@ fn from_transcript(path: &Path, project: Option<String>) -> Vec<Pending> {
     let title_base = session.clone().unwrap_or_else(|| "会话记录".to_string());
     let total_chars: usize = segments.iter().map(|(text, _)| text.chars().count()).sum();
     if segments.is_empty() || total_chars < MIN_BODY_CHARS {
-        return vec![Pending {
-            source: String::new(),
-            path: path.to_path_buf(),
-            project,
-            session,
-            created_at: None,
-            title: title_base,
-            body: String::new(),
-            skip: Some("没有可用的对话内容".to_string()),
-        }];
+        return (
+            vec![Pending {
+                source: String::new(),
+                path: path.to_path_buf(),
+                project,
+                session,
+                created_at: None,
+                title: title_base,
+                body: String::new(),
+                skip: Some("没有可用的对话内容".to_string()),
+            }],
+            next,
+        );
     }
 
     let windows = pack_windows(&segments);
@@ -788,7 +923,7 @@ fn from_transcript(path: &Path, project: Option<String>) -> Vec<Pending> {
             skip,
         });
     }
-    out
+    (out, next)
 }
 
 /// 把一段超长文本按 `limit` 字数切开（相邻片重叠 `CHUNK_OVERLAP/2`）。
@@ -965,7 +1100,9 @@ fn sources_json(scanned: &[Scanned]) -> Vec<Value> {
 
 /// 收集全部候选（读正文，但不写盘）。
 fn collect(only: Option<&str>) -> (Vec<Pending>, Vec<Value>) {
-    let (collected, rows) = collect_with(only, None, MAX_FILES_PER_SOURCE);
+    // 手动导入不启用游标：用户点「导入全部来源」的语义就是「把看到的都读一遍」，
+    // 靠 hash 去重挡住已入库的内容。游标只服务于自动增量任务。
+    let (collected, rows) = collect_with(only, None, MAX_FILES_PER_SOURCE, None);
     (collected.candidates, rows)
 }
 
@@ -993,6 +1130,8 @@ struct Collected {
     /// 表现是「A 的会话都进来了，B 一条都没有」。所以只要有来源积压，水位必须
     /// 退到**积压来源里最早那个已处理位置**，让下一轮从那里接着读。
     deferred_floor: i64,
+    /// 本轮各文件读到了哪个字节。写入全部成功后由 `run_core` 落盘。
+    advance: Vec<(PathBuf, FileCursor)>,
 }
 
 /// 带 mtime 过滤的收集：只读「`since` 之后改过」的文件。
@@ -1002,7 +1141,12 @@ struct Collected {
 /// 项目、几千个 jsonl、单个能到十几 MB）再按 mtime 丢掉，等于每半小时做一次
 /// 全量干跑 —— 磁盘和 CPU 全花在「已经读过的东西」上，笔记本风扇会先告诉你。
 /// 所以 mtime 判断放在**打开文件之前**：没变的文件连 `read_to_string` 都不发生。
-fn collect_with(only: Option<&str>, since: Option<i64>, cap: usize) -> (Collected, Vec<Value>) {
+fn collect_with(
+    only: Option<&str>,
+    since: Option<i64>,
+    cap: usize,
+    cursors: Option<&Cursors>,
+) -> (Collected, Vec<Value>) {
     let scanned = scan(only);
     let mut collected = Collected {
         candidates: Vec::new(),
@@ -1010,23 +1154,26 @@ fn collect_with(only: Option<&str>, since: Option<i64>, cap: usize) -> (Collecte
         deferred: 0,
         processed_to: 0,
         deferred_floor: 0,
+        advance: Vec::new(),
     };
     for item in &scanned {
         // 项目归属：目录名。会话记录目录常常是「~/.claude/projects/<编码路径>/」，
         // 直接取最后一级会把一串编码当项目名，所以只取来源本身的目录名。
-        let (produced, unchanged, deferred, processed_to) = collect_files(
+        let (produced, unchanged, deferred, processed_to, advance) = collect_files(
             &item.files,
             &item.source.format,
             Some(item.source.label()),
             since,
             Some(&item.source.path),
             cap,
+            cursors,
         );
         collected.candidates.extend(produced);
         collected.unchanged += unchanged;
         collected.deferred += deferred;
         collected.processed_to = collected.processed_to.max(processed_to);
         collected.deferred_floor = merge_floor(collected.deferred_floor, processed_to, deferred);
+        collected.advance.extend(advance);
     }
     (collected, sources_json(&scanned))
 }
@@ -1058,7 +1205,16 @@ fn collect_with_paths(
     since: Option<i64>,
     cap: usize,
 ) -> (Vec<Pending>, usize, usize, i64) {
-    collect_files(paths, "jsonl", Some("test".to_string()), since, None, cap)
+    let (candidates, unchanged, deferred, processed_to, _) = collect_files(
+        paths,
+        "jsonl",
+        Some("test".to_string()),
+        since,
+        None,
+        cap,
+        None,
+    );
+    (candidates, unchanged, deferred, processed_to)
 }
 
 /// 文件级收集：mtime 过滤 → 排序 → 解析 → 打来源标记。
@@ -1088,20 +1244,39 @@ fn collect_files(
     since: Option<i64>,
     source: Option<&str>,
     cap: usize,
-) -> (Vec<Pending>, usize, usize, i64) {
-    // 先过滤、再排序：`is_fresh` 要 stat 一次，但比读正文便宜三个数量级。
-    let mut fresh: Vec<(&PathBuf, i64)> = Vec::new();
+    cursors: Option<&Cursors>,
+) -> (Vec<Pending>, usize, usize, i64, Vec<(PathBuf, FileCursor)>) {
+    // 先过滤、再排序：`is_fresh` / `file_len` 只 stat 一次，比读正文便宜三个数量级。
+    let mut fresh: Vec<(&PathBuf, i64, u64)> = Vec::new();
     let mut unchanged = 0usize;
     for file in files {
-        if let Some(cutoff) = since {
-            if !is_fresh(file, cutoff) {
-                unchanged += 1;
-                continue;
+        let len = file_len(file).unwrap_or(0);
+        // 有游标时以游标为准：mtime 变了不等于有新增内容 —— `touch`、同步工具改
+        // 元数据、备份软件重写属性都会动 mtime。offset 到了文件末尾才是真的读完。
+        let from = match cursors.and_then(|all| all.get(&cursor_key(file))) {
+            Some(cursor) if cursor.offset <= len => cursor.offset,
+            // 文件变短（轮转/清空/被截断）：回到 0 重读，不能停在越界的偏移上。
+            _ => 0,
+        };
+        if cursors.is_some() && from >= len {
+            // 游标已经到（或越过）文件末尾：没有新内容。空文件也走这条 ——
+            // 否则每一轮都会「读」一次空文件并产生一条「没有可用的对话内容」。
+            unchanged += 1;
+            continue;
+        }
+        // 第一次见这个文件（from == 0）：仍按回溯窗口挡掉太旧的历史文件。
+        // 有游标的文件跳进这里时 `from > 0`，说明确实有新增内容，不看 mtime。
+        if from == 0 {
+            if let Some(cutoff) = since {
+                if !is_fresh(file, cutoff) {
+                    unchanged += 1;
+                    continue;
+                }
             }
         }
         // 没有水位（手动导入）时不需要排序：按文件名稳定遍历，结果可复现。
         let stamp = file_mtime(file).unwrap_or(0);
-        fresh.push((file, stamp));
+        fresh.push((file, stamp, from));
     }
     // 增量模式按「旧到新」：积压时先进来的是更早那批，水位才能一轮轮往前走。
     if since.is_some() {
@@ -1109,21 +1284,38 @@ fn collect_files(
     }
     let deferred = fresh.len().saturating_sub(cap);
     let mut candidates: Vec<Pending> = Vec::new();
+    // 本轮各文件的「读到哪」。写失败的文件由 `run_core` 从这组里剔掉 —— 游标
+    // 一旦提前推进，那段没写进去的内容就永久丢了（下次从更后面开始读）。
+    let mut advance: Vec<(PathBuf, FileCursor)> = Vec::new();
     let mut processed_to = 0i64;
-    for (file, stamp) in fresh.into_iter().take(cap) {
+    for (file, stamp, from) in fresh.into_iter().take(cap) {
         processed_to = processed_to.max(stamp);
         // 会话记录一个文件切出多个窗口（多条待导入），Markdown 一个文件一条。
-        let mut produced: Vec<Pending> = if format == "jsonl" {
-            from_transcript(file, project.clone())
+        let (mut produced, next) = if format == "jsonl" {
+            from_transcript_at(file, project.clone(), from)
         } else {
-            vec![from_markdown(file, project.clone())]
+            (vec![from_markdown(file, project.clone())], file_len(file).unwrap_or(0))
         };
+        if cursors.is_some() {
+            advance.push((
+                file.clone(),
+                FileCursor {
+                    offset: next,
+                    size: file_len(file).unwrap_or(next),
+                },
+            ));
+        }
         for mut candidate in produced.drain(..) {
             candidate.source = source.unwrap_or_default().to_string();
             candidates.push(candidate);
         }
     }
-    (candidates, unchanged, deferred, processed_to)
+    (candidates, unchanged, deferred, processed_to, advance)
+}
+
+/// 文件当前长度。读不到（权限/刚删/网络盘掉线）返回 `None`。
+fn file_len(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|meta| meta.len())
 }
 
 /// 文件是不是「水位之后改过」。
@@ -1442,18 +1634,31 @@ fn run_core(
     // 增量模式：mtime 过滤在 `collect_with` 内部、打开文件之前完成 ——
     // 没变的文件连读都不读。`unchanged` 是「上次已读过」的文件数，
     // `deferred` 是「有变动但超出单来源上限、这轮没轮到」的文件数。
-    let (collected, _) = collect_with(only, since, MAX_FILES_PER_SOURCE);
-    let candidates = collected.candidates;
+    //
+    // 游标只在增量模式启用：手动导入是一次性动作，用户要的是「把现在看到的都读一遍」。
+    let mut cursors = if since.is_some() {
+        Some(load_cursors())
+    } else {
+        None
+    };
+    let (collected, _) = collect_with(only, since, MAX_FILES_PER_SOURCE, cursors.as_ref());
+    let Collected {
+        candidates,
+        unchanged,
+        deferred,
+        processed_to,
+        deferred_floor,
+        advance,
+    } = collected;
     let scanned = candidates.len();
     let mut skipped = 0usize;
     let mut reasons: Vec<String> = Vec::new();
-    // 「上次已读过、这次没变」的文件数。单独计数而不是混进 `skipped`：
-    // 「跳过」在页面上是「这条内容不合格」，而这里是「这个文件上次已经读过」，
-    // 混在一起会让用户以为导入坏了。
-    let unchanged = collected.unchanged;
 
     // 先把能写的挑出来，记下每条对应哪个文件（失败时要把文件名报给用户）
-    let mut queue: Vec<(String, WriteInput)> = Vec::new();
+    //
+    // 第二个字段是**原始路径**，不是给人看的展示路径：游标表以它为键，
+    // 拿 `display_path` 去掉盘符前缀后就对不上了。
+    let mut queue: Vec<(String, PathBuf, WriteInput)> = Vec::new();
     for candidate in &candidates {
         if candidate.skip.is_some() {
             // 敏感内容开关关掉时，被标记为「含密钥」的条目也照导 —— 但只限这一类，
@@ -1469,6 +1674,7 @@ fn run_core(
         }
         queue.push((
             display_path(&candidate.path),
+            candidate.path.clone(),
             WriteInput {
                 content: candidate.body.clone(),
                 title: Some(candidate.title.clone()),
@@ -1494,6 +1700,10 @@ fn run_core(
     let mut written = 0usize;
     let mut duplicated = 0usize;
     let mut failed = 0usize;
+    // 这一轮有写入失败的文件。它们的游标**不能推进** —— 推进了就等于把没写进去
+    // 的那段永久跳过（下一轮从更后面开始读）。宁可下一轮重读一遍，靠 hash 去重
+    // 挡掉已经成功的部分。
+    let mut failed_files: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     // 一个写入器贯穿整次导入：hash 集合只建一次，之后每批都复用它。
     // 分批只是为了在批与批之间让出线程，不该让去重退回 O(n²)。
     let mut writer = super::BatchWriter::new();
@@ -1504,12 +1714,15 @@ fn run_core(
     // （800 条 × 每条最多 24k 字，克隆一轮就是几十 MB 的瞬时内存）。
     while !queue.is_empty() {
         let take = batch.max(1).min(queue.len());
+        // 本批涉及的文件：落盘阶段报错时无法精确到某一条，只能整批保守处理。
+        let mut batch_files: Vec<PathBuf> = Vec::with_capacity(take);
         // 每批开一段延迟落盘窗口：本批内对同一 l1 容器的多次追加攒在内存，
         // 批末统一写一次盘。这是切细粒度后（几千条挤同一天容器）不退化到
         // O(n²) 写放大的关键。窗口按批开关，而不是整次导入一个窗口 ——
         // 这样即便中途 panic，已完成批次也已落盘，不会整批丢在内存里。
         super::store::begin_deferred();
-        for (path, input) in queue.drain(..take) {
+        for (path, origin, input) in queue.drain(..take) {
+            batch_files.push(origin.clone());
             match writer.write(input) {
                 // `write` 命中 hash 去重时会返回 `duplicate: true` 且不新增条目
                 Ok(value) if value.get("duplicate").and_then(Value::as_bool).unwrap_or(false) => {
@@ -1518,6 +1731,7 @@ fn run_core(
                 Ok(_) => written += 1,
                 Err(error) => {
                     failed += 1;
+                    failed_files.insert(origin);
                     if reasons.len() < 8 {
                         reasons.push(format!("{path}：{error}"));
                     }
@@ -1526,7 +1740,15 @@ fn run_core(
         }
         // 关窗口 = 把本批攒下的容器统一落盘。写失败的文件也计入 failed 并留原因
         // —— 它们是记忆真正没落盘的部分，不能当成功。
-        for error in writer.flush() {
+        let flush_errors = writer.flush();
+        if !flush_errors.is_empty() {
+            // 落盘是按容器整文件写的，错误信息里只有容器路径、没有「哪一条」。
+            // 保守起来本批所有源文件都不推进游标：下一轮重读，hash 挡重复。
+            for origin in batch_files {
+                failed_files.insert(origin);
+            }
+        }
+        for error in flush_errors {
             failed += 1;
             if reasons.len() < 8 {
                 reasons.push(format!("落盘失败 {error}"));
@@ -1536,6 +1758,22 @@ fn run_core(
         // 与 `scanned` 同口径，进度条不会超过 100%。
         progress(written + duplicated + failed + skipped, scanned);
         std::thread::yield_now();
+    }
+    // ── 游标只在写成功之后推进 ──────────────────────────────────
+    // 顺序反过来（先推游标再写）的话，中途失败就等于那一段内容永久蒸发：
+    // 下一轮从更后面的偏移开始读，没人会发现少了什么。
+    if let Some(all) = cursors.as_mut() {
+        let mut moved = 0usize;
+        for (path, cursor) in advance {
+            if failed_files.contains(&path) {
+                continue;
+            }
+            all.insert(cursor_key(&path), cursor);
+            moved += 1;
+        }
+        if moved > 0 {
+            save_cursors(all);
+        }
     }
     // 这一轮写完了：把 WAL 收回去。导入是「长时间连续写 + 页面同时在读」，
     // 自动 checkpoint 在此期间落不了地，WAL 会一路长到几百 MB（实测 700 MB），
@@ -1550,12 +1788,12 @@ fn run_core(
         "skipped": skipped,
         "unchanged": unchanged,
         // 有变动但超出单来源上限、这轮没轮到。调用方据此决定水位推到哪。
-        "deferred": collected.deferred,
+        "deferred": deferred,
         // 本轮处理到的最新 mtime。`run_auto` 用它算下一轮水位 ——
         // 比「开跑时刻」安全：只覆盖真正读过的文件。
-        "processedTo": collected.processed_to,
+        "processedTo": processed_to,
         // 有积压的来源里最早的已处理位置；0 表示没有积压。水位不能越过它。
-        "deferredFloor": collected.deferred_floor,
+        "deferredFloor": deferred_floor,
         "failed": failed,
         "scanned": scanned,
         // 这一轮一共花了多少毫秒。面板上不一定要显示，但日志与排障必须能说出
@@ -1570,8 +1808,7 @@ fn run_core(
     crate::server::logging::log(
         "[Memory]",
         &format!(
-            "历史导入完成：写入 {written} 条，重复 {duplicated}，跳过 {skipped}，未变动 {unchanged}，失败 {failed}，积压 {}，用时 {} ms",
-            collected.deferred, elapsed_ms
+            "历史导入完成：写入 {written} 条，重复 {duplicated}，跳过 {skipped}，未变动 {unchanged}，失败 {failed}，积压 {deferred}，用时 {elapsed_ms} ms"
         ),
     );
     Ok(summary)
@@ -2086,6 +2323,114 @@ mod tests {
         assert_eq!(unchanged, 1);
         assert_eq!(deferred, 0);
         assert_eq!(processed, fresh_at, "水位要能推进到真正读过的那个文件的 mtime");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 增量第二轮只能读「新增的字节」，不能把整个文件重读一遍。
+    ///
+    /// ── 为什么用 `advance` 当判据 ──────────────────────────────
+    /// 只看「导入了什么」区分不出两种实现：整份重读之后 hash 去重会把旧内容
+    /// 全挡掉，结果一模一样，代价差一个数量级。真正要钉住的是「这一轮有没有
+    /// 打开文件读」—— 没有新增时 `candidates` 为空且 `advance` 为空。
+    #[test]
+    fn cursor_reads_only_appended_bytes() {
+        let dir = std::env::temp_dir().join(format!("mem-cursor-{}", crate::server::logging::now_ms()));
+        std::fs::create_dir_all(&dir).ok();
+        let file = dir.join("session.jsonl");
+        let line = |text: &str| {
+            format!(
+                r#"{{"role":"user","content":"{text}","timestamp":{}}}"#,
+                crate::server::logging::now_ms()
+            )
+        };
+        std::fs::write(
+            &file,
+            format!("{}\n{}\n", line("第一条：网关端口固定 3065"), line("第二条：不要动 beta 基线")),
+        )
+        .ok();
+        let first_len = file_len(&file).expect("应能取到文件长度");
+
+        let mut cursors = Cursors::new();
+        let (candidates, unchanged, _, _, advance) =
+            collect_files(&[file.clone()], "jsonl", None, Some(0), None, 10, Some(&cursors));
+        assert_eq!(candidates.len(), 1, "两行会合成一个窗口，实得 {candidates:?}");
+        assert_eq!(unchanged, 0);
+        assert_eq!(advance.len(), 1);
+        assert_eq!(advance[0].1.offset, first_len, "读完应停在文件末尾");
+        cursors.insert(cursor_key(&file), advance[0].1.clone());
+
+        // 第二轮：没有任何新增 —— 连打开文件都不该发生
+        let (candidates, unchanged, _, _, advance) =
+            collect_files(&[file.clone()], "jsonl", None, Some(0), None, 10, Some(&cursors));
+        assert!(candidates.is_empty(), "没有新增就不该产生候选：{candidates:?}");
+        assert_eq!(unchanged, 1, "应记成「未变动」");
+        assert!(advance.is_empty(), "没读文件就不该推进游标");
+
+        // 第三轮：追加一行 —— 只能看到这一行，旧内容一个字节都不重读
+        {
+            use std::io::Write;
+            let mut handle = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file)
+                .expect("应能追加写入");
+            writeln!(handle, "{}", line("第三条：追加的新内容")).ok();
+        }
+        let (candidates, _, _, _, advance) =
+            collect_files(&[file.clone()], "jsonl", None, Some(0), None, 10, Some(&cursors));
+        assert_eq!(candidates.len(), 1, "只该出现新增的那一段：{candidates:?}");
+        assert!(
+            candidates[0].body.contains("追加的新内容"),
+            "新增行必须进来：{}",
+            candidates[0].body
+        );
+        assert!(
+            !candidates[0].body.contains("网关端口"),
+            "旧内容不该被重读：{}",
+            candidates[0].body
+        );
+        assert!(advance[0].1.offset > first_len, "游标要越过旧内容");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 文件被清空 / 轮转（变短）时，游标必须回到 0。
+    ///
+    /// 停在越界偏移上会变成一个永远读不到任何东西的文件：`read_from` 的
+    /// `from > len` 分支就是为它写的，缺了这条，用户清空日志之后那个会话
+    /// 就再也不会被导入。
+    #[test]
+    fn cursor_restarts_when_file_shrinks() {
+        let dir = std::env::temp_dir().join(format!("mem-cursor-shrink-{}", crate::server::logging::now_ms()));
+        std::fs::create_dir_all(&dir).ok();
+        let file = dir.join("session.jsonl");
+        std::fs::write(&file, "第一行内容足够长一点\n第二行内容也够长一点\n").ok();
+        let old_len = file_len(&file).expect("应能取到长度");
+        let mut cursors = Cursors::new();
+        cursors.insert(
+            cursor_key(&file),
+            FileCursor {
+                offset: old_len,
+                size: old_len,
+            },
+        );
+
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"role":"user","content":"轮转之后唯一的一行内容","timestamp":{}}}"#,
+                crate::server::logging::now_ms()
+            ),
+        )
+        .ok();
+        let (candidates, _, _, _, advance) =
+            collect_files(&[file.clone()], "jsonl", None, Some(0), None, 10, Some(&cursors));
+        assert_eq!(candidates.len(), 1, "变短的文件必须从头重读：{candidates:?}");
+        assert!(candidates[0].body.contains("轮转之后唯一的一行"));
+        assert!(
+            advance[0].1.offset <= file_len(&file).unwrap_or(0),
+            "游标不能停在越界位置"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
