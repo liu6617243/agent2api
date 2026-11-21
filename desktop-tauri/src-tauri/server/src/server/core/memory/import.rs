@@ -166,6 +166,19 @@ struct FileCursor {
     /// 记下读取时刻的文件长度：`size == offset` 就是「已读完」，不必再 stat
     /// 之外的任何判断；文件变短（轮转/清空）则由 `offset > size` 识别。
     size: u64,
+    /// 文件头指纹（前 512 字节的 FNV-1a）。0 = 没算过（老游标升级上来）。
+    ///
+    /// ── 为什么光有 offset 不够 ──────────────────────────────────
+    /// `offset` 只能回答「读到第几个字节」，回答不了「这还是同一个文件吗」。
+    /// 会话文件被轮转/重写之后，只要新内容比旧 offset 长，`offset <= len` 就
+    /// 骗过了所有判断，我们从旧偏移继续读 —— 新文件的头部被整段跳过，那些行
+    /// 永远进不来。头部指纹一变就当作「换了一个文件」，从头重读；正文 hash
+    /// 去重保证重读不会产生重复条目。
+    ///
+    /// `serde(default)` 是给老游标表（只有 offset/size）留的：缺这个字段时按 0
+    /// 处理，等于「不比对」，升级那一刻不会把所有文件重读一遍。
+    #[serde(default)]
+    head: u64,
 }
 
 type Cursors = std::collections::BTreeMap<String, FileCursor>;
@@ -176,6 +189,35 @@ type Cursors = std::collections::BTreeMap<String, FileCursor>;
 /// 「用户手动改过盘符大小写」这种情况对不上。
 fn cursor_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+/// 文件头指纹：前 512 字节的 FNV-1a 64 位散列。0 表示「读不到 / 空文件」。
+///
+/// 为什么用散列而不是直接存前 512 字节：游标表要整张序列化进 `mem_meta`，
+/// 一万个文件各存 512 字节就是 5 MB 的库内噪音；一个 u64 是 8 字节。
+/// 为什么是 512 字节而不是整文件：会话文件长到 955 MB，算整文件散列本身就是
+/// 又一次全量读 —— 那正是这次要消灭的动作。文件被换掉时头部必然不同（JSONL
+/// 首行是会话元信息，换文件等于换行），512 字节足够区分。
+fn head_fingerprint(path: &Path) -> u64 {
+    use std::io::Read;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let mut buffer = [0u8; 512];
+    let read = match file.read(&mut buffer) {
+        Ok(read) => read,
+        Err(_) => return 0,
+    };
+    if read == 0 {
+        return 0;
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in &buffer[..read] {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn load_cursors() -> Cursors {
@@ -1258,7 +1300,15 @@ fn collect_files(
         // 有游标时以游标为准：mtime 变了不等于有新增内容 —— `touch`、同步工具改
         // 元数据、备份软件重写属性都会动 mtime。offset 到了文件末尾才是真的读完。
         let from = match cursors.and_then(|all| all.get(&cursor_key(file))) {
-            Some(cursor) if cursor.offset <= len => cursor.offset,
+            Some(cursor) if cursor.offset <= len => {
+                // 偏移没越界也可能是「换了个文件」：轮转出来的新会话比旧偏移长，
+                // `offset <= len` 一样成立。头部指纹变了就从头读（见 `FileCursor.head`）。
+                if cursor.offset > 0 && cursor.head != 0 && head_fingerprint(file) != cursor.head {
+                    0
+                } else {
+                    cursor.offset
+                }
+            }
             // 文件变短（轮转/清空/被截断）：回到 0 重读，不能停在越界的偏移上。
             _ => 0,
         };
@@ -1306,6 +1356,8 @@ fn collect_files(
                 FileCursor {
                     offset: next,
                     size: file_len(file).unwrap_or(next),
+                    // 记下「这一份文件的头长什么样」，下一轮靠它识别轮转。
+                    head: head_fingerprint(file),
                 },
             ));
         }
@@ -2408,7 +2460,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mem-cursor-shrink-{}", crate::server::logging::now_ms()));
         std::fs::create_dir_all(&dir).ok();
         let file = dir.join("session.jsonl");
-        std::fs::write(&file, "第一行内容足够长一点\n第二行内容也够长一点\n").ok();
+        // 旧文件必须**真的**比轮转后的文件大。
+        //
+        // 早先这里只写两行短句（62 字节），而下面那句 JSON 里的中文按 UTF-8
+        // 是 3 字节一个字，重新写出来的单行反而更长（89 字节）—— `from` 没有
+        // 越界，走的是「起点在行中间」那条分支，把唯一一行当残片丢掉，CI 上
+        // 三个平台一起红。用例要验的是 `from > len` 的回绕，就得让前提站得住：
+        // 先写 20 行长句，再收紧成一行。
+        std::fs::write(
+            &file,
+            "第一行内容足够长一点，这一行要写得很长，确保整个文件明显大于轮转后那一行\n".repeat(20),
+        )
+        .ok();
         let old_len = file_len(&file).expect("应能取到长度");
         let mut cursors = Cursors::new();
         cursors.insert(
@@ -2416,6 +2479,9 @@ mod tests {
             FileCursor {
                 offset: old_len,
                 size: old_len,
+                // 头部指纹按旧文件算：这段验的是「偏移越界」，指纹本身就变了，
+                // 两条判据都会指到「从头重读」，不冲突。
+                head: head_fingerprint(&file),
             },
         );
 
@@ -2427,6 +2493,8 @@ mod tests {
             ),
         )
         .ok();
+        let new_len = file_len(&file).expect("应能取到长度");
+        assert!(new_len < old_len, "用例前提：轮转后的文件必须更短（{new_len} < {old_len}）");
         let (candidates, _, _, _, advance) =
             collect_files(&[file.clone()], "jsonl", None, Some(0), None, 10, Some(&cursors));
         assert_eq!(candidates.len(), 1, "变短的文件必须从头重读：{candidates:?}");
@@ -2435,6 +2503,55 @@ mod tests {
             advance[0].1.offset <= file_len(&file).unwrap_or(0),
             "游标不能停在越界位置"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 轮转后文件**变长**时也必须从头读。
+    ///
+    /// ── 为什么单靠 offset 抓不到 ────────────────────────────────
+    /// 会话文件被整份重写（轮转、压缩、客户端重置会话），新内容比旧偏移更长，
+    /// 于是 `offset <= len` 依然成立，我们就从旧偏移继续读 —— 新文件的头部被
+    /// 整段跳过，那几行永远进不来，而且不报错。AgentHub 的 `readNewLines` 只有
+    /// `size < fromByte` 一条判据，同样抓不到这种形状（这是它也没解决的一个洞）。
+    /// 这里靠文件头指纹补：头部一变，就当「换了一个文件」，从头重读。
+    #[test]
+    fn cursor_restarts_when_rotated_file_is_longer() {
+        let dir = std::env::temp_dir().join(format!("mem-cursor-rotate-{}", crate::server::logging::now_ms()));
+        std::fs::create_dir_all(&dir).ok();
+        let file = dir.join("session.jsonl");
+        let line = |text: &str| {
+            format!(
+                r#"{{"role":"user","content":"{text}","timestamp":{}}}"#,
+                crate::server::logging::now_ms()
+            )
+        };
+
+        std::fs::write(&file, format!("{}\n", line("旧会话里的那一行"))).ok();
+        let mut cursors = Cursors::new();
+        let (_, _, _, _, advance) =
+            collect_files(&[file.clone()], "jsonl", None, Some(0), None, 10, Some(&cursors));
+        let old_len = advance[0].1.offset;
+        cursors.insert(cursor_key(&file), advance[0].1.clone());
+
+        // 轮转：整份换成新内容，且比旧文件更长 —— 偏移判据被彻底骗过的那一支。
+        std::fs::write(
+            &file,
+            format!("{}\n{}\n", line("轮转之后的第一行内容"), line("轮转之后的第二行内容")),
+        )
+        .ok();
+        let new_len = file_len(&file).expect("应能取到文件长度");
+        assert!(new_len > old_len, "用例前提：轮转后的文件必须更长（{new_len} > {old_len}）");
+
+        let (candidates, _, _, _, advance) =
+            collect_files(&[file.clone()], "jsonl", None, Some(0), None, 10, Some(&cursors));
+        assert_eq!(candidates.len(), 1, "轮转后必须从头读：{candidates:?}");
+        assert!(
+            candidates[0].body.contains("轮转之后的第一行内容"),
+            "头部不能被跳过：{}",
+            candidates[0].body
+        );
+        assert_eq!(advance[0].1.offset, new_len, "读完应停在新文件末尾");
 
         std::fs::remove_dir_all(&dir).ok();
     }
