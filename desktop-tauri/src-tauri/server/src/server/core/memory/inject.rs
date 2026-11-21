@@ -1220,6 +1220,40 @@ fn chat_request_text(body: &Value) -> String {
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return String::new();
     };
+    chat_request_text_from(messages)
+}
+
+/// 同上，但直接吃消息数组（[`super::retain`] 拿到的是已经解析好的消息列表）。
+///
+/// ── 这一份是「给探针用的」还是「给留存用的」 ────────────────
+/// 这里返回的是**含工具回显**的宽口径文本：注入抽线索时，工具回显里的路径
+/// 恰恰是唯一可用的定位依据（见下方回退逻辑）。但那双鞋子留存不能穿 ——
+/// 把 5 万字符的工具回显写进「用户说了什么」是错的。留存只要用户的话，
+/// 那条需求走 [`user_turn_text`]。
+pub fn chat_request_text_from(messages: &[Value]) -> String {
+    let mut out = user_turn_text(messages);
+    // 用户侧抽不出线索时（「请继续」这类），把最近工具回显的开头补进来：
+    // 命令行里的路径与文件名是那一轮唯一可用的定位线索。
+    if probes(&out).is_empty() {
+        for head in recent_tool_heads(messages, 2, TOOL_WINDOW) {
+            out.push_str(&head);
+            out.push('\n');
+            if out.chars().count() >= REQUEST_TEXT_CAP || !probes(&out).is_empty() {
+                break;
+            }
+        }
+    }
+    truncate_chars(&out, REQUEST_TEXT_CAP)
+}
+
+/// 只取「用户这一轮真正说的话」：`<user_query>` 优先，否则最后一条 user
+/// 内容块的尾部窗口。**不含工具回显**。
+///
+/// ── 为什么留存必须用这一份 ──────────────────────────────────
+/// 留存写的是 `**我**：…`。用 [`chat_request_text_from`] 那份的话，当用户
+/// 只说了「继续」时，写进记忆的「用户」行会变成一整屏命令行输出 —— 读起来
+/// 像「用户发了一堆 shell 日志」，而且会把工具回显永久固化进记忆库。
+pub fn user_turn_text(messages: &[Value]) -> String {
     let mut out = String::new();
 
     let blocks = last_user_blocks(messages);
@@ -1240,17 +1274,6 @@ fn chat_request_text(body: &Value) -> String {
                 out.push_str(last);
             }
             out.push('\n');
-        }
-    }
-    // 标签档抽不出线索时（「请继续」这类），把最近工具回显的开头也补进来：
-    // 命令行里的路径与文件名是这一轮唯一可用的定位线索。
-    if probes(&out).is_empty() {
-        for head in recent_tool_heads(messages, 2, TOOL_WINDOW) {
-            out.push_str(&head);
-            out.push('\n');
-            if out.chars().count() >= REQUEST_TEXT_CAP || !probes(&out).is_empty() {
-                break;
-            }
         }
     }
     truncate_chars(&out, REQUEST_TEXT_CAP)
@@ -1643,7 +1666,14 @@ mod tests {
             first_bare.map(|index| path_at < index).unwrap_or(true),
             "带目录的路径必须排在光杆文件名之前：{found:?}"
         );
-        let bare = found.iter().filter(|item| !item.contains('/')).count();
+        // 「光杆文件名」的判据必须与实现一致：**带扩展名**且不含目录分隔。
+        // 第一版这里写成 `!item.contains('/')`，于是 `import_registry`（snake_case
+        // 标识符，来自标识符桶）也被算成一个光杆文件名 —— 5 > 4 直接红。
+        // 那不是逻辑错，是这条断言把两档混在一起数了（CI 上真红过一次）。
+        let bare = found
+            .iter()
+            .filter(|item| !item.contains('/') && item.contains('.'))
+            .count();
         assert!(bare <= 4, "光杆文件名最多占 4 个名额：{found:?}");
     }
 

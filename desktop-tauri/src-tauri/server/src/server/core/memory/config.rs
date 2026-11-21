@@ -233,6 +233,23 @@ static SCHEMA: &[Knob] = &[
     knob_d("inject.pathMatch", Kind::Bool, Tier::Advanced, "请求级注入", "按文件路径精确命中",
         "记忆的 files 字段与请求里的路径做字符串匹配；权重最高、几乎不误报", "true"),
 
+    // ── 请求后留存 ─────────────────────────────────────────────
+    // 注入解决「记忆能被看见」，留存解决「新记忆能进来」。只做前者时，用户的感觉
+    // 是「它记得老东西，但新东西永远不会自己记下来」—— 而靠客户端提示词让模型
+    // 自觉调 `memory_core` 写，实测调用 1 次、真写入 0 次，跟「模型不会主动读」
+    // 是同一个病根：该做的事被放在了有选择权的位置。
+    //
+    // 所以网关在响应结束后自己判断「这一轮值不值得记」。默认开，但有一道内容闸
+    //（`retain.minChars` + 结论词判据）：逐轮写会把库灌成流水账，几个月后九成
+    // 是「好的 / 谢谢」。
+    knob_d("retain.enabled", Kind::Bool, Tier::Basic, "请求后留存", "回答结束后自动写回记忆",
+        "把这一轮的用户输入与助手结论写成一条 l1；关掉则只能靠模型或手工调 memory_core 写",
+        "true"),
+    range(knob_d("retain.minChars", Kind::Number, Tier::Advanced, "请求后留存", "最短回答长度",
+        "少于这么多字符的回答不记（挡掉「好的」「收到」这类寒暄）", "20"), 0.0, 2000.0),
+    range(knob_d("retain.maxChars", Kind::Number, Tier::Advanced, "请求后留存", "单条正文上限",
+        "一轮对话写进一条记忆时的字符上限，超出截断", "12000"), 500.0, 40000.0),
+
     // ===== 深层记忆 =====
     knob("deep.enabled", Kind::Bool, Tier::Basic, "深层记忆", "深层记忆总开关", "true"),
     knob("deep.personaEnabled", Kind::Bool, Tier::Basic, "深层记忆", "生成人格画像", "true"),
@@ -1407,6 +1424,7 @@ mod tests {
             ("enrich.rs", include_str!("enrich.rs")),
             ("llm.rs", include_str!("llm.rs")),
             ("inject.rs", include_str!("inject.rs")),
+            ("retain.rs", include_str!("retain.rs")),
             ("agents.rs", include_str!("agents.rs")),
             ("rt.rs", include_str!("rt.rs")),
             ("redact.rs", include_str!("redact.rs")),

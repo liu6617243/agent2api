@@ -183,9 +183,20 @@ pub async fn chat_completions(
     // `is_internal_origin`：记忆自己的蒸馏 / 画像任务是打本进程网关跑的
     // （UA `Agent2API-MemoryBrain/1.0`）。给它们也注入记忆，等于让旧结论去蒸馏
     // 新结论 —— 蒸馏会自我重复，新信息进不来。视觉分析同理。
+    //
+    // `turn_source` 是**注入前**的消息快照，只给请求后留存用（见下方阻塞
+    // 里的说明）。默认空 —— 后台路由 / 内部调用不会走到留存。
+    //
+    // 造它的位置必须在注入**之前**：注入会往 messages 里插一条 system 记忆块，
+    // 若留存读的是注入后的消息，那条块就会被当成「这一轮的上下文」写回 l1 ——
+    // 于是每轮都把自己刚读过的记忆重写一遍，库会指数膨胀，而且新记忆会被旧
+    // 记忆挤到后面（自我循环，跟蒸馏那边同一条病）。
+    let mut turn_source = pipeline::TurnSource::empty();
     if !special.is_background()
         && !crate::server::core::memory::inject::is_internal_origin(&user_agent)
     {
+        turn_source = pipeline::TurnSource::of(&payload);
+
         // 返回注入的 token 数（`None` = 没注入）：日志里带上数字，才能一眼看出
         // 「注入了」和「注入了个空块」的区别，也解释了这次请求贵了多少
         if let Some(tokens) = crate::server::core::blocking::in_place(|| {
@@ -277,7 +288,7 @@ pub async fn chat_completions(
                 client_reasoning, status: i64::from(response.status), raw_request, raw_response: None,
                 is_test: false, source: request_source,
             };
-            super::protocol::native_response::respond(response, context, &mut guard)
+            super::protocol::native_response::respond(response, context, &turn_source, &mut guard)
         }
         Ok(ForwardOutcome::Stream { status, stream: source }) => {
             // 流式：记账**不能**在这里做 —— 这里只是「响应头已就绪」，
@@ -314,11 +325,13 @@ pub async fn chat_completions(
             guard.handoff();
             sse_response(
                 status,
-                Box::new(RecordingStream::with_terminals(
-                    source,
-                    context,
-                    pipeline::terminal::CHAT,
-                )),
+                Box::new(
+                    RecordingStream::with_terminals(source, context, pipeline::terminal::CHAT)
+                        // 流式留存：边下发边攒 `delta.content`，流结束写回 l1。
+                        // 捕获器拿的是注入**前**的消息快照 —— 写回的东西里因此
+                        // 不会出现我们刚塞进去的那条记忆块。
+                        .with_turn(turn_source.capture(pipeline::Dialect::Chat)),
+                ),
             )
             .into_response()
         }
@@ -352,6 +365,14 @@ pub async fn chat_completions(
             );
             // 记账已完成：解除断线兜底并注销取消令牌（请求不再在途）
             guard.complete();
+            // ── 请求后留存（Hindsight 的 retain 半边）────────────────
+            // 位置选在 `guard.complete()` **之后**：响应即将下发、断线兜底已经
+            // 解除，留存无论成败都影响不到这次响应。写盘 + 索引在阻塞池上跑，
+            // 不占 tokio worker（记忆库是 55 MB 的 .md，冷启动解析要几百毫秒）。
+            //
+            // 回答文本从 `body` 现取（不另存一份）：非流式的聚合体就是最终
+            // 响应，`choices[].message.content` 是用户真正看到的那段话。
+            pipeline::retain_answer(&turn_source, &pipeline::answer_text_chat(&body), false);
             json_response(body)
         }
         Err(error) => {

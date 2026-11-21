@@ -47,6 +47,7 @@ pub mod import;
 pub mod import_registry;
 pub mod index;
 pub mod inject;
+pub mod retain;
 pub mod layout;
 pub mod llm;
 pub mod model;
@@ -1191,6 +1192,11 @@ pub fn status_with(with_tables: bool) -> Value {
         // 光给开关状态没用 —— 用户要的是「它到底注入了没有」，而这件事没有
         // 计数器就只能靠猜（注入是用户看不见的动作）。
         "inject": inject::stats(),
+        // 请求后留存的「写回来没有」证据。与 inject 成对：一个证明「读进去了」，
+        // 一个证明「写回来了」。只修前半边时用户的感觉是「它记得东西，但新东西
+        // 不进来」—— 那正是本轮真机验证暴露的缺口（Hindsight 的
+        // `wrap_openai` 是「调用前 recall、调用后 retain」，本仓原来只有前者）。
+        "retain": retain::stats(),
         // 内容版本号：每次写入 +1。排障时用来判断「Agent 看到的是不是最新」。
         "revision": revision(),
     });

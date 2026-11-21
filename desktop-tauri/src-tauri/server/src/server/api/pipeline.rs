@@ -41,6 +41,9 @@ mod raw;
 pub use raw::{capture_raw_body, capture_raw_json, raw_body_text};
 use raw::RawCapture;
 
+mod stream_retain;
+pub use stream_retain::{Dialect, TurnCapture};
+
 /// 调试落盘的目录名与文件名（Node 版 `join(CONFIG_DIR, 'debug', ...)`）
 const DEBUG_DIR: &str = "debug";
 const DEBUG_REQUEST_FILE: &str = "last-request.json";
@@ -612,6 +615,12 @@ pub struct RecordingStream {
     terminal: Option<TerminalScan>,
     /// 响应正文累积缓冲（`request_raw` 表的响应侧采集，见 [`RawCapture`]）
     raw: RawCapture,
+    /// 请求后留存的正文捕获（`None` = 这条路径不留存，如模型测试 / 后台路由）
+    ///
+    /// 与非流式的 `retain_answer` 成对：一个在聚合体上取回答，一个在流里攒。
+    /// 放在这里而不是各入口自己收流，是因为流的结束点只有一个（`settle`），
+    /// 而「这一轮到底说了什么」必须在那之前攒好 —— 流一旦被丢弃就没有字节了。
+    turn: Option<TurnCapture>,
 }
 
 impl RecordingStream {
@@ -629,7 +638,18 @@ impl RecordingStream {
         // 响应侧采集与请求侧同一道闸：调试模式关着就不攒缓冲（零开销）——
         // 这里定格一次，本请求的响应侧行为此后不再看开关（见 `RawCapture` 的说明）
         let raw = RawCapture::new(crate::server::core::debug_traffic::enabled());
-        Self { inner, context: Some(context), terminal, raw }
+        Self { inner, context: Some(context), terminal, raw, turn: None }
+    }
+
+    /// 挂上请求后留存的正文捕获（不挂 = 这条路径不留存）。
+    ///
+    /// ── 为什么是「不影响构造」的附加方法 ────────────────────────
+    /// `with_terminals` 有十来个调用点（三条入口 + 模型测试 + 助手页），
+    /// 逐个加参数会让「不需要留存的那些」也得写 `None`。默认没有捕获器，
+    /// 需要的那三条入口各自调一次 —— 调用点因此能一眼看出「这条路径会写记忆」。
+    pub fn with_turn(mut self, turn: Option<TurnCapture>) -> Self {
+        self.turn = turn;
+        self
     }
 
     /// 记账并清空上下文（幂等：第二次调用什么都不做）。
@@ -641,6 +661,19 @@ impl RecordingStream {
             // 流式路径构造时 raw_response 恒为 None，这里用缓冲定稿直接覆盖；
             // 若未来有入口想预填响应正文，那它不该再走流式包装（自相矛盾的约定）
             context.raw_response = self.raw.into_text();
+            // ── 留存的「这一轮」必须在**记账之前**收尾 ────────────────
+            // `record_entry` 之后会写库、发通知；留存自己也要写库。两者都摸
+            // 记忆库的写锁，顺序上先留存再记账能把「同一把锁被两个后台动作
+            // 交替持住」的窗口压到最小。更重要的理由是语义：这一轮的正文
+            // 到这里就完整了，再往后没有任何字节会来。
+            //
+            // `interrupted` 的判据只有一个：走到 settle 时带着 fallback_error。
+            // 三条路里两条（跑完 EOF / 已下发收尾帧后被客户端断开）都是
+            // `None` —— 那条「客户端按协议收尾后挂断」本来就是正常结束，
+            // 记成失败会让正常流式的记忆全都带一句「未正常结束」。
+            if let Some(turn) = self.turn.take() {
+                turn.finish(fallback_error.is_some());
+            }
             record_entry(&context, fallback_error);
             // 手动终止的令牌在此注销：流的结束点 = 请求不再在途（与
             // DisconnectGuard::complete 同一条生命周期；settle 由 Drop 兜底
@@ -679,6 +712,10 @@ impl futures::Stream for RecordingStream {
                 }
                 // 采集完整响应副本，透传字节原样不动。
                 this.raw.push(bytes);
+                // 留存攒正文：只读不改，字节照旧下发
+                if let Some(turn) = &mut this.turn {
+                    turn.push(bytes);
+                }
                 // 收尾帧识别：命中即说明客户端接下来随时可能断开，那属于正常收尾
                 if let Some(scan) = &mut this.terminal {
                     if scan.push(bytes) {
@@ -737,6 +774,7 @@ pub fn transformed_stream(
     source: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
     context: RecordContext,
     terminals: TerminalFrames,
+    turn: Option<TurnCapture>,
     mut transform: impl FnMut(&[u8]) -> Vec<Bytes> + Send + 'static,
 ) -> Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin> {
     use futures::StreamExt;
@@ -749,7 +787,9 @@ pub fn transformed_stream(
         };
         futures::stream::iter(frames.into_iter().map(Ok)).boxed()
     });
-    Box::new(RecordingStream::with_terminals(Box::new(converted), context, terminals))
+    Box::new(
+        RecordingStream::with_terminals(Box::new(converted), context, terminals).with_turn(turn),
+    )
 }
 
 // ─── 响应构造 ───────────────────────────────────────────────
@@ -858,6 +898,217 @@ pub fn sha256_hex(body: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+// ─── 请求后留存（记忆中枢 · retain）────────────────────────────
+
+/// 这一轮留存的原料：注入前的消息快照 + 会话标识。
+///
+/// ── 为什么要单独一个结构而不是散着传两个参数 ────────────────
+/// 三条协议入口都要把它从「注入前」抄到「收尾后」，中间隔着十万八千里
+/// （模型解析、转发、流式包装）。散着传会让每个入口各写一遍 clone，而
+/// clone 的时机一旦有一处落在注入之后，那一轮就会把注入块写回记忆 ——
+/// 这是最难从现象反推的一类错（库慢慢膨胀，且新记忆总被旧记忆挤后）。
+/// 收成一个 `TurnSource` 之后，「在注入前构造」是唯一的构造入口。
+#[derive(Debug, Clone, Default)]
+pub struct TurnSource {
+    /// 注入前（客户端原始）的 messages
+    pub messages: Vec<Value>,
+    /// 会话标识（客户端给的那个 hint；没有就不传）
+    pub session: Option<String>,
+}
+
+impl TurnSource {
+    /// 从**注入前**的请求体取快照。
+    ///
+    /// `messages` 只有 Chat 投影有；原生协议（Responses 的 `input`）在
+    /// `chat_body` 上才有同名数组，所以调用点传进来的都是已经翻译好的投影。
+    pub fn of(body: &Value) -> Self {
+        let messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let session = crate::server::core::memory::retain::session_of(body);
+        Self { messages, session }
+    }
+
+    /// 从 Responses 形态的**注入前**原始体取快照。
+    ///
+    /// ── 为什么不能直接用 [`Self::of`] ───────────────────────────
+    /// Responses 没有 `messages`，对话在 `input` 里：可能是纯字符串（单轮），
+    /// 也可能是 `[{role, content}]` 项数组。而 `retain::user_text` 复用的是
+    /// 注入侧的取词逻辑，它读的是 `role == "user"` 的消息 —— 所以这里必须把
+    /// `input` 归一成同一个形状，否则这条路**永远取不到用户输入**，写出来的
+    /// 记忆只有助手一半（而且不会报错：空用户侧在 `compose_body` 里是被允许的）。
+    ///
+    /// ── 为什么在注入**之前**调 ──────────────────────────────────
+    /// 同一个自我循环问题：注入会把记忆块写进 `instructions`，翻译后成为
+    /// system 消息。若快照取自注入后，它会跟着写回 l1。
+    pub fn of_responses(body: &Value) -> Self {
+        let mut messages: Vec<Value> = Vec::new();
+        match body.get("input") {
+            Some(Value::String(text)) => {
+                messages.push(serde_json::json!({ "role": "user", "content": text }));
+            }
+            Some(Value::Array(items)) => {
+                for item in items {
+                    let role = item.get("role").and_then(Value::as_str).unwrap_or("");
+                    if role.is_empty() {
+                        continue;
+                    }
+                    // `content` 可能是字符串，也可能是 `[{type:"input_text",text}]`
+                    // —— 两种形状都原样收下，`content_text` 认得它们。
+                    let content = item.get("content").cloned().unwrap_or(Value::Null);
+                    messages.push(serde_json::json!({ "role": role, "content": content }));
+                }
+            }
+            _ => {}
+        }
+        let session = crate::server::core::memory::retain::session_of(body);
+        Self { messages, session }
+    }
+
+    /// 空快照（后台路由 / 内部调用 / 模型测试：都不留存）
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// 建一个流式捕获器（`None` = 这条路径不留存）。
+    pub fn capture(&self, dialect: Dialect) -> Option<TurnCapture> {
+        TurnCapture::new(dialect, self.messages.clone(), self.session.clone())
+    }
+}
+
+/// 从 Chat 形态的**非流式**响应体里取出助手回答的纯文本。
+///
+/// ── 为什么只认 `choices[].message.content` ──────────────────
+/// 这里是「回答」，不是「整条响应」。`reasoning_content`（思维链）、
+/// `tool_calls`（工具调用）、`usage` 都不是用户看到的那段话：写进记忆只会让
+/// 蒸馏把模型的思考过程当成结论。
+///
+/// 多条 `choices` 时按顺序拼接：`n > 1` 的客户端拿到的是几个候选，但它们讲的
+/// 是同一件事，拼起来读着像「同一结论说了三遍」，比只取第一条更少丢信息。
+pub fn answer_text_chat(body: &Value) -> String {
+    let Some(choices) = body.get("choices").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for choice in choices {
+        let content = choice
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let text = crate::server::core::protocol::content_text(&content);
+        if !text.trim().is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(text.trim());
+        }
+    }
+    out
+}
+
+/// Responses 形态响应体里的回答文本。
+///
+/// ── 为什么不能直接复用 `answer_text_chat` ───────────────────
+/// Responses 的回答在 `output[].content[].text` 里，`type` 是 `output_text`；
+/// `reasoning` 项有自己的 `summary`。用 Chat 那条口径读它会读到空串 ——
+/// 那等于「这条协议的回答永远不进记忆」，而且不会报错。
+pub fn answer_text_responses(body: &Value) -> String {
+    let Some(output) = body.get("output").and_then(Value::as_array) else {
+        // 兜底：有些实现（含本仓的 Chat→Responses 转换）会把文本放在
+        // 顶层 `output_text`。存在就用，不存在才给空。
+        return body
+            .get("output_text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+    };
+    let mut out = String::new();
+    for item in output {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(parts) = item.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if !matches!(
+                part.get("type").and_then(Value::as_str),
+                Some("output_text" | "text")
+            ) {
+                continue;
+            }
+            let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+            if text.trim().is_empty() {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(text.trim());
+        }
+    }
+    out
+}
+
+/// Anthropic 形态响应体里的回答文本。
+///
+/// `content` 是块数组：只要 `type == "text"` 的 `text`，`thinking` /
+/// `tool_use` 都不算回答。
+pub fn answer_text_anthropic(body: &Value) -> String {
+    let Some(parts) = body.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+        if text.trim().is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(text.trim());
+    }
+    out
+}
+
+/// 请求后留存：把这一轮写回 l1（失败静默，绝不影响响应）。
+///
+/// ── 为什么在这里而不是各协议入口各写一遍 ────────────────────
+/// 三条协议（Chat / Responses / Anthropic）的收尾位置各不相同，但「取回答文本 +
+/// 交给 `retain::remember_turn`」这一步完全一样。放一处，协议入口只负责把回答
+/// 文本取出来。
+///
+/// ── 为什么用 `blocking::in_place` ───────────────────────────
+/// 写入要走 `memory::write`：读 hash 去重集合、追加 l1 容器、更新索引。冷启动
+/// 时它要摸 55 MB 的 `.md`，几百毫秒。挂在响应已经下发之后的位置上，直接在
+/// tokio worker 里做会把线程卡住 —— 而那时的用户正在等下一句。
+pub fn retain_answer(source: &TurnSource, answer: &str, interrupted: bool) {
+    if source.is_empty() || answer.trim().is_empty() {
+        return;
+    }
+    let session = source.session.clone();
+    crate::server::core::blocking::in_place(|| {
+        crate::server::core::memory::retain::remember_turn(
+            &source.messages,
+            answer,
+            None,
+            session.as_deref(),
+            interrupted,
+        )
+    });
 }
 
 #[cfg(test)]

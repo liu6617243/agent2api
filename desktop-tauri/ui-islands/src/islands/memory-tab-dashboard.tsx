@@ -160,6 +160,22 @@ function Dashboard({ status, onGo, onChanged }: DashboardProps): React.ReactElem
                   })}
           </div>
         </MetricCard>
+        {/* 「留存」这一格与上一格成对：上一格证明「记忆读进去了」，这一格证明
+            「这一轮写回来了」。两边都只是本次启动以来的计数。
+
+            副标题必须写出 skipped：只有 count 时，0 会被读成「没在工作」，
+            而实际上「跳过」才是常态（寒暄 / 太短 / 重复都不写）。 */}
+        <MetricCard>
+          <MetricLabel>{t('请求后留存')}</MetricLabel>
+          <MetricValue>{num(status.retain?.count ?? 0)}</MetricValue>
+          <div className='mm-metric-sub'>
+            {status.retain?.enabled === false
+              ? t('开关已关')
+              : t('已跳过 {n} 轮（寒暄 / 太短 / 重复）', {
+                  n: num(status.retain?.skipped ?? 0),
+                })}
+          </div>
+        </MetricCard>
       </MetricGrid>
 
       <Section

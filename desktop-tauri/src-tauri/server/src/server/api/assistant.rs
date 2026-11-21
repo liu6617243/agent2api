@@ -350,7 +350,14 @@ pub async fn chat(State(state): State<ServerState>, headers: HeaderMap, body: By
                 client_model: model, client_reasoning: reasoning.unwrap_or_default(), status: i64::from(response.status),
                 raw_request: None, raw_response: None, is_test: true, source: access.source,
             };
-            super::protocol::native_response::respond(response, context, &mut guard)
+            super::protocol::native_response::respond(
+                response,
+                context,
+                // 助手页是模型测试：不写记忆。给空快照 = 捕获器返回 None，
+                // 留存整条路径跳过（`retain_answer` 也在 `is_empty` 处早退）。
+                &pipeline::TurnSource::empty(),
+                &mut guard,
+            )
         }
         Ok(ForwardOutcome::Stream { status, stream: source }) => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);

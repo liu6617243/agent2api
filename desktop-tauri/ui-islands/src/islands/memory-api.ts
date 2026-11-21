@@ -161,6 +161,16 @@ export type MemoryStatus = {
     /** 走了注入但没命中任何记忆的次数 */
     missed?: number
   }
+  /**
+   * 请求后留存的「写回来没有」证据：本次启动以来写回 l1 的轮数、跳过的轮数。
+   *
+   * 与 `inject` 成对：一个证明「记忆读进去了」，一个证明「新记忆写回来了」。
+   * 只有前者时用户的感觉是「它记得老东西，但新东西永远不进来」。
+   *
+   * `skipped` 的含义是「走了留存逻辑但判定不值得记」（寒暄 / 太短 / 重复），
+   * 不是「出错」—— 逐轮写会把库灌成流水账，跳过才是常态。
+   */
+  retain?: { enabled: boolean; count: number; skipped: number }
   tables?: Record<string, number>
   config: MemoryConfig
   revision: number

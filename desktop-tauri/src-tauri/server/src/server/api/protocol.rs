@@ -173,9 +173,16 @@ pub async fn responses_endpoint(
     // 而 `dedupe_key` 用的是客户端原始字节（下面才算），去重不受影响。
     // `original` 是注入前的副本，回程回显仍与客户端发来的一致。
     let mut raw = raw;
+    // ── 留存快照必须在注入**之前**拍 ─────────────────────────────
+    // 注入会把记忆块写进 `instructions`，翻译后成为 system 消息；若快照取自
+    // 注入后，这条块会跟着写回 l1，每轮都把刚读过的记忆重写一遍。
+    // Responses 的对话在 `input` 里（不是 `messages`），所以走
+    // `of_responses` 归一 —— 用 `of` 的话这条路永远取不到用户输入。
+    let mut turn_source = pipeline::TurnSource::empty();
     if !special.is_background()
         && !crate::server::core::memory::inject::is_internal_origin(&pipeline::user_agent_of(&headers))
     {
+        turn_source = pipeline::TurnSource::of_responses(&raw);
         if let Some(tokens) = crate::server::core::blocking::in_place(|| {
             crate::server::core::memory::inject::inject_native(
                 &mut raw,
@@ -297,7 +304,7 @@ pub async fn responses_endpoint(
     };
 
     match outcome {
-        Ok(ForwardOutcome::Native(response)) => native_response::respond(response, context, &mut guard),
+        Ok(ForwardOutcome::Native(response)) => native_response::respond(response, context, &turn_source, &mut guard),
         Ok(ForwardOutcome::Stream { status, stream: source }) => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             let model = requested_model.clone();
@@ -307,10 +314,12 @@ pub async fn responses_endpoint(
             if stream {
                 let mut machine =
                     responses::ResponsesStream::new(&model, &request, reasoning_collapse);
+                let turn = turn_source.capture(pipeline::Dialect::Responses);
                 let transformed = pipeline::transformed_stream(
                     source,
                     context,
                     pipeline::terminal::RESPONSES,
+                    turn,
                     move |chunk| machine.push(chunk),
                 );
                 // 收尾移交给响应流（守卫不再兜底；令牌保持登记到流结束）
@@ -331,6 +340,14 @@ pub async fn responses_endpoint(
             pipeline::record_entry(&context, None);
             // 记账已完成：解除断线兜底并注销取消令牌
             guard.complete();
+            // 请求后留存：客户端要的是非流式，聚合体就是最终回答。
+            // `received == false` 说明上游流中途断了，聚合出来的正文不完整 ——
+            // 那一轮的记忆要标一句「未正常结束」。
+            pipeline::retain_answer(
+                &turn_source,
+                &pipeline::answer_text_responses(&body),
+                !received,
+            );
             json_response(body)
         }
         Ok(ForwardOutcome::Completion { body: chat }) => {
@@ -349,6 +366,12 @@ pub async fn responses_endpoint(
             pipeline::record_entry(&context, None);
             // 记账已完成：解除断线兜底并注销取消令牌
             guard.complete();
+            // 请求后留存（上游直接给聚合体的情况）：回答在 Responses 形态里
+            pipeline::retain_answer(
+                &turn_source,
+                &pipeline::answer_text_responses(&response),
+                false,
+            );
             json_response(response)
         }
         Err(error) => {
@@ -406,9 +429,15 @@ pub async fn messages_endpoint(
     // （见 `inject::append_native`）。注入后再翻译，翻译链会把它带成
     // 第一条 system 消息。
     let mut raw = raw;
+    // ── 留存快照必须在注入**之前**拍（与 /v1/responses 同一条理由）──
+    // Anthropic 的对话在 `messages` 里，但 `system` 是独立字段：注入只动
+    // `system`，所以快照里的 messages 本身不受影响。仍然先拍，是因为「快照
+    // 取自注入前」这条纪律不该靠「注入恰巧不动 messages」来保证。
+    let mut turn_source = pipeline::TurnSource::empty();
     if !special.is_background()
         && !crate::server::core::memory::inject::is_internal_origin(&pipeline::user_agent_of(&headers))
     {
+        turn_source = pipeline::TurnSource::of(&raw);
         if let Some(tokens) = crate::server::core::blocking::in_place(|| {
             crate::server::core::memory::inject::inject_native(
                 &mut raw,
@@ -523,17 +552,19 @@ pub async fn messages_endpoint(
     };
 
     match outcome {
-        Ok(ForwardOutcome::Native(response)) => native_response::respond(response, context, &mut guard),
+        Ok(ForwardOutcome::Native(response)) => native_response::respond(response, context, &turn_source, &mut guard),
         Ok(ForwardOutcome::Stream { status, stream: source }) => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             let model = requested_model.clone();
             let context = RecordContext { status: i64::from(status.as_u16()), ..context };
             if stream {
                 let mut machine = anthropic::AnthropicStream::new(&model, Some(input_estimate));
+                let turn = turn_source.capture(pipeline::Dialect::Anthropic);
                 let transformed = pipeline::transformed_stream(
                     source,
                     context,
                     pipeline::terminal::ANTHROPIC,
+                    turn,
                     move |chunk| machine.push(chunk),
                 );
                 // 收尾移交给响应流（守卫不再兜底；令牌保持登记到流结束）
@@ -541,7 +572,7 @@ pub async fn messages_endpoint(
                 return sse_response(status, transformed);
             }
             let mut collector = anthropic::AnthropicCollector::new();
-            collect_stream(source, &mut |chunk| collector.push(chunk)).await;
+            let received = collect_stream(source, &mut |chunk| collector.push(chunk)).await;
             collector.finish();
             let body = collector.into_response(&model);
             // 响应正文在记账前定稿（完整 JSON 文本；序列化失败或调试模式
@@ -553,6 +584,12 @@ pub async fn messages_endpoint(
             pipeline::record_entry(&context, None);
             // 记账已完成：解除断线兜底并注销取消令牌
             guard.complete();
+            // 请求后留存：`received == false` = 上游流中途断了，正文不完整
+            pipeline::retain_answer(
+                &turn_source,
+                &pipeline::answer_text_anthropic(&body),
+                !received,
+            );
             json_response(body)
         }
         Ok(ForwardOutcome::Completion { body: chat }) => {
@@ -564,6 +601,12 @@ pub async fn messages_endpoint(
             pipeline::record_entry(&context, None);
             // 记账已完成：解除断线兜底并注销取消令牌
             guard.complete();
+            // 请求后留存（上游直接给聚合体的情况）：回答在 Anthropic 形态里
+            pipeline::retain_answer(
+                &turn_source,
+                &pipeline::answer_text_anthropic(&response),
+                false,
+            );
             json_response(response)
         }
         Err(error) => {
