@@ -45,9 +45,12 @@
 //   node scripts/deliver.mjs --timeout 5400 # 单段等待上限（秒，默认 5400）
 
 import fs from 'node:fs'
-import { execFileSync } from 'node:child_process'
+import path from 'node:path'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { jobVerdict, describeVerdict } from './lib/run-verdict.mjs'
+import { healthVerdict, enableHint, classifyDispatch } from './lib/actions-health.mjs'
 
+const ROOT = path.resolve(import.meta.dirname, '..')
 const REPO = process.env.A2A_REPO || 'liu6617243/agent2api'
 const API = `https://api.github.com/repos/${REPO}`
 const REF = process.env.A2A_REF || 'main-patched'
@@ -140,6 +143,80 @@ async function api(path, init) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+// ── 1.5 本机编译闸（Rust 借用检查）—— 默认关闭，需显式开启 ─────────
+//
+// ── 为什么默认关闭 ────────────────────────────────────────────
+// 2026-11-21 决定：**GitHub Actions 是唯一的构建与编译权威**。本机装 Rust
+// 工具链（下载 700MB+、建 CARGO_HOME、绕沙箱解包限制）代价高、稳定性差，
+// 而且在沙箱里 cargo 连 crate 都解不开 —— 装完照样跑不通 check。
+//
+// 既然 CI 一定能跑，编译检查就交给 CI。本机这一关降级为**可选加速**：
+//
+//   node scripts/deliver.mjs --local-rust-check
+//
+// 想在推之前先拿到借用检查结果的人可以开；默认不开，交付链路不被本机
+// 环境绑死。
+//
+// ── 为什么这道闸值得保留（当 opt-in）────────────────────────────
+// 2026-11-20 烧掉一整轮 CI 的根因：`precheck-rust.mjs` 是**纯文本解析**，
+// 它抓得住「结构体字段没同步」，抓不住**借用检查**：
+//
+//   error[E0507]: cannot move out of `other.id` which is behind a shared reference
+//
+// 三个平台各跑 20 分钟，全部红在同一条，而本地从提交到推送一路畅通。
+// 本机若恰好有 Rust 工具链，先 check 一遍能省下这一轮。
+//
+// ── 失败怎么处置 ────────────────────────────────────────────────
+//   · 代码有错（cargo check 红）→ 中止，不推。这正是要拦的。
+//   · 环境没准备好（没工具链 / 依赖没拉下来）→ 放行并明确说「这一关没验过」。
+//     环境问题不该把整条链路卡死，但也不能当成通过了。
+async function rustGate() {
+  if (!has('--local-rust-check')) return
+  if (has('--skip-rust-check')) {
+    console.log('跳过本机 Rust 编译闸（--skip-rust-check）。')
+    return
+  }
+
+  // 本次提交动了 Rust 源码才跑
+  let changed = ''
+  try {
+    const base = execFileSync('git', ['rev-parse', `${SHA}^`], { encoding: 'utf8' }).trim()
+    changed = execFileSync('git', ['diff', '--name-only', base, SHA], { encoding: 'utf8' })
+  } catch {
+    changed = execFileSync('git', ['show', '--name-only', '--format=', SHA], { encoding: 'utf8' })
+  }
+  const touchedRust = changed
+    .split('\n')
+    .some((f) => f.trim() && /^desktop-tauri\/src-tauri\/.*\.rs$/.test(f.trim()))
+
+  if (!touchedRust) {
+    console.log('本次提交没动 Rust 源码，跳过本机编译闸。')
+    return
+  }
+
+  console.log('本次提交动了 Rust 源码，跑本机借用检查 …')
+  const r = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'rust-check.mjs')], {
+    cwd: ROOT,
+    stdio: 'inherit',
+  })
+  if (r.status === 0) {
+    console.log('本机编译闸通过。')
+    return
+  }
+  // 退出码 2 = 本机没有工具链（环境问题，不是代码问题）
+  if (r.status === 2) {
+    console.log('')
+    console.log('本机没有 Rust 工具链，这一关没验过 —— 借用检查交给 CI 兜底。')
+    console.log('（默认交付链路本就不跑本机编译闸；这里是 --local-rust-check 主动要求的结果。）')
+    return
+  }
+  console.error('')
+  console.error('本机借用检查不通过，已中止（未推送）。')
+  console.error('  这条错误推上去就会让三个平台的 CI 各红一次。')
+  console.error('  确有特殊情况可 --skip-rust-check 跳过，但别常用。')
+  process.exit(1)
+}
+
 // ── 1. 推送 ─────────────────────────────────────────────────────────
 function sha() {
   const given = val('--sha', '')
@@ -186,8 +263,57 @@ async function dispatch(file) {
     method: 'POST',
     body: JSON.stringify({ ref: REF }),
   })
-  if (r.status === 204 || r.ok) return null
-  return `派发 ${file} 失败 ${r.status}: ${r.text.slice(0, 300)}`
+  const verdict = classifyDispatch(r.status, r.text)
+  if (verdict.kind === 'ok') return null
+  // 熔断单独给出口：这不是「参数写错」，改 ref / 改文件名都没用，
+  // 唯一解法是维护者在网页上点一次启用。混在通用错误里会让人白改一轮。
+  if (verdict.kind === 'disabled-fork') {
+    return {
+      fatal: true,
+      message: [
+        `派发 ${file} 被拒：平台已停用本 fork 的 Actions（HTTP 422）。`,
+        '',
+        enableHint(REPO),
+      ].join('\n'),
+    }
+  }
+  return { fatal: true, message: `派发 ${file} 失败 ${r.status}: ${r.text.slice(0, 300)}` }
+}
+
+/**
+ * 推送前先确认「这个仓库的 Actions 能用」。
+ *
+ * ── 为什么放在推送之前 ─────────────────────────────────────
+ * 2026-11-21 的顺序是：推成功了 → 派发 422 → 才知道跑不了。代码已经上了远端，
+ * 本地看起来一切正常，只剩一句 422 —— 用户看到的是「推了但没包」。
+ * 先探测，就在**动手之前**给出结论，而不是事后解释。
+ *
+ * 探测不到（网络问题）不算失败：宁可放行让它继续推，也不要在网络抖动时
+ * 把整条链路拦死。只有明确读到「fork 被熔断」才中止。
+ */
+async function healthGate() {
+  const { verdict, evidence, hint } = await healthVerdict({ api, repo: REPO, token: TOKEN })
+  if (verdict === 'disabled-fork' || verdict === 'disabled-policy') {
+    console.error('')
+    console.error('这个仓库的 GitHub Actions 现在跑不了，推代码不会触发任何流水线。')
+    console.error(`  判定：${verdict}`)
+    if (evidence?.stalledRuns?.length) {
+      console.error(`  证据：run ${evidence.stalledRuns.join(',')} 排队很久但一个 job 都没分到`)
+    }
+    console.error('')
+    console.error(hint)
+    console.error('')
+    console.error('已中止（未推送）。')
+    process.exit(1)
+  }
+  if (verdict === 'forbidden') {
+    console.error('')
+    console.error('读不到仓库 Actions 策略 —— 凭据权限不足。')
+    console.error('')
+    console.error(hint)
+    process.exit(1)
+  }
+  console.log('Actions 可用。')
 }
 
 // ── 3. 找 run / 等 run ──────────────────────────────────────────────
@@ -222,6 +348,8 @@ async function findRun(file, after = 0) {
 async function waitRun(file, label, deadline, after = 0, minAttempt = 1) {
   let seen = null
   let lastAttempt = null
+  let stuckSince = 0
+  let warned = false
   while (Date.now() < deadline) {
     const run = await findRun(file, after)
     // attempt 变了（有人在 GitHub 上点了 rerun）要当成新的一次重新打印 ——
@@ -229,11 +357,32 @@ async function waitRun(file, label, deadline, after = 0, minAttempt = 1) {
     if (run && (run.id !== seen || run.run_attempt !== lastAttempt)) {
       seen = run.id
       lastAttempt = run.run_attempt
+      stuckSince = Date.now()
       console.log(`  ${label}: run ${run.id}（${run.status}，第 ${run.run_attempt || 1} 次）`)
     }
     // 刚点完 rerun 时 API 还会短暂返回上一轮的 completed 结论；必须等
     // attempt 涨到目标值，否则会立刻拿旧结论下判断。
     if (run && run.status === 'completed' && (run.run_attempt || 1) >= minAttempt) return run
+
+    // ── 永远 queued、一个 job 都没有 = 平台没在调度 ───────────────
+    // 这不是「跑得慢」。fork 熔断时不但 dispatch 会 422，已经被启用的旧
+    // run（rerun 出来那个）也会一直 queued、`/jobs` 永远 `total_count: 0`。
+    // 干等一整轮（默认 90 分钟）毫无意义，8 分钟没动静就给明确结论。
+    if (run && run.status === 'queued' && !warned) {
+      if (!stuckSince) stuckSince = Date.now()
+      if (Date.now() - stuckSince > 8 * 60_000) {
+        const jobs = await jobsOf(run.id)
+        if (!jobs.length) {
+          warned = true
+          console.error(
+            `  ${label}: run ${run.id} 排队 8 分钟仍未分到任何 job（jobs=0）—— 平台没有调度，不是测试慢。`,
+          )
+          console.error('  这通常意味着本 fork 的 Actions 被停用。')
+          console.error(enableHint(REPO))
+          return null
+        }
+      }
+    }
     await sleep(POLL)
   }
   return null
@@ -262,9 +411,9 @@ async function ensureRun(file, label, deadline) {
   }
   // 记下派发时刻：重新派发时旧 run 还在列表里，不过滤就会立刻「拿到」那个旧的失败结果。
   const base = Date.now() - 60_000
-  const err = await dispatch(file)
-  if (err) {
-    console.error(err)
+  const failure = await dispatch(file)
+  if (failure) {
+    console.error(failure.message || failure)
     process.exit(1)
   }
   return waitRun(file, label, deadline, base)
@@ -366,6 +515,14 @@ async function settle(file, label, deadline) {
 async function main() {
   console.log(`仓库 ${REPO}  分支 ${REF}  提交 ${SHORT}`)
   console.log('─'.repeat(78))
+
+  // 先探平台，再动手 —— 否则「推成功但一条流水线也不会跑」这件事
+  // 要等到派发那一步才暴露，代码已经上了远端。
+  await healthGate()
+
+  // 再过本机编译闸 —— 默认关闭（--local-rust-check 才启用）。
+  // 编译与构建的唯一权威是 GitHub Actions，本机不被工具链绑死。
+  if (!NO_PUSH) await rustGate()
 
   if (!NO_PUSH) {
     if (!push()) {

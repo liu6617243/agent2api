@@ -102,6 +102,26 @@ node scripts/ci-watch.mjs --dispatch build-windows   # 手动补一次出包
 2. **不下载安装包**。报「run id + artifact id + 文件名 + 大小」就算交付完成。
 3. **包与提交必须对应**：报告时带上 artifact 所属 run 的 `head_sha`，确认它就是你要的那一版。
 4. **测试没过就不该有包**。`build-windows` 失败先看是不是 `gate` 拦的 —— 那是设计如此，不是故障。
+5. **本机不装 Rust 工具链**（2026-11-21 起）。编译与构建的唯一权威是 GitHub Actions；
+   本机的 `D:/rust-toolchain` 与 `~/.cargo` 已卸载，`target/cargo-home` 与 `.workbuddy/cargo`
+   缓存也清掉了（约 1.5 GB）。理由：装它要下 700MB+，在沙箱里连 crate 都解不开
+   （os error 5），装完照样跑不通 check。借用检查交给 CI 的 `rust-tests`。
+   `deliver.mjs` 默认**不跑**本机编译闸；确实想要时加 `--local-rust-check`（需本机已有工具链）。
+
+### 4.1 本机预检（不需工具链，提交前就能跑）
+
+```bash
+node scripts/precheck-rust.mjs       # 结构体字面量字段 / mod 路径（纯文本解析）
+node scripts/precheck-knobs.mjs      # 旋钮 schema 与构造调用参数
+node scripts/precheck-workflows.mjs  # .github/workflows/** 的 YAML 能否被 GitHub 解析
+node scripts/precheck-actions.mjs    # 这个仓库的 Actions 现在能不能跑
+```
+
+前三个是 `pre-commit` 钩子自动跑的（只在暂存区命中对应文件时触发）。
+`precheck-actions.mjs` 给结论：`ok` / `disabled-fork` / `disabled-policy` / `forbidden` / `unknown`。
+
+**`unknown` 不等于绿灯**，也不等于故障：它表示所有判据都读不到确切结论。
+此时继续交付，但报告时要说「Actions 状态未确认」，不能当成已验证。
 
 ## 5. 排错
 
@@ -130,10 +150,117 @@ A2A_DELIVER=1 git push origin HEAD:main-patched
 - `404` —— 工作流文件名不对。Actions 的 workflow 端点认**带扩展名的文件名**：
   `/actions/workflows/rust-tests.yml/dispatches` 才对，`rust-tests` 是 404。
 - `403` —— 凭据没有 actions 写权限，或 ref 上的工作流没有 `workflow_dispatch` 入口。
-- `422` —— `ref` 上不存在该工作流文件（分支名写错，或文件在别的分支）。
+- `422` —— **两种完全不同的 422，必须看 message 原文**：
+  - `ref` 上不存在该工作流文件（分支名写错，或文件在别的分支）→ 改 ref；
+  - `{"message":"Actions has been disabled for this repository."}` → **不是 ref 问题**，
+    是平台停用了本 fork 的 Actions，见 §5.1。
 - `fetch failed` —— 网络抖动，不是业务失败。`api()` 已自带 4 次指数退避（网络异常 / 429 / 5xx 才重试），
   仍然断掉时直接**原地重跑 `node scripts/deliver.mjs`**：它按 `head_sha` 复用已存在的 run，
   推过的不会再推、绿了的不会再等。
+
+### 5.1 「Actions has been disabled for this repository」= fork 被平台熔断（2026-11-21）
+
+**症状**：任何 `workflow_dispatch` 一律返回 HTTP 422 +
+
+```json
+{"message":"Actions has been disabled for this repository."}
+```
+
+push tag、rerun 也一样不产生 run。
+
+**这是 GitHub 对 fork 的平台级熔断**，不是本仓库配置错、不是 token 权限、不是 workflow 文件名、
+不是 ref 写错、不是触发面没覆盖 `main-patched`、也不是 GitHub 整体故障。上面这些全都试过并排除了。
+
+**GitHub Actions 有三层独立开关，只有第三层是真相**：
+
+| 层 | 查法 | 能证明能跑吗 |
+|---|---|---|
+| 仓库策略层 | `GET /repos/{r}/actions/permissions` → `enabled:true` | **不能**（熔断时照样返回 true） |
+| 工作流层 | `GET /repos/{r}/actions/workflows` → 全部 `state:active` | **不能**（熔断时照样 active） |
+| 平台 fork 处置层 | Actions 页面横幅 / run 永远 0 job | **能** |
+
+**纯 API 的判据（不用开浏览器）**：run 状态 `queued`，超过 8 分钟仍 `total_count: 0` 个 job
+→ 平台没有调度，不是排队慢。`POST /actions/runs/{id}/rerun` 返回 201 但 jobs 永远是 0，也是同一现象。
+
+**线上 API 改不了这个开关**，实测都是「返回成功但不生效」：
+
+```text
+PUT /repos/{r}/actions/permissions          → 204，仍旧 422
+PUT /repos/{r}/actions/workflows/<id>/enable → 204，仍旧 422
+POST /repos/{r}/actions/runs/<id>/rerun      → 201，但 jobs 永远是 0
+```
+
+**只能由维护者在浏览器点一次**：
+
+```text
+打开 https://github.com/liu6617243/agent2api/actions
+点页面顶部横幅的 "I understand my workflows, go ahead and enable them"
+```
+
+**动手之前先查**：
+
+```bash
+node scripts/precheck-actions.mjs
+```
+
+输出会直接给结论（`ok` / `disabled-fork` / `disabled-policy` / `forbidden`）。
+熔断时**不要推代码、不要重跑 run、不要试 API**——那三样都已经在熔断状态下证明无效了。
+
+**已机制化**：
+
+- 判据收敛在 `scripts/lib/actions-health.mjs`（`bannerState` / `probeBanner` /
+  `probeStalledRuns` / `probeLiveScheduling` / `classifyDispatch` / `healthVerdict` / `enableHint`）。
+- `scripts/deliver.mjs` 的 `healthGate()` 在**推送之前**探测；熔断则直接退出码 1，**不推送**，
+  避免出现「推了但没包」这种半截交付。
+- `dispatch()` 单独识别这条 422，报错信息里带网页启用指引，不再伪装成 ref 错误。
+- `waitRun()` 遇到「queued 超过 8 分钟且 0 个 job」直接判定平台未调度并退出，不再干等 90 分钟。
+
+**注意**：本机 `github.com` 的 HTML 通道经常 fetch 失败，所以**主判据是 API**（实时调度 +
+僵死队列），页面横幅只是旁证。横幅读不到（`unknown`）不代表熔断不成立，别因为横幅 unknown 就推翻 API 结论。
+
+### 5.2 熔断解除之后（2026-11-21 后续）：僵尸 run 会伪装成「还在熔断」
+
+平台恢复后，**熔断期遗留的排队 run 永远不会被调度**，也永远不会被 GitHub 自动清理 ——
+它就那么挂在 `queued` 里，`jobs` 永远是 0。
+
+于是只按「有没有僵死 run」判定会出现假阴性：
+
+```text
+平台早已恢复 → dispatch 204、新 run 正常拿到 4 个 job
+但老僵尸 run 还在 → 判定仍是 disabled-fork → 交付被拦住
+```
+
+这是把「历史上出过一次事」当成「现在正在出事」。所以判据分两层：
+
+| 判据 | 含义 | 优先级 |
+|---|---|---|
+| `probeLiveScheduling` | **最新创建**的 run 有没有拿到 job | **第一**（不受僵尸 run 影响） |
+| `probeStalledRuns` | 排队超 8 分钟且 0 job 的 run | 第二（**只算 3 小时内创建的**，老的记为 `stale` 不下结论） |
+
+判据收敛在 `scripts/lib/actions-health.mjs`：
+
+```js
+if (live.state === 'scheduling')     return { verdict: 'ok' }           // 平台正常
+if (live.state === 'not-scheduling') return { verdict: 'disabled-fork' } // 平台没调度
+// 实时判据读不到 → 退回僵死队列判据（只算新鲜的）
+```
+
+**判据必须建在「最新那个 run 有没有 job」上**，不能建在「历史上有没有失败过」上。
+
+### 5.3 `unknown` 不是一个结论
+
+`healthVerdict` 有五种取值，用途完全不同：
+
+| verdict | 含义 | 交付时怎么办 |
+|---|---|---|
+| `ok` | 平台正常调度 | 照常推 |
+| `disabled-fork` | 平台没在调度 | **中止，不推**，给网页启用指引 |
+| `disabled-policy` | 仓库策略层被关 | 中止，先开策略 |
+| `forbidden` | 凭据读不到 permissions | 中止，换凭据 |
+| `unknown` | 所有判据都读不到确切结论 | **放行但说明「没验过」**，以派发结果为准 |
+
+`unknown` 最容易被误当成绿灯。它既不是「正常」也不是「坏了」，是「不知道」。
+脚本必须按「不知道」处理：继续跑、但把不确定性说清楚，不能默默当成已验证。
 
 ### GitHub「重跑失败任务」不是新 run
 

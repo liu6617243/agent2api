@@ -29,6 +29,12 @@
    只有用户**明确要产物文件**时才下。
 3. **验证靠代码与数据库，不靠下载产物。** 要确认改动生效，读源码 / 读 `~/.agent2api/agent2api.db`
    里的实际数据，不要去拉构建出来的二进制。
+4. **编译与构建的唯一权威是 GitHub Actions，本机不装 Rust 工具链。** 2026-11-21 起本机的
+   Rust 工具链（`D:/rust-toolchain`、`~/.cargo`）与 cargo 缓存已全部卸载 —— 装它要下 700MB+、
+   在沙箱里连 crate 都解不开（os error 5），装完照样跑不通 check，纯属浪费。
+   **不要**再在本机装 cargo/rustc 来"提前验证编译"；借用检查（E0507 / E0382 / 生命周期）
+   由 CI 的 `rust-tests` 兜底。`node scripts/deliver.mjs` 默认**不跑**本机编译闸；
+   确实需要时显式加 `--local-rust-check`（前提是本机已有工具链）。
 
 ### 交付一条命令：`node scripts/deliver.mjs`
 
