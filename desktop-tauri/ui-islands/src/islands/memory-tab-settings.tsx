@@ -568,12 +568,20 @@ function InjectPreview(): React.ReactElement {
             </div>
           ) : null}
           {/* 候选与门槛：解释「为什么没注入」。
-              pass=false → 线索不够具体（该补记忆或换说法）；
-              pass=true 却没出现在下面那段原文里 → 被预算挤掉（该调大经验预算）。
-              没有这块时，「没命中」和「命中了但没塞进去」在界面上长得一模一样。 */}
+              三种情况必须分开说，否则在界面上长得一模一样：
+                · pass=false                      → 线索不够具体（该补记忆或换说法）
+                · pass=true && duplicate=true     → 够格，但和前面某条是同一件事，被折叠
+                · pass=true && duplicate=false 却不在下面那段原文里 → 被预算挤掉
+              没有这块时，用户只能靠猜；有了它，「调门槛 / 调预算 / 补记忆」
+              三种动作各自对应一种可见状态。 */}
           {result.hits.length > 0 ? (
             <div style={{ display: 'grid', gap: 4 }}>
-              <div className='mm-cfg-card-note'>{t('候选（按得分）')}</div>
+              <div className='mm-cfg-card-note'>
+                {t('候选（按得分）· {a} 条过线 / {b} 条是重复', {
+                  a: result.hits.filter(hit => hit.pass && !hit.duplicate).length,
+                  b: result.hits.filter(hit => hit.duplicate).length,
+                })}
+              </div>
               {result.hits.map(hit => (
                 <div
                   key={hit.id}
@@ -583,8 +591,8 @@ function InjectPreview(): React.ReactElement {
                     alignItems: 'baseline',
                     fontSize: 11.5,
                     lineHeight: 1.6,
-                    color: hit.pass ? 'var(--text-2)' : 'var(--text-3, var(--text-2))',
-                    opacity: hit.pass ? 1 : 0.62,
+                    color: hit.pass && !hit.duplicate ? 'var(--text-2)' : 'var(--text-3, var(--text-2))',
+                    opacity: hit.pass && !hit.duplicate ? 1 : 0.62,
                   }}
                 >
                   <code style={{ flex: '0 0 auto' }}>{hit.score.toFixed(1)}</code>
@@ -592,10 +600,12 @@ function InjectPreview(): React.ReactElement {
                     /{hit.floor.toFixed(1)} · {hit.layer}
                   </span>
                   <span style={{ flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {hit.title}
+                    {/* 标题可能是裸 UUID（导入器拼的占位名），那种情况下显示真正
+                        会写进注入块的那一行，比显示 UUID 有用得多 */}
+                    {hit.line || hit.title}
                   </span>
                   <span style={{ flex: '0 0 auto', opacity: 0.7 }}>
-                    {hit.pass ? t('过线') : t('差一点')}
+                    {!hit.pass ? t('差一点') : hit.duplicate ? t('同一条已折叠') : t('过线')}
                   </span>
                 </div>
               ))}

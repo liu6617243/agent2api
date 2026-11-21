@@ -130,27 +130,49 @@ fn regexes() -> &'static [Regex] {
     })
 }
 
-/// 从一段请求文本里抽线索（已小写、已去重、上限 24 个）。
+/// 从一段请求文本里抽线索（已小写、已去重）。
 ///
 /// ── camelCase 为什么要单独一遍 ──────────────────────────────
 /// 其余三条正则都在小写化之后的文本上跑（大小写不该影响路径与 snake_case 的
 /// 命中）。但 camelCase 的定义就是「小写开头 + 大写转折」—— 小写化之后
 /// `injectChat` 变成 `injectchat`，那条正则永远匹配不到任何东西，等于白写。
 /// 所以它单独在原文上跑一遍，命中的结果再统一小写化（下游匹配一律小写）。
+///
+/// ── 为什么要分桶而不是「先来先占」───────────────────────────
+/// 24 个名额是硬上限。第一版按正则顺序 push，于是命中的先后就等于优先级 ——
+/// 真机上一次 `ls` 回显的 14 个光杆文件名（`agents.rs`、`config.rs`…）先把名额
+/// 占掉，紧接着才是真正被改的那个 `desktop-tauri/.../inject.rs`。而这两档的
+/// 信息量完全不同：带目录的路径在仓库里唯一，光杆文件名在仓库里有十几个同名。
+///
+/// 所以按**信息量**分三桶，路径桶先满额再轮到标识符桶，光杆文件名最后一档、
+/// 且名额最少（[`NAME_BUCKET`]）。这样一次 `ls` 无论列多少文件，都挤不掉那条
+/// 唯一的路径。
 pub fn probes(text: &str) -> Vec<String> {
+    /// 桶容量：路径最多 10 条（一次任务改不了十个文件），标识符最多 10 条，
+    /// 光杆文件名只留 4 条 —— 它是最弱的一档，多了就是纯占位。
+    const PATH_BUCKET: usize = 10;
+    const IDENT_BUCKET: usize = 10;
+    const NAME_BUCKET: usize = 4;
+
+    let mut paths: Vec<String> = Vec::new();
+    let mut idents: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+
     let lowered = text.to_lowercase();
-    let mut out: Vec<String> = Vec::new();
-    for pattern in regexes() {
+    for (index, pattern) in regexes().iter().enumerate() {
         for capture in pattern.captures_iter(&lowered) {
             let raw = capture
                 .get(1)
                 .or_else(|| capture.get(0))
                 .map(|matched| matched.as_str())
                 .unwrap_or("");
-            push_probe(&mut out, raw);
-            if out.len() >= 24 {
-                return out;
-            }
+            // index 0 = 反引号 / 1 = 带扩展名的路径 / 2 = snake_case
+            let bucket = match index {
+                0 => Bucket::Ident,
+                1 => Bucket::PathOrName,
+                _ => Bucket::Ident,
+            };
+            push_probe(&mut paths, &mut idents, &mut names, bucket, raw);
         }
     }
     if let Some(pattern) = camel() {
@@ -159,13 +181,38 @@ pub fn probes(text: &str) -> Vec<String> {
                 .get(0)
                 .map(|matched| matched.as_str())
                 .unwrap_or("");
-            push_probe(&mut out, &raw.to_lowercase());
-            if out.len() >= 24 {
-                return out;
+            push_probe(
+                &mut paths,
+                &mut idents,
+                &mut names,
+                Bucket::Ident,
+                &raw.to_lowercase(),
+            );
+        }
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for (bucket, limit) in [
+        (paths, PATH_BUCKET),
+        (idents, IDENT_BUCKET),
+        (names, NAME_BUCKET),
+    ] {
+        for value in bucket.into_iter().take(limit) {
+            if !out.iter().any(|known| known == &value) {
+                out.push(value);
             }
         }
     }
     out
+}
+
+/// 线索的三档。档位只影响排序，不影响能不能命中。
+#[derive(Debug, Clone, Copy)]
+enum Bucket {
+    /// 反引号里的片段、snake_case、camelCase —— 用户/模型明说「就是这个东西」
+    Ident,
+    /// 带扩展名的串：含目录分隔的进路径桶，光杆文件名的进名字桶
+    PathOrName,
 }
 
 /// camelCase 标识符（在**原文**上匹配，见 [`probes`] 的说明）。
@@ -241,20 +288,131 @@ pub fn harvest_paths(text: &str) -> Vec<String> {
     out
 }
 
-fn push_probe(out: &mut Vec<String>, raw: &str) {
-    let value = raw.trim().trim_matches(|ch: char| {
+/// 临时目录 / 调试产物前缀：这些路径里的「文件名」是本机运行痕迹，不是仓库资产。
+///
+/// ── 为什么必须挡掉 ──────────────────────────────────────────
+/// 本机实测抽出来的线索长这样：
+///
+/// ```text
+/// /.agent2api/debug/last-request.js
+/// .workbuddy/tmp/entries.js
+/// .workbuddy/tmp/entries-full.js
+/// ```
+///
+/// 它们全是**我自己排障时**写出的临时文件，`files` 里永远不会有一条记忆锚定到
+/// 它们 —— 也就是说这几个名额是纯浪费，而名额总共只有 24 个。更糟的是它们排在
+/// 前面（来自工具回显的最开头），会把真任务的路径挤出去。
+const NOISE_PREFIXES: &[&str] = &[
+    ".workbuddy/tmp/",
+    "/.agent2api/debug/",
+    ".agent2api/debug/",
+    "/tmp/",
+    "/temp/",
+    "appdata/local/temp/",
+    "/node_modules/",
+    "/target/debug/",
+    "/target/release/",
+];
+
+/// 语言 / 标准库 / SQL 的内部标识符，出现频率高但**不指向任何一条记忆**。
+///
+/// ── 判据为什么是「白名单式列举」而不是「猜」───────────────
+/// snake_case 正则本身很宽（`\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b`），凡是有下划线的
+/// 都进。而工具回显里塞满了这类东西：`row_factory`、`ensure_ascii`、`deleted_at`、
+/// `n_sum`。它们对「以前做过这件事吗」毫无指示性 —— 一条记忆不会因为提到
+/// `deleted_at` 就和本次任务相关（那是每张表都有的列）。
+///
+/// 列举而不做启发式：这类词是有限的、稳定的，列举可读、可审计、可以随时加；
+/// 启发式（比如「带 _at / _id 后缀就丢」）会误伤 `last_hit_at` 这种真字段名。
+const NOISE_IDENTS: &[&str] = &[
+    // Python 常用
+    "row_factory", "ensure_ascii", "isinstance", "getattr", "setattr", "hasattr",
+    "strftime", "strptime", "readlines", "writelines", "startswith", "endswith",
+    "listdir", "walk_dir", "realpath", "basename", "dirname",
+    // SQL / 表结构
+    "deleted_at", "created_at", "updated_at", "valid_from", "valid_to",
+    "group_concat", "insert_into", "order_by", "left_join", "inner_join",
+    "not_null", "auto_increment", "primary_key",
+    // 本仓常见但不指向具体结论的字段
+    "n_sum", "max_tokens", "min_tokens", "content_type", "user_agent",
+    "status_code", "request_id", "trace_id", "session_id",
+];
+
+/// 这个线索值不值得占一个名额。
+///
+/// 两道闸：临时/派生产物路径直接丢；纯内部标识符也丢。其余照旧交给打分环节 ——
+/// 这里**不**做「像不像任务词」的判断，那种判断交给门槛（`floor_for`）。
+fn noise_probe(value: &str) -> bool {
+    let lowered = value.to_lowercase();
+    if NOISE_PREFIXES.iter().any(|prefix| lowered.contains(prefix)) {
+        return true;
+    }
+    // 文件名比较：`foo/entries.json` 与 `entries.json` 都算同一条
+    if NOISE_IDENTS.iter().any(|name| lowered == *name) {
+        return true;
+    }
+    // 无下划线的纯文件名不该被当成路径线索之外的噪音 —— 交给后续判据
+    false
+}
+
+/// 把一条候选线索放进对应的桶。
+///
+/// ── 反引号片段为什么要额外体检 ──────────────────────────────
+/// 反引号正则假设「成对出现」，但真实文本里经常是奇数个（模型把一句话里的
+/// 三个反引号写进正文、或者代码围栏被截断）。真机实测抽出来过这么一条：
+///
+/// ```text
+/// 这类 workbuddy 结构时需要谨慎，因为当前 system 里的
+/// ```
+///
+/// —— 一整句中文，因为配对错位而落在两个反引号之间。它占一个名额、永远命中
+/// 不了任何记忆。所以反引号这一档要求「不含空白且不含中文」：命令、路径、
+/// 标识符都不含空格，句子必然含。
+fn push_probe(
+    paths: &mut Vec<String>,
+    idents: &mut Vec<String>,
+    names: &mut Vec<String>,
+    bucket: Bucket,
+    raw: &str,
+) {
+    let trimmed = raw.trim().trim_matches(|ch: char| {
         matches!(ch, '`' | '"' | '\'' | ',' | ';' | ')' | '(' | '[' | ']')
     });
+    // ── 反斜杠必须归一化成正斜杠 ────────────────────────────────
+    // Windows 上写 `D:\Personal\...\inject.rs`，正则的字符集不含冒号，匹配会从
+    // `\personal\...` 开始 —— 于是同一条路径抽出两条探针（一条正斜杠、一条反
+    // 斜杠），而记忆里存的是正斜杠形态，反斜杠那条永远命不中，白占名额。
+    let value = trimmed.replace('\\', "/");
+    let length = value.chars().count();
     // 太短的（`a` / `ok`）到处都是，太长的多半是一整行命令 —— 两种都不是
     // 「能定位到某条记忆」的线索
-    let length = value.chars().count();
     if length < 3 || length > 120 {
         return;
     }
-    if out.iter().any(|item| item == value) {
+    if value.split_whitespace().count() > 1 {
         return;
     }
-    out.push(value.to_string());
+    if !value.is_ascii() {
+        return;
+    }
+    if noise_probe(&value) {
+        return;
+    }
+    let target = match bucket {
+        Bucket::Ident => idents,
+        // 归一化之后只剩正斜杠，判据也只看正斜杠
+        Bucket::PathOrName => {
+            if value.contains('/') {
+                paths
+            } else {
+                names
+            }
+        }
+    };
+    if target.iter().any(|known| known == &value) {
+        return;
+    }
+    target.push(value);
 }
 
 /// 这条记忆锚定的文件里有没有一条能和线索对上。
@@ -483,6 +641,67 @@ fn floor_for(entry: &MemoryEntry) -> Option<f64> {
     Some(3.3)
 }
 
+/// 标题是不是「导入流水留下的裸标识符」。
+///
+/// ── 真机数据长这样 ──────────────────────────────────────────
+/// ```text
+/// 538e6914-d5c6-486e-8635-a90ef475b1c9（866）
+/// ```
+///
+/// 那是导入器拿「会话 id + 序号」拼出来的占位标题，同一个会话有 2200 多条这种
+/// 条目。把它渲染成 `- [daily] 538e6914-…（866） —— 结论` 只会白烧 token：
+/// 模型读那一长串十六进制得不到任何信息，真正有用的只有破折号后面的结论。
+///
+/// 判据要求「几乎全是十六进制与连字符、可选的结尾序号」—— 正常的标题（「注入点」、
+/// 「beta.1 出包」）里不可能有中文和空格之外的这种形状，误判风险接近零。
+fn junk_title(title: &str) -> bool {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    // 去掉结尾的中文/英文括号序号：`（866）` / `(866)`
+    let base = trimmed
+        .rsplit_once('（')
+        .map(|(head, _)| head)
+        .or_else(|| trimmed.rsplit_once('(').map(|(head, _)| head))
+        .unwrap_or(trimmed)
+        .trim();
+    if base.chars().count() < 8 {
+        return false;
+    }
+    base.chars()
+        .all(|ch| ch.is_ascii_hexdigit() || ch == '-')
+}
+
+/// 注入面去重的分组键。
+///
+/// ── 为什么必须去重 ──────────────────────────────────────────
+/// 真机跑分得到 14 条过线候选，**全部**来自同一个导入会话的碎片（同一个
+/// `538e6914-…` 前缀、只是序号不同）。不去重的话 6 个名额会被同一件事塞满，
+/// 而这件事本身还只是一段流水，信息量远低于另一件完全不同的事。
+///
+/// 分组键取「去掉序号后的标题」—— 那正好是「同一次会话 / 同一件事」的天然边界。
+/// 标题正常的条目不按标题分组（不同标题本来就是不同的事），改按摘要开头分组，
+/// 那能挡住「同一条结论被蒸馏了两遍」。
+fn group_key(entry: &MemoryEntry) -> String {
+    if junk_title(&entry.title) {
+        let base = entry
+            .title
+            .trim()
+            .rsplit_once('（')
+            .map(|(head, _)| head)
+            .or_else(|| entry.title.trim().rsplit_once('(').map(|(head, _)| head))
+            .unwrap_or(entry.title.trim());
+        return format!("junk:{}", base.to_lowercase());
+    }
+    let head: String = entry
+        .summary(60)
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    format!("text:{}", head.to_lowercase())
+}
+
 fn rule_candidate(entry: &MemoryEntry) -> bool {
     entry.is_live()
         && (entry.pinned
@@ -490,8 +709,22 @@ fn rule_candidate(entry: &MemoryEntry) -> bool {
 }
 
 /// 渲染一行。
+///
+/// 标题是裸标识符时只渲染摘要 —— 那一长串十六进制对模型是纯噪音（见
+/// [`junk_title`]）。
 fn line(entry: &MemoryEntry, width: usize) -> String {
     let summary = entry.summary(width);
+    if junk_title(&entry.title) {
+        if !summary.trim().is_empty() {
+            return format!("- [{}] {}", entry.kind.label(), summary);
+        }
+        // 标题没用、摘要也空：这条拿不出任何可读内容，标题就是全部
+        return format!(
+            "- [{}] {}",
+            entry.kind.label(),
+            truncate_chars(&entry.title, width)
+        );
+    }
     if summary.trim().is_empty() {
         format!("- [{}] {}", entry.kind.label(), truncate_chars(&entry.title, width))
     } else {
@@ -586,11 +819,15 @@ pub fn compose(request_text: &str) -> Option<String> {
     if !settings.enabled || settings.max_tokens == 0 {
         return None;
     }
+    // ── 空请求文本不等于不注入 ──────────────────────────────────
+    // 第一版在这里直接 `return None`，理由是「没文本就没线索」。但「必须遵守」
+    // 那一段（pinned / preference / profile）**不依赖线索** —— 用户钉的规矩对
+    // 每一条请求都成立。真机后果：凡是取不到任务文本的请求（客户端只发 system、
+    // 或 `<user_query>` 是空的），连「版本号保持 3.5.0-beta.1」这种硬规则都进不去。
+    //
+    // 所以空文本照常往下走：线索为空 → 「相关经验」自然空，但「必须遵守」还在。
     let text = request_text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    let probes = probes(text);
+    let probes = if text.is_empty() { Vec::new() } else { probes(text) };
     let key = cache_key(&settings, &probes);
     if let Some(hit) = cache_get(key) {
         return hit;
@@ -743,6 +980,11 @@ fn build(settings: &Settings, probes: &[String]) -> Option<String> {
     let mut experience_text = String::new();
     let mut experience_used = 0usize;
     let mut picked = 0usize;
+    // 已经渲染过的正文（去重第二道闸）：同一条结论可能以两条 l1 碎片存在，
+    // 分组键挡不住（两条的摘要尾部措辞略有差异），但渲染出来的行完全一样。
+    let mut seen_lines: Vec<String> = Vec::new();
+    // 去重第一道闸：同一件事只让**得分最高**的那条进来。
+    let mut seen_groups: Vec<String> = Vec::new();
     for (_, entry) in &scored {
         // `max_items` 在**选中之后**才计数，不在排序之后先截断：先截断的话，
         // 前 6 条若都是长摘要，预算一满就直接 break，后面那些短而准的条目
@@ -750,7 +992,19 @@ fn build(settings: &Settings, probes: &[String]) -> Option<String> {
         if picked >= settings.max_items {
             break;
         }
+        // ── 注入面去重 ──────────────────────────────────────────
+        // 真机跑分得到 14 条过线，全部是同一个导入会话的碎片（同前缀、只差序号）。
+        // `scored` 已按得分降序，所以「每组只取第一条」等于「每组取最好的那条」，
+        // 剩下的名额留给别的组 —— 用户需要的是「三件不同的事」，不是「一件事的
+        // 六种流水写法」。
+        let group = group_key(entry);
+        if seen_groups.iter().any(|known| known == &group) {
+            continue;
+        }
         let rendered = line(entry, 56);
+        if seen_lines.iter().any(|known| known == &rendered) {
+            continue;
+        }
         let cost = estimate_tokens(&rendered) + 1;
         if experience_used + cost > settings.experience_tokens {
             continue;
@@ -762,6 +1016,8 @@ fn build(settings: &Settings, probes: &[String]) -> Option<String> {
         experience_text.push('\n');
         experience_used += cost;
         picked += 1;
+        seen_groups.push(group);
+        seen_lines.push(rendered);
     }
     if !experience_text.is_empty() {
         body.push_str("\n## 相关经验\n");
@@ -787,50 +1043,217 @@ fn header() -> String {
 
 // ── 注入到请求体 ─────────────────────────────────────────────
 
-/// 这个 body 里已经注入过了吗。
+/// 这个 body 里**本进程**已经注入过了吗。
+///
+/// ── 为什么不能扫全部消息找 MARKER ────────────────────────────
+/// 第一版是 `messages.iter().any(|m| m.content.to_string().contains(MARKER))`。
+/// 那在真机上等于永久关闭注入，而且症状极难反推：
+///
+///   · 用户会话里**有** `<agent2api-memory>` 字面量 —— 历史摘要里写了它、
+///     模型把注入块贴回聊天里、或者工具读了一遍 `inject.rs` 把它回显出来；
+///   · 于是从那一刻起，这条会话的每一个请求都被判成「已注入」直接 `return None`；
+///   · 计数器上表现为 `attempts` 一路涨、`count` 永远 0、`missed` 一动不动地
+///     累加 —— 看上去像「没命中」，实际是「根本没跑」。
+///
+/// 真机上就是这么炸的：`attempts = 109`、`count = 0`，而请求体里 MARKER 出现 9
+/// 次，7 次在历史摘要里、2 次在 tool 回显里。
+///
+/// 正确的判据只有一个：**这条消息是不是我们插进去的那条**。注入块的形状是
+/// 确定的（`system` 角色 + 内容以 [`MARKER`] 开头），任何带 MARKER 的 user /
+/// tool 文本都不是我们插的。所以这里只认「system / developer 角色 + 开头就是
+/// MARKER」，其余一律当作没注入过。
 fn already_chat(body: &Value) -> bool {
     body.get("messages")
         .and_then(Value::as_array)
         .map(|messages| {
             messages.iter().any(|message| {
-                message
-                    .get("content")
-                    .map(|content| content.to_string().contains(MARKER))
-                    .unwrap_or(false)
+                if !matches!(
+                    message.get("role").and_then(Value::as_str),
+                    Some("system" | "developer")
+                ) {
+                    return false;
+                }
+                let text = match message.get("content") {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(content) => crate::server::core::protocol::content_text(content),
+                    None => return false,
+                };
+                text.trim_start().starts_with(MARKER)
             })
         })
         .unwrap_or(false)
 }
 
+/// 尾部窗口：最后一条 user 消息里「真正的这一句」通常压在末尾。
+///
+/// WorkBuddy / CodeBuddy 会把整段会话（含上一轮摘要，本机实测 43,658 字符）压进
+/// 同一条 user 消息，真正的输入只有最后百来个字符。取尾部窗口比取头部窗口命中
+/// 率高得多：任务的落点是「继续做 X」，而历史摘要的开头永远是上一件事。
+const TAIL_WINDOW: usize = 4_000;
+/// 工具回显只取开头这么多个字符。
+///
+/// 开头是 `Command: cd ... && ...`，路径与命令名都在那里 —— 那正是最可靠的线索。
+/// 再往后就是文件正文（一次 `Read` 能回显 5 万字符），抽出来全是代码里的标识符，
+/// 24 个线索名额会被它们占满，把真任务的关键词挤出去。
+const TOOL_WINDOW: usize = 600;
+/// 整段取词文本的上限。probes 只认前 24 个，这里给足余量即可。
+const REQUEST_TEXT_CAP: usize = 12_000;
+
+/// 取出文本里所有 `<user_query>…</user_query>` 的内容。
+///
+/// ── 为什么优先认这个标签 ────────────────────────────────────
+/// 它是**客户端自己写的**，不是模型编的，所以按它取词比按长度猜可靠。本机实测
+/// WorkBuddy 的请求里：一条 user 消息 45,932 字符，其中 43,658 是上一轮摘要、
+/// 2,094 是 system-reminder，真正的任务只有 `<user_query>` 里的 180 字符。
+/// 不按标签取，就等于拿上一件事的关键词去检索这一件事的经验。
+///
+/// ── 为什么必须在**单个内容块**内配对 ────────────────────────
+/// 这是第一版的真 bug。同一条 user 消息有三个内容块，历史摘要那个块里出现了
+/// 3 次 `<user_query>`（正文在讨论这个标签），而**一个闭合标签都没有**；
+/// 真正的任务在第三个块里，配对完整。把三块拼成一串再抽，第一个 `<user_query>`
+/// 就会一路吃到第三个块的 `</user_query>` —— 抽出来的是 4 万多字符的整段历史
+/// 摘要，真任务反而被包在里面当成正文。所以这里一定逐块调用。
+fn user_queries(text: &str) -> Vec<String> {
+    const OPEN: &str = "<user_query>";
+    const CLOSE: &str = "</user_query>";
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        let body = &rest[start + OPEN.len()..];
+        let Some(end) = body.find(CLOSE) else { break };
+        let value = body[..end].trim();
+        if !value.is_empty() && !out.iter().any(|known| known == value) {
+            out.push(value.to_string());
+        }
+        rest = &body[end + CLOSE.len()..];
+    }
+    out
+}
+
+/// 最近一条**非空** user 消息的各个内容块（已过滤空块）。
+///
+/// 返回块列表而不是拼接后的整串：`user_queries` 需要逐块配对（见其说明），
+/// 而「这块是不是空」比「整串是不是空」严格 —— 一条只有图片占位的 user 消息
+/// 拼起来是非空的，逐块看才知道它没有文字。
+fn last_user_blocks(messages: &[Value]) -> Vec<String> {
+    messages
+        .iter()
+        .rev()
+        .find_map(|message| {
+            if message.get("role").and_then(Value::as_str) != Some("user") {
+                return None;
+            }
+            let content = message.get("content").cloned().unwrap_or(Value::Null);
+            let blocks: Vec<String> = match &content {
+                Value::String(text) => vec![text.clone()],
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|part| {
+                        if let Some(text) = part.as_str() {
+                            return Some(text.to_string());
+                        }
+                        let kind = part
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_lowercase();
+                        matches!(kind.as_str(), "text" | "input_text" | "output_text")
+                            .then(|| part.get("text").and_then(Value::as_str).unwrap_or("").to_string())
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let blocks: Vec<String> = blocks
+                .into_iter()
+                .filter(|text| !text.trim().is_empty())
+                .collect();
+            (!blocks.is_empty()).then_some(blocks)
+        })
+        .unwrap_or_default()
+}
+
+/// 最后 `count` 条 tool 消息的开头 `window` 个字符。
+fn recent_tool_heads(messages: &[Value], count: usize, window: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for message in messages.iter().rev() {
+        if message.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        let content = message.get("content").cloned().unwrap_or(Value::Null);
+        let text = crate::server::core::protocol::content_text(&content);
+        let head = truncate_chars(text.trim(), window);
+        if !head.trim().is_empty() {
+            out.push(head);
+        }
+        if out.len() >= count {
+            break;
+        }
+    }
+    out
+}
+
 /// 从 Chat 形态的请求体里取「要拿去做线索的文本」。
 ///
-/// 只取最后 4 条 user / tool 消息：最新的一条 user 是本次任务，tool 结果里常有
-/// 文件名与报错。整段历史都拿进来会让线索池被前面几十轮的话题污染。
+/// ── 取词顺序就是优先级 ──────────────────────────────────────
+/// [`probes`] 的名额按桶分配，所以**谁先进来谁占名额**：
+///
+/// | 顺序 | 来源 | 为什么 |
+/// |---|---|---|
+/// | 1 | 最近一条 user 里各内容块的 `<user_query>` | 客户端标注的真实输入，最干净 |
+/// | 2 | 最近一条 user 最后一个块的尾部窗口 | 没打标签的客户端（Claude Code 等）靠这一档 |
+/// | 3 | 最近 2 条 tool 的开头 600 字符 | 命令行里的路径、报错文件位置 |
+///
+/// ── 第一版为什么一条都命中不了 ──────────────────────────────
+/// 第一版取「最后 4 条 user / tool」，且按**倒序**往里拼，20,000 字符预算先被
+/// 最近三条 tool 吃掉 —— 真机上那三条是 631 + 1,195 + 49,630 字符的文件回显和
+/// 日志，拼到第二条就超预算 `break`，**真正含任务的 user 消息一个字都没进**。
+/// 抽出来的线索全是 `.workbuddy/tmp/entries.json`、`row_factory`、`deleted_at`
+/// 这类临时文件与脚本内部名，对着 5,997 条真实记忆跑分，`score >= floor` 的
+/// 候选数是 0。
+///
+/// ── 为什么标签取不到时还要回退 ──────────────────────────────
+/// `<user_query>` 里放的可能是一句「请继续」（本机实测就是这样，180 字符，
+/// 抽不出任何路径或标识符）。只信这一档就等于「用户说请继续 → 零线索 → 不注入」，
+/// 而上下文的真实任务恰恰就在最近那条 tool 回显的命令行里。所以标签档拿到的
+/// 文本里**一个线索都没有**时，继续往下补 tool 开头 —— 有线索才停。
 fn chat_request_text(body: &Value) -> String {
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return String::new();
     };
-    let mut picked: Vec<&Value> = Vec::new();
-    for message in messages.iter().rev() {
-        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
-        if !matches!(role, "user" | "tool") {
-            continue;
-        }
-        picked.push(message);
-        if picked.len() >= 4 {
-            break;
+    let mut out = String::new();
+
+    let blocks = last_user_blocks(messages);
+    for block in &blocks {
+        for query in user_queries(block) {
+            out.push_str(&query);
+            out.push('\n');
         }
     }
-    let mut text = String::new();
-    for message in picked {
-        let content = message.get("content").cloned().unwrap_or(Value::Null);
-        text.push_str(&crate::server::core::protocol::content_text(&content));
-        text.push('\n');
-        if text.chars().count() > 20_000 {
-            break;
+    if out.trim().is_empty() {
+        // 没有标签（或标签里是空的）：退到最后一个内容块的尾部窗口。
+        // 取尾部而不是头部 —— 任务的落点是结尾那一句，历史摘要的开头永远是上一件事。
+        if let Some(last) = blocks.last() {
+            let total = last.chars().count();
+            if total > TAIL_WINDOW {
+                out.extend(last.chars().skip(total - TAIL_WINDOW));
+            } else {
+                out.push_str(last);
+            }
+            out.push('\n');
         }
     }
-    truncate_chars(&text, 20_000)
+    // 标签档抽不出线索时（「请继续」这类），把最近工具回显的开头也补进来：
+    // 命令行里的路径与文件名是这一轮唯一可用的定位线索。
+    if probes(&out).is_empty() {
+        for head in recent_tool_heads(messages, 2, TOOL_WINDOW) {
+            out.push_str(&head);
+            out.push('\n');
+            if out.chars().count() >= REQUEST_TEXT_CAP || !probes(&out).is_empty() {
+                break;
+            }
+        }
+    }
+    truncate_chars(&out, REQUEST_TEXT_CAP)
 }
 
 /// 把注入块插进 Chat 形态的 `messages`。
@@ -1003,12 +1426,38 @@ pub fn preview(request_text: &str) -> Value {
                 .partial_cmp(&left.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        rows.truncate(12);
-        rows.iter()
-            .map(|(score, floor, entry)| {
-                // `score` / `floor` 在这里是引用（`rows.iter()` 给的是借用），
-                // 显式解引用一次，免得读的人以为比较的是指针
-                let (score, floor) = (*score, *floor);
+        // ── 去重必须在截断**之前** ──────────────────────────────
+        // 先截 12 条再按组去重，得到的是「12 条里剩 1 条」，而不是「12 个不同的
+        // 组」。真机就是这样：前 12 条全是同一个导入会话的碎片（`538e6914-…`，
+        // 只是序号不同），界面上看着像 12 条候选，其实是同一件事说了 12 遍。
+        //
+        // 这里逐条走完，把「过线且是某个组的第一条」的数到 12 为止；重复项仍然
+        // 收进来（但标 `duplicate: true`），用户才能看见「14 条候选里 13 条被折叠」
+        // —— 那是门槛和去重都在工作的证据。
+        let mut seen_groups: Vec<String> = Vec::new();
+        let mut seen_lines: Vec<String> = Vec::new();
+        let mut kept: Vec<(f64, f64, &MemoryEntry, bool, bool, String, String)> = Vec::new();
+        let mut fresh_passed = 0usize;
+        for (score, floor, entry) in rows {
+            let group = group_key(entry);
+            let text = line(entry, 56);
+            let duplicate = seen_groups.iter().any(|known| known == &group)
+                || seen_lines.iter().any(|known| known == &text);
+            if !duplicate {
+                seen_groups.push(group.clone());
+                seen_lines.push(text.clone());
+            }
+            let pass = score >= floor;
+            if pass && !duplicate {
+                fresh_passed += 1;
+            }
+            kept.push((score, floor, entry, pass, duplicate, group, text));
+            if fresh_passed >= 12 || kept.len() >= 24 {
+                break;
+            }
+        }
+        kept.into_iter()
+            .map(|(score, floor, entry, pass, duplicate, group, text)| {
                 serde_json::json!({
                     "id": entry.id,
                     "title": entry.title,
@@ -1016,7 +1465,11 @@ pub fn preview(request_text: &str) -> Value {
                     "layer": if entry.layer == Layer::L2 { "l2" } else { "l1" },
                     "score": (score * 100.0).round() / 100.0,
                     "floor": floor,
-                    "pass": score >= floor,
+                    "pass": pass,
+                    // 同一件事的重复项：`pass` 仍为真，但不会进注入块
+                    "duplicate": duplicate,
+                    "group": group,
+                    "line": text,
                     "files": entry.files.clone(),
                 })
             })
@@ -1055,6 +1508,236 @@ mod tests {
         assert!(!is_internal_origin("claude-cli/2.0.1 (external, cli)"));
         assert!(!is_internal_origin("codex_cli_rs/0.51.0"));
         assert!(!is_internal_origin(""));
+    }
+
+    // ── 真机事故回归（attempts=109 / count=0）────────────────────
+
+    #[test]
+    fn marker_in_user_text_does_not_block_injection() {
+        // 真机事故：历史摘要正文里写了 `<agent2api-memory>` 这个标签名，模型也把
+        // 注入块贴回过聊天里。第一版 `already_chat` 扫**全部**消息找 MARKER，
+        // 于是从那一刻起整条会话被永久判成「已注入」，注入一次都没发生
+        //（计数器 attempts=109 / count=0 / missed=109）。
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "你是助手" },
+                // 历史摘要里提到这个标签名 —— 必须不算「已注入」
+                { "role": "user", "content": "上次说过 ` <agent2api-memory> ` 这个标签" },
+                // tool 回显把 inject.rs 读了一遍 —— 也必须不算
+                { "role": "tool", "content": "120: pub const MARKER: &str = \"<agent2api-memory>\";" },
+                { "role": "user", "content": "继续" }
+            ]
+        });
+        assert!(
+            !already_chat(&body),
+            "user / tool 文本里出现 MARKER 不能判成已注入"
+        );
+
+        // 真正被注入过的形状：system 角色 + 开头就是 MARKER
+        let injected = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "你是助手" },
+                { "role": "system", "content": format!("{MARKER}\n以下是本机记忆中枢…{MARKER_END}") },
+                { "role": "user", "content": "继续" }
+            ]
+        });
+        assert!(already_chat(&injected));
+        // 前面有空白的也算（渲染时可能有缩进）
+        let padded = serde_json::json!({
+            "messages": [{ "role": "system", "content": format!("  \n{MARKER}x{MARKER_END}") }]
+        });
+        assert!(already_chat(&padded));
+    }
+
+    #[test]
+    fn chat_text_prefers_user_query_over_tool_dump() {
+        // 真机请求的形状：一条 user 消息里三个块，第二块是 4 万字符的历史摘要
+        // （正文里出现了 3 次 `<user_query>` 但没有闭合标签），第三块才是真任务。
+        // 第一版把三块拼成一串再抽标签，第一个 `<user_query>` 一路吃到第三块的
+        // 闭合标签 —— 抽出来是整段历史摘要，真任务反而被包在里面。
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "系统说明：用户输入用 <user_query> 标签标注" },
+                { "role": "user", "content": [
+                    { "type": "text", "text": "<system-reminder>\n当前时间 10:49\n</system-reminder>" },
+                    // 历史摘要：含 3 次未闭合的 <user_query> —— 拼接后会造成错配
+                    { "type": "text", "text": "<conversation_history_summary>\n1. 修改 `<user_query>` / `<user_query> tag` 这类结构\n2. 之前提到 `<user_query>` 写错的坑\n</conversation_history_summary>" },
+                    { "type": "text", "text": "<user_query>改一下 inject.rs 里的 chat_request_text</user_query>" }
+                ]},
+                // 最近一条 tool：一次 Read 回显了 5 万字符源码
+                { "role": "tool", "content": "   1→//! 记忆中枢 请求级注入\n  120→pub const MARKER..." }
+            ]
+        });
+        let text = chat_request_text(&body);
+        assert!(
+            text.contains("chat_request_text"),
+            "真任务必须被取到：{text}"
+        );
+        assert!(
+            !text.contains("conversation_history_summary"),
+            "历史摘要不能顶替真任务：{text}"
+        );
+        // 抽出来的线索必须是路径/标识符，不该是历史摘要里的泛词
+        let found = probes(&text);
+        assert!(
+            found.iter().any(|item| item.contains("inject.rs")),
+            "真任务的路径必须进线索池：{found:?}"
+        );
+    }
+
+    #[test]
+    fn chat_text_falls_back_to_tool_when_query_has_no_clue() {
+        // 「请继续」这类输入抽不出任何线索。这时必须退到最近工具回显的命令行 ——
+        // 那是这一轮唯一可用的定位线索，不退的话注入永远是空的。
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "user", "content": "<user_query>please continue</user_query>" },
+                { "role": "tool", "content": "Command: cd repo && wc -l desktop-tauri/src-tauri/server/src/server/core/memory/inject.rs" }
+            ]
+        });
+        let found = probes(&chat_request_text(&body));
+        assert!(
+            found.iter().any(|item| item.contains("inject.rs")),
+            "用户输入无线索时必须回退到工具回显：{found:?}"
+        );
+    }
+
+    #[test]
+    fn probes_skip_temp_files_and_library_idents() {
+        // 真机抽出来的第一批线索全是噪音：它们来自「我自己排障时」写出的临时
+        // 文件和脚本内部名，`files` 里永远不会有记忆锚定到它们，纯占名额。
+        let text = "python -c \"json.dump(..., open('.workbuddy/tmp/entries-full.json'))\" \
+                    conn.row_factory = sqlite3.Row; ensure_ascii=False; deleted_at is null; \
+                    改 desktop-tauri/src-tauri/server/src/server/core/memory/inject.rs";
+        let found = probes(text);
+        assert!(
+            !found.iter().any(|item| item.contains("workbuddy/tmp")),
+            "临时目录不该进线索池：{found:?}"
+        );
+        assert!(
+            !found.iter().any(|item| item == "row_factory" || item == "deleted_at" || item == "ensure_ascii"),
+            "库内部标识符不该进线索池：{found:?}"
+        );
+        assert!(
+            found.iter().any(|item| item.contains("memory/inject.rs")),
+            "真路径必须留住：{found:?}"
+        );
+    }
+
+    #[test]
+    fn probes_rank_paths_above_bare_filenames() {
+        // 一次 `ls` 会回显十几个光杆文件名（`agents.rs`、`config.rs`…）。它们和
+        // 真正被改的那条路径混在一起时，必须让带目录的路径排在前面并占满额度 ——
+        // 带目录的路径在仓库里唯一，光杆文件名有十几个同名。
+        let text = "ls memory/\nagents.rs\nconfig.rs\nenrich.rs\nimport.rs\nimport_registry.rs\n\
+                    index.rs\ninject.rs\nlayout.rs\nllm.rs\nmod.rs\nmodel.rs\nredact.rs\n\
+                    schedule.rs\nsearch.rs\nstore.rs\nsync.rs\n\
+                    改的是 desktop-tauri/src-tauri/server/src/server/core/memory/inject.rs";
+        let found = probes(text);
+        let path_at = found
+            .iter()
+            .position(|item| item.contains("memory/inject.rs"))
+            .expect("带目录的路径必须在：{found:?}");
+        let first_bare = found.iter().position(|item| item == "inject.rs");
+        assert!(
+            first_bare.map(|index| path_at < index).unwrap_or(true),
+            "带目录的路径必须排在光杆文件名之前：{found:?}"
+        );
+        let bare = found.iter().filter(|item| !item.contains('/')).count();
+        assert!(bare <= 4, "光杆文件名最多占 4 个名额：{found:?}");
+    }
+
+    #[test]
+    fn probes_normalise_backslashes_and_drop_odd_backtick_runs() {
+        // Windows 路径的反斜杠形态必须归一化：不归一化就会抽出两条（\personal\…
+        // 与 /personal/…），而记忆里存的是正斜杠，反斜杠那条永远命不中。
+        let found = probes("读 D:\\Personal\\Desktop\\agent2api-main\\desktop-tauri\\src-tauri\\server\\src\\server\\core\\memory\\inject.rs");
+        assert!(
+            found.iter().all(|item| !item.contains('\\')),
+            "线索里不该残留反斜杠：{found:?}"
+        );
+        assert!(
+            found.iter().any(|item| item.contains("memory/inject.rs")),
+            "归一化后必须还能命中：{found:?}"
+        );
+
+        // 奇数个反引号会导致配对错位，抽出一整句中文 —— 那一档要求「不含空白」，
+        // 句子必然含空格，所以自然被挡掉。
+        let noisy = probes("当前 `system` 里的 ` <user_query> tag` 是说明文字，`后面没了");
+        assert!(
+            noisy.iter().all(|item| !item.contains(' ') && item.is_ascii()),
+            "错位抽出来的句子必须被挡掉：{noisy:?}"
+        );
+    }
+
+    #[test]
+    fn junk_titles_are_detected_and_not_rendered() {
+        // 导入器拿「会话 id + 序号」拼标题，同一个会话有 2200 多条这种条目。
+        // 把裸 UUID 渲染进注入块是纯浪费：模型从那串十六进制里得不到任何信息。
+        assert!(junk_title("538e6914-d5c6-486e-8635-a90ef475b1c9（866）"));
+        assert!(junk_title("538e6914-d5c6-486e-8635-a90ef475b1c9"));
+        assert!(junk_title(""));
+        // 正常标题不能被误判
+        assert!(!junk_title("注入点"));
+        assert!(!junk_title("beta.1 出包与索引锁"));
+        assert!(!junk_title("deliver.mjs 是唯一交付入口"));
+
+        let mut entry = MemoryEntry::draft(
+            "j1",
+            "538e6914-d5c6-486e-8635-a90ef475b1c9（866）",
+            MemoryKind::Daily,
+            "正文",
+        );
+        entry.summary_text = "beta.1 安装包 19.1MB 出包，三闸全绿".to_string();
+        let rendered = line(&entry, 56);
+        assert!(
+            !rendered.contains("538e6914"),
+            "裸 UUID 不该出现在注入行里：{rendered}"
+        );
+        assert!(
+            rendered.contains("19.1MB"),
+            "摘要必须留下 —— 那是这条唯一有用的内容：{rendered}"
+        );
+    }
+
+    #[test]
+    fn same_session_shards_share_a_group() {
+        // 真机跑分得到 14 条过线候选，全部来自同一个导入会话（同前缀、只差序号）。
+        // 不去重的话 6 个名额会被「一件事的六种流水写法」占满。
+        let mut first = MemoryEntry::draft("a", "538e6914-d5c6-486e-8635-a90ef475b1c9（866）", MemoryKind::Daily, "正文");
+        first.summary_text = "出包成功".to_string();
+        let mut second = MemoryEntry::draft("b", "538e6914-d5c6-486e-8635-a90ef475b1c9（15）", MemoryKind::Daily, "正文");
+        second.summary_text = "另一段流水".to_string();
+        assert_eq!(
+            group_key(&first),
+            group_key(&second),
+            "同一会话的碎片必须落在同一组"
+        );
+        // 不同会话不能被并到一组
+        let other = MemoryEntry::draft("c", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee（1）", MemoryKind::Daily, "正文");
+        assert_ne!(group_key(&first), group_key(&other));
+    }
+
+    #[test]
+    fn rules_survive_an_empty_request_even_with_zero_clues() {
+        // 「必须遵守」不依赖线索：用户钉的规矩对每一条请求都成立。第一版在
+        // `compose` 里对空文本直接 `return None`，于是「版本号保持 beta.1」
+        // 这类硬规则在取不到任务文本的请求里全都被丢掉。
+        // 这里只钉判据本身（不碰真实快照）：空线索 + 有规则候选时，`build` 的
+        // 规则段必须还能产出一条规则行 —— 用一个 draft 条目直接验证渲染路径。
+        let mut rule = MemoryEntry::draft(
+            "r1",
+            "版本号保持 3.5.0-beta.1",
+            MemoryKind::Preference,
+            "用户明确要求：不要自行 bump 版本号。",
+        );
+        rule.pinned = true;
+        assert!(rule_candidate(&rule), "钉住的条目必须进「必须遵守」");
+        let rendered = line(&rule, 56);
+        assert!(rendered.contains("3.5.0-beta.1"), "{rendered}");
+
+        // 空线索时 `probes("")` 为空 —— 「相关经验」段自然空，但规则段不受影响
+        assert!(probes("").is_empty());
     }
 
     #[test]
@@ -1099,12 +1782,28 @@ mod tests {
 
     #[test]
     fn probe_budget_is_capped() {
-        // 24 个上限：线索池要是被一整段长日志塞满，真正的路径会被挤出去
+        // 名额按桶分配（路径 10 + 标识符 10 + 光杆文件名 4 = 24）。一整段长日志
+        // 塞进 60 个标识符时，最多只能占满标识符那一桶 —— 路径桶永远留得下位置，
+        // 这是「一次日志把真任务的路径挤出去」那个真 bug 的回归钉。
         let text = (0..60)
             .map(|index| format!("foo_bar_{index}"))
             .collect::<Vec<_>>()
             .join(" ");
-        assert_eq!(probes(&text).len(), 24);
+        assert_eq!(probes(&text).len(), 10, "标识符桶上限 10");
+
+        // 三档加起来不超过 24
+        let mixed = format!(
+            "{}\n{}",
+            (0..30)
+                .map(|index| format!("dir{index}/nested/file{index}.rs"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            (0..30)
+                .map(|index| format!("ident_{index}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert!(probes(&mixed).len() <= 24, "总名额 24 是硬上限");
     }
 
     #[test]

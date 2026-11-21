@@ -150,6 +150,10 @@ function Dashboard({ status, onGo, onChanged }: DashboardProps): React.ReactElem
               ? t('开关已关')
               : (status.inject?.attempts ?? 0) === 0
                 ? t('还没有请求走过注入')
+                /* `missed` 是「跑过但没命中」。真机上出现过一次假性 missed：
+                   attempts 一路涨、count 恒为 0，根因是判重逻辑把会话里的
+                   MARKER 字面量当成「已注入」直接跳过。修完之后这种形态会
+                   重新变成真实的「没命中」，所以数字本身没有特别标注。 */
                 : t('平均 {n} token / 次 · 未命中 {m} 次', {
                     n: num(status.inject?.avgTokens ?? 0),
                     m: num(status.inject?.missed ?? 0),

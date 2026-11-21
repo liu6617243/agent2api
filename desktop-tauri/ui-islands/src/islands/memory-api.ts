@@ -892,6 +892,16 @@ export type InjectHit = {
   floor: number
   /** `score >= floor` —— 过线了；过线却不在 `text` 里说明被预算挤掉 */
   pass: boolean
+  /**
+   * 和前面某条是「同一件事」（同会话碎片 / 同一句摘要）。
+   * `pass === true && duplicate === true` 表示：够格，但被去重折叠了 ——
+   * 界面上要和「没命中」分开说，否则用户会以为门槛调错了。
+   */
+  duplicate: boolean
+  /** 去重分组键（`junk:<会话id>` 或 `text:<摘要开头>`） */
+  group: string
+  /** 实际会写进注入块的那一行 —— 和 `text` 里的内容逐字一致 */
+  line: string
   files: string[]
 }
 
