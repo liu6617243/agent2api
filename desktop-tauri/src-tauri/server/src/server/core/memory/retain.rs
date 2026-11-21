@@ -106,7 +106,52 @@ pub fn settings() -> Settings {
 /// 与尾部窗口都在 `inject` 里），只是留存不要那层工具回退。
 pub fn user_text(messages: &[Value]) -> String {
     let text = super::inject::user_turn_text(messages);
+    let text = strip_client_wrappers(&text);
     text.chars().take(USER_CAP).collect()
+}
+
+/// 把客户端的包装块从「用户侧」剔掉。
+///
+/// ── 为什么留存要单独剔一遍 ──────────────────────────────────
+/// [`super::inject::user_turn_text`] 是**两边共用**的取词口径，它必须宽：注入侧
+/// 在用户只说「继续」时要靠历史摘要里的路径 / 标识符去索引记忆，剔掉等于让
+/// 注入永远命中不了。
+///
+/// 但留存写的是 `**我**：…`。同一段摘要被写进去，就变成「我上一轮总结过…」
+/// 的伪记录：每轮都把上一轮的结论再存一遍，库开始自我增殖；更糟的是它会把
+/// 真正的一句话挤到后面，读记忆时看到的是模型自己的旧总结。
+///
+/// 所以这里按客户端自己的标签剔：那些块是**客户端**写的，不是用户说的。
+/// 只剔整块命中包装标签的段落，正常的一句话不受影响。
+fn strip_client_wrappers(text: &str) -> String {
+    const WRAPPERS: &[(&str, &str)] = &[
+        ("<conversation_history_summary>", "</conversation_history_summary>"),
+        ("<system-reminder>", "</system-reminder>"),
+        ("<environment_context>", "</environment_context>"),
+    ];
+    let mut out = text.to_string();
+    for (open, close) in WRAPPERS {
+        while let Some(start) = out.find(open) {
+            let rest = &out[start + open.len()..];
+            // 有闭合标签：整段剔掉。没有闭合标签（真机出现过：摘要块只有开标签）
+            // 就从开标签一直剔到结尾 —— 留半截摘要比整段丢掉更糟。
+            let end = match rest.find(close) {
+                Some(at) => start + open.len() + at + close.len(),
+                None => out.len(),
+            };
+            out.replace_range(start..end, "");
+        }
+    }
+    // 上一轮摘要的另一族写法：`<summary>…</summary>` 也按同样方式处理
+    while let Some(start) = out.find("<summary>") {
+        let rest = &out[start + "<summary>".len()..];
+        let end = match rest.find("</summary>") {
+            Some(at) => start + "<summary>".len() + at + "</summary>".len(),
+            None => out.len(),
+        };
+        out.replace_range(start..end, "");
+    }
+    out.trim().to_string()
 }
 
 /// 助手侧文本：最近一条 assistant 消息的正文（不含工具调用块）。
@@ -489,6 +534,33 @@ mod tests {
         ];
         let text = user_text(&messages);
         assert_eq!(text.trim(), "继续", "工具回显不该进用户侧：{text}");
+    }
+
+    #[test]
+    fn user_text_never_includes_history_summary() {
+        // 真机形态：整条 user 消息里只有摘要块 + system-reminder，没有
+        // `<user_query>`（用户这一轮只发了张图 / 只点了继续）。尾部窗口会落在
+        // 摘要上 —— 直接写进 `**我**：` 就等于「我上一轮总结过…」的伪记录，
+        // 每轮都把上一轮的结论再存一遍。
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "<conversation_history_summary>上一轮我说：注入零命中的根因是 already_chat 扫全部消息。收尾：已提交 ca045bc9。</conversation_history_summary>" },
+                { "type": "text", "text": "<system-reminder>今天是 2026-11-21，工作目录 D:\\Personal\\Desktop\\agent2api-main。</system-reminder>" }
+            ]
+        })];
+        let text = user_text(&messages);
+        assert!(text.is_empty(), "摘要不该被当成「我说的话」：{text}");
+
+        // 真话与摘要混在一起：只留真话
+        let mixed = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "<conversation_history_summary>旧结论……</conversation_history_summary>\n继续把留存接上" }
+            ]
+        })];
+        let text = user_text(&mixed);
+        assert_eq!(text.trim(), "继续把留存接上", "{text}");
     }
 
     #[test]
