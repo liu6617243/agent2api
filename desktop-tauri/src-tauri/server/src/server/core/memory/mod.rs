@@ -1609,7 +1609,11 @@ fn near_duplicate(entry: &MemoryEntry) -> Option<(String, f64)> {
     let w_edit = config::number("dedup.l2.wEdit");
     let w_title = config::number("dedup.l2.wTitle");
     let mut best: Option<(String, f64)> = None;
-    for other in store::snapshot().iter() {
+    // 快照先绑到局部变量：`for other in store::snapshot().iter()` 虽然临时值会
+    // 活到循环结束（只调一次），但读代码的人得先知道这条临时值生命周期规则才能
+    // 确信它没在每轮重读 55 MB。绑出来是零成本的，且意图直接可读。
+    let all = store::snapshot();
+    for other in all.iter() {
         if other.id == entry.id || !other.is_live() || other.layer != Layer::L2 {
             continue;
         }
@@ -1628,7 +1632,11 @@ fn near_duplicate(entry: &MemoryEntry) -> Option<(String, f64)> {
             continue;
         }
         if best.as_ref().map(|(_, current)| score > *current).unwrap_or(true) {
-            best = Some((other.id, score));
+            // 必须 `.clone()`：`all` 是 `Arc<Vec<MemoryEntry>>`，`other` 是共享
+            // 借用，搬不走 `id`（E0507）。这条在上一轮把 `load_all()` 换成
+            // `snapshot()` 时漏了 —— 当时 `load_all()` 返回 owned `Vec`，
+            // `into_iter()` 能直接搬；换成 `iter()` 之后语义变了。
+            best = Some((other.id.clone(), score));
         }
     }
     best

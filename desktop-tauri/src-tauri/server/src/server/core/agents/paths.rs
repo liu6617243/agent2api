@@ -271,7 +271,7 @@ pub fn config_path(def: &ClientDef) -> PathBuf {
     // 缓存键是客户端 id。`save_override` 会显式 `forget_detection()`（同时清
     // 这张表），所以「改完路径 5 秒内还是旧值」只可能发生在用户手编 json 时。
     if let Ok(cache) = shallow_cache().lock() {
-        if let Some((at, path)) = cache.get(def.id).filter(|(at, _)| at.elapsed() < DETECT_TTL) {
+        if let Some((_, path)) = cache.get(def.id).filter(|(at, _)| at.elapsed() < DETECT_TTL) {
             return path.clone();
         }
     }
