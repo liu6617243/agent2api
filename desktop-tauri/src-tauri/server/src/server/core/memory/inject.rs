@@ -277,7 +277,7 @@ fn push_probe(out: &mut Vec<String>, raw: &str) {
 /// 少这两道闸，线索 `api`（3 个字符，抽得出来）会命中 `src/server/api/chat.rs`，
 /// 拿满 3.0 分直接进注入块 —— 而「请求里出现了 api 这个词」根本不代表它在讲
 /// 那个文件。唯一放宽的是「线索就是完整文件名」（`chat.rs`）：那本身就是精确匹配。
-fn file_hit<'a>(files: impl Iterator<Item = &'a str>, probe: &str) -> bool {
+fn file_hit<'a>(mut files: impl Iterator<Item = &'a str>, probe: &str) -> bool {
     let probe_len = probe.chars().count();
     if probe_len < 4 {
         return false;
