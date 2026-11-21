@@ -75,6 +75,42 @@ git push HEAD:main-patched
 历史上每个 run 都是手动 `workflow_dispatch`，每次都要用户提醒才想起出包。现在这条路已经堵死：
 裸推会被钩子拦下，唯一入口会顺手把包出完。
 
+## 排障纪律：先看真机，再读代码（2026-11-21 因浪费用户 5 小时立此条）
+
+**用户报「页面打不开 / 按钮没反应 / 界面不对」时，第一动作是看真机，不是读代码。**
+
+本机软件就在跑，进程和窗口都能直接拿到：
+
+```bash
+# 1) 找到正在运行的软件主窗口（不要猜进程名）
+powershell -NoProfile -Command "Get-Process | Where-Object { \$_.MainWindowHandle -ne 0 } | Select-Object Id, ProcessName, MainWindowTitle"
+# 2) 截这个窗口的真实画面（Python + PIL，本机已验证可用）
+python - <<'PY'
+import ctypes, ctypes.wintypes as wt, time
+from PIL import ImageGrab
+u = ctypes.windll.user32
+CB = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+found = []
+def cb(h, _):
+    n = u.GetWindowTextLengthW(h)
+    if n:
+        b = ctypes.create_unicode_buffer(n + 1); u.GetWindowTextW(h, b, n + 1)
+        if "Agent2API" in b.value: found.append(h)
+    return True
+u.EnumWindows(CB(cb), 0)
+h = found[0]; u.ShowWindow(h, 9); u.SetForegroundWindow(h); time.sleep(0.8)
+r = wt.RECT(); u.GetWindowRect(h, ctypes.byref(r))
+ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom), all_screens=True).save(r".workbuddy/tmp/live.png")
+PY
+```
+
+**禁止的做法（已犯过的错）**：自己 `python -m http.server` 起静态页、用浏览器直连
+`127.0.0.1:3065` 测接口 —— 那既不是用户看到的界面（没有面板会话、没有桌面壳的 60 秒超时），
+还会因为 401/404 把排查方向带偏。**用户说的「打不开」发生在桌面壳里，就必须在桌面壳里复现。**
+
+**顺序固定为**：真机截图 / 真机日志 → 定位到具体文案或请求 → 再回代码找那一条字符串的出处。
+反过来的顺序（先读代码猜、猜完编个场景验证）已经浪费过用户一整个上午，代价是 5 小时。
+
 ## 反代提供商问题排查
 
 收到反代提供商相关的问题反馈时，**优先使用网络搜索查找已有解决方案**，重点参考同类项目的 Issue、PR、修复记录和适配实现，了解其他项目是否遇到过相同问题、如何解决。**不要默认从零自行排查**：先核对已有方案与本项目的适用性，优先借鉴可靠的解决思路；未找到可靠方案、现有方案不适用或仍有未解决的问题时，再开展针对性的本地排查。
