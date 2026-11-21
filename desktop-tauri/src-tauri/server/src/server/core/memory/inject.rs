@@ -1084,6 +1084,41 @@ fn already_chat(body: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// 原生体（Responses 的 `instructions` / Anthropic 的 `system`）里本进程注入过了吗。
+///
+/// ── 为什么不能 `to_string().contains(MARKER)` ────────────────
+/// 与 [`already_chat`] 是同一个病，只是更容易中招：这两个字段装的是**整个系统
+/// 提示词**，而 Claude Code / Codex 的系统提示词里常年带着项目说明、CLAUDE.md
+/// 全文、甚至一段讨论本仓源码的内容 —— 只要其中出现过 `<agent2api-memory>`
+/// 这个字面量（本仓的 `inject.rs` 自己就写着它），这条路从此永久跳过注入，
+/// 而计数器上表现为「attempts 涨、count 恒 0」，看上去像没命中。
+///
+/// ── 判据为什么是「末尾」而不是「开头」 ──────────────────────
+/// 与 chat 侧不同：原生体不做插入，[`append_native`] 一律把记忆块**追加到
+/// 字段末尾**。所以我们插进去的那一块一定是最后一个内容块 / 字符串尾部，
+/// 且它的结尾恒为 [`MARKER_END`]。判「末尾是否以 MARKER_END 收束」既精确
+/// （不看正文里出现过什么）又与写入方式同构（写在哪就认在哪）。
+fn already_native(
+    body: &Value,
+    key: &str,
+    protocol: crate::server::core::protocol::native::WireProtocol,
+) -> bool {
+    use crate::server::core::protocol::native::WireProtocol;
+    let ends_with_block = |text: &str| text.trim_end().ends_with(MARKER_END);
+    match body.get(key) {
+        // Anthropic 的 `system` 可以是内容块数组：只看**最后一块**的 `text`。
+        // 不能 `filter_map` 回溯前一块 —— 那样「最后一块没有 text」时会拿上一块
+        // 来判，而那正是「没注入」的形状，会被读成「注入过」。
+        Some(Value::Array(parts)) if protocol == WireProtocol::Anthropic => parts
+            .last()
+            .and_then(|part| part.get("text").and_then(Value::as_str))
+            .map(ends_with_block)
+            .unwrap_or(false),
+        Some(Value::String(current)) => ends_with_block(current),
+        _ => false,
+    }
+}
+
 /// 尾部窗口：最后一条 user 消息里「真正的这一句」通常压在末尾。
 ///
 /// WorkBuddy / CodeBuddy 会把整段会话（含上一轮摘要，本机实测 43,658 字符）压进
@@ -1344,11 +1379,7 @@ pub fn inject_native(body: &mut Value, protocol: crate::server::core::protocol::
         WireProtocol::Chat => return inject_chat(body),
     };
     note_attempt();
-    if body
-        .get(key)
-        .map(|value| value.to_string().contains(MARKER))
-        .unwrap_or(false)
-    {
+    if already_native(body, key, protocol) {
         return None;
     }
     // 原生体几 KB 到几百 KB，序列化一次是可接受的（上游请求本来就要序列化它）。
@@ -1873,6 +1904,63 @@ mod tests {
         assert!(already_chat(&injected));
         let plain = serde_json::json!({ "messages": [{ "role": "user", "content": "hi" }] });
         assert!(!already_chat(&plain));
+    }
+
+    #[test]
+    fn already_native_ignores_marker_mentioned_in_system_prompt() {
+        use crate::server::core::protocol::native::WireProtocol;
+        // 真机事故形态：系统提示词里**提到过**这个标签（讨论本仓源码、贴
+        // CLAUDE.md、Codex 的 AGENTS.md 里写了注入块长什么样），但并不是本进程
+        // 追加的那一块。旧判据 `to_string().contains(MARKER)` 会把它当成「已注入」，
+        // 从此这条路永久不注入，而计数器显示 count 恒 0。
+        let poisoned = serde_json::json!({
+            "instructions": format!("你在改 agent2api。注入块长这样：{MARKER}…{MARKER_END}，注意别重复。"),
+            "input": "把注入修好"
+        });
+        assert!(
+            !already_native(&poisoned, "instructions", WireProtocol::Responses),
+            "系统提示词里提到字面量 ≠ 已注入"
+        );
+
+        // 真正追加过的那一块：结尾恒为 MARKER_END
+        let injected = serde_json::json!({
+            "instructions": format!("你在改 agent2api。\n\n{MARKER}\n规则…\n{MARKER_END}"),
+            "input": "把注入修好"
+        });
+        assert!(already_native(&injected, "instructions", WireProtocol::Responses));
+
+        // 没这个字段 = 没注入
+        assert!(!already_native(
+            &serde_json::json!({ "input": "hi" }),
+            "instructions",
+            WireProtocol::Responses
+        ));
+    }
+
+    #[test]
+    fn already_native_checks_last_system_block_for_anthropic() {
+        use crate::server::core::protocol::native::WireProtocol;
+        // Anthropic 的 `system` 是内容块数组：只在**最后一块**是记忆块时才算注入过。
+        // 前面某块正文里提到标签不算 —— 那正是旧判据会误判的形状。
+        let mentioned = serde_json::json!({
+            "system": [
+                { "type": "text", "text": format!("以前见过 {MARKER} 这种块，别照抄。") },
+                { "type": "text", "text": "你是资深工程师。" }
+            ]
+        });
+        assert!(!already_native(
+            &mentioned,
+            "system",
+            WireProtocol::Anthropic
+        ));
+
+        let injected = serde_json::json!({
+            "system": [
+                { "type": "text", "text": "你是资深工程师。" },
+                { "type": "text", "text": format!("{MARKER}\n规则…\n{MARKER_END}") }
+            ]
+        });
+        assert!(already_native(&injected, "system", WireProtocol::Anthropic));
     }
 
     #[test]
