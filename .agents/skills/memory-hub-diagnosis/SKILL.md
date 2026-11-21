@@ -136,7 +136,49 @@ fn next_watermark(processed_to: i64, since: i64, started: i64) -> Option<i64> {
 
 对外入口已拆：`list_for` / `get_for` / `recent_for` / `core_text_for` 单独接 caller。
 
-## 6. 交付
+## 6. 「打开记忆页转半天」怎么查
+
+现象：点记忆中枢，卡在「正在读取记忆库…」好几秒。AgentHub 里很快就出数据。
+
+先量化，别猜。本机实测基线（65 个 `.md` / 55 MB）：
+
+| 动作 | 耗时 |
+| --- | --- |
+| 全量 `load_all()`（读 + 切节 + 每节 SHA-256） | 300~530 ms |
+| 一屏打三遍全量（`/config` + `/projects` + `status`） | ~900 ms |
+| 目录指纹 stat 遍历（快照命中） | ~8 ms |
+| **13 个客户端各跑一次 `paths::detect`** | **2~3 秒** |
+
+最后一行才是主犯：`detect()` 里的 `find_binary` 会把 PATH 上每个目录 ×
+每个可执行名 × 每个 PATHEXT 后缀各 stat 一次（本机 58 × 11 ≈ 4.4 万次）。
+
+### 四个必须一起看的点
+
+| 点 | 症状 | 判据 |
+| --- | --- | --- |
+| `paths::detect` 缓存是 `thread_local` | axum 多线程，每条 worker 各自冷启动，TTL 形同虚设 | 缓存容器是 `thread_local!` + `RefCell` → 改成进程级 `Mutex<HashMap>` |
+| `resources::for_client` 走完整 `detect` | 只要一个路径却扫全盘 | 有没有 `paths::config_path()` 这条浅通道 |
+| `status()` 带 `table_stats()` | 10 张表各一次 `COUNT(*)`，`mem_link` 可达千万行 | 前端有没有真的读 `tables`（本仓：零消费） |
+| `snapshot()` 冷启动没人预热 | 55 MB 解析由第一个开页面的用户付 | 启动后台有没有 `store::warm()` |
+
+### 一条经验：前端首屏不能等「重接口」
+
+`booted` 只该等**决定页面骨架**的那一个请求（`/config`：有哪些页签、默认落哪页）。
+项目列表、体检、表统计都属于「页面画出来之后再补」——把它们放进 `Promise.all`
+等于让最慢的那个决定首屏。
+
+### 派生表也会撑爆索引库
+
+`mem_link` 是派生的，`rebuild()` 却从来不清它 —— 每次重建都在旧图上叠加。
+老 `relink()` 按「同项目 + 任意共同标签」连线，5818 条带 `导入` 标签的记忆
+两两相连 → 810 万行 / 275 MB。
+
+- 泛标签（出现在 >5% 条目上的标签）不能当主题；
+- 每条记忆最多连 5 条边（`MEM_LINK_FANOUT`）；
+- 重建前必须 `clear_links()`；
+- 反向查邻居要有 `mem_link(to_id)` 索引，否则 `WHERE to_id = ?` 是全表扫。
+
+## 7. 交付
 
 改动完照 `delivery-pipeline` 走：
 
