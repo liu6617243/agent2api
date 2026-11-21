@@ -323,8 +323,10 @@ mod tests {
             None,
         )
         .expect("有请求就该有捕获");
-        turn.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"根因\"}}]}\n");
-        turn.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"是标记误判\"}}]}");
+        turn.push("data: {\"choices\":[{\"delta\":{\"content\":\"根因\"}}]}\n".as_bytes());
+        turn.push(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"是标记误判\"}}]}".as_bytes(),
+        );
         assert_eq!(turn.text(), "根因", "最后一句还在 tail 里等着");
 
         // finish 的收尾这一段：把 tail 当最后一行吃掉
