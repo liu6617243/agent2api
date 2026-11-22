@@ -64,7 +64,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use layout::Classified;
-use model::{truncate_chars, DedupStatus, Layer, MemoryEntry};
+use model::{information_score, truncate_chars, DedupStatus, Layer, MemoryEntry};
 use search::Query;
 
 /// 对外暴露的核心类型。
@@ -1564,19 +1564,63 @@ fn write_inner(
     //    是唯一的例外，且它**只标取代、不物理删除**（旧条目仍可恢复）──
     if config::bool_of("dedup.enabled") && config::bool_of("dedup.l2.enabled") && layer == Layer::L2 {
         if let Some((candidate, score)) = near_duplicate(&entry) {
+            // 谁留下不由「谁更新」决定，由信息量决定 —— 见 `information_score`。
+            // 原来的规则是「新的必赢」，真实场面是隔天的「同上，已修复」把一份
+            // 带根因带路径的完整结论顶进回收站，越整理越空。
+            let keep = dedup_keeper(&entry, &candidate);
+            let mut merged_into: Option<String> = None;
             if config::bool_of("review.autoConfirmDedup")
                 && score >= config::number("dedup.l2.autoMergeThreshold")
             {
-                if let Err(error) = apply_dedup(&entry.id, &candidate) {
-                    crate::server::logging::log("[Memory]", &format!("⚠️ 自动采纳去重失败：{error}"));
+                let result = if keep == DedupKeeper::New {
+                    apply_dedup(&entry.id, &candidate)
+                } else {
+                    // 反向：旧的那条更全，把**本次新写的**标成被它取代。
+                    // 仍然不删新条目 —— 演化链要能倒着走回去。
+                    apply_dedup(&candidate, &entry.id)
+                };
+                match result {
+                    Ok(()) => {
+                        if keep == DedupKeeper::Candidate {
+                            merged_into = Some(candidate.clone());
+                        }
+                    }
+                    Err(error) => {
+                        crate::server::logging::log("[Memory]", &format!("⚠️ 自动采纳去重失败：{error}"));
+                    }
                 }
             } else {
                 index::global().enqueue(
                     "dedup",
                     &entry.id,
-                    &json!({ "candidate": candidate, "score": score }),
+                    &json!({
+                        "candidate": candidate,
+                        "score": score,
+                        // 队列里要能看出「批准后会留哪一条」。只写 candidate 的
+                        // 话，人工裁决时无法判断这次批准是把新条并进去还是反过来。
+                        "keep": if keep == DedupKeeper::New { "new" } else { "candidate" },
+                    }),
                     score,
                 );
+            }
+            if let Some(into) = merged_into {
+                // 这一轮写进去的条目当场就被判成旧结论的旁支。返回既有条目的 id，
+                // 否则调用方拿到的是一个「写了但搜不到」的 id（它已被 superseded
+                // 过滤掉），会以为记忆丢了。
+                //
+                // 只在**真的执行了**反向合并时才提前返回：`autoConfirmDedup` 关着
+                // 的时候上面只入队、什么都不改，此时新条目是活的，必须照常返回。
+                crate::server::logging::log(
+                    "[Memory]",
+                    &format!("写入并入 {into}（旧条目信息量更大，本次内容标为被取代）"),
+                );
+                return Ok(json!({
+                    "id": into,
+                    "entry": Value::Null,
+                    "duplicate": true,
+                    "superseded": 0,
+                    "mergedInto": into,
+                }));
             }
         }
     }
@@ -1633,6 +1677,44 @@ fn find_hash_duplicate(hash: &str) -> Option<MemoryEntry> {
         // （例如同一个决定在两个项目里各下了一次），合并会丢掉项目归属
         .find(|entry| entry.layer == Layer::L1)
         .cloned()
+}
+
+/// 两条近似重复里，谁该留下。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DedupKeeper {
+    /// 本次新写的这条信息量更大（或至少一样大）
+    New,
+    /// 库里已有的那条更全，本次内容并入它
+    Candidate,
+}
+
+/// 由**信息量**决定留下谁，而不是由时间。
+///
+/// ── 为什么平手时留新的 ────────────────────────────────────
+/// 分数相同意味着「两边信息量一样」，此时新条目通常包含用户刚补充的口径
+/// （同一句结论的新版本），留它更符合直觉；而且留旧的会让「刚写的东西立刻
+/// 被标成已取代」这种难以解释的结果变多。
+///
+/// ── 为什么不看 `updated_at` ────────────────────────────────
+/// `updated_at` 会被「改了个标签」「点亮星标」推到现在，一次无关操作就能让
+/// 一条短条目赢过一份完整结论。时间只以 `created_at` 的形态进入
+/// `information_score` 的新鲜度项，权重 0.15，压不过「长度 + 标签」。
+fn dedup_keeper(entry: &MemoryEntry, candidate_id: &str) -> DedupKeeper {
+    // 关掉开关就等于退回旧规则：新条取代旧条。这是唯一能让用户「恢复原样」的
+    // 出口 —— 判据本身改的是已有数据的去向。
+    if !config::bool_of("dedup.l2.preferRicher") {
+        return DedupKeeper::New;
+    }
+    let Some(other) = store::snapshot().iter().find(|item| item.id == candidate_id).cloned() else {
+        // 快照里找不到（刚被删 / id 拼错）：结论只能是「保留刚写的这条」，
+        // 因为没有可比的对手。宁可少合并一次，也不能把新条目挂到空气上。
+        return DedupKeeper::New;
+    };
+    if information_score(&other) > information_score(entry) {
+        DedupKeeper::Candidate
+    } else {
+        DedupKeeper::New
+    }
 }
 
 /// L2 近似重复的候选：词面相似度（Dice + 编辑距离）超过 `dedup.l2.candidateThreshold`。
@@ -2218,7 +2300,21 @@ pub fn review_resolve(id: i64, approve: bool) -> Result<Value, String> {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if !candidate.is_empty() {
-                    apply_dedup(&row.target, candidate)?;
+                    // 方向由载荷里的 `keep` 决定：`candidate` = 库里那条更全，
+                    // 把 `target`（新写的）并进去；其余（含老载荷没这个键）沿用
+                    // 「新条取代候选」的旧语义。裁决错了会把一份完整结论埋掉，
+                    // 所以这里不能靠猜。
+                    let keep_candidate = row
+                        .payload
+                        .get("keep")
+                        .and_then(Value::as_str)
+                        .map(|value| value == "candidate")
+                        .unwrap_or(false);
+                    if keep_candidate {
+                        apply_dedup(candidate, &row.target)?;
+                    } else {
+                        apply_dedup(&row.target, candidate)?;
+                    }
                 }
             }
             "supersede" => {
@@ -2597,5 +2693,69 @@ mod tests {
     fn dice_and_levenshtein_sanity() {
         assert!((dice_coefficient("abcd", "abcd") - 1.0).abs() < 1e-9);
         assert_eq!(levenshtein("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn longer_entry_keeps_its_place_over_a_short_follow_up() {
+        // 真实场面：前一天写了一条带根因带路径的完整结论，第二天补一句
+        // 「同上，已修复」。旧的规则是「新的必赢」，这句话会把完整结论顶进回收站。
+        let mut full = MemoryEntry::draft(
+            "a",
+            "发布脚本为什么读不到版本号",
+            MemoryKind::Pitfall,
+            "根因：`scripts/deliver.mjs` 里读的是 `process.env.VERSION`，而 CI 只写了 \
+             `GITHUB_REF_NAME`。修法是把两处对齐，并且不要在读不到时回落到 1.0.0 —— \
+             那会让包名显示成错的版本。实测跑 `node scripts/deliver.mjs` 能看到正确的 \
+             3.5.0-beta.1。",
+        );
+        full.tags = vec!["发布".into(), "版本号".into(), "ci".into()];
+        full.evidence = vec!["run 44921295723".into()];
+
+        let mut short = MemoryEntry::draft(
+            "b",
+            "发布脚本版本号",
+            MemoryKind::Pitfall,
+            "同上，已修复。",
+        );
+        short.tags = vec!["发布".into()];
+
+        assert!(
+            information_score(&full) > information_score(&short),
+            "完整结论的信息量必须高于一句「已修复」"
+        );
+    }
+
+    #[test]
+    fn information_score_caps_runaway_bodies() {
+        // 把整个文件倒进记忆不该换来更高的分：600 字封顶。
+        let mut huge = MemoryEntry::draft("a", "标题", MemoryKind::Knowledge, "字".repeat(20_000));
+        huge.tags = vec!["t".into()];
+        let mut compact = MemoryEntry::draft("b", "标题", MemoryKind::Knowledge, "字".repeat(600));
+        compact.tags = vec!["t".into()];
+        let (h, c) = (information_score(&huge), information_score(&compact));
+        assert!((h - c).abs() < 1e-9, "超长正文与 600 字封顶应当同分，实际 {h} vs {c}");
+    }
+
+    #[test]
+    fn keeper_prefers_the_richer_existing_entry() {
+        // `dedup_keeper` 要查真实记忆根（`snapshot()`），单测环境不保证有，
+        // 所以这里验的是它的**判据**：信息量高的一方必须在比较里胜出。
+        let mut rich = MemoryEntry::draft("old", "t", MemoryKind::Decision, "x".repeat(800));
+        rich.tags = vec!["a".into(), "b".into(), "c".into()];
+        rich.evidence = vec!["ev".into()];
+        let thin = MemoryEntry::draft("new", "t", MemoryKind::Decision, "x".repeat(40));
+        assert!(
+            information_score(&rich) > information_score(&thin),
+            "库里的完整结论应当赢过刚写的一句短话"
+        );
+
+        // 平手时 `dedup_keeper` 返回 New（留新的）：同一句话的修订版通常带
+        // 用户刚补的口径。这里验「同长度同标签 = 同分」，即平手真的会发生。
+        let same_a = MemoryEntry::draft("a", "t", MemoryKind::Decision, "x".repeat(300));
+        let same_b = MemoryEntry::draft("b", "t", MemoryKind::Decision, "x".repeat(300));
+        assert!(
+            (information_score(&same_a) - information_score(&same_b)).abs() < 1e-9,
+            "内容等量时必须真的打成平手，否则「平手留新的」这条规则永远走不到"
+        );
     }
 }

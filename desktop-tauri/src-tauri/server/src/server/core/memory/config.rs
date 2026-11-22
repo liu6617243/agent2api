@@ -311,6 +311,14 @@ static SCHEMA: &[Knob] = &[
         "\"full\""),
         &["none", "trim", "full"]),
     knob("dedup.l2.enabled", Kind::Bool, Tier::Basic, "去重", "L2 文本近似去重", "true"),
+    // 两条近似重复里留谁：默认由信息量决定，而不是「谁更新」。
+    //
+    // 关掉就退回旧规则（新条取代旧条）。留着这个开关是因为它改的是**已有数据**
+    // 的去向：判错的话一条完整结论会被标成已取代（仍可在回收站/演化链里找回），
+    // 用户需要一个不必改配置文件的退路。
+    knob_d("dedup.l2.preferRicher", Kind::Bool, Tier::Advanced, "去重", "留信息量更大的那条",
+        "开：两条近似重复时，正文更长 / 标签更全 / 带代码与证据的那条留下，另一条标为被取代。\
+         关：退回「新条取代旧条」—— 隔天补一句「同上」就可能把完整结论埋掉", "true"),
     range(knob("dedup.l2.autoMergeThreshold", Kind::Number, Tier::Advanced, "去重", "L2 自动合并阈值", "0.9"), 0.5, 1.0),
     range(knob("dedup.l2.candidateThreshold", Kind::Number, Tier::Advanced, "去重", "L2 候选阈值", "0.72"), 0.3, 1.0),
     range(knob("dedup.l2.wDice", Kind::Number, Tier::Internal, "去重", "L2 集合相似度权重", "0.5"), 0.0, 1.0),
