@@ -887,6 +887,68 @@ fn from_transcript(path: &Path, project: Option<String>) -> Vec<Pending> {
 ///
 /// 读失败时游标**原地不动** —— 下一轮会重试同一段，而不是把读不了的区间悄悄
 /// 跳过。这是「失败不推进水位」在文件级的同一条口径。
+/// 会话记录自己声明的工作目录，取末级目录名当项目名。
+///
+/// ── 为什么不能直接用来源目录名 ──────────────────────────────
+/// 来源是「客户端把会话存在哪」，不是「这段对话在哪个项目里」。两者在真机上
+/// 差异极大：`~/.workbuddy/projects/<编码后的工作区>/` 里，来源末级恒为
+/// `projects`，于是几千条不同项目的对话全被归进同一个 `projects` 项目。
+///
+/// ── 认哪些声明 ───────────────────────────────────────────────
+/// | 客户端 | 声明形态 |
+/// |---|---|
+/// | WorkBuddy | `<user_info>` 里 `Workspace Folder: C:\...\名字` |
+/// | 各类 harness | `<environment_context>cwd=/x/y</environment_context>` |
+/// | 会话元数据 | 行内 `"cwd":"/x/y"` |
+///
+/// 只取**末级目录名**，且要求它像名字（不是 `C:`、不是纯数字）。末级目录名
+/// 会在写入侧走 `layout::classify`，那里再按 git 身份折成 slug —— 这里不做
+/// 第二套判断。
+fn declared_project_of(raw: &str) -> Option<String> {
+    const KEYS: &[&str] = &[
+        "Workspace Folder:",
+        "workspace folder:",
+        "\"cwd\"",
+        "cwd=",
+        "working directory:",
+        "Working directory:",
+    ];
+    // 只扫前 40 KB：工作目录是会话开头的固定信息，扫全文等于把十几 MB 读两遍
+    let head: String = raw.chars().take(40_000).collect();
+    for key in KEYS {
+        let Some(at) = head.find(key) else { continue };
+        let rest = &head[at + key.len()..];
+        let rest = rest.trim_start_matches(|ch: char| {
+            matches!(ch, ':' | '"' | '=' | '>' | ' ' | '\t')
+        });
+        // 路径到引号 / 换行 / 尖括号为止
+        let path = rest
+            .split(|ch: char| matches!(ch, '"' | '\n' | '\r' | '<' | '>'))
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(|ch: char| matches!(ch, '\\' | '/' | '。' | '.' | ','));
+        if path.is_empty() {
+            continue;
+        }
+        // 末级目录名：Windows 反斜杠与 Unix 正斜杠都算分隔符。
+        // ⚠️ 这里不能用 `?`：`declared_project_of` 返回 Option，`?` 会直接
+        // 结束整个函数（而不是「跳过这个 key 看下一个」）—— 第一个 key 命中但
+        // 末尾带斜杠时，后面所有 key 就再也不会被检查了。
+        let Some(name) = path.rsplit(|ch| ch == '\\' || ch == '/').find(|part| !part.trim().is_empty())
+        else {
+            continue;
+        };
+        let name = name.trim();
+        // 盘符（`C:`）、纯数字、单字符都不像项目名 —— 宁可退回来源名
+        if name.len() < 3 || name.ends_with(':') || name.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        return Some(name.to_string());
+    }
+    None
+}
+
 fn from_transcript_at(
     path: &Path,
     project: Option<String>,
@@ -918,6 +980,20 @@ fn from_transcript_at(
     // 收成「一段发言一行」的片段：`(格式化正文, 该段原始时间)`。超长单段先单独切碎，
     // 保证后面按窗口打包时每片都不会撑爆窗口。
     let mut segments: Vec<(String, Option<i64>)> = Vec::new();
+    // ── 项目名要按会话自己声明的工作目录修正 ────────────────────
+    // 真机事故：导入把 `~/.workbuddy/projects` 这份来源的末级目录名
+    // (`projects`) 当成项目名，3162 条全部落进一个叫 `projects` 的假项目，
+    // 真正的项目目录一个都没建出来。同一台机器上 `~/.qoder-cn/projects`
+    // 也是末级 `projects` —— 两个来源合起来更像「一个项目」了。
+    //
+    // 会话记录里其实写着工作目录：`Workspace Folder: C:\...\WorkBuddy\2026-09-23-...`
+    // 或 `<environment_context>cwd=/x</environment_context>`。它的末级目录名
+    // 才是「这段对话在哪个项目里」，比来源目录名准得多（来源目录名只说明
+    // 「这个客户端把会话存在哪」）。
+    //
+    // 只在会话自己**说了**的时候才改：没说就沿用来源名，不能凭空造。
+    let declared_project = declared_project_of(&raw);
+    let project = declared_project.or(project);
     for line in raw.lines() {
         if line.trim().is_empty() {
             continue;
@@ -2210,6 +2286,35 @@ mod tests {
         // 元数据行不该变成一条对话
         assert!(line_to_turn(r#"{"type":"summary","summary":"x"}"#).is_none());
         assert!(line_to_turn("not json").is_none());
+    }
+
+    #[test]
+    fn declared_workspace_name_beats_the_source_folder() {
+        // 真机事故：来源末级目录恒为 `projects`，3162 条全被归进一个假项目。
+        // 会话自己声明了 Workspace Folder，它的末级目录名才是真正的项目名。
+        let raw = concat!(
+            r#"{"type":"user","content":[{"type":"input_text","text":"#,
+            r#""<system-reminder><user_info>Workspace Folder: C:\\Users\\me\\WorkBuddy\\2026-09-23-23-24-35</user_info></system-reminder>"#,
+            r#""}]}"#,
+            "\n"
+        );
+        assert_eq!(
+            declared_project_of(raw).as_deref(),
+            Some("2026-09-23-23-24-35"),
+            "应取 Workspace Folder 的末级目录名"
+        );
+
+        // harness 的 environment_context 写法
+        let raw = r#"{"role":"user","content":"<environment_context>cwd=/home/me/project</environment_context>"}"#;
+        assert_eq!(declared_project_of(raw).as_deref(), Some("project"));
+
+        // 没声明就不能凭空造：返回 None，调用方沿用来源名
+        let raw = r#"{"role":"user","content":"帮我把端口改成 3065"}"#;
+        assert_eq!(declared_project_of(raw), None);
+
+        // 盘符 / 纯数字不像项目名，宁可退回来源名
+        let raw = r#"{"cwd":"C:\\"}"#;
+        assert_eq!(declared_project_of(raw), None);
     }
 
     /// 客户端注入的上下文信封不是对话内容，必须整段滤掉。
