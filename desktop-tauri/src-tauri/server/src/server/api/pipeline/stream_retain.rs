@@ -219,7 +219,7 @@ impl TurnCapture {
 /// 只认「开始」类事件就够：一次工具调用必然先出现这些帧。不做「参数是否收完」
 /// 那种判定 —— 参数在 `input_json_delta` 里逐片拼，拼完才完整，而「有工具
 /// 调用」这件事在第一个分片上就已经成立。
-fn has_tool_call(dialect: &Dialect, value: &Value) -> bool {
+fn has_tool_call(dialect: Dialect, value: &Value) -> bool {
     match dialect {
         Dialect::Chat => value
             .get("choices")
@@ -459,7 +459,11 @@ mod tests {
     fn plain_text_answer_is_not_marked_as_continued() {
         // 收尾轮：模型只说了话、没再调工具 —— 这种才该写进记忆。
         let mut turn = capture(Dialect::Chat);
-        turn.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"**结论**：修好了。\"}}]}\n\n");
+        // ⚠️ 不能写 `b"...中文..."`：Rust 的字节串字面量只接受 ASCII，
+        // 中文必须写成普通字符串再 `.as_bytes()`（同 0109f57f 那次的事故）。
+        turn.push(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"**结论**：修好了。\"}}]}\n\n".as_bytes(),
+        );
         assert!(!turn.used_tools());
 
         // Responses 的推理项不能误判成工具调用

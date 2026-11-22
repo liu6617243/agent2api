@@ -439,6 +439,132 @@ function buildModuleTree(files) {
   return { declared, parentOf }
 }
 
+/// 字节串字面量 `b"..."` 里不允许非 ASCII。
+///
+/// ── 为什么这条检查必须在本地跑 ──────────────────────────────
+/// Rust 的 `b"..."` 只接受 ASCII；塞进中文的报错是
+/// `error: non-ASCII character in byte string literal`，而且**一处中文会拆成
+/// 每字节一条错误**（「修好了」三个字能刷出 9 条）。CI 上看到的是十来条
+/// 同形错误，很容易误以为是别的地方炸了。
+///
+/// 这个坑踩过两次（0109f57f、c0488917），两次都是测试夹具里写了
+/// `turn.push(b"data: {...中文...}")`。正确写法是普通字符串再 `.as_bytes()`。
+/// 它是**纯文本**就能判的，不该等到 CI 编译才发现。
+function scanByteStrings(files) {
+  const problems = []
+  for (const file of files) {
+    const src = readFileSync(file, 'utf8')
+    // ⚠️ 不能用 `maskCode`：它把字节串的**内容**也清成空格（那正是给结构体
+    // 字段扫描用的），于是中文早就被抹平了，永远扫不到。这里只遮注释。
+    const mask = blankComments(src)
+    // 匹配 `b"..."`（含 `br"..."` 原始字节串），跳过转义字符
+    const re = /\bbr?"(?:[^"\\]|\\.)*"/g
+    let hit
+    while ((hit = re.exec(mask)) !== null) {
+      const literal = hit[0]
+      if (!/^[\x00-\x7F]*$/.test(literal)) {
+        const line = mask.slice(0, hit.index).split('\n').length
+        problems.push({ file, line, literal: literal.slice(0, 60) })
+      }
+    }
+  }
+  return problems
+}
+
+/// 只把注释抹成空白，字符串原样保留（与 `maskCode` 分开）。
+function blankComments(src) {
+  const out = src.split('')
+  const n = src.length
+  let i = 0
+  const blank = (from, to) => {
+    for (let k = from; k < to && k < n; k += 1) if (out[k] !== '\n') out[k] = ' '
+  }
+  while (i < n) {
+    const c = src[i]
+    const next = src[i + 1]
+    if (c === '/' && next === '/') {
+      let j = i
+      while (j < n && src[j] !== '\n') j += 1
+      blank(i, j)
+      i = j
+      continue
+    }
+    if (c === '/' && next === '*') {
+      let depth = 0
+      let j = i
+      while (j < n) {
+        if (src[j] === '/' && src[j + 1] === '*') {
+          depth += 1
+          j += 2
+          continue
+        }
+        if (src[j] === '*' && src[j + 1] === '/') {
+          depth -= 1
+          j += 2
+          if (depth === 0) break
+          continue
+        }
+        j += 1
+      }
+      blank(i, j)
+      i = j
+      continue
+    }
+    // 普通字符串 / 字节串 / 原始字符串整段跳过，免得里面的 `//` 被当成注释
+    if (c === '"') {
+      let j = i + 1
+      while (j < n) {
+        if (src[j] === '\\') {
+          j += 2
+          continue
+        }
+        if (src[j] === '"') {
+          j += 1
+          break
+        }
+        j += 1
+      }
+      i = j
+      continue
+    }
+    if (c === 'b' && (next === '"' || next === 'r')) {
+      let j = i + 1
+      if (src[j] === 'r') {
+        j += 1
+        let hashes = 0
+        while (src[j] === '#') {
+          hashes += 1
+          j += 1
+        }
+        if (src[j] === '"') {
+          const terminator = '"' + '#'.repeat(hashes)
+          const end = src.indexOf(terminator, j + 1)
+          i = end === -1 ? n : end + terminator.length
+          continue
+        }
+      }
+      if (src[j] === '"') {
+        j += 1
+        while (j < n) {
+          if (src[j] === '\\') {
+            j += 2
+            continue
+          }
+          if (src[j] === '"') {
+            j += 1
+            break
+          }
+          j += 1
+        }
+        i = j
+        continue
+      }
+    }
+    i += 1
+  }
+  return out.join('')
+}
+
 function scanModPaths(files) {
   const { declared, parentOf } = buildModuleTree(files)
   const problems = []
@@ -491,9 +617,10 @@ if (!files.length) {
 const types = scanDefinitions(files)
 const problems = scanLiterals(files, types)
 const pathProblems = scanModPaths(files)
+const byteProblems = scanByteStrings(files)
 const rel = file => path.relative(root, file).split(path.sep).join('/')
 
-if (!problems.length && !pathProblems.length) {
+if (!problems.length && !pathProblems.length && !byteProblems.length) {
   console.log(
     `precheck:rust OK — ${files.length} 个文件 / ${types.size} 个类型定义，结构体字面量字段与 mod 路径都没问题。`,
   )
@@ -529,5 +656,16 @@ if (problems.length) {
 if (pathProblems.length) {
   console.error(`\nprecheck:rust 失败：${pathProblems.length} 处 mod 路径解析不了。`)
   console.error('这会在 CI 里以 E0433 编译失败 —— 把代码搬进内联 mod 之后，super:: 的层级跟着变了。')
+}
+for (const item of byteProblems) {
+  console.error(`✗ ${rel(item.file)}:${item.line} — 字节串字面量里有非 ASCII 字符`)
+  console.error(`    ${item.literal}`)
+}
+if (byteProblems.length) {
+  console.error(`\nprecheck:rust 失败：${byteProblems.length} 处字节串里塞了非 ASCII。`)
+  console.error(
+    '这会在 CI 里以「non-ASCII character in byte string literal」编译失败（而且一处中文会拆成每字节一条错误）。' +
+      '改成普通字符串再 `.as_bytes()`：`\"...中文...\".as_bytes()`。',
+  )
 }
 process.exit(1)
