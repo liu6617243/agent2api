@@ -150,6 +150,11 @@ function MemoryPage(): React.ReactElement {
   const [booted, setBooted] = React.useState(false)
   const [focusId, setFocusId] = React.useState<string | null>(null)
   const [focusProject, setFocusProject] = React.useState<string | null>(null)
+  /**
+   * 「跳浏览页并直接打开这一段」。目前只有「待确认」需要：仪表盘与顶栏的待确认
+   * 徽标点进去必须落在待裁决清单上，而不是落在普通列表上再让人自己找。
+   */
+  const [focusView, setFocusView] = React.useState<'review' | null>(null)
 
   /**
    * 项目列表：**不参与首屏**，由 `loadShell()` 在后台触发。
@@ -297,6 +302,17 @@ function MemoryPage(): React.ReactElement {
     switchTab('browse')
   }
 
+  /**
+   * 「去裁决」/「N 条待确认」→ 浏览页的待确认清单。
+   *
+   * 只调 `switchTab('browse')` 是不够的：浏览页默认是「列表」，待确认在四段控件
+   * 的第三段里。真机反馈正是「仪表盘说有 41 条待确认，点进去不知道去哪处理」。
+   */
+  const openReview = () => {
+    setFocusView('review')
+    switchTab('browse')
+  }
+
   return (
     <div className='mm-page'>
       <div className='mm-head'>
@@ -318,7 +334,16 @@ function MemoryPage(): React.ReactElement {
             </Badge>
           ) : null}
           {status && (status.review.pending ?? 0) > 0 ? (
-            <Badge variant='warning' shape='tag'>{t('{n} 条待确认', { n: status.review.pending ?? 0 })}</Badge>
+            // 徽标本身就是入口：看到「41 条待确认」的第一反应是「点它」，
+            // 以前它只是个 Badge，点了没反应，也没有别处写着处理路径。
+            <button
+              type='button'
+              onClick={openReview}
+              title={t('去「浏览 → 待确认」逐条批准或忽略')}
+              style={{ background: 'none', border: 0, padding: 0, cursor: 'pointer', lineHeight: 0 }}
+            >
+              <Badge variant='warning' shape='tag'>{t('{n} 条待确认', { n: status.review.pending ?? 0 })}</Badge>
+            </button>
           ) : null}
           <Button
             type='button'
@@ -342,7 +367,12 @@ function MemoryPage(): React.ReactElement {
         <div className='mm-body-area'>
           {tab === 'dashboard' ? (
             <TabBoundary name='仪表盘'>
-              <Dashboard status={status} onGo={next => switchTab(next as Tab)} onChanged={afterChange} />
+              <Dashboard
+                status={status}
+                onGo={next => switchTab(next as Tab)}
+                onReview={openReview}
+                onChanged={afterChange}
+              />
             </TabBoundary>
           ) : null}
 
@@ -356,6 +386,8 @@ function MemoryPage(): React.ReactElement {
                 onFocusConsumed={() => setFocusId(null)}
                 focusProject={focusProject}
                 onFocusProjectConsumed={() => setFocusProject(null)}
+                focusView={focusView}
+                onFocusViewConsumed={() => setFocusView(null)}
                 pageSize={ui?.pageSize}
               />
             </TabBoundary>

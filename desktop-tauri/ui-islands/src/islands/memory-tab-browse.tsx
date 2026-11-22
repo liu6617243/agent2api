@@ -68,6 +68,15 @@ type BrowseProps = {
   /** 外部要求按某个项目筛选（项目页「查看记忆」跳过来） */
   focusProject?: string | null
   onFocusProjectConsumed?: () => void
+  /**
+   * 外部要求直接打开某个视图（仪表盘「去裁决」跳「待确认」）。
+   *
+   * 为什么不能只跳页签：浏览页默认落在「列表」，而待确认是四段控件里的第三段。
+   * 只切页签的结果是用户到了一张「共 199 条」的普通列表，看不见任何一条待裁决
+   * 建议 —— 那正是「点了去裁决却不知道去哪处理」的来源。跳转必须带视图。
+   */
+  focusView?: View | null
+  onFocusViewConsumed?: () => void
   /** 每页条数（配置项 `ui.pageSize`）。缺省按 50 —— 老后端不下发这个值时照样能用。 */
   pageSize?: number
 }
@@ -80,6 +89,8 @@ function Browse({
   onFocusConsumed,
   focusProject,
   onFocusProjectConsumed,
+  focusView,
+  onFocusViewConsumed,
   pageSize = PAGE_SIZE_FALLBACK,
 }: BrowseProps): React.ReactElement {
   const [view, setView] = React.useState<View>('list')
@@ -127,6 +138,18 @@ function Browse({
   const pages = Math.max(1, Math.ceil(total / pageSize))
 
   const review = useLoad(() => m.loadReview('pending', undefined, 50), [])
+
+  // 外部指定视图（仪表盘「去裁决」）：切到那一段并拉一次最新队列。
+  // 消费后立刻清掉，否则用户手动切回「列表」又会被下一次渲染顶回来。
+  React.useEffect(() => {
+    if (!focusView) return
+    setView(focusView)
+    setPage(0)
+    if (focusView === 'review') review.reload()
+    onFocusViewConsumed?.()
+    // review.reload 每次渲染都是新函数，但它只读同一个 useLoad 状态
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusView, onFocusViewConsumed])
 
   const heat = useLoad<m.MemoryHeat | null>(
     () => (view === 'heatmap' ? m.loadHeat(HEAT_DAYS) : Promise.resolve(null)),

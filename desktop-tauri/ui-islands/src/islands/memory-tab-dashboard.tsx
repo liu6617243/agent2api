@@ -26,11 +26,19 @@ import { Empty, Panel, Section, StateBadge, num, timeText, useLoad } from './mem
 type DashboardProps = {
   status: m.MemoryStatus | null
   onGo: (tab: 'browse' | 'profile' | 'auto' | 'sync' | 'agents') => void
+  /**
+   * 「去裁决」的专用出口：跳浏览页**并直接落在「待确认」那一段**。
+   *
+   * 以前这个按钮只调 `onGo('browse')`，用户落到的是「共 N 条」的普通列表 ——
+   * 待确认是四段控件里的第三段，得自己发现并点进去。真机反馈就是
+   * 「显示 41 条待确认，但不知道去哪处理」。跳页签必须带视图。
+   */
+  onReview?: () => void
   /** 重建索引会改条数，重建完让外层刷新一次 status。 */
   onChanged?: () => void
 }
 
-function Dashboard({ status, onGo, onChanged }: DashboardProps): React.ReactElement {
+function Dashboard({ status, onGo, onReview, onChanged }: DashboardProps): React.ReactElement {
   const auto = useLoad(() => m.loadAuto(), [])
   const health = useLoad(() => m.loadHealth(20), [])
   const sync = useLoad(() => m.loadSync(), [])
@@ -191,8 +199,12 @@ function Dashboard({ status, onGo, onChanged }: DashboardProps): React.ReactElem
           <TodoRow
             state={backlogged ? 'warn' : 'ok'}
             title={t('待确认队列')}
-            detail={pending ? t('{n} 条建议等待裁决（去重 / 归类 / 失效判定）', { n: pending }) : t('没有积压')}
-            action={pending ? { label: t('去裁决'), run: () => onGo('browse') } : undefined}
+            detail={pending
+              ? t('{n} 条建议等待裁决（去重 / 归类 / 失效判定）· 在「浏览 → 待确认」逐条批准或忽略', { n: pending })
+              : t('没有积压')}
+            action={pending
+              ? { label: t('去裁决'), run: () => (onReview ? onReview() : onGo('browse')) }
+              : undefined}
           />
           <TodoRow
             state={stale > 0 ? 'warn' : 'ok'}
