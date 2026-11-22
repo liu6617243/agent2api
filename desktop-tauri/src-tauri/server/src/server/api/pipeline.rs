@@ -1107,8 +1107,82 @@ pub fn retain_answer(source: &TurnSource, answer: &str, interrupted: bool) {
             None,
             session.as_deref(),
             interrupted,
+            false,
         )
     });
+}
+
+/// 收尾时发现这一轮的响应里带了工具调用：说明模型还要接着跑，不是「一轮说完」。
+///
+/// ── 为什么单独一个参数而不是并进 `retain_answer` 的返回 ──────
+/// 三条协议、流式 / 非流式、原生转发几个调用点各自从不同形状里判工具调用
+/// （`choices[].message.tool_calls` / `output[].type=="function_call"` /
+/// `content[].type=="tool_use"`）。判定散在各自的协议代码里最准，但「判出
+/// 来了怎么办」必须只有一处 —— 否则四五个调用点各写一遍「有工具调用就
+/// 不写记忆」，迟早有一处漏掉，那一处就继续往库里灌执行旁白。
+pub fn retain_tool_turn(source: &TurnSource) {
+    if source.is_empty() {
+        return;
+    }
+    let session = source.session.clone();
+    crate::server::core::blocking::in_place(|| {
+        crate::server::core::memory::retain::remember_turn(
+            &source.messages,
+            "",
+            None,
+            session.as_deref(),
+            false,
+            true,
+        )
+    });
+}
+
+/// 这条响应里有工具调用吗（Chat 形态）。
+pub fn chat_used_tools(body: &Value) -> bool {
+    body.get("choices")
+        .and_then(Value::as_array)
+        .map(|choices| {
+            choices.iter().any(|choice| {
+                choice
+                    .get("message")
+                    .and_then(|message| message.get("tool_calls"))
+                    .and_then(Value::as_array)
+                    .map(|calls| !calls.is_empty())
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 这条响应里有工具调用吗（Responses 形态：`output[].type == "function_call"`）。
+pub fn responses_used_tools(body: &Value) -> bool {
+    body.get("output")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter().any(|item| {
+                item.get("type")
+                    .and_then(Value::as_str)
+                    .map(|kind| matches!(kind, "function_call" | "computer_call" | "custom_tool_call"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 这条响应里有工具调用吗（Anthropic 形态：`content[]` 里 `type == "tool_use"`）。
+pub fn anthropic_used_tools(body: &Value) -> bool {
+    body.get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks.iter().any(|block| {
+                block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|kind| kind == "tool_use" || kind == "server_tool_use")
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

@@ -61,6 +61,17 @@ pub struct TurnCapture {
     text: String,
     /// 已经到上限（此后只下发，不攒）
     capped: bool,
+    /// 这一段回答里出现过工具调用吗。
+    ///
+    /// ── 为什么这一位决定「写不写」─────────────────────────────
+    /// Agent 类客户端的一次任务会走几十轮工具调用，每轮都是独立的 HTTP 请求。
+    /// 若每轮都写一条，库里就是「先看文件。」「现在接进去。」这类执行旁白 ——
+    /// 真机一天攒了 30 条，而且按信息量排序时它们排在前面，把真正的结论挤掉。
+    ///
+    /// 判据为什么在**响应**侧而不是请求侧：请求形状分不出中间轮与收尾轮
+    /// （两者都以 `tool` 消息结尾），而「模型这一轮还调了工具」说明它没说完，
+    /// 这件事只有在响应里能看到。
+    used_tools: bool,
 }
 
 impl TurnCapture {
@@ -76,6 +87,7 @@ impl TurnCapture {
             tail: Vec::new(),
             text: String::new(),
             capped: false,
+            used_tools: false,
         })
     }
 
@@ -86,9 +98,10 @@ impl TurnCapture {
     /// `\n` 上发生，所以切出来的每一行都是完整的 UTF-8 字节序列
     /// （多字节字符可能被分片切开，但不会跨 `\n` 边界）。
     pub fn push(&mut self, chunk: &[u8]) {
-        if self.capped {
-            return;
-        }
+        // 到上限后**仍然**要继续解析：`used_tools` 可能出现在正文之后
+        // （先给一大段解释、再调工具去验证）。若这里直接 return，长回答型的
+        // 中间轮就会被判成「收尾轮」写进库 —— 正是要挡掉的那类旁白。
+        // 所以只停止攒正文（由 `absorb` 判断），不停止扫描。
         self.tail.extend_from_slice(chunk);
         let mut start = 0usize;
         while let Some(offset) = self.tail[start..].iter().position(|byte| *byte == b'\n') {
@@ -96,9 +109,6 @@ impl TurnCapture {
             let line = String::from_utf8_lossy(&self.tail[start..end]).into_owned();
             self.absorb(&line);
             start = end + 1;
-            if self.capped {
-                break;
-            }
         }
         if start > 0 {
             self.tail.drain(..start);
@@ -138,12 +148,25 @@ impl TurnCapture {
             Dialect::Responses => responses_delta(&value),
             Dialect::Anthropic => anthropic_delta(&value),
         };
+        // 工具调用标记与正文增量是**并列**的两件事：一帧可能只带工具调用
+        // （`delta.tool_calls`），也可能只带正文。所以先独立判一次，再看正文。
+        if !self.used_tools && has_tool_call(self.dialect, &value) {
+            self.used_tools = true;
+        }
         if let Some(delta) = delta {
+            if self.capped {
+                return;
+            }
             self.text.push_str(&delta);
             if self.text.len() >= CAP_BYTES {
                 self.capped = true;
             }
         }
+    }
+
+    /// 这一段回答里模型是否调用过工具（`true` = 不是收尾轮，不该写成记忆）。
+    pub fn used_tools(&self) -> bool {
+        self.used_tools
     }
 
     /// 已攒到的正文（测试与日志用）。
@@ -177,9 +200,64 @@ impl TurnCapture {
         let messages = self.messages;
         let session = self.session;
         let text = self.text;
+        let continued = self.used_tools;
         crate::server::core::blocking::in_place(|| {
-            retain::remember_turn(&messages, &text, None, session.as_deref(), interrupted);
+            retain::remember_turn(&messages, &text, None, session.as_deref(), interrupted, continued);
         });
+    }
+}
+
+/// 这一帧是不是「模型要调工具」的信号。
+///
+/// ── 三种方言各自的形状 ──────────────────────────────────────
+/// | 协议 | 工具调用出现在哪 |
+/// |---|---|
+/// | Chat | `choices[].delta.tool_calls[]`（首个分片带 `index` / `id` / `name`） |
+/// | Responses | `response.output_item.added` 且 `item.type == "function_call"` |
+/// | Anthropic | `content_block_start` 且 `content_block.type == "tool_use"` |
+///
+/// 只认「开始」类事件就够：一次工具调用必然先出现这些帧。不做「参数是否收完」
+/// 那种判定 —— 参数在 `input_json_delta` 里逐片拼，拼完才完整，而「有工具
+/// 调用」这件事在第一个分片上就已经成立。
+fn has_tool_call(dialect: &Dialect, value: &Value) -> bool {
+    match dialect {
+        Dialect::Chat => value
+            .get("choices")
+            .and_then(Value::as_array)
+            .map(|choices| {
+                choices.iter().any(|choice| {
+                    choice
+                        .get("delta")
+                        .and_then(|delta| delta.get("tool_calls"))
+                        .and_then(Value::as_array)
+                        .map(|calls| !calls.is_empty())
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false),
+        Dialect::Responses => {
+            let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+            if kind == "response.output_item.added" || kind == "response.output_item.done" {
+                return value
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str)
+                    .map(|kind| matches!(kind, "function_call" | "computer_call" | "custom_tool_call"))
+                    .unwrap_or(false);
+            }
+            false
+        }
+        Dialect::Anthropic => {
+            if value.get("type").and_then(Value::as_str) != Some("content_block_start") {
+                return false;
+            }
+            value
+                .get("content_block")
+                .and_then(|block| block.get("type"))
+                .and_then(Value::as_str)
+                .map(|kind| kind == "tool_use" || kind == "server_tool_use")
+                .unwrap_or(false)
+        }
     }
 }
 
@@ -357,6 +435,55 @@ mod tests {
             "尾缓冲必须有上限，实际 {} 字节",
             turn.tail.len()
         );
+    }
+
+    #[test]
+    fn tool_call_frames_mark_the_turn_as_continued() {
+        // 真机事故：一次任务走二十多轮工具调用，每轮都写成一条 l1，一天攒
+        // 30 条「先看文件。」这类执行旁白。判据在响应侧：这一轮还调了工具，
+        // 说明模型没说完，不该写成记忆。
+        let mut turn = capture(Dialect::Chat);
+        turn.push(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"Bash\"}}]}}]}\n\n");
+        assert!(turn.used_tools(), "Chat 的 delta.tool_calls 必须被认出来");
+
+        let mut turn = capture(Dialect::Responses);
+        turn.push(b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\"}}\n\n");
+        assert!(turn.used_tools(), "Responses 的 function_call 必须被认出来");
+
+        let mut turn = capture(Dialect::Anthropic);
+        turn.push(b"data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\"}}\n\n");
+        assert!(turn.used_tools(), "Anthropic 的 tool_use 必须被认出来");
+    }
+
+    #[test]
+    fn plain_text_answer_is_not_marked_as_continued() {
+        // 收尾轮：模型只说了话、没再调工具 —— 这种才该写进记忆。
+        let mut turn = capture(Dialect::Chat);
+        turn.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"**结论**：修好了。\"}}]}\n\n");
+        assert!(!turn.used_tools());
+
+        // Responses 的推理项不能误判成工具调用
+        let mut turn = capture(Dialect::Responses);
+        turn.push(b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\"}}\n\n");
+        assert!(!turn.used_tools());
+
+        // Anthropic 的 thinking 块同理
+        let mut turn = capture(Dialect::Anthropic);
+        turn.push(b"data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"thinking\"}}\n\n");
+        assert!(!turn.used_tools());
+    }
+
+    #[test]
+    fn tool_call_after_a_long_answer_still_counts() {
+        // 先给一大段解释、再调工具去验证：这是典型的中间轮。若「攒到上限就
+        // 停止扫描」，这一帧的 tool_calls 会被漏掉，长回答型的中间轮就会被
+        // 当成收尾轮写进库 —— 正是要挡掉的那类旁白。
+        let mut turn = capture(Dialect::Chat);
+        let big = "x".repeat(200_000);
+        turn.push(format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{big}\"}}}}]}}\n\n").as_bytes());
+        assert!(!turn.used_tools());
+        turn.push(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}\n\n");
+        assert!(turn.used_tools(), "正文封顶之后仍要看后面的工具调用帧");
     }
 
     #[test]

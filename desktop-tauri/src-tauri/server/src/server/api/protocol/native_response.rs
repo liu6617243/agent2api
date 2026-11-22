@@ -54,13 +54,26 @@ pub(in crate::server::api) fn respond(
             pipeline::record_entry(&context, None);
             guard.complete();
             // 请求后留存：原生非流式体的回答位置按协议分三种（见
-            // `pipeline::answer_text_*`），这里按同一个 `protocol` 选口径
-            let answer = match response.protocol {
-                WireProtocol::Anthropic => pipeline::answer_text_anthropic(&body),
-                WireProtocol::Responses => pipeline::answer_text_responses(&body),
-                WireProtocol::Chat => pipeline::answer_text_chat(&body),
+            // `pipeline::answer_text_*`），这里按同一个 `protocol` 选口径。
+            //
+            // 带工具调用的响应不留存：原生分支正是 Codex / Claude Code 的常态
+            // 路径，而它们的一次任务会走几十轮工具调用。每轮都写就成了执行日志
+            // （真机一天 30 条），只有「没再调工具」的那一轮才是结论。
+            let used_tools = match response.protocol {
+                WireProtocol::Anthropic => pipeline::anthropic_used_tools(&body),
+                WireProtocol::Responses => pipeline::responses_used_tools(&body),
+                WireProtocol::Chat => pipeline::chat_used_tools(&body),
             };
-            pipeline::retain_answer(turn_source, &answer, false);
+            if used_tools {
+                pipeline::retain_tool_turn(turn_source);
+            } else {
+                let answer = match response.protocol {
+                    WireProtocol::Anthropic => pipeline::answer_text_anthropic(&body),
+                    WireProtocol::Responses => pipeline::answer_text_responses(&body),
+                    WireProtocol::Chat => pipeline::answer_text_chat(&body),
+                };
+                pipeline::retain_answer(turn_source, &answer, false);
+            }
             let mut result = pipeline::json_response(body);
             *result.status_mut() = status;
             result

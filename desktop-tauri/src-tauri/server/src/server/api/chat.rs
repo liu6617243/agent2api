@@ -372,7 +372,16 @@ pub async fn chat_completions(
             //
             // 回答文本从 `body` 现取（不另存一份）：非流式的聚合体就是最终
             // 响应，`choices[].message.content` 是用户真正看到的那段话。
-            pipeline::retain_answer(&turn_source, &pipeline::answer_text_chat(&body), false);
+            //
+            // 带工具调用的响应不留存：Agent 类客户端的一次任务走几十轮工具调用
+            // （每轮都是独立请求）。这些中间轮的「回答」是「先看文件。」这类
+            // 执行旁白，写进 l1 就是执行日志 —— 真机一天攒了 30 条，而且在按
+            // 信息量排序时排在前面，把真正的结论挤掉。
+            if pipeline::chat_used_tools(&body) {
+                pipeline::retain_tool_turn(&turn_source);
+            } else {
+                pipeline::retain_answer(&turn_source, &pipeline::answer_text_chat(&body), false);
+            }
             json_response(body)
         }
         Err(error) => {

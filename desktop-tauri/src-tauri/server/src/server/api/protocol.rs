@@ -343,11 +343,18 @@ pub async fn responses_endpoint(
             // 请求后留存：客户端要的是非流式，聚合体就是最终回答。
             // `received == false` 说明上游流中途断了，聚合出来的正文不完整 ——
             // 那一轮的记忆要标一句「未正常结束」。
-            pipeline::retain_answer(
-                &turn_source,
-                &pipeline::answer_text_responses(&body),
-                !received,
-            );
+            //
+            // 带工具调用的响应不留存：Agent 客户端一次任务会走几十轮，
+            // 只有「没再调工具」的那轮才是结论（见 `retain_tool_turn`）。
+            if pipeline::responses_used_tools(&body) {
+                pipeline::retain_tool_turn(&turn_source);
+            } else {
+                pipeline::retain_answer(
+                    &turn_source,
+                    &pipeline::answer_text_responses(&body),
+                    !received,
+                );
+            }
             json_response(body)
         }
         Ok(ForwardOutcome::Completion { body: chat }) => {
@@ -367,11 +374,15 @@ pub async fn responses_endpoint(
             // 记账已完成：解除断线兜底并注销取消令牌
             guard.complete();
             // 请求后留存（上游直接给聚合体的情况）：回答在 Responses 形态里
-            pipeline::retain_answer(
-                &turn_source,
-                &pipeline::answer_text_responses(&response),
-                false,
-            );
+            if pipeline::chat_used_tools(&chat) {
+                pipeline::retain_tool_turn(&turn_source);
+            } else {
+                pipeline::retain_answer(
+                    &turn_source,
+                    &pipeline::answer_text_responses(&response),
+                    false,
+                );
+            }
             json_response(response)
         }
         Err(error) => {
@@ -585,11 +596,17 @@ pub async fn messages_endpoint(
             // 记账已完成：解除断线兜底并注销取消令牌
             guard.complete();
             // 请求后留存：`received == false` = 上游流中途断了，正文不完整
-            pipeline::retain_answer(
-                &turn_source,
-                &pipeline::answer_text_anthropic(&body),
-                !received,
-            );
+            //
+            // 带工具调用的响应不留存（同 Responses 分支的说明）。
+            if pipeline::anthropic_used_tools(&body) {
+                pipeline::retain_tool_turn(&turn_source);
+            } else {
+                pipeline::retain_answer(
+                    &turn_source,
+                    &pipeline::answer_text_anthropic(&body),
+                    !received,
+                );
+            }
             json_response(body)
         }
         Ok(ForwardOutcome::Completion { body: chat }) => {
@@ -602,11 +619,15 @@ pub async fn messages_endpoint(
             // 记账已完成：解除断线兜底并注销取消令牌
             guard.complete();
             // 请求后留存（上游直接给聚合体的情况）：回答在 Anthropic 形态里
-            pipeline::retain_answer(
-                &turn_source,
-                &pipeline::answer_text_anthropic(&response),
-                false,
-            );
+            if pipeline::chat_used_tools(&chat) {
+                pipeline::retain_tool_turn(&turn_source);
+            } else {
+                pipeline::retain_answer(
+                    &turn_source,
+                    &pipeline::answer_text_anthropic(&response),
+                    false,
+                );
+            }
             json_response(response)
         }
         Err(error) => {

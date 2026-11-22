@@ -235,6 +235,129 @@ fn compose_body(user: &str, answer: &str, interrupted: bool) -> String {
     body
 }
 
+/// 这一轮的标题。
+///
+/// ── 为什么网关要自己给标题，而不是留给 `infer_title` ────────
+/// 写入侧的 `infer_title` 取「正文第一个非空行」。而这里正文的第一个非空行
+/// 恒为 `**我**：…` —— 真机库里 30 条留存全部显示成
+/// 「**我**：动第一批，第二批和第三批我还没理解是什么意思…」。
+/// 那不是标题，那是标签被当成内容。列表页一屏全是同一个前缀，扫一眼分不出
+/// 哪条是哪条，等于把标题这一列废掉。
+///
+/// 所以这里在网关侧自己拼：用户的话够长就用它（`**我**：` 之后的原话本来
+/// 就是「这一轮在谈什么」），用户只说了「继续」才退到助手的第一句。
+fn infer_title(user: &str, answer: &str) -> String {
+    /// 标题太短说明不了「这一轮在谈什么」（「继续」「改一下」「看下」）
+    const MIN_TITLE: usize = 12;
+    fn first_line(text: &str) -> String {
+        text.lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .unwrap_or("")
+            // 标题是纯文本展示，`**` / `-` / `>` 这些标记留着会把列表页渲染成
+            // 一堆断开的重号
+            .trim_start_matches(|ch: char| matches!(ch, '*' | '-' | '>' | '·' | ' '))
+            .trim()
+            .to_string()
+    }
+    let from_user = first_line(user);
+    let picked = if from_user.chars().count() >= MIN_TITLE {
+        from_user
+    } else {
+        let from_answer = first_line(answer);
+        if from_answer.chars().count() >= MIN_TITLE {
+            from_answer
+        } else {
+            "对话留存".to_string()
+        }
+    };
+    picked.chars().take(60).collect()
+}
+
+/// 从请求里取工作目录。
+///
+/// ── 为什么必须取到它 ────────────────────────────────────────
+/// 真机事故：修好注入之后，库里的留存全部落在 `general/`，一条都没进
+/// `projects/`。原因是 `remember_turn` 的 `cwd` 一直传 `None`，而项目归类
+/// 在写入侧是「显式项目名 > cwd 的 git 身份 > general」—— 三者都没有就进
+/// `general`。结果就是「在 agent2api 这个仓库里干了三天活，记忆库里一条都
+/// 不在 agent2api 项目下」，项目页永远是空的，注入也少了「按项目取」这一档。
+///
+/// ── 为什么不指望客户端给 `cwd` 字段 ─────────────────────────
+/// OpenAI 协议没有这个字段，WorkBuddy / Claude Code 都不发。它们把工作目录
+/// 写在**上下文块**里：`<system-reminder>今天是 …，工作目录 D:\…。</…>`、
+/// `<environment_context><cwd>…</cwd></environment_context>`。所以只能从
+/// 消息文本里抠。抠不到就不传（`None` 仍是合法的「不知道」）。
+///
+/// 只认「路径形状」的结果：`X:\…` / `/…` / `~/…`。抠到一句中文不算命中 ——
+/// 把中文当目录去 `classify` 会登记出一个假项目，比不归类更糟。
+pub fn cwd_of(messages: &[Value]) -> Option<String> {
+    const PATTERNS: &[&str] = &[
+        "工作目录",
+        "working directory",
+        "Primary working directory",
+        "Current working directory",
+        "<cwd>",
+        "<workspace>",
+        "workspace folder",
+    ];
+    let looks_like_path = |text: &str| {
+        let text = text.trim().trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '。' | '.' | '，' | ','));
+        text.starts_with("~/")
+            || text.starts_with('/')
+            || (text.len() >= 3
+                && text.as_bytes()[1] == b':'
+                && (text.as_bytes()[2] == b'\\' || text.as_bytes()[2] == b'/'))
+    };
+    // 只扫最近几条 user 消息的前半段：工作目录是上下文块里的固定信息，
+    // 在整段历史摘要里翻等于把 4 万字符读两遍。
+    for message in messages.iter().rev().take(3) {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let blocks = match message.get("content") {
+            Some(Value::String(text)) => vec![text.clone()],
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str).map(str::to_string))
+                .collect(),
+            _ => continue,
+        };
+        for block in blocks {
+            let head: String = block.chars().take(4_000).collect();
+            for pattern in PATTERNS {
+                let Some(at) = head.find(pattern) else { continue };
+                let rest = &head[at + pattern.len()..];
+                // 标记后面可能跟着 `:` / `：` / `>` / 空白，逐个跳过
+                let rest = rest.trim_start_matches(|ch: char| {
+                    matches!(ch, ':' | '：' | '=' | '>' | ' ' | '\t' | '\n' | '\r')
+                });
+                // 路径到空白或闭合标签为止（Windows 路径可能带空格，所以先试到
+                // 行尾：取行内第一个「像完整路径」的片段）
+                for candidate in rest.split(|ch: char| matches!(ch, '<' | '\n' | '\r')) {
+                    let candidate = candidate.trim();
+                    if !looks_like_path(candidate) {
+                        continue;
+                    }
+                    // 带空格的中文句子里，路径通常到第一个空格就结束；
+                    // 但 `D:\Program Files\...` 是合法的。取「最后一个不存在的
+                    // 空格位置」太猜，这里保守取整段（`classify` 里
+                    // `detect_identity` 找不到目录就退回目录名匹配，不会炸）。
+                    let path = candidate
+                        .trim_end_matches(|ch: char| {
+                            matches!(ch, '。' | '.' | ',' | '，' | ';' | '；' | ')' | '）' | '"' | '\'')
+                        })
+                        .trim();
+                    if path.chars().count() >= 3 {
+                        return Some(path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 这一轮的去重键。
 ///
 /// ── 为什么本节内要去重 ──────────────────────────────────────
@@ -318,12 +441,35 @@ pub fn remember_turn(
     cwd: Option<&str>,
     session: Option<&str>,
     interrupted: bool,
+    continued: bool,
 ) -> Option<String> {
     let settings = settings();
     if !settings.enabled {
         return None;
     }
+    // ── 工具循环里的中间轮不算「一轮」────────────────────────────
+    // 真机事故：一次「动第一批」的任务，Agent 走了二十多次工具调用。每次调用
+    // 客户端都发一个新请求，网关每次都当「一轮对话」存下来 —— 一天攒出 30 条
+    // 「先看留存写入路径。」「现在把它接进去。」这种旁白，全部落进 l1。
+    // 那不是记忆，那是执行日志；而且它们把真正的结论挤到后面，注入时按分数
+    // 取前几名，取到的全是旁白。
+    //
+    // 判据只能放在**响应**侧：请求形状分不出「中间轮」和「最后一轮」——
+    // 两者都以 `tool` 消息结尾。响应里有工具调用 = 模型还要接着跑，这一轮
+    // 还没结束，不写。真正的收尾那一轮响应里没有工具调用，才会落库。
+    if continued {
+        use std::sync::atomic::Ordering;
+        RETAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     let user = user_text(messages);
+    // ── cwd 传下去才进得了项目目录 ────────────────────────────────
+    // 调用方一律传 `None`（网关拿不到客户端的 cwd 字段），所以这里必须自己
+    // 从上下文块抠。抠不到就进 `general`，那是正确的降级。
+    let cwd: Option<String> = match cwd {
+        Some(given) if !given.trim().is_empty() => Some(given.to_string()),
+        _ => cwd_of(messages),
+    };
     if !worth_keeping(&user, answer, settings.min_chars) {
         use std::sync::atomic::Ordering;
         RETAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
@@ -340,10 +486,9 @@ pub fn remember_turn(
 
     let input = super::WriteInput {
         content: body,
-        // 标题留空由写入侧推断（`infer_title` 取正文第一句）—— 网关不该在这里
-        // 编标题：它看到的是整段正文，而标题需要「一句话说清这是什么」，
-        // 那是摘要任务的活。
-        title: None,
+        // 标题由这里给，不能留给写入侧的 `infer_title`：正文第一行恒为
+        // `**我**：…`，推断出来就是把标签当标题（真机库 30 条全中）。
+        title: Some(infer_title(&user, answer)),
         // l1 流水：网关写的是「这一轮发生了什么」，不是提炼后的结论。
         // 提炼是 distill 的活，那条链已经在跑。
         kind: Some("daily".to_string()),
@@ -357,7 +502,7 @@ pub fn remember_turn(
         supersedes: Vec::new(),
         pinned: None,
         starred: None,
-        cwd: cwd.map(str::to_string),
+        cwd,
         session: session.map(str::to_string),
         created_at: None,
         valid_to: None,
@@ -561,6 +706,63 @@ mod tests {
         })];
         let text = user_text(&mixed);
         assert_eq!(text.trim(), "继续把留存接上", "{text}");
+    }
+
+    #[test]
+    fn title_is_the_user_words_not_the_label() {
+        // 真机事故：库里 30 条留存的标题全是 `**我**：动第一批，第二批和第三批…`。
+        // 写入侧 `infer_title` 取正文第一个非空行，而这里第一个非空行恒为
+        // `**我**：…` 这个标签 —— 列表页一屏全是同一个前缀，标题列等于废掉。
+        let title = infer_title(
+            "动第一批，第二批和第三批我还没理解是什么意思，需要你解释",
+            "**结论**：第一批只做了 information_score。",
+        );
+        assert!(!title.contains("**我**"), "标题不能带标签：{title}");
+        assert!(title.starts_with("动第一批"), "{title}");
+
+        // 用户只说了「继续」：太短说明不了在谈什么，退到助手第一句
+        let title = infer_title("继续", "记忆中枢：两条近似重复改由信息量决定留谁");
+        assert_eq!(title, "记忆中枢：两条近似重复改由信息量决定留谁");
+
+        // 两边都短：给一个不丢人的默认值，不要写成空串
+        assert_eq!(infer_title("继续", "好的"), "对话留存");
+    }
+
+    #[test]
+    fn cwd_is_dug_out_of_the_context_block() {
+        // 真机事故：留存全部落进 `general/`，一条都没进 `projects/`。原因是
+        // `remember_turn` 的 cwd 一直传 None，而写入侧归类是「显式项目名 >
+        // cwd 的 git 身份 > general」。OpenAI 协议没有 cwd 字段，客户端把
+        // 工作目录写在上下文块里，只能从文本里抠。
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "<system-reminder>今天是 2026-11-21，工作目录 D:\\Personal\\Desktop\\agent2api-main。</system-reminder>" },
+                { "type": "text", "text": "<user_query>继续</user_query>" }
+            ]
+        })];
+        assert_eq!(
+            cwd_of(&messages),
+            Some("D:\\Personal\\Desktop\\agent2api-main".to_string())
+        );
+
+        // 英文写法 + 正斜杠
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "<environment_context>working directory: /home/me/project</environment_context>"
+        })];
+        assert_eq!(cwd_of(&messages), Some("/home/me/project".to_string()));
+
+        // 抠不到就不猜：返回 None 仍会进 general，那是正确的降级
+        let messages = vec![serde_json::json!({ "role": "user", "content": "继续" })];
+        assert_eq!(cwd_of(&messages), None);
+
+        // 中文不算路径：把一句话当目录去 classify 会登记出假项目
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "工作目录这块还没配好"
+        })];
+        assert_eq!(cwd_of(&messages), None);
     }
 
     #[test]
