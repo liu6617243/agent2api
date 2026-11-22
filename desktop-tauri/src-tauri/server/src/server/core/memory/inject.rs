@@ -814,14 +814,24 @@ fn relevance(
     if score <= 0.0 {
         return 0.0;
     }
-    // 类型加成：踩坑与决策是「下次做同样的事会踩到」的那一类，比日常流水值钱
-    score += match entry.kind {
-        MemoryKind::Pitfall => 1.5,
-        MemoryKind::Decision => 1.0,
-        MemoryKind::Preference | MemoryKind::Profile => 1.0,
-        MemoryKind::Knowledge | MemoryKind::Insight => 0.5,
-        _ => 0.0,
-    };
+    // 类型加成：踩坑与决策是「下次做同样的事会踩到」的那一类，比日常流水值钱。
+    //
+    // ── 自动抽取的候选不享受这一档 ─────────────────────────────
+    // 类型是模型自己填的：它把一条流水写成 `pitfall`，这里就白送 1.5 分，于是
+    // 「一个标题命中 2.0 + 踩坑 1.5 + importance 0.6 = 4.1」直接越过 [`floor_for`]
+    // 给候选定的 3.4 —— 那一档的意图是「必须路径命中或两条独立线索」，实际被
+    // 类型加成淹没了（真机复现：单标题命中即可放行）。类型加成的前提是「有人
+    // 认定这是一条踩坑」，而 auto-extract 的产物还没有人认定过；等它被 reinforce
+    // 升到 l2 之后，这条限制自然失效。
+    if entry.agent.as_deref() != Some(AUTO_EXTRACT_AGENT) {
+        score += match entry.kind {
+            MemoryKind::Pitfall => 1.5,
+            MemoryKind::Decision => 1.0,
+            MemoryKind::Preference | MemoryKind::Profile => 1.0,
+            MemoryKind::Knowledge | MemoryKind::Insight => 0.5,
+            _ => 0.0,
+        };
+    }
     score += entry.importance;
     if entry.pinned {
         score += 0.5;
@@ -864,6 +874,10 @@ fn floor_for(entry: &MemoryEntry) -> Option<f64> {
     // 同一件事被抽出几份不同措辞，同时挤进注入预算（真机取证：132 条 l2 里
     // 五组同义结论各占 3-6 条）。这里要求「路径命中」或「两条独立线索」
     // （3.4 档）；被 reinforce 到升 l2 之后自然回到上面那条 2.0。
+    //
+    // 光给门槛不够：候选的类型是模型自己填的，`pitfall` 会白拿 1.5 分类型加成，
+    // 2.0 + 1.5 + importance 就轻松越过 3.4。所以 [`relevance`] 里对候选关掉了
+    // 类型加成 —— 两处要一起看，改一处等于没改。
     if entry.agent.as_deref() == Some(AUTO_EXTRACT_AGENT) {
         return Some(3.4);
     }

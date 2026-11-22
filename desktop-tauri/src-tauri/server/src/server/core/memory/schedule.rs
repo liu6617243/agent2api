@@ -785,7 +785,13 @@ fn detail_of(task: &str, outcome: &Outcome) -> String {
                 }
                 "summarize" => format!("生成摘要 {} 条", n("summarized")),
                 "tag" => format!("打标 {} 条", n("tagged")),
-                "distill" => format!("读 {} 条素材，产出 {} 条结论", n("material"), n("queued")),
+                "distill" => {
+                    let (queued, applied, reinforced) = (n("queued"), n("applied"), n("reinforced"));
+                    format!(
+                        "读 {} 条素材，新建 {queued} 条（落地 {applied} 条），强化 {reinforced} 条",
+                        n("material")
+                    )
+                }
                 // 归类巡检报两个数：扫了多少条没项目的、其中新提了几条建议。
                 // 只报「扫描 0 条」读起来像它没干活；只报建议数又在全部 skipped
                 // 的轮次里没有内容 —— 两件事分开写，用户看得出「扫过了、没命中」
@@ -1344,7 +1350,7 @@ fn extract(project: Option<&str>) -> Outcome {
             if target.is_empty() || !known_ids.contains(target) {
                 continue;
             }
-            if let Ok(upgraded) = reinforce(target, &cue) {
+            if let Ok(upgraded) = super::reinforce_entry(target, &cue) {
                 reinforced += 1;
                 if upgraded {
                     promoted += 1;
@@ -1359,6 +1365,25 @@ fn extract(project: Option<&str>) -> Outcome {
         let kind = item.get("type").and_then(Value::as_str).unwrap_or("knowledge");
         let title = item.get("title").and_then(Value::as_str).unwrap_or("").to_string();
         let importance = item.get("importance").and_then(Value::as_f64).unwrap_or(0.6);
+        // ── 候选之间也要判重 ───────────────────────────────────
+        //
+        // 模型这次说的是 `new`，但它只看得到「清单里的标题」，看不到清单外那些
+        // 措辞相近的候选。同一件事被抽成两份候选，两份各自攒证据、各自升 l2，
+        // 重复只是被推迟到升级那一刻。所以落盘前再比一次正文：已经有近似候选
+        // 时，这次算「又确认了一次」，不算新建。
+        //
+        // 判据只看 auto-extract 的 l1 候选（见 `similar_l1_candidate`），
+        // 不碰人写的流水 —— 那条界线不能越。
+        let candidate_kind = super::MemoryKind::parse(kind);
+        if let Some(existing) = super::similar_l1_candidate(project, candidate_kind, body) {
+            if let Ok(upgraded) = super::reinforce_entry(&existing, &cue) {
+                reinforced += 1;
+                if upgraded {
+                    promoted += 1;
+                }
+            }
+            continue;
+        }
         // 继承素材条目的 `files`：抽取出来的结论建立在同一批文件之上，继承之后
         // 请求级注入的路径命中（权重最高的一档）才能打到这条 l2 上。早先这里
         // 写死空数组，等于让所有自动产出的结论对「按文件命中」永久隐形。
@@ -1420,48 +1445,6 @@ fn extract(project: Option<&str>) -> Outcome {
         "material": recent.len(),
         "model": reply.model
     }))
-}
-
-/// 把一条已有结论「确认一次」：追加证据锚点，够了就升 l2。返回是否升级。
-///
-/// ── 为什么用 `evidence` 当计数器，而不是新加 `reinforced` 字段 ────
-/// 强化次数 = 被多少批不同的流水独立确认过。这正好是 `evidence` 的语义
-/// （「支撑这条结论的原始记忆 id」）。新加字段要动 `ENTRY_COLUMNS` /
-/// `ENTRY_SELECT` / 行解析 / `write_row` 四处，老库还要迁移；而 `cue` 是
-/// 流水 id，同一条流水重复跑时天然去重，计数不会虚高。
-///
-/// ── 升级为什么要清 path ─────────────────────────────────────
-/// l1 落的是容器（`general/l1/<agent>/<date>.md`，一个文件多节），l2 是一条
-/// 一文件。`entry_path` 见到非空 `path` 就直接沿用它，不清空的话「升级」只会
-/// 改 layer 字段、文件还留在 l1 容器里，下一轮扫描又把它当流水。
-fn reinforce(target: &str, cue: &str) -> Result<bool, String> {
-    let Some(before) = store::load_all().into_iter().find(|entry| entry.id == target) else {
-        return Err(format!("强化目标不存在：{target}"));
-    };
-    if !before.is_live() {
-        return Err(format!("强化目标已失效：{target}"));
-    }
-    let mut entry = before.clone();
-    if !cue.is_empty() && !entry.evidence.iter().any(|known| known.as_str() == cue) {
-        entry.evidence.push(cue.to_string());
-        // 上限 20：证据链是给人看「凭什么」的，不是越长越好
-        if entry.evidence.len() > 20 {
-            let overflow = entry.evidence.len() - 20;
-            entry.evidence.drain(0..overflow);
-        }
-    }
-    entry.updated_at = super::model::now_ms();
-    let ready = entry.layer == super::Layer::L1
-        && entry.evidence.len() >= super::model::PROMOTE_AFTER_REINFORCE;
-    if ready {
-        entry.layer = super::Layer::L2;
-        entry.path.clear();
-        store::move_save(&before, &entry)?;
-    } else {
-        store::save(&entry)?;
-    }
-    index::global().upsert(&entry)?;
-    Ok(ready)
 }
 
 const SYSTEM_EXTRACT: &str = "You curate a long-term project memory. \

@@ -20,6 +20,8 @@
 //! 摘要写进「新增的一条 `l2 / insight`」，原文一个字都不动。记忆是历史陈述，
 //! 改写历史等于伪造证据链。用户想看生成物就去看新条目，不想看就删掉它。
 
+use std::collections::HashSet;
+
 use serde_json::{json, Value};
 
 use super::llm::{self, LlmError, Request};
@@ -98,18 +100,27 @@ A different angle or an extra detail is not obsolescence. Output strict JSON, no
 /// （沉淀结论 + 踩坑/决策）就永远没东西可注。所以改成「先落地 + 队列留档」
 /// （`review.autoConfirmDistill`，默认开）：批准时 `apply_derived` 靠内容哈希
 /// 幂等，不会写成两条。
+/// 现在还会先比对已有结论：能强化（追加证据锚点）的不再新建，确实没有才 new ——
+/// 重复从生成端就被拦住，否则每跑一轮 distill 都净增几条同义 l2。
 pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
     if !config::bool_of("deep.enabled") {
         return Outcome::Skipped("深层记忆已关闭（deep.enabled）".into());
     }
     let cap = if limit == 0 { config::usize_of("deep.distillMaxPerProject").max(20) } else { limit };
-    let mut source: Vec<model::MemoryEntry> = store::load_all()
-        .into_iter()
+    let all = store::load_all();
+    let mut source: Vec<model::MemoryEntry> = all
+        .iter()
         .filter(|entry| entry.is_live() && entry.layer == Layer::L1)
+        // 素材池不喂 auto-extract 自己的候选：那些条目是「待确认的结论」，不是
+        // 原始流水。拿它们再蒸馏一遍 = 模型对自己上一轮的输出做二次压缩，同一件
+        // 事被改写两遍，正是这一轮要消灭的重复。它们只作为「已有结论清单」出现，
+        // 走 reinforce 那条路。
+        .filter(|entry| entry.agent.as_deref() != Some(model::AUTO_EXTRACT_AGENT))
         .filter(|entry| match project {
             Some(slug) => entry.project.as_deref() == Some(slug),
             None => true,
         })
+        .cloned()
         .collect();
     if source.len() < 5 {
         return Outcome::Skipped(format!("L1 素材只有 {} 条，至少需要 5 条", source.len()));
@@ -121,6 +132,40 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
         score(right).partial_cmp(&score(left)).unwrap_or(std::cmp::Ordering::Equal)
     });
     source.truncate(cap.min(200));
+
+    // 已有结论清单：口径与 extract 一致 —— l2（真沉淀）+ auto-extract 候选都算
+    // 「已经有人提过」。只喂 l2 的话，候选会先被 distill 原样造一遍，等于把上一轮
+    // 在生成端拦住的重复又放回来。和 source 共用同一次 load_all，不重复读盘。
+    //
+    // 上限 60 条是 token 预算的取舍：清单只用于让模型「认出这是老话题」，不是
+    // 让它逐条比对。按 updated_at 倒序取最近的，冷门老结论认不出来时会走 new，
+    // 由后续的 near_duplicate 兜底。
+    let mut known: Vec<model::MemoryEntry> = all
+        .iter()
+        .filter(|entry| entry.is_live())
+        .filter(|entry| {
+            entry.layer == Layer::L2
+                || entry.agent.as_deref() == Some(model::AUTO_EXTRACT_AGENT)
+        })
+        .filter(|entry| match project {
+            Some(slug) => entry.project.as_deref() == Some(slug),
+            None => true,
+        })
+        .cloned()
+        .collect();
+    known.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
+    known.truncate(60);
+    let known_ids: HashSet<String> = known.iter().map(|entry| entry.id.clone()).collect();
+    let catalog = known
+        .iter()
+        .map(|entry| format!("[{}] {}", entry.id, model::truncate_chars(&entry.title, 40)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let catalog = if catalog.is_empty() {
+        "（还没有任何结论）".to_string()
+    } else {
+        catalog
+    };
 
     let material = source
         .iter()
@@ -148,7 +193,17 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
          写成命令句（「版本号保持 3.5.0-beta.1，不要自行 bump」），不要写成汇报\n\
          （「用户说他不想升版本号」）—— 这条会被原样注入到之后每一次对话里，\n\
          汇报句读起来像历史，命令句读起来像要求。\n\n\
-         输出 JSON：{{\"items\":[{{\"title\":\"不超过 40 字\",\"type\":\"decision\",\"body\":\"100-300 字，含理由与取舍\",\"importance\":0.0-1.0,\"evidence\":[\"引用到的条目 id\"]}}]}}\n\n\
+         ── 先比对已有结论，再决定动作 ─────────────────────────\n\
+         已经有这些结论（id 只能从这里选，不要自己编）：\n{catalog}\n\n\
+         reinforce = 这批流水讲的事，上面清单里已经有了。target 填那条的 id，\n\
+                     note 写这次补充或确认了什么。\n\
+                     **哪怕措辞完全不同，只要是同一件事，就是 reinforce。**\n\
+         new       = 清单里确实没有，才新建。\n\
+                     同一件事被记成两条是最严重的错误 —— 宁可 reinforce，不要 new。\n\n\
+         输出 JSON：{{\"items\":[\n\
+         {{\"action\":\"reinforce\",\"target\":\"清单里的 id\",\"note\":\"这次补充或确认了什么\"}},\n\
+         {{\"action\":\"new\",\"title\":\"不超过 40 字\",\"type\":\"decision|knowledge|insight|pitfall|preference\",\"body\":\"100-300 字，含理由与取舍\",\"importance\":0.0-1.0,\"evidence\":[\"引用到的条目 id\"]}}\n\
+         ]}}\n\n\
          素材：\n{material}"
     );
     let reply = match llm::complete(Request::new("distill", SYSTEM_EXTRACT, ask)) {
@@ -161,13 +216,57 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
     let items = parsed.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut queued = 0usize;
     let mut applied_count = 0usize;
+    let mut reinforced = 0usize;
+    // 强化锚点：这批素材的指纹，不是模型写的 `note`。
+    //
+    // ── 为什么不能用 note ─────────────────────────────────────
+    // `note` 是自然语言（「再次确认了版本号约束」），模型对不同批次写出同一句
+    // 话是常态。而 `reinforce_entry` 按 cue 去重 —— 两句一模一样的 note 只会
+    // 记一次证据，于是「被多批流水反复确认」这个升级条件永远攒不满，候选卡在
+    // l1 出不来。这正是要修的毛病的反面：从「太容易升」变成「永远升不了」。
+    //
+    // 用素材指纹则两边都对：同一批流水重跑 → 同一串 → 去重，计数不虚高；
+    // 不同批流水确认同一件事 → 不同串 → 真的加一。与 `extract` 拿
+    // `recent.first().id` 当 cue 是同一思路（那边素材是「最近 N 条流水」，
+    // 这里素材是「按重要度截断后的 N 条」，同样取最新一条的 id）。
+    let cue = source
+        .iter()
+        .max_by_key(|entry| entry.updated_at)
+        .map(|entry| format!("distill:{}", entry.id))
+        .unwrap_or_default();
     for item in items.iter().take(20) {
+        if item.get("action").and_then(Value::as_str) == Some("reinforce") {
+            let target = item.get("target").and_then(Value::as_str).unwrap_or("").trim();
+            // 模型编了 id 或指向清单外：直接丢，不降级成 new。
+            // 降级会把它变成一条新的重复结论，正是这一轮要消灭的东西。
+            if target.is_empty() || !known_ids.contains(target) {
+                continue;
+            }
+            if super::reinforce_entry(target, &cue).is_ok() {
+                reinforced += 1;
+            }
+            continue;
+        }
         let body = item.get("body").and_then(Value::as_str).unwrap_or("").trim();
         if body.chars().count() < 12 {
             continue;
         }
         let title = item.get("title").and_then(Value::as_str).unwrap_or("").trim().to_string();
         let kind = MemoryKind::parse(item.get("type").and_then(Value::as_str).unwrap_or("insight"));
+        // ── 候选之间也判一次重 ─────────────────────────────────
+        //
+        // 模型说 `new` 的依据只是「清单里的标题」，而清单只有 60 条、只有标题。
+        // 清单外那些措辞相近的候选它看不到，于是同一件事被蒸馏成第二份候选，
+        // 两份各自攒证据、各自升级 —— 重复被推迟，没被消灭。
+        //
+        // 落盘前按正文再比一次（判据见 `similar_l1_candidate`，只比 auto-extract
+        // 的 l1 候选，不碰人写的流水）。命中就算「又确认了一次」。
+        if let Some(existing) = super::similar_l1_candidate(project, kind, body) {
+            if super::reinforce_entry(&existing, &cue).is_ok() {
+                reinforced += 1;
+            }
+            continue;
+        }
         let evidence: Vec<String> = item
             .get("evidence")
             .and_then(Value::as_array)
@@ -232,12 +331,13 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
         }
         queued += 1;
     }
-    if queued == 0 {
-        return Outcome::Skipped("模型没给出满足条件的结论（可能都缺证据链）".into());
+    if queued == 0 && reinforced == 0 {
+        return Outcome::Skipped("模型既没给出新结论，也没确认任何已有结论".into());
     }
     Outcome::Done(json!({
         "queued": queued,
         "applied": applied_count,
+        "reinforced": reinforced,
         "material": source.len(),
         "model": reply.model,
         "tokens": reply.prompt_tokens + reply.completion_tokens,

@@ -2398,6 +2398,88 @@ fn apply_supersede(new_id: &str, old_id: &str) -> Result<(), String> {
     apply_dedup(new_id, old_id)
 }
 
+/// 把一条已有结论「确认一次」：追加证据锚点，够了就升 l2。返回是否升级。
+///
+/// ── 为什么用 `evidence` 当计数器，而不是新加 `reinforced` 字段 ────
+/// 强化次数 = 被多少批不同的流水独立确认过。这正好是 `evidence` 的语义
+/// （「支撑这条结论的原始记忆 id」）。新加字段要动 `ENTRY_COLUMNS` /
+/// `ENTRY_SELECT` / 行解析 / `write_row` 四处，老库还要迁移；而 `cue` 是
+/// 流水 id，同一条流水重复跑时天然去重，计数不会虚高。
+///
+/// ── 升级为什么要清 path ─────────────────────────────────────
+/// l1 落的是容器（`general/l1/<agent>/<date>.md`，一个文件多节），l2 是一条
+/// 一文件。`entry_path` 见到非空 `path` 就直接沿用它，不清空的话「升级」只会
+/// 改 layer 字段、文件还留在 l1 容器里，下一轮扫描又把它当流水。
+pub(super) fn reinforce_entry(target: &str, cue: &str) -> Result<bool, String> {
+    let Some(before) = store::load_all().into_iter().find(|entry| entry.id == target) else {
+        return Err(format!("强化目标不存在：{target}"));
+    };
+    if !before.is_live() {
+        return Err(format!("强化目标已失效：{target}"));
+    }
+    let mut entry = before.clone();
+    if !cue.is_empty() && !entry.evidence.iter().any(|known| known.as_str() == cue) {
+        entry.evidence.push(cue.to_string());
+        // 上限 20：证据链是给人看「凭什么」的，不是越长越好
+        if entry.evidence.len() > 20 {
+            let overflow = entry.evidence.len() - 20;
+            entry.evidence.drain(0..overflow);
+        }
+    }
+    entry.updated_at = model::now_ms();
+    let ready = entry.layer == Layer::L1
+        && entry.evidence.len() >= model::PROMOTE_AFTER_REINFORCE;
+    if ready {
+        entry.layer = Layer::L2;
+        entry.path.clear();
+        store::move_save(&before, &entry)?;
+    } else {
+        store::save(&entry)?;
+    }
+    index::global().upsert(&entry)?;
+    Ok(ready)
+}
+
+/// 在**自动抽取的 l1 候选**里找一条讲同一件事的，返回它的 id。
+///
+/// ── 为什么候选之间也要判重 ─────────────────────────────────
+/// 候选要攒够 `PROMOTE_AFTER_REINFORCE` 条证据才升 l2，看起来「多一条候选」只是
+/// 多一行待确认。但升级是**每条候选各升各的**：同一件事被抽成两份措辞不同的
+/// 候选，各自攒够证据，最后就是两条 l2 —— 重复只是被推迟了，没被消灭。真机那
+/// 五组同义结论（版本号 / 交付方式 / 信息量裁决）就是这么来的。
+///
+/// 所以新建候选之前先看一眼：已经有近似候选时，这次不是「新建」而是「又确认了
+/// 一次」，走 `reinforce_entry`。
+///
+/// ── 只比候选，不比人写的 l1 ────────────────────────────────
+/// 人写的流水可能是同一件事的不同侧面（上午的排查、下午的结论），把它们合成
+/// 一条等于改写历史。候选则相反：它本来就是模型对同一批素材的压缩产物，合并
+/// 是它的本职。判据只认 `agent == auto-extract` 且 `layer == L1`。
+pub(super) fn similar_l1_candidate(
+    project: Option<&str>,
+    kind: MemoryKind,
+    body: &str,
+) -> Option<String> {
+    let threshold = config::number("dedup.l2.candidateThreshold");
+    store::snapshot()
+        .iter()
+        .filter(|entry| entry.is_live() && entry.layer == Layer::L1)
+        .filter(|entry| entry.agent.as_deref() == Some(model::AUTO_EXTRACT_AGENT))
+        .filter(|entry| entry.project.as_deref() == project)
+        .filter(|entry| entry.kind == kind)
+        .filter(|entry| {
+            // 与 `apply_derived` 同一道粗筛：长度差一倍以上不可能是同一件事，
+            // 先挡掉能省下绝大部分 O(n·m) 的字符比对
+            let (left, right) = (body.chars().count(), entry.body.chars().count());
+            let (short, long) = if left < right { (left, right) } else { (right, left) };
+            short * 2 >= long
+        })
+        .map(|entry| (entry.id.clone(), similarity(body, &entry.body)))
+        .filter(|(_, score)| *score >= threshold)
+        .max_by(|left, right| left.1.partial_cmp(&right.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(id, _)| id)
+}
+
 /// 把一条「派生建议」（蒸馏 / 合并）落成真正的记忆条目。
 ///
 /// 载荷形状由 `enrich::distill` / `schedule::consolidate` 产出。合并类载荷带
@@ -2497,6 +2579,85 @@ fn apply_derived(payload: &Value) -> Result<(), String> {
             "派生结论已存在（同内容 l2），跳过重复落盘",
         );
         return Ok(());
+    }
+    // ── 同义改写也不写第二份 ───────────────────────────────────
+    //
+    // 上面那道哈希只挡「一字不差」。真机上 132 条 l2 里五组同义结论各占 3-6 条，
+    // 每组措辞都不同 —— 哈希全放行。生成端（`extract` / `distill`）已经让模型
+    // 先认清单，但还有一条绕过它的路：队列里的人工批准，`review_resolve` 直接
+    // 调这里，模型当时看到的清单早就不作数了。
+    //
+    // 所以派生入口自己再判一次词面近似：同项目、同类型、相似度过
+    // `dedup.l2.candidateThreshold`（默认 0.72）的活 l2 已经存在时，把这次的内容
+    // 当成对那条的「再一次确认」—— 追加证据锚点、刷新时间，不再新建。
+    //
+    // 阈值用候选阈值而不是自动合并阈值（0.9）：0.9 只抓得住几乎一样的句子，
+    // 而这里要抓的正是「换了个说法」。判错的代价可控 —— 被强化的那条只是多了
+    // 一个证据锚点、正文没被改写，人随时能在浏览页看出来。
+    //
+    // ── 合并（consolidate）不走这一档 ───────────────────────────
+    // 合并的产物本来就比任何单条来源更全，把它「强化」进一条既有结论等于把新
+    // 写出来的内容丢掉、只留一个锚点。合并载荷带 `sources`（≥2 条），蒸馏载荷
+    // 带 `evidence` —— 按**键名**区分，不按条数：蒸馏的一条结论也可能引用两三条
+    // 流水，按条数会把它们误判成合并。
+    let is_merge = payload.get("sources").map(|value| !value.is_null()).unwrap_or(false);
+    let near = if is_merge {
+        None
+    } else {
+        snapshot
+            .iter()
+            .filter(|other| other.is_live() && other.layer == Layer::L2)
+            .filter(|other| other.project.as_deref() == payload.get("project").and_then(Value::as_str))
+            .filter(|other| {
+                payload
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|kind| other.kind == MemoryKind::parse(kind))
+                    .unwrap_or(true)
+            })
+            // 长度先粗筛：`similarity()` 是 O(n·m) 的字符二元组比对，一次蒸馏最多
+            // 20 条结论 × 上百条 l2，不做粗筛就是几亿次比较。长度差一倍以上不可能
+            // 是同一件事 —— 这是免费且不会误杀的前置条件。
+            .filter(|other| {
+                let (left, right) = (body.chars().count(), other.body.chars().count());
+                let (short, long) = if left < right { (left, right) } else { (right, left) };
+                short * 2 >= long
+            })
+            .map(|other| (other.id.clone(), similarity(body, &other.body)))
+            .filter(|(_, score)| *score >= config::number("dedup.l2.candidateThreshold"))
+            .max_by(|left, right| left.1.partial_cmp(&right.1).unwrap_or(std::cmp::Ordering::Equal))
+    };
+    if let Some((existing, score)) = near {
+        // 锚点用「这次是从哪来的」：合并载荷带 sources，蒸馏载荷带 evidence，
+        // 都没有就退回内容哈希前缀 —— 同一份内容重复批准时天然去重。
+        let cue = sources
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("derived:{}", &digest[..12]));
+        match reinforce_entry(&existing, &cue) {
+            Ok(_) => {
+                crate::server::logging::verbose(
+                    "[Memory]",
+                    &format!(
+                        "派生结论与已有 l2 近似（{score:.2}），改为强化 {existing} 而不新建"
+                    ),
+                );
+                // 这里**不动** `sources`。走到这一步的一定是蒸馏载荷（合并载荷
+                // 的 `is_merge` 为真、`near` 直接是 None），而蒸馏载荷里的
+                // `sources` 来自 `evidence` —— 那是「这条结论引用过哪些流水」，
+                // 不是「哪些条目被这条结论取代」。把它们标成 superseded 等于
+                // 把证据链上的原始流水打成失效，比重复更糟。
+                return Ok(());
+            }
+            Err(error) => {
+                // 强化失败（目标刚被删 / 盘写不进去）不该让整条派生结论丢掉：
+                // 落到下面正常新建那条路，最坏结果是多一条，比丢一条好。
+                crate::server::logging::verbose(
+                    "[Memory]",
+                    &format!("近似结论改为强化失败，退回新建：{error}"),
+                );
+            }
+        }
     }
     let input = WriteInput {
         content: body.to_string(),
