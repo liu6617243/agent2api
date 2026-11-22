@@ -1015,8 +1015,13 @@ fn push_unique(out: &mut Vec<String>, text: &str) {
 /// ── 三个边界（与旧 `read_from` 同口径）────────────────────────
 /// 1. `from == 0`：从文件头开始读，一个字节都不跳。
 /// 2. 文件变短（被轮转/截断）：`from > len` → 回到 0 重读，不能原地空转。
-/// 3. 末尾没有换行（正在写的最后一行）：游标停在最后一个完整行的末尾，下一轮
-///    重读这一行。宁可多读一行，不能吞掉半行 JSON。
+/// 3. 末尾没有换行：分两种情况，用「这一行本身是不是一条完整 JSON」区分 ——
+///    * **完整 JSON，只是客户端没补换行** → 消费掉。旧实现（`read_to_string` +
+///      `split('\n')`）本来就会读它；新实现要是把它当成半行丢掉，那个会话的
+///      **最后一条消息永远进不来**（文件不会再长，游标卡在这一行开头不动）。
+///    * **半行（正在写）** → 不消费，游标停在这一行开头，下一轮整行重读。
+///      判据可靠：JSON 对象的收尾 `}` 一定是最后落盘的那几个字节，截断到一半
+///      必然解析失败；而完整写完的行一定解析成功。
 ///
 /// 用 `from_utf8_lossy` 而不是 `read_line` 到 `String`：截断点可能落在一个多字节
 /// 字符中间，而「整个文件读不出来」比「有一个替换符」糟糕得多。
@@ -1040,17 +1045,42 @@ fn for_each_line(
         if read == 0 {
             break;
         }
-        // 没读到换行 = 这是正在写的半行，不消费它（游标停在本行开头）
-        if buffer.last() != Some(&b'\n') {
+        let line = String::from_utf8_lossy(&buffer);
+        let text = line.trim_end_matches(['\n', '\r']);
+        // 没读到换行 = 最后一行。它到底是「写完了没补换行」还是「正在写的半行」，
+        // 由「它本身能不能解析成完整 JSON」决定 —— 详见函数注释的边界 3。
+        if buffer.last() != Some(&b'\n') && !is_complete_json_line(text) {
             break;
         }
-        let line = String::from_utf8_lossy(&buffer);
         cursor += read as u64;
-        if !visit(line.trim_end_matches(['\n', '\r'])) {
+        if !visit(text) {
             break;
         }
     }
     Ok(cursor.min(len))
+}
+
+/// 这一行本身是不是一条**完整**的 JSON 会话行。
+///
+/// 判据只用「能不能整体解析」，不看换行 —— 因为要区分的正是「内容写完了
+/// 但换行没来」和「内容只写了一半」这两种情况。
+///
+/// JSON 对象的收尾 `}` 一定是最后落盘的那几个字节，所以被截断的行必然解析失败；
+/// 反过来，完整写完的行必然解析成功。
+///
+/// 顶层只认**非空对象**：会话记录一行就是一个 JSON 对象。顶层标量
+/// （`123` / `"abc"` / `true`）虽然也能解析成功，但它是「正在写的数字」的前缀
+/// 时也会碰巧合法 —— 那种行不该被当成完整记录消费掉。空对象 `{}` 同理：
+/// 它更像写到一半的壳子，不像一条真记录。
+fn is_complete_json_line(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    matches!(
+        serde_json::from_str::<Value>(trimmed),
+        Ok(Value::Object(map)) if !map.is_empty()
+    )
 }
 
 /// 读会话记录（从 0 开始，兼容旧调用）。见 [`for_each_line`]。
@@ -3244,6 +3274,76 @@ mod tests {
             candidates[0].body
         );
         assert!(advance[0].1.offset > first_len, "游标要越过旧内容");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 末尾没有换行的那一行：**完整 JSON 要读进来，半行不能读**。
+    ///
+    /// ── 为什么这条必须分开判 ──────────────────────────────────
+    /// 「写完了但客户端没补换行」和「正在写的半行」在磁盘上长得一模一样 ——
+    /// 都读不到换行符。旧实现一律当半行丢掉，代价是：那个会话的**最后一条
+    /// 消息永远进不来**（文件不会再长，游标卡在这一行开头，每一轮都重读它、
+    /// 每一轮都丢掉它）。
+    ///
+    /// 判据是「这一行本身能不能整体解析成 JSON」：JSON 对象的收尾 `}` 一定
+    /// 是最后落盘的那几个字节，截断到一半必然解析失败。
+    #[test]
+    fn tail_without_newline_is_read_only_when_it_is_complete_json() {
+        let dir = std::env::temp_dir()
+            .join(format!("mem-tail-line-{}", crate::server::logging::now_ms()));
+        std::fs::create_dir_all(&dir).ok();
+        let file = dir.join("session.jsonl");
+
+        // 完整的一行，末尾没有换行 → 必须读进来
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"role":"user","content":"最后一条消息：网关端口固定 3065","timestamp":{}}}"#,
+                crate::server::logging::now_ms()
+            ),
+        )
+        .ok();
+        let mut seen: Vec<String> = Vec::new();
+        let cursor = for_each_line(&file, 0, |line| {
+            seen.push(line.to_string());
+            true
+        })
+        .expect("流式读应成功");
+        assert_eq!(seen.len(), 1, "完整的尾行必须被读进来：{seen:?}");
+        assert!(seen[0].contains("最后一条消息"));
+        assert_eq!(
+            cursor,
+            file_len(&file).expect("应能取到长度"),
+            "读完应停在文件末尾"
+        );
+
+        // 写到一半的尾行 → 不能读，游标停在它前面
+        std::fs::write(
+            &file,
+            format!(
+                "{}\n{{\"role\":\"user\",\"content\":\"写到一半",
+                r#"{"role":"user","content":"前面那一行完整内容"}"#
+            ),
+        )
+        .ok();
+        let complete_len = std::fs::metadata(&file).expect("应能取到元数据").len();
+        let mut seen: Vec<String> = Vec::new();
+        let cursor = for_each_line(&file, 0, |line| {
+            seen.push(line.to_string());
+            true
+        })
+        .expect("流式读应成功");
+        assert_eq!(seen.len(), 1, "半行不能被读进来：{seen:?}");
+        assert!(
+            seen[0].contains("前面那一行完整内容"),
+            "读到的是完整的那一行：{}",
+            seen[0]
+        );
+        assert!(
+            cursor < complete_len,
+            "游标必须停在半行之前（{cursor} < {complete_len}）"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
