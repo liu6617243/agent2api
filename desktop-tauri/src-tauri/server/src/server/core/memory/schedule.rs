@@ -93,6 +93,11 @@ fn default_interval(task: &str) -> i64 {
         // 「列一遍目录 + stat」，比它跑一次模型便宜五个数量级。
         "ingest" => 30,
         "index-scan" => 360,
+        // 抽取是这批任务里唯一「跑得越勤、库越脏」的一个：每轮最多 3 条，
+        // 半小时一轮就是每天上限 144 条，而真机一天的流水只有 85 条 ——
+        // 产 l2 的速度比产 l1 还快。改成 2 小时一轮（每天上限 36 条），
+        // 让它先有足够的流水可压缩，而不是每次都在同一批素材上重复抽取。
+        "extract" => 120,
         // 按天跑的任务用 24h 表达；具体时刻由 `auto.tasks` 里的 `daily` 字段给，
         // 这里只是「两次之间至少隔多久」的兜底
         "supersede" | "distill" | "cleanup" | "health" => 1_440,
@@ -138,12 +143,16 @@ fn task_uses_model(task: &str) -> bool {
 
 fn task_interval(task: &str) -> i64 {
     let tasks = config::object_of("auto.tasks");
-    tasks
+    let configured = tasks
         .get(task)
         .and_then(|item| item.get("intervalMin"))
         .and_then(Value::as_i64)
-        .unwrap_or_else(|| default_interval(task))
-        .max(1)
+        .unwrap_or_else(|| default_interval(task));
+    // `extract` 的下限单列一档：它每轮最多写 3 条记忆，跑太勤等于把同一批
+    // 流水反复抽成多条结论（真机取证：配置写的 30 分钟，三天抽了 132 条）。
+    // 这条下限是「数据质量」不是「性能」，配置里写 30 也按 120 执行。
+    let floor = if task == "extract" { 120 } else { 1 };
+    configured.max(floor)
 }
 
 fn task_batch(task: &str) -> usize {
@@ -746,8 +755,8 @@ fn ingest() -> Outcome {
 /// `{"queued":4,"checked":100}` —— 得自己翻译。
 ///
 /// ── 为什么按任务名分支而不是按载荷键猜 ──────────────────────
-/// 同一句话在 `extract` 里是「写入 N 条」、在 `consolidate` 里是「合并 N 条」，
-/// 语义不同却都叫 `written` / `queued`。按任务名写死措辞比按键名猜更准。
+/// 同一句话在 `extract` 里是「新建 N 条候选」、在 `consolidate` 里是「合并
+/// N 条」，语义不同却都叫 `written` / `queued`。按任务名写死措辞比按键名猜更准。
 /// 每个分支都做了「键可能不存在」的兜底（`unwrap_or(0)`），因为任务的载荷
 /// 形状会随实现调整，而这个函数只该影响展示，绝不该 panic。
 fn detail_of(task: &str, outcome: &Outcome) -> String {
@@ -759,7 +768,21 @@ fn detail_of(task: &str, outcome: &Outcome) -> String {
             match task {
                 // 「处理 N 条，更新 M 条」—— 目标界面里最有信息量的一栏：
                 // 读到几条、写了几个是两件事（有些挡在去重上）。
-                "extract" => format!("处理 {} 条，写入 {} 条", n("material"), n("written")),
+                // 「处理 N 条，新建 C 条候选，确认 R 条」—— 三个数是三种结局：
+                // 读到多少流水、其中多少是清单里没有的新话题、多少只是又一次
+                // 确认。以前只报「写入 N 条」，读起来像「抽了 3 条就沉淀了 3 条」，
+                // 恰好掩盖了 l2 泛滥这件事。
+                "extract" => {
+                    let (created, reinforced, promoted) = (n("created"), n("reinforced"), n("promoted"));
+                    if promoted > 0 {
+                        format!(
+                            "处理 {} 条，新建 {created} 条候选，确认 {reinforced} 条（{promoted} 条升沉淀）",
+                            n("material")
+                        )
+                    } else {
+                        format!("处理 {} 条，新建 {created} 条候选，确认 {reinforced} 条", n("material"))
+                    }
+                }
                 "summarize" => format!("生成摘要 {} 条", n("summarized")),
                 "tag" => format!("打标 {} 条", n("tagged")),
                 "distill" => format!("读 {} 条素材，产出 {} 条结论", n("material"), n("queued")),
@@ -1175,16 +1198,32 @@ fn health_check() -> Outcome {
 /// 抽取：把最近的 l1 流水压成结论候选（`extract` 与 `distill` 的分工）。
 ///
 /// `extract` 只看**最近一批**（默认 20 条），产出比 distill 更轻：它不要求
-/// 跨项目规律，只回答「这批流水里有什么值得留下来」。所以它的产物直接走
-/// `memory_write`（写一条 l2），不进队列 —— 轻量、可撤销（删掉就行）。
+/// 跨项目规律，只回答「这批流水里有什么值得留下来」。
+///
+/// ── 产物为什么落 l1，而不是 l2 ───────────────────────────────
+/// 早先这里写死 `layer: Some("l2")`，等于「模型抽一次就直接算沉淀」。真机
+/// 取证：三天产出 132 条 l2，`agent` 全是 `auto-extract`，真蒸馏产物 0 条；
+/// 同一件事被抽出 3-6 份不同措辞（「版本号」3 条、「交付流程」6 条），l2
+/// 数量反超 l1。抽取是**压缩流水**，不是**确认结论** —— 它该产出候选，
+/// 候选要被后续流水反复确认，才配升 l2（`PROMOTE_AFTER_REINFORCE`）。
+///
+/// ── 为什么要喂已有结论 ───────────────────────────────────────
+/// 以前 prompt 里只有流水素材，模型每轮从零生成「新」结论，同一件事换个说法
+/// 再写一条。现在把已有 l2 与抽取产物的标题 + id 一起给它，并区分
+/// `new` / `reinforce`：能复述成清单里某条的就是 reinforce，追加证据、
+/// 计数 +1，不再新建。这一条比任何排序算法都重要 —— 重复在生成端就被拦住。
 fn extract(project: Option<&str>) -> Outcome {
     if !config::bool_of("deep.enabled") {
         return Outcome::Skipped("深层记忆已关闭".into());
     }
     let batch = task_batch("extract");
+    // 素材只收「真流水」：自动抽取自己的产物不能当下一轮的输入。剔掉的话
+    // 第一轮写下的 l1 会在第二轮变成素材，被再抽一遍，越抽越多且每条都
+    // 「有据可依」—— 自我循环比重复更难看懂。
     let mut recent: Vec<super::model::MemoryEntry> = store::load_all()
         .into_iter()
         .filter(|entry| entry.is_live() && entry.layer == super::Layer::L1)
+        .filter(|entry| entry.agent.as_deref() != Some(super::model::AUTO_EXTRACT_AGENT))
         .filter(|entry| match project {
             Some(slug) => entry.project.as_deref() == Some(slug),
             None => true,
@@ -1195,6 +1234,45 @@ fn extract(project: Option<&str>) -> Outcome {
     if recent.len() < 3 {
         return Outcome::Skipped("最近流水太少，不值得抽取".into());
     }
+    // 已有结论清单：l2（真沉淀）+ 抽取产物（还没升上去的候选）。两类都要喂，
+    // 否则「候选 vs 候选」的重复识别不出来。
+    //
+    // 上限 60 条是 token 预算的取舍：清单只是让模型「认出这是老话题」，不是
+    // 让它逐条比对。按 updated_at 倒序取最近的，冷门老结论认不出来时会走
+    // new，由下一轮的 near_duplicate 兜底。
+    let mut known: Vec<super::model::MemoryEntry> = store::load_all()
+        .into_iter()
+        .filter(|entry| entry.is_live())
+        .filter(|entry| {
+            entry.layer == super::Layer::L2
+                || entry.agent.as_deref() == Some(super::model::AUTO_EXTRACT_AGENT)
+        })
+        .filter(|entry| match project {
+            Some(slug) => entry.project.as_deref() == Some(slug),
+            None => true,
+        })
+        .collect();
+    known.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
+    known.truncate(60);
+    let known_ids: std::collections::HashSet<String> =
+        known.iter().map(|entry| entry.id.clone()).collect();
+    let catalog = known
+        .iter()
+        .map(|entry| {
+            format!(
+                "[{}] ({}) {}",
+                entry.id,
+                entry.kind.as_str(),
+                super::model::truncate_chars(&entry.title, 40)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let catalog = if catalog.is_empty() {
+        "（还没有任何结论）".to_string()
+    } else {
+        catalog
+    };
     let material = recent
         .iter()
         .map(|entry| {
@@ -1212,7 +1290,14 @@ fn extract(project: Option<&str>) -> Outcome {
         "下面是最近的若干条工作流水。请挑出**仍然值得长期记住**的内容，最多 3 条。\n\
          只挑有明确结论或明确教训的；进度汇报、寒暄、临时状态全部丢掉。\n\
          一条都没有就输出 {{\"items\":[]}}。\n\n\
-         ── type 怎么选 ──────────────────────────────────────\n\
+         ── 先比对已有结论，再决定动作 ─────────────────────────\n\
+         已经有这些结论（id 只能从这里选，不要自己编）：\n{catalog}\n\n\
+         reinforce = 这批流水讲的事，上面清单里已经有了。target 填那条的 id，\n\
+                     note 写这次补充或确认了什么。\n\
+                     **哪怕措辞完全不同，只要是同一件事，就是 reinforce。**\n\
+         new       = 清单里确实没有，才新建。\n\
+                     同一件事被记成两条是最严重的错误 —— 宁可 reinforce，不要 new。\n\n\
+         ── type 怎么选（只在 new 时填）─────────────────────────\n\
          decision  = 做了选择且说得出理由\n\
          knowledge = 外部事实、接口形态、平台规矩\n\
          pitfall   = 踩过的坑、下次要绕开的东西\n\
@@ -1221,7 +1306,10 @@ fn extract(project: Option<&str>) -> Outcome {
          而且**要写成命令句**（「版本号保持 3.5.0-beta.1，不要自行 bump」），\n\
          不要写成汇报句（「用户不想升版本号」）—— 这条会被原样注入到之后的\n\
          每一次对话里，汇报句读起来像历史，命令句读起来像要求。\n\n\
-         输出 JSON：{{\"items\":[{{\"title\":\"不超过 40 字\",\"type\":\"decision|knowledge|pitfall|preference\",\"body\":\"100-300 字\",\"importance\":0.0-1.0}}]}}\n\n\
+         输出 JSON：{{\"items\":[\
+         {{\"action\":\"reinforce\",\"target\":\"已有 id\",\"note\":\"补充了什么\"}},\
+         {{\"action\":\"new\",\"title\":\"不超过 40 字\",\"type\":\"decision|knowledge|pitfall|preference\",\"body\":\"100-300 字\",\"importance\":0.0-1.0}}\
+         ]}}\n\n\
          流水：\n{material}"
     );
     let reply = match super::llm::complete(super::llm::Request::new("extract", SYSTEM_EXTRACT, ask)) {
@@ -1238,8 +1326,32 @@ fn extract(project: Option<&str>) -> Outcome {
         return Outcome::Failed("抽取结果不是合法 JSON，已丢弃".into());
     };
     let items = parsed.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
-    let mut written = 0usize;
+    let mut created = 0usize;
+    let mut reinforced = 0usize;
+    let mut promoted = 0usize;
+    // 一次强化的证据锚点：这批流水里最新的那条。它代表「这次是哪批流水确认
+    // 的」，比塞时间戳干净，也比「把 20 条素材全挂上」克制。同一批流水重复
+    // 跑时这个 id 已经在 evidence 里，不会重复计数。
+    let cue = recent
+        .first()
+        .map(|entry| entry.id.clone())
+        .unwrap_or_default();
     for item in items.iter().take(3) {
+        if item.get("action").and_then(Value::as_str) == Some("reinforce") {
+            let target = item.get("target").and_then(Value::as_str).unwrap_or("").trim();
+            // 模型编了 id / 指向清单外：直接丢，不降级成 new。降级会把它变成
+            // 一条新的重复结论，正是这一轮要消灭的东西。
+            if target.is_empty() || !known_ids.contains(target) {
+                continue;
+            }
+            if let Ok(upgraded) = reinforce(target, &cue) {
+                reinforced += 1;
+                if upgraded {
+                    promoted += 1;
+                }
+            }
+            continue;
+        }
         let body = item.get("body").and_then(Value::as_str).unwrap_or("").trim();
         if body.chars().count() < 20 {
             continue;
@@ -1274,9 +1386,10 @@ fn extract(project: Option<&str>) -> Outcome {
             content: body.to_string(),
             title: Some(title),
             kind: Some(kind.to_string()),
-            layer: Some("l2".to_string()),
+            // 落 l1：抽取是候选，不是沉淀。升 l2 由 reinforce 触发。
+            layer: Some("l1".to_string()),
             project: project.map(str::to_string),
-            agent: Some("auto-extract".to_string()),
+            agent: Some(super::model::AUTO_EXTRACT_AGENT.to_string()),
             tags: Vec::new(),
             importance: Some(importance),
             files,
@@ -1287,17 +1400,68 @@ fn extract(project: Option<&str>) -> Outcome {
             session: None,
             created_at: None,
             valid_to: None,
-            evidence: recent.iter().map(|entry| entry.id.clone()).take(5).collect(),
+            // 只挂「这次是哪批流水产出的」一条：`evidence` 现在兼职强化计数，
+            // 一上来塞 5 条会让新建的候选在第一次 reinforce 时就跨过升级门槛，
+            // 等于「新建 + 确认一次 = 沉淀」，跟以前一样松。
+            evidence: if cue.is_empty() { Vec::new() } else { vec![cue.clone()] },
         };
         // 走 super::write 而不是直接落盘：抽取产物同样要经过去重、hash、索引
         if super::write(input).is_ok() {
-            written += 1;
+            created += 1;
         }
     }
-    if written == 0 {
+    if created == 0 && reinforced == 0 {
         return Outcome::Skipped("这批流水里没有值得留下来的结论".into());
     }
-    Outcome::Done(json!({ "written": written, "material": recent.len(), "model": reply.model }))
+    Outcome::Done(json!({
+        "created": created,
+        "reinforced": reinforced,
+        "promoted": promoted,
+        "material": recent.len(),
+        "model": reply.model
+    }))
+}
+
+/// 把一条已有结论「确认一次」：追加证据锚点，够了就升 l2。返回是否升级。
+///
+/// ── 为什么用 `evidence` 当计数器，而不是新加 `reinforced` 字段 ────
+/// 强化次数 = 被多少批不同的流水独立确认过。这正好是 `evidence` 的语义
+/// （「支撑这条结论的原始记忆 id」）。新加字段要动 `ENTRY_COLUMNS` /
+/// `ENTRY_SELECT` / 行解析 / `write_row` 四处，老库还要迁移；而 `cue` 是
+/// 流水 id，同一条流水重复跑时天然去重，计数不会虚高。
+///
+/// ── 升级为什么要清 path ─────────────────────────────────────
+/// l1 落的是容器（`general/l1/<agent>/<date>.md`，一个文件多节），l2 是一条
+/// 一文件。`entry_path` 见到非空 `path` 就直接沿用它，不清空的话「升级」只会
+/// 改 layer 字段、文件还留在 l1 容器里，下一轮扫描又把它当流水。
+fn reinforce(target: &str, cue: &str) -> Result<bool, String> {
+    let Some(before) = store::load_all().into_iter().find(|entry| entry.id == target) else {
+        return Err(format!("强化目标不存在：{target}"));
+    };
+    if !before.is_live() {
+        return Err(format!("强化目标已失效：{target}"));
+    }
+    let mut entry = before.clone();
+    if !cue.is_empty() && !entry.evidence.iter().any(|known| known.as_str() == cue) {
+        entry.evidence.push(cue.to_string());
+        // 上限 20：证据链是给人看「凭什么」的，不是越长越好
+        if entry.evidence.len() > 20 {
+            let overflow = entry.evidence.len() - 20;
+            entry.evidence.drain(0..overflow);
+        }
+    }
+    entry.updated_at = super::model::now_ms();
+    let ready = entry.layer == super::Layer::L1
+        && entry.evidence.len() >= super::model::PROMOTE_AFTER_REINFORCE;
+    if ready {
+        entry.layer = super::Layer::L2;
+        entry.path.clear();
+        store::move_save(&before, &entry)?;
+    } else {
+        store::save(&entry)?;
+    }
+    index::global().upsert(&entry)?;
+    Ok(ready)
 }
 
 const SYSTEM_EXTRACT: &str = "You curate a long-term project memory. \

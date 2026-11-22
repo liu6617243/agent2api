@@ -51,7 +51,9 @@ use regex::Regex;
 use serde_json::Value;
 
 use super::config;
-use super::model::{estimate_tokens, truncate_chars, MemoryEntry, MemoryKind, Layer};
+use super::model::{
+    estimate_tokens, truncate_chars, MemoryEntry, MemoryKind, Layer, AUTO_EXTRACT_AGENT,
+};
 use super::store;
 
 /// 注入块的起止标记。
@@ -856,6 +858,14 @@ fn floor_for(entry: &MemoryEntry) -> Option<f64> {
     // 沉淀层本身就是结论，标题/摘要里出现线索就够
     if entry.layer == Layer::L2 {
         return Some(2.0);
+    }
+    // 自动抽取产出、还没被反复确认的 l1：它是一次模型调用的产物，不是人写下
+    // 的结论。按下面「l1 里的要求/踩坑/决策天然是结论」那条 2.0 放行，结果是
+    // 同一件事被抽出几份不同措辞，同时挤进注入预算（真机取证：132 条 l2 里
+    // 五组同义结论各占 3-6 条）。这里要求「路径命中」或「两条独立线索」
+    // （3.4 档）；被 reinforce 到升 l2 之后自然回到上面那条 2.0。
+    if entry.agent.as_deref() == Some(AUTO_EXTRACT_AGENT) {
+        return Some(3.4);
     }
     // l1 里「要求 / 踩坑 / 决策 / 画像」这几类天然是「下次要用」的；加星与高
     // importance 是有人主动抬过 —— 两种都按结论对待

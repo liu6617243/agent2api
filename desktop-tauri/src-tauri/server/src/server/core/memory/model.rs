@@ -20,6 +20,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+/// 自动抽取流水线的写入方标识。
+///
+/// 单独拎成常量而不是在 `schedule` 里写字符串字面量，是因为它现在有三处判据
+/// 要读：抽取时打标、注入时降权（`inject::floor_for`）、抽取素材池剔除自身
+/// 产物（不剔的话第一轮写下的 l1 会变成第二轮的「流水」，自我循环）。
+/// 三处各写一遍 `== "auto-extract"`，改名字时必漏一处。
+pub const AUTO_EXTRACT_AGENT: &str = "auto-extract";
+
+/// 抽取产物升入 l2 前要被独立流水确认的次数。
+///
+/// 这个数字就是压缩比：以前是 0（抽一次直接落 l2），库里的 l2 涨到 l1 的
+/// 1.5 倍；设成 2 意味着同一件事至少要被两批不同的流水讲一遍才配叫「沉淀」。
+/// 别调得太高 —— 三批流水讲同一件事在本仓这种单线开发节奏里已经很少见了。
+pub const PROMOTE_AFTER_REINFORCE: usize = 2;
+
 /// 记忆层。`l1` = 原始日常（一天一文件多节），`l2` = 蒸馏/沉淀（一文件一条）。
 ///
 /// ── 为什么要有这一层 ────────────────────────────────────────
@@ -483,7 +498,7 @@ pub fn normalize_for_hash(text: &str) -> String {
     }
 }
 
-fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     crate::server::logging::now_ms()
 }
 
