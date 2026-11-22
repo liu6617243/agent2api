@@ -68,15 +68,21 @@ impl std::fmt::Display for CheckinError {
 /// 国际版没有签到活动，签到相关操作一律排除该版本账号
 /// （Node: `account.edition !== 'intl'`）。
 ///
-/// **Qoder 国际版已不再吃这条判据**（2026-10，issue #140）：国际版有独立的
-/// 签到链路（带设备风控身份领「每日 100 Credits」，见 `providers::qoder::checkin`
-/// 与 `qoder::risk`），在下面的 provider 判定里显式放行 —— 与 WorkBuddy
-/// 国际版同一手法。拆家后两家 provider id 各自独立，放行判据按 id 写。
+/// **Qoder 国际版不再吃这条判据，也不再因此被放行**（2026-11 修正）：
+/// Qoder 两个地区的每日权益领取已随实现搬到提供商插件（`agent2api-providers`
+/// 的 `qoder` / `qoder-intl`）。插件被停用后（插件管理里把这家关掉，
+/// `plugins.json` 对应项为 false），库里残留的账号如果仍被判进签到目标，
+/// `checkin_for` 就没有执行体可走，稳定报「签到链路尚未接入」——
+/// 2026-11-21/22 真机台账正是这个形状（11-18 还能领 100 credits，
+/// 11-20 起全部 failed）。判据改为**执行体优先**：没有插件接管、也没有
+/// 内置执行体的家，一律不参与签到；装回插件（或把开关打开）账号原样回来。
 ///
 /// Accio 系（两个地区）**整家**也没有签到活动：上游客户端全包检索不到
 /// 「签到 / checkin / 每日任务」的任何痕迹（见 `providers::accio` 的模块头）。
 /// 它按 **provider id** 排除而不是 edition —— 两个地区都没有活动，而 provider
-/// 是落盘契约，不会因为凭证里多一个字段而改变判定。
+/// 是落盘契约，不会因为凭证里多一个字段而改变判定。执行体判据收紧后它们
+/// 自然落不进每日签到；`checkin_center::out_of_scope_reason` 仍按家族给
+/// 「未接入签到链路」的文案。
 ///
 /// 这一步是**必需的**：不在范围的家会落到 `checkin_for` 的分派里，拿另一家的
 /// 令牌去打错的签到接口只会稳定报错（见那里的最后两条分支）。
@@ -113,57 +119,41 @@ pub fn supports_checkin(account: &Value) -> bool {
             .and_then(|adapter| adapter.plugin_checkin_capability())
             .unwrap_or(false);
     }
-    // WorkBuddy 国际版没有国内版的普通签到接口，但上游客户端把它接到同一条
-    // 「每日活跃」调度上（活动探测 + 条件领取 + 免费模型保活），所以它**参与**
-    // 签到目标集合，执行形态在 `checkin_for` 按 provider 分派（workbuddy-intl）。
-    // 它的 provider id 是拆家后的独立 id，不与国内版共用 —— 放行必须写在
-    // 下面的 edition 判定之前，否则会被「intl 一刀切」挡掉。
-    if provider == crate::server::core::providers::workbuddy::Region::Intl.provider_id() {
-        return true;
+    // ── 内置执行体（2026-11 收紧）───────────────────────────────
+    // Qoder 两个地区与各家签到实现已陆续搬进提供商插件；网关里**仍留着
+    // 内置签到执行体**的只剩 WorkBuddy 两个地区：
+    //   - 国内版：`billing::checkin::workbuddy::checkin`（计费服务每日签到）；
+    //   - 国际版：`billing::workbuddy_daily_activity`（每日活跃链路）。
+    // 其余已知家没有插件接管时一律**不参与**。曾经的写法是给 Qoder 国际版
+    // 单独放行、其余已知家落到尾部 `!is_accio_family` 兜底返回 true ——
+    // 那是插件化**之前**的形状；插件化之后这几条放行就变成了「目录里
+    // 没有这家，统一签到却去签它」的缺口（本次事故的根因）。
+    if provider == crate::server::core::providers::DEFAULT_PROVIDER_ID {
+        // 国内版访客不在签到范围（旧判据：`isGuest` 在 WorkBuddy 分支之后
+        // 仍然生效）。国际版访客维持旧口径放行 —— 那条链是「每日活跃」，
+        // 不依赖积分体系。
+        return account.get("isGuest").and_then(Value::as_bool) != Some(true);
     }
-    // Qoder 国际版同理（2026-10 拆家 + issue #140）：它有自己的签到链路
-    // （带设备风控身份领「每日 100 Credits」，见 `providers::qoder::checkin`
-    // 与 `qoder::risk`），放行同样必须写在 edition 判定之前。
-    if provider == crate::server::core::providers::qoder::endpoints::Region::Global.provider_id() {
+    if provider == crate::server::core::providers::workbuddy::Region::Intl.provider_id() {
         return true;
     }
     if account.get("edition").and_then(Value::as_str) == Some("intl") {
         return false;
     }
-    // CodeArts **参与**本链（2026-10 按用户要求纳入，见 `auto_checkin::CHECKIN_PROVIDERS`
-    // 里那一条的说明）：它的每日福利是 ops 活动交付（三个接口、两套状态），形态与
-    // 别家差别最大，所以在「今天还能不能再领」「要不要重试」这两件事上与签到同构 ——
-    // 上面那条按 `edition` 的 intl 一刀切与本家无关（它没有版本概念，恒 cn）。
-    // Trae 曾与 CodeArts 同列排除表；SOLO 转积分制后模型调用花的就是签到钱包
-    // 那份钱，它已接入本链（实现现由插件提供），不要再加回来。
+    // 走到这里 = 不是 WorkBuddy 两个地区、也没有插件接管。已知家（Qoder、
+    // 小浣熊、AutoClaw、Trae、CodeArts、ModelScope、智谱清言…）的签到执行体
+    // 都在插件里；未知 id 同样没有执行体。一律排除 —— 与签到中心「供应商
+    // 目录」的可用清单同一口径：目录里没有的家，统一签到也不去签它。
     //
-    // ── 智谱清言的**访客账号**不在签到范围 ──────────────────────
-    // 访客没有积分体系：上游对每日登录积分 / 积分活动 / 任务中心一律 401
-    // （实测；实现已搬到插件，那段说明在插件的 `chatglm/checkin` 模块头），
-    // 所以它进本链的
-    // **唯一**后果是负面的 —— 永远显示「待签」、把「今日签到进度」的分母
-    // 撑大（`checkin_center` 按本判据分组），并在签到记录台账里每天落一条
-    // 失败（那句中性文案不在 `claim_pending` 的白名单里）。因此按访客形态
-    // 排除，改由签到中心的「不参与每日签到」如实说明原因
-    // （`api::checkin_center::out_of_scope_reason`）—— 静默消失比签不上更糟。
+    // 访客（智谱清言等）同样落进这一档：访客没有积分体系，进本链的唯一
+    // 后果是每天落一条失败。判据读公开形态的 `isGuest`（插件账号由插件的
+    // `account_view` 给，存量账号由 `store_view::public_account` 注入）——
+    // 签到中心的分组与批量签到的目标解析读的是同一份快照。
     //
-    // 判据读公开形态的 `isGuest`（插件账号由插件的 `account_view` 给，
-    // 存量账号由 `store_view::public_account` 注入，见那里的说明）：**必须走
-    // 公开形态**，因为签到中心的分组与批量签到的目标解析读的是同一份快照 ——
-    // 判据只此一处，两处才不会分叉。
-    if account.get("isGuest").and_then(Value::as_bool) == Some(true) {
-        return false;
-    }
-    // ── 插件家：能力位来自握手 ─────────────────────────────────
-    // 走到这里说明它不在上面任何一个内置分支里（`edition` / `isGuest` 那些
-    // 账号级判据对插件家没有意义 —— 插件上报的是不透明 JSON，网关不知道
-    // 里面有没有 `edition`）。所以这里问的是握手里那个静态能力位。
-    if crate::server::core::providers::kind_from_id(provider).is_none() {
-        return crate::server::core::providers::adapter::adapter_by_id(provider)
-            .and_then(|adapter| adapter.plugin_checkin_capability())
-            .unwrap_or(false);
-    }
-    !crate::server::core::account_store::is_accio_family(provider)
+    // Accio 家族自然落进这一档（它们既不是 WorkBuddy，也没插件接管签到）。
+    // `checkin_center::out_of_scope_reason` 会按 `is_accio_family` 先给
+    // 「未接入签到链路」的文案；这里不需要再特判一次。
+    false
 }
 
 /// 账号的提供商 id（缺失时按默认 provider 处理，与账号存储的兜底口径一致）。
@@ -251,6 +241,10 @@ pub fn resolve_checkin_targets(
         }
         return Ok((found, 0));
     }
+    // 批量签到读的是 `listAccounts()`（全部账号，含停用与缺插件的家），
+    // 与签到中心的 `listVisibleAccounts()` 不同 —— 那是「目录里没有这家，
+    // 统一签到却去签它」的分叉点。资格判定（`supports_checkin`）必须把
+    // 没有执行体的家挡在外面（2026-11-22 qoder 事故）。
     let available: Vec<Value> = all.into_iter().filter(is_available).collect();
     let total = available.len();
     let eligible: Vec<Value> = available
@@ -271,9 +265,9 @@ pub fn resolve_checkin_targets(
 ///     （`billing.workbuddy_daily_activity`，模型链可在签到中心自定义）；
 ///   - **小浣熊**：桌面登录积分链路（实现已搬到插件）；
 ///   - **AutoClaw**：通用任务接口的 `daily_signin` 任务（实现已搬到插件）；
-///   - **Qoder**：活动（campaign）领取链路，中国版直领；国际版要先带设备
-///     风控身份重新拉活动列表（`providers::qoder::checkin` + `qoder::risk`）；
-///     （`providers::qoder::checkin::claim_daily_checkin`）；
+///   - **Qoder 两个地区**：活动（campaign）领取链路已随实现搬到提供商插件
+///     （`agent2api-providers` 的 `qoder` / `qoder-intl`）。插件被停用时
+///     `supports_checkin` 已把它们排除，不会走到这里的兜底。
 ///   - **Trae**：Trae 的 `checkin_credits` 领取（实现已搬到插件）；
 ///   - **CodeArts**：当日 ops 福利（实现已搬到插件，走插件分支）。
 ///
@@ -343,8 +337,9 @@ pub async fn checkin_for(
         // 那条插件分支（`plugin_checkin_capability`）。
         // AutoClaw 的两个地区：签到已随实现搬到插件，走上面那条插件分支
         // （`plugin_checkin_capability`）。
-        // Qoder 的每日权益领取已随实现搬到插件，走上面那条插件分支
-        // （`plugin_checkin_capability`）。
+        // Qoder 的两个地区：每日权益领取已随实现搬到插件，走上面那条插件分支
+        // （`plugin_checkin_capability`）。插件停用时 `supports_checkin` 已把
+        // 这家排除，不会落进这里报「尚未接入」。
         // Trae 的每日签到已随实现搬到插件，走上面那条插件分支
         // （`plugin_checkin_capability`）。
         "workbuddy-intl" => {
@@ -403,6 +398,8 @@ pub async fn checkin_for(
         // 令牌去打腾讯的签到接口，稳定报错且看不出原因（Qoder 接入前正是这个处境）。
         // 现在落到这里的未知家明确报「未接入」，新增一家时忘了加分支会立刻暴露
         // （WorkBuddy 国际版拆家后是独立 id，走上面的 workbuddy-intl 分支）。
+        // 配套的资格判定在 `supports_checkin`：插件停用/未装的已知家不会进来，
+        // 这里只兜「资格判定放行了、分派却没接」的漂移（新增内置家忘了加分支）。
         _ if provider_id == crate::server::core::providers::DEFAULT_PROVIDER_ID => {
             workbuddy::checkin(store, billing, id, name, &display).await
         }
@@ -806,3 +803,54 @@ fn spawn_streak_bonus(store: AccountStore, targets: Vec<Value>) {
         RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 2026-11-22 qoder 事故的回归测试：插件被停用（`serves_provider` 为假、
+    /// `checkin_of` 为 None）时，库里残留的 qoder / qoder-intl 账号**不得**
+    /// 进入签到目标 —— 否则统一签到会拿它们去撞 `checkin_for` 的兜底，
+    /// 稳定报「Qoder 中国版 的签到链路尚未接入」（真机台账 11-20 起两条 failed）。
+    ///
+    /// 测试进程没有装插件，`serves_provider` / `checkin_of` 对所有 id 都返回
+    /// None / false，正好就是「插件停用」的形状。
+    #[test]
+    fn qoder_without_plugin_is_out_of_checkin_scope() {
+        assert!(!supports_checkin(&json!({ "provider": "qoder" })));
+        assert!(!supports_checkin(&json!({ "provider": "qoder-intl" })));
+        // 国际版账号曾因「issue #140 显式放行」绕过 edition 一刀切；
+        // 插件化之后这条放行必须同时下线。
+        assert!(!supports_checkin(&json!({ "provider": "qoder-intl", "edition": "intl" })));
+        // 停用账号照旧参与判定（签到不看 enabled），这里只验 provider 维度。
+        assert!(!supports_checkin(&json!({ "provider": "qoder", "enabled": false })));
+    }
+
+    /// WorkBuddy 两个地区是网关里**仅存**的内置签到执行体：
+    /// 国内版走计费服务每日签到，国际版走每日活跃链路。
+    #[test]
+    fn workbuddy_regions_still_have_builtin_executors() {
+        assert!(supports_checkin(&json!({ "provider": "workbuddy" })));
+        assert!(supports_checkin(&json!({})));
+        assert!(supports_checkin(&json!({ "provider": "workbuddy-intl" })));
+    }
+
+    /// Accio 两地没有签到活动；未知 provider 同样没有执行体，一律排除
+    /// （曾经的 `!is_accio_family` 兜底会把未知家也放进来）。
+    #[test]
+    fn accio_and_unknown_providers_are_out_of_scope() {
+        assert!(!supports_checkin(&json!({ "provider": "accio" })));
+        assert!(!supports_checkin(&json!({ "provider": "accio-cn" })));
+        assert!(!supports_checkin(&json!({ "provider": "no-such-provider" })));
+    }
+
+    /// 访客没有积分体系，任何家都不参与（插件申报的 `exclude_guest` 之外，
+    /// 内置形态也要挡住）。
+    #[test]
+    fn guest_accounts_are_out_of_scope() {
+        assert!(!supports_checkin(&json!({ "provider": "qoder", "isGuest": true })));
+        assert!(!supports_checkin(&json!({ "provider": "workbuddy", "isGuest": true })));
+    }
+}
+

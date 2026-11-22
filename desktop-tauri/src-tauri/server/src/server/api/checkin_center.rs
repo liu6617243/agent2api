@@ -17,9 +17,10 @@
 //! 执行体在插件里，网关只做分派。）
 //!
 //! ── 分组口径与批量签到完全一致 ─────────────────────────────
-//! 进「每日签到」分组的账号 = 提供商 ∈ 可签清单（`auto_checkin::checkin_providers()`，
-//! 内置常量表 + 运行时装入的插件家）**且** `supports_checkin` 为真 —— 与 `resolve_checkin_targets` 的过滤是同一对判据，
-//! 签到中心看到的「可签 9 个」与点「立即全部签到」实际签到的集合不会分叉。
+//! 进「每日签到」分组的账号 = 提供商 ∈ **可用**清单
+//! （`auto_checkin::available_checkin_providers`：插件正接管这家）**且**
+//! `supports_checkin` 为真 —— 与 `resolve_checkin_targets` 的过滤是同一对判据，
+//! 签到中心看到的「可签 N 个」与点「立即全部签到」实际签到的集合不会分叉。
 //! 其余账号进 `outOfScope`（按提供商聚合，附原因文案）。
 //!
 //! ── 响应形状 ───────────────────────────────────────────────
@@ -113,13 +114,21 @@ fn out_of_scope_reason(account: &Value) -> &'static str {
     if guest {
         return "访客账号没有积分体系";
     }
-    // WorkBuddy / Qoder 两个地区的国际版都在 `supports_checkin` 里显式放行
-    //（前者走日活链、后者带风控领积分），还落在范围外的 intl 只可能是 Accio。
+    // WorkBuddy 国际版在 `supports_checkin` 里显式放行（走日活链）；
+    // 还落在范围外的 intl 只可能是 Accio。
+    // WorkBuddy 国际版在 `supports_checkin` 里显式放行（走日活链）；
+    // 还落在范围外的 intl 只可能是 Accio。
     if account.get("edition").and_then(Value::as_str) == Some("intl") {
         return "国际版账号没有签到活动";
     }
     if crate::server::core::account_store::is_accio_family(&provider) {
         return "未接入签到链路";
+    }
+    // 已知家但插件没接管（停用或未装）：目录里没有这家，统一签到也不会签它。
+    // 文案要指向「装回插件 / 把开关打开」，而不是让人以为这家天生不能签 ——
+    // Qoder 2026-11-22 的事故正是这个形状（库里残留账号 + 插件被关）。
+    if crate::server::core::providers::kind_from_id(&provider).is_some() {
+        return "本家签到由插件提供，插件当前未启用";
     }
     "没有签到链路"
 }
