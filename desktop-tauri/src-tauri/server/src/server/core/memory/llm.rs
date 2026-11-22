@@ -71,8 +71,14 @@ impl Request {
 /// 的 JSON 解析失败，表现成一句「模型返回空内容」。用户看到的是「深度记忆 0 条」，
 /// 而真正的原因是预算不够。
 ///
-/// 1200 对 `extract` / `tag` / `summarize` 是够的（一次十来条短句），所以不能
-/// 简单地把全局值调大 —— 那会让每一条小任务都按大任务的额度去预留。
+/// 1200 对 `tag` / `summarize` 是够的（一次十来条短句），所以不能简单地把全局值
+/// 调大 —— 那会让每一条小任务都按大任务的额度去预留。
+///
+/// ── `extract` 为什么从 1200 提到 2400（2026-11-22）─────────────
+/// 真机 `task_run` 里 `extract` 最近 12 次有 7 次失败，其中 4 次是
+/// `max_tokens=1200` 截断、3 次是截断后 JSON 不合法。而它的输出还要再长一截：
+/// 现在每条要么是 `action/target/note`，要么是 `title/type/body/importance`，
+/// 结构比原来那版多两个字段。不抬预算的话，「减少重复」换来的是一半解析失败。
 ///
 /// 可按 `models.taskMaxTokens` 覆盖（`{"distill": 4000}`），未列的走这张表。
 fn max_tokens_for(task: &str) -> u32 {
@@ -83,6 +89,9 @@ fn max_tokens_for(task: &str) -> u32 {
         }
     }
     match task {
+        // 最多 3 条，每条要么带 action/target/note，要么带 title/type/body/importance；
+        // 正文 100-300 字，JSON 骨架本身也要占掉几百 token
+        "extract" => 2400,
         // 一次产出 3-8 条结论，每条含标题 + 100-300 字正文 + 证据 id
         "distill" => 3000,
         // 四类画像各 1-4 条，每条含标题 + 一句话 + 证据 id

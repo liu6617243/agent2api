@@ -405,7 +405,7 @@ static SCHEMA: &[Knob] = &[
     // 的结论，1200 token 会被截断，截断后 JSON 解析失败，用户看到的是「深度记忆
     // 0 条」而不是「预算不够」。留一个能改的键，比让用户去猜 prompt 有用。
     knob("models.taskMaxTokens", Kind::Map, Tier::Internal, "模型与网关", "各任务输出 token 上限",
-        "{\"extract\":1200,\"tag\":1600,\"classify\":800,\"summarize\":1600,\
+        "{\"extract\":2400,\"tag\":1600,\"classify\":800,\"summarize\":1600,\
           \"distill\":3000,\"profile\":3000,\"consolidate\":3000,\"supersede\":800,\
           \"dedup\":800,\"insight\":1600}"),
 
