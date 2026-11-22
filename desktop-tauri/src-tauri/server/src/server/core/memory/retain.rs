@@ -145,31 +145,20 @@ fn strip_client_wrappers(text: &str) -> String {
         }
         out.replace_range(start..end, "");
     }
-    const WRAPPERS: &[(&str, &str)] = &[
-        ("<conversation_history_summary>", "</conversation_history_summary>"),
-        ("<system-reminder>", "</system-reminder>"),
-        ("<environment_context>", "</environment_context>"),
-    ];
-    for (open, close) in WRAPPERS {
-        while let Some(start) = out.find(open) {
-            let rest = &out[start + open.len()..];
-            // 有闭合标签：整段剔掉。没有闭合标签（真机出现过：摘要块只有开标签）
-            // 就从开标签一直剔到结尾 —— 留半截摘要比整段丢掉更糟。
-            let end = match rest.find(close) {
-                Some(at) => start + open.len() + at + close.len(),
-                None => out.len(),
-            };
-            out.replace_range(start..end, "");
-        }
-    }
-    // 上一轮摘要的另一族写法：`<summary>…</summary>` 也按同样方式处理
-    while let Some(start) = out.find("<summary>") {
-        let rest = &out[start + "<summary>".len()..];
-        let end = match rest.find("</summary>") {
-            Some(at) => start + "<summary>".len() + at + "</summary>".len(),
-            None => out.len(),
-        };
-        out.replace_range(start..end, "");
+    // ── 客户端的包装标签：开标签可能带属性 ────────────────────
+    // 真机事故：WorkBuddy 发的是 `<system-reminder data-role="user-context">`，
+    // 旧实现只认 `<system-reminder>` 精确前缀，整块摘要/环境说明原样进了
+    // `**我**：`。按「标签名 + 可选属性」配对，`<system-reminderX>` 不会误伤。
+    for tag in [
+        "system-reminder",
+        "conversation_history_summary",
+        "environment_context",
+        "summary",
+        // 客户端把会话容器也塞进 user：`<session>…</session>` 里没有真话，
+        // 留下来标题就成了 `<session>`（真机 13:17 那条）。
+        "session",
+    ] {
+        out = strip_paired_tag(&out, tag);
     }
     // ── 客户端的「工具回执」不是用户的话 ────────────────────────
     // 真机事故：库里出现 `**我**：Attached image(s) from tool result:`，
@@ -197,6 +186,54 @@ fn strip_client_wrappers(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// 删掉 `<tag …>…</tag>` 整段；没有闭合就从开标签剔到结尾。
+///
+/// ── 为什么开标签要按「标签名 + 可选属性」配对 ────────────────
+/// 真机形状是 `<system-reminder data-role="user-context">`。只认
+/// `<system-reminder>` 会把整块环境说明原样写进 `**我**：`；放宽成
+/// `starts_with("<system-reminder")` 又会误伤 `<system-reminders>`。
+/// 所以开标签必须满足：`<` + 标签名 + 后面跟 `>` / 空白 / `/`。
+fn strip_paired_tag(text: &str, tag: &str) -> String {
+    let mut out = text.to_string();
+    let open_prefix = format!("<{tag}");
+    let close = format!("</{tag}>");
+    // find_next：从 `from` 开始找下一个**真正命中**的开标签
+    // （`<tag>` / `<tag ` / `<tag>` 自闭合 / `<tag/`），跳过 `<tagX>` 这类更长标签
+    fn find_next(hay: &str, from: usize, open_prefix: &str) -> Option<usize> {
+        let mut cursor = from;
+        while let Some(at) = hay[cursor..].find(open_prefix) {
+            let start = cursor + at;
+            let after = &hay[start + open_prefix.len()..];
+            let ok = after.starts_with('>')
+                || after.starts_with(' ')
+                || after.starts_with('\t')
+                || after.starts_with('\n')
+                || after.starts_with('\r')
+                || after.starts_with('/');
+            if ok {
+                return Some(start);
+            }
+            cursor = start + 1;
+        }
+        None
+    }
+    let mut from = 0;
+    while let Some(start) = find_next(&out, from, &open_prefix) {
+        let after = &out[start + open_prefix.len()..];
+        let open_end = start
+            + open_prefix.len()
+            + after.find('>').map(|at| at + 1).unwrap_or(0);
+        let rest = &out[open_end..];
+        let end = match rest.find(&close) {
+            Some(at) => open_end + at + close.len(),
+            None => out.len(),
+        };
+        out.replace_range(start..end, "");
+        from = start;
+    }
+    out
+}
+
 /// 整行即等于这些字符串时，这一行是客户端工具回执，不是用户的话。
 ///
 /// 只列**见过真机原文**的形状（见 `.workbuddy/tmp` 里的核对记录）。
@@ -210,6 +247,12 @@ const TOOL_ECHO_LINES: &[&str] = &[
 ];
 
 /// 助手侧文本：最近一条 assistant 消息的正文（不含工具调用块）。
+///
+/// ── 为什么还要看正文开头 ────────────────────────────────────
+/// 真机事故：有的模型不把工具调用放进 `tool_calls` / `tool_use`，而是把
+/// `<antml:function_calls>` / `<function_calls>` 当**正文**吐出来。这类消息
+/// 不是「回答」，写进 l1 的标题就成了 `<antml:function_calls>`。命中工具
+/// 调用标记的 assistant 消息整条跳过 —— 真正的收尾轮不会以调用工具开头。
 pub fn assistant_text(messages: &[Value]) -> String {
     for message in messages.iter().rev() {
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
@@ -217,6 +260,19 @@ pub fn assistant_text(messages: &[Value]) -> String {
         }
         let content = message.get("content").cloned().unwrap_or(Value::Null);
         let text = protocol::content_text(&content);
+        let trimmed = text.trim_start();
+        const TOOL_TEXT_PREFIXES: &[&str] = &[
+            "<antml:function_calls>",
+            "<function_calls>",
+            "<tool_call>",
+            "<tool_calls>",
+        ];
+        if TOOL_TEXT_PREFIXES
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+        {
+            continue;
+        }
         if !text.trim().is_empty() {
             return text.chars().take(ASSISTANT_CAP).collect();
         }
@@ -304,10 +360,27 @@ fn compose_body(user: &str, answer: &str, interrupted: bool) -> String {
 fn infer_title(user: &str, answer: &str) -> String {
     /// 标题太短说明不了「这一轮在谈什么」（「继续」「改一下」「看下」）
     const MIN_TITLE: usize = 12;
+    /// 这些开头的「正文」是工具调用 / 控制消息，不是标题
+    const BAD_TITLE_PREFIXES: &[&str] = &[
+        "<antml:",
+        "<function_calls",
+        "<tool_call",
+        "<system-reminder",
+        "<task-notification",
+        "<session",
+        "**我**",
+        "**助手**",
+    ];
     fn first_line(text: &str) -> String {
         text.lines()
             .map(str::trim)
-            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .find(|line| {
+                !line.is_empty()
+                    && !line.starts_with('#')
+                    && !BAD_TITLE_PREFIXES
+                        .iter()
+                        .any(|prefix| line.starts_with(prefix))
+            })
             .unwrap_or("")
             // 标题是纯文本展示，`**` / `-` / `>` 这些标记留着会把列表页渲染成
             // 一堆断开的重号
@@ -410,6 +483,98 @@ pub fn cwd_of(messages: &[Value]) -> Option<String> {
             }
         }
     }
+    // ── 兜底：历史摘要里「工作目录」是讨论代码，不是真的 cwd ────
+    // 真机形状：`<conversation_history_summary>` 里全是「工作目录末级名」
+    // 这种**讨论留存实现**的话，按 PATTERNS 抠会把讨论当目录。真正的项目
+    // 路径藏在 user-context 块里：
+    //   `D:\Personal\Desktop\agent2api-main/.workbuddy/memory/YYYY-MM-DD.md`
+    // 取「存在且往上能找到 .git」的绝对路径；`.workbuddy` 前的那段优先
+    // （那就是项目根）。`C:\Users\…\.workbuddy\clipboard-images` 的父目录
+    // 没有 .git，不会被误当成项目。
+    for message in messages.iter().rev().take(3) {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let blocks = match message.get("content") {
+            Some(Value::String(text)) => vec![text.clone()],
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str).map(str::to_string))
+                .collect(),
+            _ => continue,
+        };
+        for block in blocks {
+            let head: String = block.chars().take(4_000).collect();
+            for candidate in absolute_path_candidates(&head) {
+                if !std::path::Path::new(&candidate).exists() {
+                    continue;
+                }
+                if let Some(root) = project_root_of(&candidate) {
+                    return Some(root);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 从一段文本里抽「长得像本机绝对路径」的候选。
+fn absolute_path_candidates(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Windows 盘符 `X:\` 或 `X:/`
+        let is_win = i + 2 < bytes.len()
+            && bytes[i].is_ascii_alphabetic()
+            && bytes[i + 1] == b':'
+            && (bytes[i + 2] == b'\\' || bytes[i + 2] == b'/');
+        // POSIX 绝对路径（前面不是字母冒号）
+        let is_nix = bytes[i] == b'/'
+            && i + 1 < bytes.len()
+            && bytes[i + 1].is_ascii_alphanumeric();
+        if !is_win && !is_nix {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i;
+        while end < bytes.len() {
+            let b = bytes[end];
+            let stop = matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'<' | b'>' | b'|' | b'*' | b'?' | b'`' | b')' | b'(');
+            if stop {
+                break;
+            }
+            end += 1;
+        }
+        let raw = &text[start..end];
+        let raw = raw.trim_end_matches(|ch: char| matches!(ch, '.' | ',' | '。' | '，' | ';' | '；'));
+        if raw.chars().count() >= 4 {
+            out.push(raw.to_string());
+        }
+        i = end.max(start + 1);
+    }
+    out
+}
+
+/// 候选路径 → 项目根（有 .git 的最近祖先；`.workbuddy` 的父目录优先）。
+fn project_root_of(candidate: &str) -> Option<String> {
+    let path = std::path::Path::new(candidate);
+    // `.workbuddy/...`：项目根在它爹那一级
+    for ancestor in path.ancestors() {
+        if ancestor.file_name().and_then(|n| n.to_str()) == Some(".workbuddy") {
+            if let Some(parent) = ancestor.parent() {
+                if parent.join(".git").exists() {
+                    return Some(parent.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    // 本身就是仓库根，或往上找
+    if let Some(root) = super::layout::find_git_root(candidate) {
+        return Some(root);
+    }
+    // 存在但不在仓库里：不猜（把桌面 / 下载目录当 cwd 会登记出假项目）
     None
 }
 
@@ -904,6 +1069,92 @@ mod tests {
     }
 
     #[test]
+    fn system_reminder_with_attributes_is_stripped() {
+        // 真机 2026-11-22 13:32：WorkBuddy 发的是
+        // `<system-reminder data-role="user-context">`，旧实现只认
+        // `<system-reminder>` 精确前缀，整块环境说明进了 `**我**：`。
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "<system-reminder data-role=\"user-context\">\n<additional_data>\n<current_time>\nSunday, November 22, 2026\n</current_time>\n</additional_data>\n</system-reminder>" },
+                { "type": "text", "text": "<user_query>把 qoder 签到修好</user_query>" }
+            ]
+        })];
+        let text = user_text(&messages);
+        assert!(text.contains("把 qoder 签到修好"), "{text}");
+        assert!(!text.contains("system-reminder"), "{text}");
+        assert!(!text.contains("user-context"), "{text}");
+        assert!(!text.contains("Sunday"), "{text}");
+
+        // 只有带属性那块、没有 user_query：剥完应为空（noUser），不能把环境说明当原话
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "<system-reminder data-role=\"user-context\">工作目录 D:\\x</system-reminder>"
+        })];
+        assert!(user_text(&messages).is_empty());
+
+        // `<system-reminderX>` 不是同一个标签，不能误伤
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "<system-reminders>这是用户在讨论标签本身</system-reminders>"
+        })];
+        assert_eq!(user_text(&messages).trim(), "<system-reminders>这是用户在讨论标签本身</system-reminders>");
+    }
+
+    #[test]
+    fn session_wrapper_is_not_user_words() {
+        // 真机 2026-11-22 13:17：`**我**：<session>`，正文里 `<session>` 空壳。
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "<session>\n<id>abc</id>\n</session>"
+        })];
+        assert_eq!(user_text(&messages), "");
+
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "<session>\n</session>\n真正的这一句"
+        })];
+        assert_eq!(user_text(&messages).trim(), "真正的这一句");
+    }
+
+    #[test]
+    fn assistant_tool_call_text_is_not_an_answer() {
+        // 真机 2026-11-22 13:17：模型把 `<antml:function_calls>` 当正文吐出来，
+        // 标题就成了 `<antml:function_calls>`。这不是回答，整条跳过。
+        let messages = vec![
+            serde_json::json!({ "role": "user", "content": "查一下任务" }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "<antml:function_calls>\n<antml:invoke name=\"TaskOutput\">\n<antml:parameter name=\"task_id\">BYoet4</antml:parameter>\n</antml:invoke>\n</antml:function_calls>"
+            }),
+        ];
+        assert_eq!(assistant_text(&messages), "");
+
+        // 后面还有真回答：取那条
+        let messages = vec![
+            serde_json::json!({ "role": "user", "content": "查一下任务" }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "<function_calls>{\"name\":\"TaskOutput\"}</function_calls>"
+            }),
+            serde_json::json!({ "role": "assistant", "content": "任务已完成，qoder 不在目标里。" }),
+        ];
+        assert_eq!(assistant_text(&messages), "任务已完成，qoder 不在目标里。");
+    }
+
+    #[test]
+    fn title_never_lands_on_markup() {
+        // 用户侧被剥空 / 助手侧是调用标记时，标题不能变成 `<antml:…>` / `<session>`
+        assert_eq!(infer_title("<session>", ""), "对话留存");
+        assert_eq!(infer_title("", "<antml:function_calls>…"), "对话留存");
+        assert_eq!(infer_title("**我**：摘要", "**助手**：结论"), "对话留存");
+        assert_eq!(
+            infer_title("qoder 统一签到为什么会去签停用的家", "已修复。"),
+            "qoder 统一签到为什么会去签停用的家"
+        );
+    }
+
+    #[test]
     fn title_is_the_user_words_not_the_label() {
         // 真机事故：库里 30 条留存的标题全是 `**我**：动第一批，第二批和第三批…`。
         // 写入侧 `infer_title` 取正文第一个非空行，而这里第一个非空行恒为
@@ -958,6 +1209,40 @@ mod tests {
             "content": "工作目录这块还没配好"
         })];
         assert_eq!(cwd_of(&messages), None);
+    }
+
+    #[test]
+    fn cwd_falls_back_to_real_project_path_when_patterns_hit_prose() {
+        // 真机 2026-11-22：user-context 里只有
+        // `D:\Personal\Desktop\agent2api-main/.workbuddy/memory/YYYY-MM-DD.md`，
+        // 「工作目录」三个字出现在讨论留存实现的历史摘要里，按 PATTERNS 抠
+        // 会把讨论当目录。兜底：取存在且能找到 .git 的项目根。
+        // 本测试跑在 agent2api 仓库里，用仓库自己的路径当正样本。
+        let here = env!("CARGO_MANIFEST_DIR");
+        let probe = format!("{here}/.workbuddy/memory/2026-11-22.md");
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "<system-reminder data-role=\"user-context\">Memory: After substantive work, first check whether today's {probe} exists.</system-reminder>".replace("{probe}", &probe) },
+                { "type": "text", "text": "<user_query>继续</user_query>" }
+            ]
+        })];
+        let cwd = cwd_of(&messages);
+        assert!(cwd.is_some(), "应能从 .workbuddy 路径反推出项目根: {probe}");
+        let cwd = cwd.unwrap();
+        assert!(cwd.contains("agent2api") || std::path::Path::new(&cwd).join(".git").exists(), "{cwd}");
+        assert!(!cwd.ends_with(".workbuddy"), "不应把 .workbuddy 本身当项目: {cwd}");
+
+        // 讨论性质的「工作目录」句子里没有真实路径：不猜
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "<conversation_history_summary>修复：title_from_session() 优先取第一句用户话，其次工作目录末级名。</conversation_history_summary>"
+        })];
+        // 这条可能有别的绝对路径吗？没有。应为 None 或至少不是中文句子
+        if let Some(cwd) = cwd_of(&messages) {
+            assert!(std::path::Path::new(&cwd).is_absolute(), "{cwd}");
+            assert!(!cwd.contains('：') && !cwd.contains('。'), "中文句子不该被当成目录: {cwd}");
+        }
     }
 
     #[test]
