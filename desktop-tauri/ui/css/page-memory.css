@@ -1004,6 +1004,37 @@
 }
 .mm-review-actions { margin-top: 7px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 
+/* 批量裁决条：勾选 + 构成 + 两个动作挤在一行。
+   放在队列上方而不是底部 —— 41 条时滚到底才知道能批量，等于没有。 */
+.mm-review-batch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 7px 10px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  font-size: 12.5px;
+}
+.mm-review-batch-actions { margin-left: auto; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+/* 确认块：用 warn 边框与「批量条」区分开 —— 它是唯一会真的改数据的一步。 */
+.mm-review-confirm {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  margin-bottom: 8px;
+  border: 1px solid var(--warn);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.mm-review-confirm .mm-review-batch-actions { align-self: center; }
+
 /* ── 项目表 ──
    布局：工具条（搜索 + 统计 chip + 说明）→ 一张表（表头吸顶 + 行）。
 

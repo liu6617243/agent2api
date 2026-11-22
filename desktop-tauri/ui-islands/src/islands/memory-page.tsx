@@ -13,7 +13,7 @@ import { Auto } from './memory-tab-auto'
 import { Import } from './memory-tab-import'
 import { Sync } from './memory-tab-sync'
 import { Settings } from './memory-tab-settings'
-import { TabBoundary } from './memory-shared'
+import { TabBoundary, notifyMemoryEnter, notifyMemoryRefresh } from './memory-shared'
 
 /**
  * Agent2API · 记忆中枢（页面岛）。
@@ -148,6 +148,15 @@ function MemoryPage(): React.ReactElement {
   const [projectsError, setProjectsError] = React.useState('')
   const [error, setError] = React.useState('')
   const [booted, setBooted] = React.useState(false)
+  /**
+   * `booted` 的镜像 ref。
+   *
+   * `wb:page` 的监听器只挂一次（回调里读 state 会永远读到首次渲染的 `false`），
+   * 而它要用 `booted` 区分两种 `wb:page`：首屏那一次（`loadShell()` 正在拉，
+   * 再来一次就是重复请求）和「离开又回来」那一次（必须刷新）。用 ref 拿最新值。
+   */
+  const bootedRef = React.useRef(false)
+  bootedRef.current = booted
   const [focusId, setFocusId] = React.useState<string | null>(null)
   const [focusProject, setFocusProject] = React.useState<string | null>(null)
   /**
@@ -156,18 +165,24 @@ function MemoryPage(): React.ReactElement {
    */
   const [focusView, setFocusView] = React.useState<'review' | null>(null)
 
+  /** 项目列表是否已经落过一次盘（决定 `projectsLoading` 还该不该为真）。 */
+  const projectsSettled = React.useRef(false)
+
   /**
    * 项目列表：**不参与首屏**，由 `loadShell()` 在后台触发。
    *
    * 定义在 `loadShell` 之前是为了让依赖关系顺着读：首屏只用它，不依赖它完成。
    */
   const refreshProjects = React.useCallback(async () => {
-    setProjectsLoading(true)
+    // `setProjectsLoading(true)` 只在「还没拿到过列表」时为真：重新进入页面会
+    // 静默重拉一次，那时项目卡上已经有内容，再亮骨架就是一整块闪。
+    setProjectsLoading(!projectsSettled.current)
     try {
       const projectList = await m.loadProjects()
       setProjects(projectList.items)
       setGeneral(projectList.general ?? null)
       setProjectsError('')
+      projectsSettled.current = true
     } catch (caught) {
       setProjectsError(caught instanceof Error ? caught.message : String(caught))
     } finally {
@@ -250,6 +265,23 @@ function MemoryPage(): React.ReactElement {
   }, [refreshStatus, refreshProjects])
 
   /**
+   * 「这一页重新成为当前页」时要刷的全部数据。
+   *
+   * 三类分开表述，因为归属不同：
+   * - `status`   → 壳这一层的 state（顶栏徽标 + 全部指标卡）；
+   * - `projects` → 壳这一层的 state（项目页、浏览页的项目下拉）；
+   * - `notifyMemoryEnter()` → 当前页签内部自己 `useLoad` 的那些数据，壳够不着。
+   *
+   * 第三类只发一次信号，九个页签各自决定要不要跟（详见 `memory-shared.tsx`
+   * 里 `notifyMemoryEnter` / `useLoad` 的说明）。
+   */
+  const refreshOnEnter = React.useCallback(() => {
+    void refreshStatus()
+    void refreshProjects()
+    notifyMemoryEnter()
+  }, [refreshStatus, refreshProjects])
+
+  /**
    * 监听页签切换请求（`mm:tab`）。
    *
    * 为什么用自定义事件而不是 props 回调：发起方是「同步页里的『修改凭据』」
@@ -277,11 +309,57 @@ function MemoryPage(): React.ReactElement {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  /**
+   * 重新进入这一页就刷新 —— 不必再手动点「刷新」。
+   *
+   * ── 两条触发路径，各管一种「回来」──────────────────────────
+   * 1. `wb:page`：外壳切页面（用户点左侧导航）。detail 就是页面名，本页是 `memory`。
+   * 2. `visibilitychange`：页面没换、窗口被切走又切回来（最小化、切到别的应用、
+   *    从别的窗口点回主窗口）。这种情况下 `wb:page` 不派发，只看第一路会漏。
+   *
+   * ── 为什么首屏那一次要跳过 ──────────────────────────────────
+   * `index.tsx` 在模块求值末尾会为「上次停留的页面」先派发一次 `wb:page`。如果
+   * 上次正好停在记忆页，这一发会在 `loadShell()` 刚发出请求时到达 —— 不拦就是
+   * 首屏同一批接口各请求两次。`bootedRef` 为 `false` 时说明首屏正在加载，跳过；
+   * 首屏的数据由 `loadShell()` 负责，语义上也不该由「切页」来拉。
+   *
+   * ── 为什么不做定时轮询 ──────────────────────────────────────
+   * 记忆库的变化都是「用户刚才做了什么」引起的（批准、导入、跑任务），不是
+   * 自己按秒变的。定时拉只会让静止的页面每 N 秒闪一次 loading。签到页要轮询是
+   * 因为它真有一个后台任务在跑；这里没有。
+   */
+  React.useEffect(() => {
+    const onPage = (event: Event) => {
+      if ((event as CustomEvent<unknown>).detail !== 'memory') return
+      if (!bootedRef.current) return
+      refreshOnEnter()
+    }
+    const onVisible = () => {
+      if (document.hidden) return
+      const current = (window as unknown as { wbApp?: { currentPage?: string } }).wbApp?.currentPage
+      // `currentPage` 缺失（老外壳没有这个字段）时按「就在这一页」处理：
+      // 宁可多刷一次，也不要因为读不到字段就退化成「永不刷新」。
+      if (current && current !== 'memory') return
+      if (!bootedRef.current) return
+      refreshOnEnter()
+    }
+    window.addEventListener('wb:page', onPage)
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      window.removeEventListener('wb:page', onPage)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [refreshOnEnter])
+
   const switchTab = (next: Tab) => {
     activeTab = next
     setTab(next)
     // 切到需要新鲜项目数据的页签时补一次（项目可能在别处被合并/归档）
     if (next === 'projects' || next === 'browse') void refreshProjects()
+    // 切回仪表盘：`Dashboard` 是条件渲染，重建时会自己重拉体检/同步/自动化，
+    // 但指标卡与顶栏读的是壳这一层的 `status` —— 它不会因为换页签而更新，
+    // 于是「条数 / 待确认 / 今日新增」会停在离开时的数字。
+    if (next === 'dashboard') void refreshStatus()
   }
 
   const openEntryFromProject = (id: string) => {
@@ -349,7 +427,15 @@ function MemoryPage(): React.ReactElement {
             type='button'
             size='sm'
             variant='ghost'
-            onClick={() => { void loadShell() }}
+            onClick={() => {
+              // 「刷新」要刷得比「重新进入」更全：`loadShell()` 管壳这一层
+              // （配置 / 状态 / 项目），`notifyMemoryRefresh()` 让所有页签的
+              // `useLoad` 都重拉 —— 包括那些豁免了「进页面重拉」的贵端点
+              // （导入页要递归扫十二个来源）。
+              // 只调 loadShell 的话，用户点完会发现条数变了、体检和同步没变。
+              void loadShell()
+              notifyMemoryRefresh()
+            }}
           >
             {t('刷新')}
           </Button>

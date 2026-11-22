@@ -170,37 +170,115 @@ export function StateBadge({
   return <Badge variant={variant} shape='tag'>{label}</Badge>
 }
 
+/* ─── 「这一页又被看见了」信号 ───────────────── */
+
 /**
- * 一个页签自己的加载器：面板挂载与「刷新」都走它。
+ * 「重新进入这一页」与「用户点了刷新」两个计数器。
  *
- * 为什么不用全局 store：每个页签的数据来自不同端点、刷新节奏也不同（同步页要
- * 手动刷新，浏览页要跟着筛选走）。一个全局 store 会让「点刷新」变成「重拉十个
- * 端点」，而用户只想刷新眼前这一页。
+ * ── 为什么需要跨组件的信号 ──────────────────────────────────
+ * 九个页签的数据各自用 `useLoad` 自己拉，壳那层够不着它们的 `reload()`。
+ * 而「离开记忆页再回来」时组件树并不重建（`mountOnPage` 只挂一次 React root，
+ * 之后外壳只切 `active` 类），`useLoad(..., [])` 不会重跑 —— 用户看到的是
+ * 离开时的快照，只能手动点刷新。真机反馈就是这一条。
+ *
+ * 于是把「这一页又被看见了」做成一个模块级信号：页面监听 `wb:page` /
+ * `visibilitychange`，在这里打一次戳；每个 `useLoad` 自己订阅，把戳编进依赖。
+ * 不需要给九个组件各传一个 prop。
+ *
+ * ── 为什么要两个计数器 ──────────────────────────────────────
+ * 两者的代价与语义不同：
+ * - `enterStamp`：进页面就重拉。只有**显式开启**的端点跟（目前是仪表盘、
+ *   浏览页、项目页的列表）。
+ * - `forceStamp`：用户**主动**点了「刷新」，连没开启的那些也一起重拉。
+ *
+ * 分开是必须的：进页面重拉是「顺手」，可以只覆盖常用页；用户点刷新是「我现在
+ * 就要最新的」，把导入页那种递归扫十二个来源目录的贵端点也排除在外就是耍赖。
+ */
+let enterStamp = 0
+let forceStamp = 0
+
+const watchers = new Set<() => void>()
+
+/** 这一页重新成为当前页（切回来、窗口重新可见）。 */
+export function notifyMemoryEnter(): void {
+  enterStamp += 1
+  for (const watcher of watchers) watcher()
+}
+
+/** 用户点了「刷新」：所有 `useLoad` 都重拉，包括豁免了「进页面重拉」的那些。 */
+export function notifyMemoryRefresh(): void {
+  forceStamp += 1
+  for (const watcher of watchers) watcher()
+}
+
+function watchEnter(watcher: () => void): () => void {
+  watchers.add(watcher)
+  return () => { watchers.delete(watcher) }
+}
+
+/**
+ * 一个页签自己的加载器：面板挂载、重新进入页面、以及「刷新」都走它。
+ *
+ * ── 为什么 `loading` 只表示「还没拿到过数据」────────────────
+ * 重新进入页面时会静默重拉。如果 `loading` 在重拉期间也是 true，页面会整块闪
+ * 成骨架 —— 每切一次页面闪一次，比不刷新还烦。所以：
+ *
+ * - `loading === true` ⇔ 请求还没回来 **且** 手上一条数据都没有 → 该显示骨架；
+ * - 有旧数据时的重拉 → `loading` 保持 false，界面继续显示旧值，新值到了就地替换。
+ *
+ * 这个口径让各页签里现有的 `if (loading) return <Panel loading/>` 自动变成
+ * 「只在首屏闪」，不必逐页改判断。
  */
 export function useLoad<T>(
   loader: () => Promise<T>,
   deps: React.DependencyList,
+  options?: {
+    /**
+     * 重新进入页面时要不要重拉。**默认 `false`（不跟）**。
+     *
+     * 刻意做成「按页签显式开启」而不是默认全开：重拉是要花钱的（有的端点要扫
+     * 目录、有的会让正在编辑的表单换一份依据），哪些页该跟是产品决定，不该由
+     * 公共 hook 替所有页签决定。目前开启的只有仪表盘、浏览页、项目页。
+     *
+     * 用户点「刷新」时**不看这个开关**，一律重拉（见 `notifyMemoryRefresh`）。
+     */
+    refreshOnEnter?: boolean
+  },
 ): { data: T | null; loading: boolean; error: string; reload: () => void } {
   const [data, setData] = React.useState<T | null>(null)
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState('')
   const [tick, setTick] = React.useState(0)
+  /** 只为「信号变了要重渲染一次」而存在；真正的判据是下面的 `signal`。 */
+  const [, rerender] = React.useState(0)
   const loaderRef = React.useRef(loader)
   loaderRef.current = loader
+  /** 是否已经有过一次请求结束（成功或失败都算）。决定 `loading` 还该不该为真。 */
+  const settled = React.useRef(false)
+
+  React.useEffect(() => watchEnter(() => rerender(value => value + 1)), [])
+
+  // 进入页面 / 手动刷新合成的依赖项。没开启 `refreshOnEnter` 的端点只看
+  // `forceStamp`，所以 `enterStamp` 变化时它的这一项不变，effect 不会重跑。
+  const signal = `${options?.refreshOnEnter === true ? String(enterStamp) : 'stay'}:${forceStamp}`
 
   React.useEffect(() => {
     let alive = true
-    setLoading(true)
+    if (!settled.current) setLoading(true)
     setError('')
     loaderRef.current()
       .then(value => { if (alive) setData(value) })
       .catch((caught: unknown) => {
         if (alive) setError(caught instanceof Error ? caught.message : String(caught))
       })
-      .finally(() => { if (alive) setLoading(false) })
+      .finally(() => {
+        if (!alive) return
+        settled.current = true
+        setLoading(false)
+      })
     return () => { alive = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [...deps, tick])
+  }, [...deps, tick, signal])
 
   return { data, loading, error, reload: () => setTick(value => value + 1) }
 }

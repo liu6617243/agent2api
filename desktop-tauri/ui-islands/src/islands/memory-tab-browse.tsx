@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Badge, Button, Input, Switch, Textarea } from '@ui'
+import { Badge, Button, Checkbox, Input, Switch, Textarea } from '@ui'
 import { t } from '../i18n'
 import * as m from './memory-api'
 import { agentText, Empty, num, Panel, Section, stamp, StateBadge, timeText, fullTime, useLoad } from './memory-shared'
@@ -116,6 +116,24 @@ function Browse({
   const [draft, setDraft] = React.useState<m.WritePayload | null>(null)
   const [error, setError] = React.useState('')
   const [busy, setBusy] = React.useState('')
+  /**
+   * 批量裁决：勾中的待确认项 id。
+   *
+   * ── 为什么是「勾选 + 批量」而不是「全部批准」────────────────
+   * 批准是写操作，四类建议没有一类是纯记录：
+   * - 归类会把记忆文件搬进 `projects/<slug>/`，slug 不存在就**新建目录**；
+   * - 去重 / 事实失效会把一条记忆标记为「被取代」，默认检索从此看不到它；
+   * - 蒸馏 / 合并会新落一条 l2 结论，之后每个请求都会注入它。
+   *
+   * 全部批准 = 把「哪条会被搬错、哪条会被埋掉、哪条错知识会长期在线」这三个
+   * 判断一次性交出去。后端也因此只提供批量拒绝（`rejectAll`），没有批量批准。
+   * 所以这里的批量是「你逐条勾出来的那几条」，一次点确认，但每一条都是你选的。
+   */
+  const [picked, setPicked] = React.useState<Set<number>>(new Set())
+  /** 批量执行进度；null = 没在跑。逐条串行，后端一次只认一个 id。 */
+  const [batch, setBatch] = React.useState<{ done: number; total: number } | null>(null)
+  /** 批准前的一次确认（写操作，不能一键到底）。 */
+  const [confirmApprove, setConfirmApprove] = React.useState(false)
 
   const list = useLoad(
     () => m.loadList({
@@ -132,12 +150,16 @@ function Browse({
       offset: page * pageSize,
     }),
     [submitted, kind, project, agent, level, tag, starred, pinned, includeSuperseded, page, pageSize],
+    // 重新进入页面就重拉：列表是最容易「刚在别处改过、回来还是旧的」的地方
+    // （批准一条、导入一批、跑完一个任务，回到列表还停在改动前）。
+    { refreshOnEnter: true },
   )
 
   const total = list.data?.total ?? 0
   const pages = Math.max(1, Math.ceil(total / pageSize))
 
-  const review = useLoad(() => m.loadReview('pending', undefined, 50), [])
+  // 待确认队列同上：它是唯一「AI 一直在往里加」的列表，切回来必须是最新条数。
+  const review = useLoad(() => m.loadReview('pending', undefined, 50), [], { refreshOnEnter: true })
 
   /** 库里真实存在的项目 slug —— 归类建议要跟它对照，指向不存在的项目必须点出来。 */
   const projectSlugs = React.useMemo(() => new Set(projects.map(item => item.slug)), [projects])
@@ -263,6 +285,60 @@ function Browse({
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
       setBusy('')
+    }
+  }
+
+  /* ─── 批量裁决 ───────────────────────────────────────────── */
+
+  /** 勾选 / 取消一条待确认项。 */
+  const togglePicked = (id: number, next: boolean) => {
+    setPicked(prev => {
+      const holder = new Set(prev)
+      if (next) holder.add(id)
+      else holder.delete(id)
+      return holder
+    })
+  }
+
+  /** 当前页里真正被勾中的那些（上一轮裁决后已不在队列里的 id 自动不算）。 */
+  const pickedItems = (review.data?.items ?? []).filter(item => picked.has(item.id))
+  const pickable = review.data?.items.length ?? 0
+  const allPicked = pickable > 0 && pickedItems.length === pickable
+  const somePicked = pickedItems.length > 0 && !allPicked
+  /** 勾中项的构成：批准前必须让人看清「将执行哪几类写操作」。 */
+  const pickedTally = reviewTally(pickedItems)
+
+  /**
+   * 批量执行：逐条串行调 `resolveReview`。
+   *
+   * 后端一次只认一个 id（没有批量批准接口，见 `review_reject_all` 的注释），
+   * 所以这里是前端串行循环，不是「一个请求改一批」。
+   *
+   * 不中断：一条失败（比如目标记忆已被别人删掉）不该把剩下 20 条全卡住 ——
+   * 失败的逐条记下来，跑完一起报。
+   */
+  const runBatch = async (approve: boolean) => {
+    const items = pickedItems
+    if (items.length === 0 || batch) return
+    setBatch({ done: 0, total: items.length })
+    setError('')
+    const failed: string[] = []
+    for (const [index, item] of items.entries()) {
+      try {
+        await m.resolveReview(item.id, approve)
+      } catch (caught) {
+        failed.push(`${item.target}：${caught instanceof Error ? caught.message : String(caught)}`)
+      }
+      setBatch({ done: index + 1, total: items.length })
+    }
+    setBatch(null)
+    setConfirmApprove(false)
+    setPicked(new Set())
+    review.reload()
+    list.reload()
+    onChanged()
+    if (failed.length > 0) {
+      setError(t('{n} 条没成功：{detail}', { n: failed.length, detail: failed.slice(0, 3).join('；') }))
     }
   }
 
@@ -667,6 +743,76 @@ function Browse({
                 {reviewTally(review.data.items)}
               </div>
             ) : null}
+
+            {/* 批量条：勾 → 看清楚构成 → 一次确认。
+                不提供「全部批准」，只提供「批准所选」—— 理由见上面 `picked` 的注释。 */}
+            {pickable > 0 ? (
+              <div className='mm-review-batch'>
+                <Checkbox
+                  checked={allPicked}
+                  indeterminate={somePicked}
+                  disabled={!!batch}
+                  aria-label={t('全选当前队列')}
+                  onCheckedChange={next => setPicked(next === true
+                    ? new Set((review.data?.items ?? []).map(item => item.id))
+                    : new Set())}
+                />
+                {batch ? (
+                  <span className='mm-muted'>
+                    {t('正在裁决 {done}/{total}…', { done: batch.done, total: batch.total })}
+                  </span>
+                ) : pickedItems.length > 0 ? (
+                  <span>{t('已选 {n} 条：{tally}', { n: pickedItems.length, tally: pickedTally })}</span>
+                ) : (
+                  <span className='mm-muted'>{t('逐条勾选，可一次批准或忽略；批准是写操作，会先让你确认一次')}</span>
+                )}
+                <div className='mm-review-batch-actions'>
+                  <Button
+                    type='button'
+                    size='sm'
+                    disabled={pickedItems.length === 0 || !!batch}
+                    onClick={() => setConfirmApprove(true)}
+                  >
+                    {t('批准所选')}
+                  </Button>
+                  <Button
+                    type='button'
+                    size='sm'
+                    variant='ghost'
+                    disabled={pickedItems.length === 0 || !!batch}
+                    onClick={() => void runBatch(false)}
+                  >
+                    {t('忽略所选')}
+                  </Button>
+                  {pickedItems.length > 0 && !batch ? (
+                    <Button type='button' size='sm' variant='link' onClick={() => setPicked(new Set())}>
+                      {t('清空选择')}
+                    </Button>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+
+            {/* 批准前的确认：把「即将发生什么」写全。四类建议的后果不同，
+                只说「确认批准 22 条」等于让人闭眼签字。 */}
+            {confirmApprove && pickedItems.length > 0 ? (
+              <div className='mm-review-confirm'>
+                <div>
+                  <strong>{t('确认批准这 {n} 条？', { n: pickedItems.length })}</strong>
+                  <div className='mm-muted' style={{ marginTop: 4 }}>
+                    {t('构成：{tally}。归类会移动记忆文件（目标项目不存在时会新建目录）；事实失效 / 去重会让旧条目从默认检索里消失；蒸馏会新落一条之后会被注入的结论。忽略只改队列状态，可以随时反悔。', { tally: pickedTally })}
+                  </div>
+                </div>
+                <div className='mm-review-batch-actions'>
+                  <Button type='button' size='sm' variant='destructive' onClick={() => void runBatch(true)}>
+                    {t('确认批准 {n} 条', { n: pickedItems.length })}
+                  </Button>
+                  <Button type='button' size='sm' variant='ghost' onClick={() => setConfirmApprove(false)}>
+                    {t('取消')}
+                  </Button>
+                </div>
+              </div>
+            ) : null}
             {review.data && review.data.items.length === 0 ? (
               <Empty>{t('队列空了。没有待裁决的建议。')}</Empty>
             ) : null}
@@ -674,6 +820,12 @@ function Browse({
               {review.data?.items.map(item => (
                 <div key={item.id} className='mm-review'>
                   <div className='mm-review-head'>
+                    <Checkbox
+                      checked={picked.has(item.id)}
+                      disabled={!!batch}
+                      aria-label={t('选择这一条')}
+                      onCheckedChange={next => togglePicked(item.id, next === true)}
+                    />
                     <StateBadge state='warn' label={reviewLabel(item.type)} />
                     <span className='mm-review-target'>{item.target}</span>
                     <span className='mm-muted'>{t('置信度 {n}%', { n: Math.round(item.confidence * 100) })}</span>

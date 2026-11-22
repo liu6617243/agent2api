@@ -41,9 +41,11 @@ type DashboardProps = {
 }
 
 function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: DashboardProps): React.ReactElement {
-  const auto = useLoad(() => m.loadAuto(), [])
-  const health = useLoad(() => m.loadHealth(20), [])
-  const sync = useLoad(() => m.loadSync(), [])
+  // 这一页三份数据都显式开启「重新进入就重拉」：状态页是全套里唯一需要「一眼看全
+  // 现在」的一页，切回来还显示几分钟前的数字等于这一页白设。
+  const auto = useLoad(() => m.loadAuto(), [], { refreshOnEnter: true })
+  const health = useLoad(() => m.loadHealth(20), [], { refreshOnEnter: true })
+  const sync = useLoad(() => m.loadSync(), [], { refreshOnEnter: true })
   const [rebuilding, setRebuilding] = React.useState(false)
   const [showStale, setShowStale] = React.useState(false)
   const [actionError, setActionError] = React.useState('')
@@ -73,7 +75,13 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
 
   const l2Ratio = status.live > 0 ? Math.round((status.l2 / status.live) * 100) : 0
   const pending = status.review?.pending ?? 0
-  const backlogged = pending >= (status.review?.warnThreshold ?? 20)
+  /** 积压阈值（配置项 `dedup.pendingWarnThreshold`，后端默认 50）。
+   *
+   *  它现在的职责只有「描述」：超过它才在 detail 里写「已超过提醒阈值」。**不再决定
+   *  这一行亮不亮** —— 旧逻辑用它当开关，41 条 < 50 就显示「正常」，而 detail 同时
+   *  写着「41 条建议等待裁决」，一行里两个结论互相打脸。 */
+  const warnThreshold = status.review?.warnThreshold ?? 50
+  const backlogged = pending >= warnThreshold
   const conflicts = sync.data?.conflicts ?? 0
   const stale = health.data?.staleCount ?? 0
   const drift = health.data ? !health.data.index.inSync : false
@@ -199,10 +207,19 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
         {actionError ? <div className='mm-error'>{actionError}</div> : null}
         <div className='mm-todo-list'>
           <TodoRow
-            state={backlogged ? 'warn' : 'ok'}
+            /* 只要队列里有东西等人点头，这一行就不该是「正常」。
+               以前判据是 `pending >= warnThreshold`（真机阈值 50），41 条积压
+               照样亮绿「正常」，detail 却写着「41 条建议等待裁决」—— 同一行里
+               自相矛盾，用户当然会问「有 41 条你说正常？」。
+               阈值现在只用来区分「有积压」和「积压严重」，不再决定要不要提醒。 */
+            state={pending ? 'warn' : 'ok'}
+            label={t('待确认')}
             title={t('待确认队列')}
             detail={pending
-              ? t('{n} 条建议等待裁决（去重 / 归类 / 失效判定）· 在「浏览 → 待确认」逐条批准或忽略', { n: pending })
+              ? t('{n} 条建议等待裁决（去重 / 归类 / 失效判定）· 在「浏览 → 待确认」逐条批准或忽略{crowded}', {
+                  n: pending,
+                  crowded: backlogged ? t(' · 已超过提醒阈值 {n}', { n: warnThreshold }) : '',
+                })
               : t('没有积压')}
             action={pending
               ? { label: t('去裁决'), run: () => (onReview ? onReview() : onGo('browse')) }
@@ -283,6 +300,8 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
 
       <div className='mm-two-col'>
         <Section title={t('自动化')} hint={t('后台任务默认只开零 token 的那几个。')}>
+          {/* `loading` 只在「一条数据都还没到」时为真（口径见 memory-shared.tsx 的
+              `useLoad`）：重新进入页面的静默重拉不会把这张卡闪成骨架。 */}
           {auto.loading ? <Panel loading error=''>{null}</Panel> : auto.data ? (
             <>
               <div className='mm-inline-meta'>
@@ -368,11 +387,14 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
 
 function TodoRow({
   state,
+  label,
   title,
   detail,
   action,
 }: {
   state: 'ok' | 'warn' | 'bad' | 'idle'
+  /** 徽标文案（默认「待处理」）。待确认那行用「待确认」——它要人点头，不是要人修。 */
+  label?: string
   title: string
   detail: string
   action?: { label: string; run: () => void }
@@ -384,7 +406,9 @@ function TodoRow({
       <div className='mm-todo-body'>
         <div className='mm-todo-title'>
           {title}
-          <Badge variant={variant} shape='tag'>{state === 'ok' ? t('正常') : t('待处理')}</Badge>
+          <Badge variant={variant} shape='tag'>
+            {state === 'ok' ? t('正常') : (label ?? t('待处理'))}
+          </Badge>
         </div>
         <div className='mm-todo-detail'>{detail}</div>
       </div>
