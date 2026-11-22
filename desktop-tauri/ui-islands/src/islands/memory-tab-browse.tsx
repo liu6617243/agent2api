@@ -139,6 +139,9 @@ function Browse({
 
   const review = useLoad(() => m.loadReview('pending', undefined, 50), [])
 
+  /** 库里真实存在的项目 slug —— 归类建议要跟它对照，指向不存在的项目必须点出来。 */
+  const projectSlugs = React.useMemo(() => new Set(projects.map(item => item.slug)), [projects])
+
   // 外部指定视图（仪表盘「去裁决」）：切到那一段并拉一次最新队列。
   // 消费后立刻清掉，否则用户手动切回「列表」又会被下一次渲染顶回来。
   React.useEffect(() => {
@@ -656,6 +659,14 @@ function Browse({
           >
             {review.loading && !review.data ? <Panel loading error=''>{null}</Panel> : null}
             {review.error ? <Panel loading={false} error={review.error} onRetry={review.reload}>{null}</Panel> : null}
+            {/* 队列构成先摆出来：41 条里是「22 条归类 + 10 条失效 + 8 条蒸馏 + 1 条重复」
+                还是「41 条全是归类」，处置完全不一样 —— 前者要逐类看，后者可以整批忽略。
+                以前只有 41 这个总数，用户打开这一页也不知道该从哪条下手。 */}
+            {review.data && review.data.items.length > 0 ? (
+              <div className='mm-muted' style={{ marginBottom: 8 }}>
+                {reviewTally(review.data.items)}
+              </div>
+            ) : null}
             {review.data && review.data.items.length === 0 ? (
               <Empty>{t('队列空了。没有待裁决的建议。')}</Empty>
             ) : null}
@@ -668,7 +679,7 @@ function Browse({
                     <span className='mm-muted'>{t('置信度 {n}%', { n: Math.round(item.confidence * 100) })}</span>
                     <span className='mm-muted'>{item.createdText ?? timeText(item.createdAt)}</span>
                   </div>
-                  <div className='mm-review-detail'>{reviewDetail(item)}</div>
+                  <div className='mm-review-detail'>{reviewDetail(item, projectSlugs)}</div>
                   <div className='mm-review-actions'>
                     <Button type='button' size='sm' onClick={() => void act(`review-${item.id}`, () => m.resolveReview(item.id, true))}>
                       {t('批准')}
@@ -1512,8 +1523,28 @@ function reviewLabel(type: string): string {
   }
 }
 
-/** 把队列载荷翻译成一句人话。载荷是各任务自己写的，形状不统一，所以逐类处理。 */
-function reviewDetail(item: m.ReviewItem): string {
+/**
+ * 队列构成的一句话：`22 条项目归类 · 10 条事实失效 · 8 条蒸馏结论 · 1 条疑似重复`。
+ *
+ * 为什么要有：41 这个总数不说明任何处置方式。「全是归类」可以整批忽略；
+ * 「8 条蒸馏结论」则值得逐条读正文 —— 这两件事在界面上必须一眼能分开。
+ */
+function reviewTally(items: m.ReviewItem[]): string {
+  const counts = new Map<string, number>()
+  for (const item of items) counts.set(item.type, (counts.get(item.type) ?? 0) + 1)
+  return [...counts]
+    .map(([type, n]) => t('{n} 条{label}', { n, label: reviewLabel(type) }))
+    .join(' · ')
+}
+
+/**
+ * 把队列载荷翻译成一句人话。载荷是各任务自己写的，形状不统一，所以逐类处理。
+ *
+ * `projectSlugs` 是库里真实存在的项目：归类建议如果指向一个不存在的 slug，
+ * 批准后 `apply_classification` 会**照着这个 slug 新建目录**（假项目就是这么
+ * 复活的）。这种建议必须当场标出来，不能等批完了才发现。
+ */
+function reviewDetail(item: m.ReviewItem, projectSlugs?: Set<string>): string {
   const payload = item.payload ?? {}
   const pick = (key: string) => {
     const value = payload[key]
@@ -1529,15 +1560,31 @@ function reviewDetail(item: m.ReviewItem): string {
     }
     case 'classify': {
       const suggestion = pick('suggestion')
-      return suggestion
-        ? t('建议归入项目 {slug}。批准后记忆会被搬到那个项目目录。', { slug: suggestion })
-        : t('建议归类，但载荷里没有目标项目')
+      if (!suggestion) return t('建议归类，但载荷里没有目标项目')
+      const missing = projectSlugs ? !projectSlugs.has(suggestion) && suggestion !== '_global' : false
+      return missing
+        ? t('建议归入项目 {slug} —— 这个项目现在不存在，批准会新建它。', { slug: suggestion })
+        : t('建议归入项目 {slug}。批准后记忆会被搬到那个项目目录。', { slug: suggestion })
     }
     case 'supersede': {
       const oldId = pick('oldId') || pick('superseded')
-      return oldId
-        ? t('新记忆让 {id} 不再成立。批准后旧条目被标记为已取代。', { id: oldId })
-        : t('建议标记旧事实失效，但载荷里没有目标 id')
+      const reason = pick('reason')
+      if (!oldId) return t('建议标记旧事实失效，但载荷里没有目标 id')
+      return reason
+        ? t('新记忆让 {id} 不再成立：{reason} 批准后旧条目被标记为已取代。', { id: oldId, reason })
+        : t('新记忆让 {id} 不再成立。批准后旧条目被标记为已取代。', { id: oldId })
+    }
+    case 'distill':
+    case 'consolidate': {
+      // 这两类的载荷带的是**成品正文**（`body`）与证据 id 列表。以前落到
+      // `JSON.stringify`，界面上是一串转义 JSON —— 用户没法读，也就没法裁决。
+      const body = pick('body')
+      const evidence = Array.isArray(payload.evidence) ? payload.evidence.length : 0
+      if (!body) return t('建议沉成一条结论，但载荷里没有正文')
+      const clipped = body.length > 160 ? `${body.slice(0, 160)}…` : body
+      return evidence
+        ? t('依据 {n} 条记忆写成：{body}', { n: evidence, body: clipped })
+        : t('写成：{body}', { body: clipped })
     }
     default:
       return JSON.stringify(payload).slice(0, 200)
