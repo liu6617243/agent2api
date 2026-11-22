@@ -1261,21 +1261,25 @@ mod tests {
         // `D:\Personal\Desktop\agent2api-main/.workbuddy/memory/YYYY-MM-DD.md`，
         // 「工作目录」三个字出现在讨论留存实现的历史摘要里，按 PATTERNS 抠
         // 会把讨论当目录。兜底：取存在且能找到 .git 的项目根。
-        // 本测试跑在 agent2api 仓库里，用仓库自己的路径当正样本。
+        // 测试用 `CARGO_MANIFEST_DIR` 本身当存在路径 —— CI 上 crate 目录
+        // 一定存在，往上必能找到仓库根；不依赖 `.workbuddy` 是否在。
         let here = env!("CARGO_MANIFEST_DIR");
-        let probe = format!("{here}/.workbuddy/memory/2026-11-22.md");
+        let probe = format!("{here}/src/lib.rs");
         let messages = vec![serde_json::json!({
             "role": "user",
             "content": [
-                { "type": "text", "text": "<system-reminder data-role=\"user-context\">Memory: After substantive work, first check whether today's {probe} exists.</system-reminder>".replace("{probe}", &probe) },
+                { "type": "text", "text": format!("<system-reminder data-role=\"user-context\">Memory: After substantive work, first check whether today's {probe} exists.</system-reminder>") },
                 { "type": "text", "text": "<user_query>继续</user_query>" }
             ]
         })];
         let cwd = cwd_of(&messages);
-        assert!(cwd.is_some(), "应能从 .workbuddy 路径反推出项目根: {probe}");
+        assert!(cwd.is_some(), "应能从存在的源码路径反推出项目根: {probe}");
         let cwd = cwd.unwrap();
-        assert!(cwd.contains("agent2api") || std::path::Path::new(&cwd).join(".git").exists(), "{cwd}");
-        assert!(!cwd.ends_with(".workbuddy"), "不应把 .workbuddy 本身当项目: {cwd}");
+        assert!(
+            std::path::Path::new(&cwd).join(".git").exists(),
+            "反推出的应是仓库根: {cwd}"
+        );
+        assert!(!cwd.ends_with("src"), "不应把 src 当项目: {cwd}");
 
         // 讨论性质的「工作目录」句子里没有真实路径：不猜
         let messages = vec![serde_json::json!({
