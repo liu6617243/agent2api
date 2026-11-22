@@ -724,6 +724,28 @@ pub fn remember_turn(
         note_skip(&RETAIN_SKIP_TOOL);
         return None;
     }
+    // ── 正文本身就是工具调用：等同中间轮 ────────────────────────
+    // 真机 13:17：流式帧里 `delta.tool_calls` 存在，`used_tools` 应已置位，
+    // 但那条请求仍写进了库，标题 `<antml:function_calls>`。说明有些路径
+    // （非流式 / 多路合并 / JSON 体）没走 `stream_retain::finish` 的
+    // `used_tools` 判定，把调用标记当**回答文本**传进来了。
+    // 在入口再拦一次：不管哪条路，只要「回答」以工具调用标记开头就不写。
+    {
+        let trimmed = answer.trim_start();
+        const TOOL_TEXT_PREFIXES: &[&str] = &[
+            "<antml:function_calls>",
+            "<function_calls>",
+            "<tool_call>",
+            "<tool_calls>",
+        ];
+        if TOOL_TEXT_PREFIXES
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+        {
+            note_skip(&RETAIN_SKIP_TOOL);
+            return None;
+        }
+    }
     let user = user_text(messages);
     // ── cwd 传下去才进得了项目目录 ────────────────────────────────
     // 调用方一律传 `None`（网关拿不到客户端的 cwd 字段），所以这里必须自己
@@ -1140,6 +1162,28 @@ mod tests {
             serde_json::json!({ "role": "assistant", "content": "任务已完成，qoder 不在目标里。" }),
         ];
         assert_eq!(assistant_text(&messages), "任务已完成，qoder 不在目标里。");
+    }
+
+    #[test]
+    fn remember_turn_rejects_tool_call_text_even_if_not_flagged() {
+        // 真机 13:17：那条请求的流式帧里明明有 `delta.tool_calls`，
+        // 仍写出了标题 `<antml:function_calls>`。说明有的路径没把
+        // `continued` 置位，把调用标记当回答文本传进来了。
+        // 入口必须再拦一次，不能只信调用方的 `used_tools`。
+        let before = stats();
+        let tool_before = before["skippedBy"]["toolTurn"].as_u64().unwrap();
+        let id = remember_turn(
+            &vec![serde_json::json!({ "role": "user", "content": "查一下任务" })],
+            "<antml:function_calls>\n<antml:invoke name=\"TaskOutput\">\n<antml:parameter name=\"task_id\">BYoet4</antml:parameter>\n</antml:invoke>\n</antml:function_calls>",
+            None,
+            None,
+            false,
+            false, // 调用方没置 continued —— 正是要防的那条漏网路
+        );
+        assert_eq!(id, None, "工具调用正文不该写库");
+        let after = stats();
+        let tool_after = after["skippedBy"]["toolTurn"].as_u64().unwrap();
+        assert!(tool_after > tool_before, "应记进 toolTurn");
     }
 
     #[test]
