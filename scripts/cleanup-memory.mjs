@@ -225,7 +225,12 @@ function sectionParts(section) {
   const text = section.lines.join('\n')
   const titleMatch = text.match(/^##\s+[^·]*·\s*(.*)$/m)
   const title = titleMatch ? titleMatch[1].trim() : ''
-  const bodyStart = text.search(/^##\s/m)
+  // 正文起点：mem 行之后的第一行 `## HH:MM · 标题`。
+  //
+  // 不能用「第一个 `## ` 行」—— 真机正文里就有 markdown 小标题
+  // （`## 一、确认 xxx 已在真机生效`），那不是记忆段标题。
+  // 段标题的形状是 `## HH:MM · 标题`（时间 + 分隔点），按它认。
+  const bodyStart = text.search(/^##\s+\d{2}:\d{2}\s*·/m)
   const body = bodyStart >= 0 ? text.slice(bodyStart).replace(/^##[^\n]*\n/, '') : text
   const userMatch = body.match(/\*\*我\*\*：([\s\S]*?)(?=\n\n\*\*助手\*\*：|$)/)
   const user = userMatch ? userMatch[1].trim() : ''
@@ -413,42 +418,80 @@ function shortPrefix(text) {
   return text.slice(0, 24).replace(/\s+/g, ' ')
 }
 
+// ── section 三段拆解 ──────────────────────────────────────────
+//
+// l1 容器的形状是：`<!-- mem {json} -->` 一行、`## HH:MM · 标题` 一行、正文。
+// mem 行里**也有** `**我**：` —— 它在 JSON 的 title 字段里
+// （真机样本：title = "**我**：Attached image(s) from tool result:"）。
+//
+// 所以拿整段文本跑 `**我**：` 正则，第一个命中的就是 mem 行里的那个 ——
+// 替换时会把 mem 行从中间截断，JSON 变成半截，服务端
+// `parse_marker()` 解析失败 → 那条记忆从索引里消失（磁盘上有、查不到）。
+// 真机实测：75 条被改成 31 条，44 条变僵尸。
+//
+// 正确做法：**正文与元数据分开处理**，正则只碰正文。
+function splitSection(section) {
+  const lines = section.lines
+  const metaIdx = lines.findIndex((line) => /^<!-- mem \{/.test(line))
+  // 段标题形状：`## HH:MM · 标题`。正文里的 `## 一、xxx` 是 markdown 小标题，
+  // 不能当成段标题 —— 否则正文会被从中间切开。
+  const headIdx = lines.findIndex((line) => /^##\s+\d{2}:\d{2}\s*·/.test(line))
+  const meta = metaIdx >= 0 ? lines[metaIdx] : null
+  const heading = headIdx >= 0 ? lines[headIdx] : null
+  // 正文起点：mem 行与标题行之后的第一个非空行
+  let bodyStart = 0
+  if (metaIdx >= 0) bodyStart = metaIdx + 1
+  if (headIdx >= 0) bodyStart = Math.max(bodyStart, headIdx + 1)
+  while (bodyStart < lines.length && !lines[bodyStart].trim()) bodyStart += 1
+  const body = lines.slice(bodyStart)
+  return { meta, heading, body }
+}
+
+// 元数据行：改 title 后重写。JSON 解析失败就原样保留（不能造坏行）。
+function rewriteMeta(line, newTitle) {
+  if (!line || !newTitle) return line
+  const m = line.match(/^<!-- mem (\{.*\}) -->\s*$/)
+  if (!m) return line
+  try {
+    const meta = JSON.parse(m[1])
+    meta.title = newTitle
+    return `<!-- mem ${JSON.stringify(meta)} -->`
+  } catch {
+    return line
+  }
+}
+
+// 标题行：改 `## HH:MM · 标题`（只认这个形状，别碰正文里的 markdown 小标题）
+function rewriteHeading(line, newTitle) {
+  if (!line || !newTitle) return line
+  if (!/^##\s+\d{2}:\d{2}\s*·/.test(line)) return line
+  return line.replace(/^(##\s+[^·]*·\s*).*$/, `$1${newTitle}`)
+}
+
 // stub-user：把不可信的用户侧换成一行说明，并保留助手结论
 const STUB_USER = '_（本轮触发是客户端控制消息 / 工具回执，不是用户原话；结论见下）_'
 function applyStubUser(section, newTitle) {
-  const text = section.lines.join('\n')
-  const userMatch = text.match(/(\*\*我\*\*：)([\s\S]*?)(?=\n\n\*\*助手\*\*：|$)/)
-  let replaced = userMatch ? text.replace(userMatch[0], `**我**：${STUB_USER}`) : text
-  // 同时改标题（标题是元数据 + `## HH:MM · title` 两处，都要动）
-  if (newTitle) {
-    replaced = replaced.replace(/^(##\s+[^·]*·\s*).*$/m, `$1${newTitle}`)
-    replaced = replaced.replace(/^<!-- mem (\{.*\}) -->\s*$/m, (whole, raw) => {
-      try {
-        const meta = JSON.parse(raw)
-        meta.title = newTitle
-        return `<!-- mem ${JSON.stringify(meta)} -->`
-      } catch {
-        return whole
-      }
-    })
-  }
-  return { ...section, lines: replaced.split('\n') }
+  const { meta, heading, body } = splitSection(section)
+  // 用户侧只在**正文**里找 —— 绝不碰 mem 行
+  const bodyText = body.join('\n')
+  const userMatch = bodyText.match(/(\*\*我\*\*：)([\s\S]*?)(?=\n\n\*\*助手\*\*：|$)/)
+  const newBody = userMatch
+    ? bodyText.replace(userMatch[0], `**我**：${STUB_USER}`)
+    : bodyText
+  const out = []
+  if (meta) out.push(rewriteMeta(meta, newTitle))
+  if (heading) out.push(rewriteHeading(heading, newTitle))
+  out.push(...newBody.split('\n'))
+  return { ...section, lines: out }
 }
 
 function applyRetitle(section, newTitle) {
-  const text = section.lines.join('\n')
-  const replaced = text.replace(/^(##\s+[^·]*·\s*).*$/m, `$1${newTitle}`)
-  // meta 里的 title 也要同步，否则下一次 rebuild 又把它写回来
-  const fixedMeta = replaced.replace(/^<!-- mem (\{.*\}) -->\s*$/m, (whole, raw) => {
-    try {
-      const meta = JSON.parse(raw)
-      meta.title = newTitle
-      return `<!-- mem ${JSON.stringify(meta)} -->`
-    } catch {
-      return whole
-    }
-  })
-  return { ...section, lines: fixedMeta.split('\n') }
+  const { meta, heading, body } = splitSection(section)
+  const out = []
+  if (meta) out.push(rewriteMeta(meta, newTitle))
+  if (heading) out.push(rewriteHeading(heading, newTitle))
+  out.push(...body)
+  return { ...section, lines: out }
 }
 
 // ── 遍历 ────────────────────────────────────────────────────────
@@ -661,6 +704,44 @@ function main() {
   console.log(`  删除 section ${removedSections}`)
   console.log(`  改标题 ${retitled}`)
   console.log(`  替换不可信用户侧 ${stubbed}`)
+  console.log('')
+
+  // ── 事后校验：mem 行必须仍能整体解析 ──────────────────────────
+  // 这是本脚本踩过的最贵的坑：2026-11-22 第一次 apply 把 75 条改成 31 条。
+  // 根因是「用户侧替换」的正则跑到了 mem 行的 JSON 里（title 字段里也有
+  // `**我**：`），把 mem 行从中间截断 —— 服务端 `parse_marker()` 解析失败，
+  // 那条记忆从索引里消失。磁盘上看着还在，检索时查不到。
+  //
+  // 所以改完必须当场数一遍：改之前能解析多少行，改之后还得是多少行。
+  const broken = []
+  for (const file of walkMd(ROOT)) {
+    const raw = fs.readFileSync(file, 'utf8')
+    for (const [index, line] of raw.split('\n').entries()) {
+      if (!line.includes('<!-- mem {')) continue
+      const m = line.match(/^<!-- mem (\{.*\}) -->\s*$/)
+      if (!m) {
+        broken.push({ file, index, why: '标记行不是单行完整 JSON' })
+        continue
+      }
+      try {
+        JSON.parse(m[1])
+      } catch (error) {
+        broken.push({ file, index, why: `JSON 解析失败: ${error.message}` })
+      }
+    }
+  }
+  if (broken.length) {
+    console.log(`✗ 校验失败：${broken.length} 条 mem 标记行被改坏了`)
+    for (const item of broken.slice(0, 5)) {
+      console.log(`  ${path.basename(item.file)}:${item.index + 1}  ${item.why}`)
+    }
+    console.log('')
+    console.log('这些行服务端解析不了 → 那些记忆会从索引里消失。')
+    console.log('备份在上面的输出里，直接从备份恢复这个文件即可。')
+    process.exitCode = 1
+    return
+  }
+  console.log('✓ 校验通过：所有 mem 标记行仍能整体解析成 JSON')
   console.log('')
   console.log('下一步：让 index-scan 重建索引，或重启应用（启动时也会 warm/rebuild）。')
 }
