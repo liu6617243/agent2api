@@ -609,6 +609,11 @@ impl CjkClues {
     /// 这段文字的四字组是不是**全都在**线索里（诊断与单测用）。
     ///
     /// 按中文连续段逐段判：标点两侧的字本来就不该算连续。
+    ///
+    /// 只在测试里用：它回答的是「这份线索能不能覆盖这句话」，产品代码走的是
+    /// [`cjk_units`] 那种按连续命中计权的路。放在 `cfg(test)` 里，免得二进制
+    /// 构建背上一条 dead_code 警告。
+    #[cfg(test)]
     pub fn covers(&self, text: &str) -> bool {
         let runs = cjk_runs(text);
         if runs.is_empty() {
@@ -677,7 +682,7 @@ fn cjk_runs(text: &str) -> Vec<String> {
 fn gram_hash(window: &[char]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for ch in window {
-        for byte in (ch as u32).to_le_bytes() {
+        for byte in (*ch as u32).to_le_bytes() {
             hash ^= byte as u64;
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
