@@ -2507,8 +2507,28 @@ fn apply_supersede(new_id: &str, old_id: &str) -> Result<(), String> {
 /// l1 落的是容器（`general/l1/<agent>/<date>.md`，一个文件多节），l2 是一条
 /// 一文件。`entry_path` 见到非空 `path` 就直接沿用它，不清空的话「升级」只会
 /// 改 layer 字段、文件还留在 l1 容器里，下一轮扫描又把它当流水。
-pub(super) fn reinforce_entry(target: &str, cue: &str) -> Result<bool, String> {
+pub(super) fn reinforce_entry(target: &str, cue: &str) -> Result<Reinforce, String> {
     reinforce_entry_with(target, cue, None, None)
+}
+
+/// 一次强化的结果。
+///
+/// ── 为什么不是 `bool`（是否升级）──────────────────────────────
+/// 调用方要分别回答两个问题：「这次真的写进去了吗」（决定计数与日志）和
+/// 「有没有升层」（决定 `promoted` 计数）。挤成一个 `bool` 的话，`false` 既
+/// 可能是「确认了但还没攒够」也可能是「什么都没变、没写盘」—— 前者要计一次
+/// 强化，后者不能。真机上表现为「本轮强化 3 条」而库里一条都没动。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reinforce {
+    /// 这次是否真的改了东西（正文被吸收 / 锚点被追加）。false = 完全没写盘。
+    pub changed: bool,
+    /// 这次是否把它从 l1 升到了 l2。
+    pub promoted: bool,
+}
+
+impl Reinforce {
+    /// 什么都没变。
+    const NOOP: Self = Reinforce { changed: false, promoted: false };
 }
 
 /// 强化一条既有结论；如果**这次产出的正文信息量更大**，顺手把正文吸收进来。
@@ -2531,7 +2551,7 @@ pub(super) fn reinforce_entry_with(
     cue: &str,
     incoming_body: Option<&str>,
     incoming_title: Option<&str>,
-) -> Result<bool, String> {
+) -> Result<Reinforce, String> {
     let Some(before) = store::load_all().into_iter().find(|entry| entry.id == target) else {
         return Err(format!("强化目标不存在：{target}"));
     };
@@ -2539,6 +2559,7 @@ pub(super) fn reinforce_entry_with(
         return Err(format!("强化目标已失效：{target}"));
     }
     let mut entry = before.clone();
+    let mut changed = false;
     if let Some(body) = incoming_body.map(str::trim).filter(|body| !body.is_empty()) {
         if should_absorb(&entry, body) {
             entry.body = body.to_string();
@@ -2549,6 +2570,7 @@ pub(super) fn reinforce_entry_with(
             if let Some(title) = incoming_title.map(str::trim).filter(|title| !title.is_empty()) {
                 entry.title = truncate_chars(title, 80);
             }
+            changed = true;
             crate::server::logging::verbose(
                 "[Memory]",
                 &format!("强化 {target} 时吸收了信息量更大的新正文"),
@@ -2556,17 +2578,39 @@ pub(super) fn reinforce_entry_with(
         }
     }
     if !cue.is_empty() && !entry.evidence.iter().any(|known| known.as_str() == cue) {
-        entry.evidence.push(cue.to_string());
-        // 上限 20：证据链是给人看「凭什么」的，不是越长越好
-        if entry.evidence.len() > 20 {
-            let overflow = entry.evidence.len() - 20;
-            entry.evidence.drain(0..overflow);
+        // ── 满员时不能从头部丢 ──────────────────────────────────
+        //
+        // 原来的写法是 `push` 之后 `drain(0..overflow)` —— 丢掉最早的那几条。
+        // 但 `evidence` 对 l1 候选是**计数器**（攒够 2 条升层），对 l2 是**出处**
+        // （这条结论凭什么成立）。后者越早的那条往往就是根因所在的那次排查，
+        // 把它挤掉等于：一条结论被确认得越多，越说不清自己从哪来。
+        //
+        // 现在的取舍：草稿阶段满了先丢最旧的（它的语义只是计数，同一件事被
+        // 反复抽到，旧的确认没有额外价值）；已经是 l2 了就不再追加 —— 20 条
+        // 独立确认足够说明问题，再多的锚点只是把出处列表变成流水账。
+        if entry.layer == Layer::L1 {
+            entry.evidence.push(cue.to_string());
+            if entry.evidence.len() > 20 {
+                let overflow = entry.evidence.len() - 20;
+                entry.evidence.drain(0..overflow);
+            }
+            changed = true;
         }
     }
+    // ── 什么都没变就别写盘 ──────────────────────────────────────
+    //
+    // 蒸馏每轮都会把「清单里已有的结论」重新 reinforce 一遍，命中的多半正是
+    // 已经攒够锚点的 l2。原实现无条件 `save()` + `upsert()`：每轮给同一批
+    // 结论各写一次文件、推一次 `updated_at`。后果不只是白费 IO —— `updated_at`
+    // 被推到此刻，`profile` 的「距上次画像有没有新素材」、热力图的「最近更新」
+    // 全被这些空写搅乱，看起来像「一直在动」。
+    if !changed {
+        return Ok(Reinforce::NOOP);
+    }
     entry.updated_at = model::now_ms();
-    let ready = entry.layer == Layer::L1
+    let promoted = entry.layer == Layer::L1
         && entry.evidence.len() >= model::PROMOTE_AFTER_REINFORCE;
-    if ready {
+    if promoted {
         entry.layer = Layer::L2;
         entry.path.clear();
         store::move_save(&before, &entry)?;
@@ -2574,7 +2618,7 @@ pub(super) fn reinforce_entry_with(
         store::save(&entry)?;
     }
     index::global().upsert(&entry)?;
-    Ok(ready)
+    Ok(Reinforce { changed: true, promoted })
 }
 
 /// 人工采纳一条草稿：把它直接升成 l2 结论。

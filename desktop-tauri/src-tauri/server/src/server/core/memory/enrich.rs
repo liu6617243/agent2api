@@ -242,7 +242,10 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
             if target.is_empty() || !known_ids.contains(target) {
                 continue;
             }
-            if super::reinforce_entry(target, &cue).is_ok() {
+            // 只数「真的写进去了」的那些：模型每轮都会把清单里的老结论
+            // reinforce 一遍，其中多数锚点早就有了。把 NOOP 也计入会让审计
+            // 文案变成「本轮确认 8 条」，而库里一条都没动。
+            if super::reinforce_entry(target, &cue).map(|out| out.changed).unwrap_or(false) {
                 reinforced += 1;
             }
             continue;
@@ -264,7 +267,11 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
         if let Some(existing) = super::similar_l1_candidate(project, kind, body) {
             // 带正文一起强化：候选被同一件事的另一个措辞覆盖时，留信息量更大的那份。
             // 只加锚点的话，先落盘的那份半截候选会一直代表这件事，直到它升 l2。
-            if super::reinforce_entry_with(&existing, &cue, Some(body), Some(title.as_str())).is_ok() {
+            // 同样只数真的写进去的（见上面 reinforce 分支的说明）。
+            if super::reinforce_entry_with(&existing, &cue, Some(body), Some(title.as_str()))
+                .map(|out| out.changed)
+                .unwrap_or(false)
+            {
                 reinforced += 1;
             }
             continue;

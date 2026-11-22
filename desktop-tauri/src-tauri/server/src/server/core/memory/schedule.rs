@@ -1376,9 +1376,12 @@ fn extract(project: Option<&str>, manual: bool) -> Outcome {
             if target.is_empty() || !known_ids.contains(target) {
                 continue;
             }
-            if let Ok(upgraded) = super::reinforce_entry(target, &cue) {
-                reinforced += 1;
-                if upgraded {
+            // 只数「真的写进去了」的：NOOP（锚点已有、正文没变大）不该计入。
+            if let Ok(out) = super::reinforce_entry(target, &cue) {
+                if out.changed {
+                    reinforced += 1;
+                }
+                if out.promoted {
                     promoted += 1;
                 }
             }
@@ -1404,9 +1407,11 @@ fn extract(project: Option<&str>, manual: bool) -> Outcome {
         if let Some(existing) = super::similar_l1_candidate(project, candidate_kind, body) {
             // 正文一起比：同一件事的两份候选，留信息量更大的那份。只加锚点会让
             // 先落盘的半截版本一直代表这件事，直到它凑够次数升 l2 为止。
-            if let Ok(upgraded) = super::reinforce_entry_with(&existing, &cue, Some(body), Some(title.as_str())) {
-                reinforced += 1;
-                if upgraded {
+            if let Ok(out) = super::reinforce_entry_with(&existing, &cue, Some(body), Some(title.as_str())) {
+                if out.changed {
+                    reinforced += 1;
+                }
+                if out.promoted {
                     promoted += 1;
                 }
             }
