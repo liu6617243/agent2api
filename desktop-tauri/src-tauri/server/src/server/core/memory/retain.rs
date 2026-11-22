@@ -467,6 +467,14 @@ pub fn cwd_of(messages: &[Value]) -> Option<String> {
                     if !looks_like_path(candidate) {
                         continue;
                     }
+                    // 闭合标签碎片：`</conversation_history_summary>` 按 `<` 切完
+                    // 剩 `/conversation_history_summary>`，`starts_with('/')` 会被
+                    // 当成 POSIX 路径。Windows 上 `Path::is_absolute()` 不认 `/foo`，
+                    // CI 2026-11-22 `6d21bdbb` 因此独红（Linux 侥幸过）。
+                    // 真实路径不会带 `>`。
+                    if candidate.contains('>') {
+                        continue;
+                    }
                     // 带空格的中文句子里，路径通常到第一个空格就结束；
                     // 但 `D:\Program Files\...` 是合法的。取「最后一个不存在的
                     // 空格位置」太猜，这里保守取整段（`classify` 里
@@ -1281,16 +1289,15 @@ mod tests {
         );
         assert!(!cwd.ends_with("src"), "不应把 src 当项目: {cwd}");
 
-        // 讨论性质的「工作目录」句子里没有真实路径：不猜
+        // 讨论性质的「工作目录」句子里没有真实路径：不猜。
+        // 不能放宽成 is_absolute：POSIX 上 `/conversation_history_summary>`
+        // 这种闭合标签碎片也「是绝对路径」，会把这个 bug 在 Linux CI 上藏掉
+        // （Windows `6d21bdbb` 独红就是这么漏过去的）。
         let messages = vec![serde_json::json!({
             "role": "user",
             "content": "<conversation_history_summary>修复：title_from_session() 优先取第一句用户话，其次工作目录末级名。</conversation_history_summary>"
         })];
-        // 这条可能有别的绝对路径吗？没有。应为 None 或至少不是中文句子
-        if let Some(cwd) = cwd_of(&messages) {
-            assert!(std::path::Path::new(&cwd).is_absolute(), "{cwd}");
-            assert!(!cwd.contains('：') && !cwd.contains('。'), "中文句子不该被当成目录: {cwd}");
-        }
+        assert_eq!(cwd_of(&messages), None, "讨论性质的句子不该抠出目录");
     }
 
     #[test]
