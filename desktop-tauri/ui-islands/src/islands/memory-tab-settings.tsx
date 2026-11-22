@@ -539,7 +539,7 @@ function InjectPreview(): React.ReactElement {
         </div>
       </div>
       <div className='mm-cfg-card-sub'>
-        {t('贴一句你真会说的话（带上文件名、函数名、命令名效果最好）。网关按这些线索去记忆里找命中，命不中就什么都不注入 —— 宁可不给，也不给错的。')}
+        {t('贴一句你真会说的话：中文整句照原样贴也认（按连续命中的四字组算分），带上文件名、函数名、命令名更准。网关按这些线索去记忆里找命中，命不中就什么都不注入 —— 宁可不给，也不给错的。')}
       </div>
       <Input
         value={probe}
@@ -554,17 +554,30 @@ function InjectPreview(): React.ReactElement {
             {!result.enabled
               ? t('注入开关是关的：这段内容现在不会进任何请求。')
               : result.text
-                ? t('会注入 {n} token（上限 {max}）· 抽出 {k} 个线索', {
+                ? t('会注入 {n} token（上限 {max}）· 线索：路径 {k} 个{cjk}', {
                     n: result.tokens,
                     max: result.settings.maxTokens,
                     k: result.probes.length,
+                    cjk: result.cjkGrams > 0 ? t(' · 中文 {c} 组', { c: result.cjkGrams }) : '',
                   })
-                : t('没有命中：这次不会注入任何记忆。')}
+                : result.probes.length === 0 && result.cjkGrams === 0
+                  // 一句中文只说了三个字、或者一堆纯标点：压根没有可比的线索。
+                  // 这和「线索够、库里没对上」是两件事，处置完全不同。
+                  ? t('这句话里没抽出任何线索（路径、标识符、中文四字组都算）：这次不会注入任何记忆。')
+                  : t('没有命中：线索抽到了，但库里没有一条够格 —— 宁可不给，也不给错的。')}
           </div>
           {result.probes.length > 0 ? (
             <div className='mm-cfg-card-note'>
               {t('线索：')}
               {result.probes.map(item => ` ${item}`).join(' · ')}
+            </div>
+          ) : null}
+          {/* 中文线索单独一行：它不在 `probes` 里（那边只认 ASCII 整串），
+              但中文提问靠它才能命中 —— 不显示出来，用户会以为「抽出 0 个线索」
+              等于「没找」。 */}
+          {result.cjkGrams > 0 ? (
+            <div className='mm-cfg-card-note'>
+              {t('中文线索：{c} 个四字组（中文没有词边界，按连续命中算分）', { c: result.cjkGrams })}
             </div>
           ) : null}
           {/* 候选与门槛：解释「为什么没注入」。

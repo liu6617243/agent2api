@@ -787,7 +787,12 @@ fn skip_leading_close_tags(text: &str) -> &str {
 ///
 /// 名单只收真机上出现过的、且**内容一定不是人话**的那几类：环境信封、两种客户端
 /// 摘要、后台任务回执、图片回执、工具调用壳。
-fn strip_client_blocks(raw: &str) -> String {
+///
+/// 注入侧（[`super::inject`]）也用这一份：它要从请求文本里抽中文线索，而
+/// `<system-reminder>` / `<task-notification>` / `<previous_*>` 里全是中文 ——
+/// 那是客户端的说明文字与上一轮回灌，不是用户说的话。名单两处各长各的，
+/// 迟早会漏一类。
+pub(crate) fn strip_client_blocks(raw: &str) -> String {
     // (开标签, 闭标签)。开标签带属性，所以只比前缀，闭标签要比全。
     const PAIRS: &[(&str, &str)] = &[
         ("<system-reminder", "</system-reminder>"),

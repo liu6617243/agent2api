@@ -43,6 +43,7 @@
 //! 没有记忆」而不是「这次请求 500」。所以所有函数返回 `Option` / `bool`，
 //! 没有 `Result`，也没有 `unwrap`。
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -517,6 +518,221 @@ fn path_like(probes: &[String]) -> bool {
     })
 }
 
+// ── 中文线索 ─────────────────────────────────────────────────────────
+
+/// 中文线索的最小长度：4 个字。
+///
+/// 与 [`head_hit`] 的 4 字符门槛同义：「记忆中枢」四个字是一个完整的词，
+/// 比英文的 `api` 这种碎片可靠得多。
+const CJK_MIN: usize = 4;
+
+/// 中文线索算「强命中」的长度：8 个字。
+///
+/// 8 个字以上的**连续**片段被原样复述，几乎必然是同一件事（用户当年的原话，
+/// 或者同一个结论被写了两遍）。这一档的权重对齐路径档。
+const CJK_STRONG: usize = 8;
+
+/// 中文线索最多折算几个单位。
+///
+/// 2 个单位 = 4.0 分 =「两条独立线索互相印证」，与 ASCII 的两条探针同档。
+/// 再多就是灌分 —— 一条记忆只该被自己的证据推进，不能被十个子串推进。
+const CJK_UNITS_MAX: f64 = 2.0;
+
+/// 中文线索最多取请求里的几段。
+///
+/// 请求文本不只有用户的话：Chat 路径会在用户侧抽不出结构线索时补上工具回显
+/// （`chat_request_text_from`），原生路径更是取整个 body 的尾部。那些回显里
+/// 也有中文 —— 源码注释、日志、报错 —— 那是「正在处理的文件」，不是「用户想
+/// 做的事」。拿它们当线索，命中的会是碰巧含同一句注释的旧记忆。
+///
+/// ── 16 这个数是量出来的，不是拍的 ────────────────────────────
+/// 真机一次真实请求（WorkBuddy CLI，814 KB，`<user_query>` 里是 2.5 万字符的
+/// 会话摘要，截到 12k 后 453 个中文段）拿去跑打分：
+///
+/// | 取段数 | 四字组 | 命中 | 过线 | 前两名 |
+/// |---|---|---|---|---|
+/// | 8 | 99 | 29 | 29 | 全是同一条 l1 流水的碎片 |
+/// | 12 | 130 | 71 | 33 | 「记忆留存边界」「留存边界：通知是控制消息」 |
+/// | 16 | 167 | 71 | 33 | 同上（已饱和） |
+/// | 24 | 235 | 71 | 33 | 同上 |
+/// | 32 | 299 | 73 | 35 | 同上 |
+/// | 64 | 478 | 102 | 66 | 开始混进相邻主题 |
+///
+/// 8 段太少（召回不到 l2 结论），64 段太多（噪音翻倍）。12 段已饱和，取 16
+/// 留一点余量，同时避免抓到工具回显。
+const CJK_RUNS_MAX: usize = 16;
+
+/// 请求里的中文线索。
+///
+/// ── 为什么用「四字组集合」而不是「短语列表」 ───────────────────
+/// 中文没有词边界，用户的话也没有标点分词：「记忆中枢的检索为什么命中不了」
+/// 到底该切成哪几段？切错了就永远命中不了。
+///
+/// 四字组（4-gram）绕开分词问题：只要**同一段连续文字**在两边都出现，它
+/// 内部的四字组就一定重合。于是「这两边是不是同一件事」变成一个纯集合问题：
+/// 记忆那一侧的 4-gram 序列里，有多少个**连续**落在请求的 4-gram 集合里。
+///
+/// 代价是集合里混得进「差一点也算」的碎片（四字组重合 ≠ 整段重合）。所以
+/// 下面按**连续**命中计数：k 个连续命中的 4-gram 拼起来就是 k+3 个字的
+/// 连续片段，中间隔一个就断。
+#[derive(Debug, Clone, Default)]
+pub struct CjkClues {
+    grams: HashSet<u64>,
+}
+
+impl CjkClues {
+    /// 这份请求里有没有中文线索。
+    pub fn is_empty(&self) -> bool {
+        self.grams.is_empty()
+    }
+
+    /// 抽到了多少个四字组（诊断用：界面上能看出「这次到底有没有中文线索」）。
+    pub fn len(&self) -> usize {
+        self.grams.len()
+    }
+
+    /// 指纹 —— 缓存键要用。
+    ///
+    /// 排序后再算：`HashSet` 的遍历顺序随进程种子变，同一份请求在不同进程里
+    /// 必须算出同一个指纹，否则缓存命中率会随重启塌掉。
+    pub fn fingerprint(&self) -> u64 {
+        let mut grams: Vec<u64> = self.grams.iter().copied().collect();
+        grams.sort_unstable();
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for gram in grams {
+            hash ^= gram;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// 这段文字的四字组是不是**全都在**线索里（诊断与单测用）。
+    ///
+    /// 按中文连续段逐段判：标点两侧的字本来就不该算连续。
+    pub fn covers(&self, text: &str) -> bool {
+        let runs = cjk_runs(text);
+        if runs.is_empty() {
+            return false;
+        }
+        runs.iter().all(|run| {
+            let chars: Vec<char> = run.chars().collect();
+            chars.len() >= CJK_MIN
+                && chars
+                    .windows(CJK_MIN)
+                    .all(|window| self.grams.contains(&gram_hash(window)))
+        })
+    }
+}
+
+/// 从一段请求文本里抽中文线索。
+///
+/// ── 为什么先剥客户端包裹块 ────────────────────────────────────
+/// `<system-reminder>`、`<task-notification>`、`<previous_user_message>` 这些
+/// 里全是中文，但它们不是用户说的话 —— 是客户端的说明文字与上一轮的回灌。
+/// 拿它们当线索，命中的会是「客户端在解释自己」那条记忆，与本轮任务无关。
+///
+/// 剥的名单与导入侧共用一份（[`super::import::strip_client_blocks`]）。
+///
+/// ── 为什么这里只做「抽」，不做「切分」 ────────────────────────
+/// 切分是错的那一步：中文没有词边界，`记忆中枢的检索` 切成 `记忆中枢`+`的检索`
+/// 还是 `记忆中`+枢的检索，全凭猜。4-gram 把这个问题推给集合运算，答案稳定。
+pub fn cjk_clues(text: &str) -> CjkClues {
+    let mut grams = HashSet::new();
+    if text.trim().is_empty() {
+        return CjkClues { grams };
+    }
+    let cleaned = super::import::strip_client_blocks(text);
+    let mut runs = cjk_runs(&cleaned);
+    // 按长度取前几段（见 [`CJK_RUNS_MAX`]）：用户的话通常最长，工具回显里的
+    // 中文该被挡在外面。稳定排序 → 长度相同时保持原顺序，指纹才不会飘。
+    runs.sort_by(|left, right| right.chars().count().cmp(&left.chars().count()));
+    runs.truncate(CJK_RUNS_MAX);
+    for run in runs {
+        let chars: Vec<char> = run.chars().collect();
+        for window in chars.windows(CJK_MIN) {
+            grams.insert(gram_hash(window));
+        }
+    }
+    CjkClues { grams }
+}
+
+/// 把文本切成一段段连续的中文（标点、ASCII、空白都是分隔符）。
+fn cjk_runs(text: &str) -> Vec<String> {
+    let mut runs: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if super::model::is_cjk(ch) {
+            current.push(ch);
+        } else if !current.is_empty() {
+            runs.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs
+}
+
+/// 四字组的哈希（FNV-1a，64 位）。
+fn gram_hash(window: &[char]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for ch in window {
+        for byte in (ch as u32).to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+/// 记忆这一侧命中的中文线索有几个「单位」。
+///
+/// 一个独立命中区域算 1.0 个单位；连续 [`CJK_STRONG`] 个字以上的区域算 1.5 个
+/// 单位。上限 [`CJK_UNITS_MAX`]。
+fn cjk_units(head: &str, cjk: Option<&CjkClues>) -> f64 {
+    let Some(clues) = cjk else { return 0.0 };
+    if clues.is_empty() {
+        return 0.0;
+    }
+    let mut units = 0.0f64;
+    for run in cjk_runs(head) {
+        let chars: Vec<char> = run.chars().collect();
+        // 沿这一段扫四字组：连续命中的 k 个 = k+3 个字的连续片段
+        let mut streak = 0usize;
+        let mut region = 0usize;
+        for window in chars.windows(CJK_MIN) {
+            if clues.grams.contains(&gram_hash(window)) {
+                streak += 1;
+                let length = streak + CJK_MIN - 1;
+                if length > region {
+                    region = length;
+                }
+            } else if streak > 0 {
+                // 断了：这个区域结算，独立算一条线索
+                units += region_weight(region);
+                streak = 0;
+                region = 0;
+            }
+        }
+        if streak > 0 {
+            units += region_weight(region);
+        }
+        if units >= CJK_UNITS_MAX {
+            return CJK_UNITS_MAX;
+        }
+    }
+    units.min(CJK_UNITS_MAX)
+}
+
+/// 一个命中区域的权重：连续 [`CJK_STRONG`] 个字以上算强线索（1.5），否则 1.0。
+fn region_weight(length: usize) -> f64 {
+    if length >= CJK_STRONG {
+        1.5
+    } else {
+        1.0
+    }
+}
+
 /// 标题 / 摘要 / 标签里有没有这条线索。
 ///
 /// 线索短于 4 个字符时**不参与**这一档：`api`、`md`、`v1` 这类碎片在几千条
@@ -536,13 +752,19 @@ fn head_hit(head: &str, probe: &str) -> bool {
 ///
 /// `extra` 是从正文抽出来的路径（见 [`derived_paths`]），只对 `files` 为空的
 /// 存量条目有值 —— 否则那批数据在「按文件命中」这一档上永久隐形。
+///
+/// `cjk` 是请求里的中文线索（见 [`cjk_clues`]）。它与 `probes` 是**两套**机制：
+/// `probes` 认「整串出现」（路径、标识符），中文没有词边界，切出来的短语
+/// 几乎不可能整串出现在标题里 —— 所以中文走 4-gram 的连续命中，走另一套权重。
 fn relevance(
     entry: &MemoryEntry,
     probes: &[String],
     path_match: bool,
     extra: Option<&Vec<String>>,
+    cjk: Option<&CjkClues>,
 ) -> f64 {
-    if probes.is_empty() {
+    // 没有结构线索、也没有中文线索 → 这一次请求跟记忆库没关系，整库扫过去也是白扫
+    if probes.is_empty() && cjk.map_or(true, |clues| clues.is_empty()) {
         return 0.0;
     }
     // ── 为什么用 `summary(240)` 而不是 `summary_text` ────────────
@@ -575,6 +797,13 @@ fn relevance(
             score += 2.0;
         }
     }
+    // ── 中文线索 ────────────────────────────────────────────────
+    // 一个单位 = 一条独立线索 = 2.0 分，与 ASCII 的标题命中同档；
+    // 连续 8 字以上算 1.5 个单位 = 3.0 分，与路径命中同档。
+    //
+    // 档位刻意对齐 ASCII 那两档：门槛（[`floor_for`]）是按「一个泛词命中进不来、
+    // 一条路径或两条独立线索才能进」定的，中文走同一套刻度，精度口径不变。
+    score += cjk_units(&head, cjk) * 2.0;
     if score <= 0.0 {
         return 0.0;
     }
@@ -828,11 +1057,18 @@ pub fn compose(request_text: &str) -> Option<String> {
     // 所以空文本照常往下走：线索为空 → 「相关经验」自然空，但「必须遵守」还在。
     let text = request_text.trim();
     let probes = if text.is_empty() { Vec::new() } else { probes(text) };
-    let key = cache_key(&settings, &probes);
+    // 中文线索与结构线索是**两套**独立机制：结构线索认「整串出现」，中文没有
+    // 词边界，只能按 4-gram 的连续命中算。
+    let cjk = if text.is_empty() {
+        None
+    } else {
+        Some(cjk_clues(text))
+    };
+    let key = cache_key(&settings, &probes, cjk.as_ref());
     if let Some(hit) = cache_get(key) {
         return hit;
     }
-    let block = build(&settings, &probes);
+    let block = build(&settings, &probes, cjk.as_ref());
     cache_put(key, block.as_deref());
     block
 }
@@ -861,7 +1097,7 @@ fn cache() -> &'static Mutex<Vec<(u64, Instant, Option<Arc<String>>)>> {
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn cache_key(settings: &Settings, probes: &[String]) -> u64 {
+fn cache_key(settings: &Settings, probes: &[String], cjk: Option<&CjkClues>) -> u64 {
     // FNV-1a：只需要「撞了也无所谓」的散列，撞了最多是拿错一次注入结果 ——
     // 而键里带着全部线索，实际碰撞概率可以忽略。
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -882,6 +1118,12 @@ fn cache_key(settings: &Settings, probes: &[String]) -> u64 {
     for probe in probes {
         feed(probe.as_bytes());
         feed(b"\x1f");
+    }
+    // ── 中文线索也要进键 ────────────────────────────────────────
+    // 两条请求的 ASCII 线索可能一模一样（都只提到一个 `inject.rs`），但中文
+    // 不同 —— 不进键就会拿上一条请求的注入块来用，中文那部分整个串台。
+    if let Some(clues) = cjk {
+        feed(&clues.fingerprint().to_le_bytes());
     }
     hash
 }
@@ -906,7 +1148,7 @@ fn cache_put(key: u64, value: Option<&str>) {
     guard.push((key, Instant::now(), value.map(|text| Arc::new(text.to_string()))));
 }
 
-fn build(settings: &Settings, probes: &[String]) -> Option<String> {
+fn build(settings: &Settings, probes: &[String], cjk: Option<&CjkClues>) -> Option<String> {
     let entries = store::snapshot();
 
     // ── 第一段：必须遵守 ────────────────────────────────────────
@@ -965,7 +1207,7 @@ fn build(settings: &Settings, probes: &[String]) -> Option<String> {
         .filter_map(|entry| {
             let floor = floor_for(entry)?;
             let extra = derived.as_ref().and_then(|index| index.get(&entry.id));
-            let score = relevance(entry, probes, settings.path_match, extra);
+            let score = relevance(entry, probes, settings.path_match, extra, cjk);
             (score >= floor).then_some((score, entry))
         })
         .collect();
@@ -1449,15 +1691,14 @@ fn append_native(
 /// 真的没命中（该补记忆或换线索）。这两种情况的处置完全相反。
 pub fn preview(request_text: &str) -> Value {
     let settings = settings();
-    let query = if request_text.trim().is_empty() {
-        "（未提供请求文本，仅展示「必须遵守」）"
-    } else {
-        request_text
-    };
-    let block = compose(query);
+    // 注入块与候选命中**必须**用同一份请求文本。以前这里塞的是一句占位中文
+    // （「未提供请求文本，仅展示『必须遵守』」），而 `probes` 用的是真文本 ——
+    // 两边口径不一致。现在中文线索也参与匹配，占位句不能再来冒充请求。
+    let block = compose(request_text);
     // 命中的那几条单独扫一遍：`build` 只回拼好的文本，拿不到「差多少分」。
     // 这条接口是用户手点的，多扫一遍全库是几十毫秒，可以接受。
     let probes = probes(request_text);
+    let cjk = cjk_clues(request_text);
     let hits: Vec<Value> = if settings.enabled {
         let entries = store::snapshot();
         let derived = if settings.path_match && path_like(&probes) {
@@ -1470,7 +1711,7 @@ pub fn preview(request_text: &str) -> Value {
             .filter_map(|entry| {
                 let floor = floor_for(entry)?;
                 let extra = derived.as_ref().and_then(|index| index.get(&entry.id));
-                let score = relevance(entry, &probes, settings.path_match, extra);
+                let score = relevance(entry, &probes, settings.path_match, extra, Some(&cjk));
                 (score > 0.0).then_some((score, floor, entry))
             })
             .collect();
@@ -1541,6 +1782,9 @@ pub fn preview(request_text: &str) -> Value {
             "pathMatch": settings.path_match,
         },
         "probes": probes,
+        // 中文线索抽到了多少个四字组：界面上能一眼看出「这次到底有没有中文线索」，
+        // 中文检索为 0 条时先看这个数，别再去猜。
+        "cjkGrams": cjk.len(),
         "hits": hits,
         "text": block,
         "tokens": block.as_deref().map(estimate_tokens).unwrap_or(0),
@@ -2039,16 +2283,16 @@ mod tests {
         // 一条路径命中 = 3.0 + 0.4，刚好过线
         let one_path = vec!["chat.rs".to_string()];
         assert!(
-            relevance(&imported, &one_path, true, None) >= floor,
+            relevance(&imported, &one_path, true, None, None) >= floor,
             "路径命中必须能进：{} vs {floor}",
-            relevance(&imported, &one_path, true, None)
+            relevance(&imported, &one_path, true, None, None)
         );
         // 一个泛词命中 = 2.0 + 0.4，不该进
         let mut titled = MemoryEntry::draft("i2", "注入点说明", MemoryKind::Daily, "正文");
         titled.layer = Layer::L1;
         titled.importance = 0.4;
         let noise = vec!["注入点说明".to_string()];
-        assert!(relevance(&titled, &noise, true, None) < floor_for(&titled).unwrap());
+        assert!(relevance(&titled, &noise, true, None, None) < floor_for(&titled).unwrap());
 
         // 沉淀层与「天然是结论」的类别门槛低：它们本来就是结论
         let mut l2 = MemoryEntry::draft("l2", "注入点", MemoryKind::Knowledge, "正文");
@@ -2080,12 +2324,12 @@ mod tests {
         let probe = vec!["chat.rs".to_string()];
         let floor = floor_for(&legacy).unwrap();
         // 没有派生路径：只剩标题可比，进不了
-        assert!(relevance(&legacy, &probe, true, None) < floor);
+        assert!(relevance(&legacy, &probe, true, None, None) < floor);
         // 有派生路径：3.0 + 0.4 过线
         assert!(
-            relevance(&legacy, &probe, true, Some(&extra)) >= floor,
+            relevance(&legacy, &probe, true, Some(&extra), None) >= floor,
             "派生路径命中必须能进：{} vs {floor}",
-            relevance(&legacy, &probe, true, Some(&extra))
+            relevance(&legacy, &probe, true, Some(&extra), None)
         );
         // `files` 非空时不该再走派生路径（自己那份更准）—— 由调用侧保证，
         // 这里钉住判据：两处都命中不会重复加分，因为 `file_hit` 是短路 `any`
@@ -2098,5 +2342,108 @@ mod tests {
         assert!(!path_like(&["a/b".to_string()]));
         assert!(path_like(&["src/server/api/chat.rs".to_string()]));
         assert!(path_like(&["src\\server\\chat.rs".to_string()]));
+    }
+
+    // ── 中文线索（真机事故：中文提问永远注不进「相关经验」）────────
+
+    #[test]
+    fn cjk_clues_pick_chinese_and_ignore_ascii() {
+        assert!(!cjk_clues("帮我看看记忆中枢的检索").is_empty());
+        assert!(cjk_clues("just plain english text").is_empty());
+        assert!(cjk_clues("   ").is_empty());
+        // 三个字不算线索：中文三个字太碎，比英文的 4 字符门槛还宽一格
+        assert!(cjk_clues("中文的").is_empty());
+    }
+
+    #[test]
+    fn cjk_clues_skip_client_envelopes() {
+        // `<system-reminder>` 里全是中文，但那是客户端的说明文字，不是用户说的话。
+        // 拿它当线索，命中的会是「客户端在解释自己」那条记忆，与本轮任务无关。
+        let clues = cjk_clues(
+            "<system-reminder>客户端注入的说明文字</system-reminder>用户真正说的话在这里",
+        );
+        assert!(!clues.is_empty());
+        assert!(
+            !clues.covers("客户端注入的说明文字"),
+            "客户端包裹块里的中文不能进线索"
+        );
+        assert!(
+            clues.covers("用户真正说的话在这里"),
+            "用户原话必须进线索"
+        );
+    }
+
+    #[test]
+    fn chinese_request_can_hit_imported_l1() {
+        // 真机 2026-11-22：`/api/memory/inject/preview?q=复用` 命中 0 条，
+        // 同一条中文在 FTS 列表检索里命中 10 条 —— 差别就在这里：注入走
+        // `probes()`，而它只抽 ASCII。中文提问 = 永远失忆。
+        let mut imported =
+            MemoryEntry::draft("i3", "记忆中枢按复用价值沉淀", MemoryKind::Daily, "正文");
+        imported.layer = Layer::L1;
+        imported.importance = 0.4;
+        let floor = floor_for(&imported).unwrap();
+        let clues = cjk_clues("记忆中枢按复用价值沉淀");
+        let score = relevance(&imported, &[], true, None, Some(&clues));
+        assert!(
+            score >= floor,
+            "整段中文被复述必须能进：{score} vs {floor}"
+        );
+    }
+
+    #[test]
+    fn weak_chinese_match_keeps_l1_precision() {
+        // 一个四字词组 = 一条独立线索 = 2.0 分，与 ASCII 的单条标题命中同档：
+        // 普通 l1 的门槛是 3.3，单条进不来 —— 精度不因中文而放松。
+        let mut titled = MemoryEntry::draft("i4", "注入点说明", MemoryKind::Daily, "正文");
+        titled.layer = Layer::L1;
+        titled.importance = 0.4;
+        let floor = floor_for(&titled).unwrap();
+        let one = cjk_clues("注入点说明");
+        let score = relevance(&titled, &[], true, None, Some(&one));
+        assert!(score < floor, "单个词组不该进普通 l1：{score} vs {floor}");
+
+        // 两条独立线索 = 4.0 分 → 进得来（与 ASCII 的两条探针同一口径）
+        let mut two =
+            MemoryEntry::draft("i5", "注入点说明", MemoryKind::Daily, "还有一条别的结论");
+        two.layer = Layer::L1;
+        two.importance = 0.4;
+        let clues = cjk_clues("注入点说明 还有一条别的结论");
+        let score = relevance(&two, &[], true, None, Some(&clues));
+        assert!(
+            score >= floor_for(&two).unwrap(),
+            "两条独立中文线索必须能进：{score}"
+        );
+    }
+
+    #[test]
+    fn probes_stay_ascii_only() {
+        // 中文**不能**进 `probes()`：那条链路靠「`probes()` 为空就补工具回显」
+        // 来拿路径线索（`chat_request_text_from`）。中文一进去，纯中文提问就
+        // 再也拿不到工具回显里的路径 —— 那是拿旧的毛病换新的毛病。
+        assert!(probes("帮我看看记忆中枢的检索").is_empty());
+        assert!(
+            probes("改一下 inject.rs 里的 probes")
+                .contains(&"inject.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn cache_key_separates_different_chinese_requests() {
+        // 中文线索必须进缓存键：两条请求的 ASCII 线索可以完全一样，
+        // 不进键就会拿上一条请求的注入块来用，中文那部分整个串台。
+        let settings = Settings::default();
+        let probes = vec!["inject.rs".to_string()];
+        let one = cjk_clues("记忆中枢按复用价值沉淀");
+        let two = cjk_clues("完全不同的另一段中文内容");
+        assert_ne!(
+            cache_key(&settings, &probes, Some(&one)),
+            cache_key(&settings, &probes, Some(&two))
+        );
+        assert_eq!(
+            cache_key(&settings, &probes, Some(&one)),
+            cache_key(&settings, &probes, Some(&one)),
+            "同一份中文线索必须算出同一个键，否则缓存永远不命中"
+        );
     }
 }
