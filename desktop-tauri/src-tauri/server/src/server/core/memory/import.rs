@@ -949,6 +949,80 @@ fn declared_project_of(raw: &str) -> Option<String> {
     None
 }
 
+/// 导入条目的标题基数：优先会话里第一句像「事情」的话，退回文件名。
+///
+/// ── 为什么文件名不能直接当标题 ──────────────────────────────
+/// 真机事故：导入进来的 5,974 条标题全是裸 UUID（`538e6914-d5c6-…（2）`）。
+/// 那些文件名是客户端生成的会话 id，对读的人零信息：列表页一屏全是十六进制，
+/// 分不清哪条是关于什么的，连「这条讲的是哪个项目」都要点进去才知道。
+///
+/// ── 取什么 ──────────────────────────────────────────────────
+/// 1. 第一句来自用户的话（`我：…`），且像一句话 —— 它天然就是「这段在谈什么」；
+/// 2. 否则用 `Workspace Folder` 的末级目录名（至少能说清是哪个项目）；
+/// 3. 再否则用文件名，但把纯 UUID / 纯十六进制换成「会话记录」。
+///
+/// 只取**已经解析好的** `raw` 里第一处 `我：` —— 与 `line_to_turn` 同一个口径，
+/// 不另写一套解析。标题长度按 60 字符截断（同 `retain::infer_title`）。
+fn title_from_session(session: Option<&str>, raw: &str) -> String {
+    const MIN_TITLE: usize = 6;
+    const UUID_LEN: usize = 32;
+
+    /// 这段文字是不是「不像人话」的机器 id。
+    fn looks_machine(text: &str) -> bool {
+        let compact: String = text.chars().filter(|ch| ch.is_ascii_alphanumeric()).collect();
+        // 裸 UUID（含花括号 / 连字符 / 带序号后缀）
+        if compact.len() >= UUID_LEN
+            && compact
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit())
+        {
+            return true;
+        }
+        // 纯数字 / 纯十六进制短串（`a3f1`、`173056`）
+        compact.chars().all(|ch| ch.is_ascii_digit()) && compact.len() >= 8
+    }
+
+    /// 第一句来自用户的话（`我：` / `**我**：`）。
+    fn first_user_line(raw: &str) -> Option<String> {
+        for line in raw.lines().take(400) {
+            let line = line.trim();
+            let Some((speaker, text, _)) = line_to_turn(line) else { continue };
+            if speaker != "我" {
+                continue;
+            }
+            let text = text.trim();
+            if text.chars().count() < MIN_TITLE {
+                continue;
+            }
+            // 客户端包装块不算「在谈什么」
+            if text.starts_with('<') || text.starts_with("Attached ") {
+                continue;
+            }
+            return Some(text.to_string());
+        }
+        None
+    }
+
+    let candidate = first_user_line(raw)
+        .or_else(|| declared_project_of(raw))
+        .or_else(|| {
+            session
+                .map(str::trim)
+                .filter(|stem| !stem.is_empty())
+                .filter(|stem| !looks_machine(stem))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "会话记录".to_string());
+    candidate
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(60)
+        .collect()
+}
+
 fn from_transcript_at(
     path: &Path,
     project: Option<String>,
@@ -1005,7 +1079,7 @@ fn from_transcript_at(
             }
         }
     }
-    let title_base = session.clone().unwrap_or_else(|| "会话记录".to_string());
+    let title_base = title_from_session(session.as_deref(), &raw);
     let total_chars: usize = segments.iter().map(|(text, _)| text.chars().count()).sum();
     if segments.is_empty() || total_chars < MIN_BODY_CHARS {
         return (
@@ -2402,6 +2476,38 @@ mod tests {
         let total: usize = windows.iter().map(|window| window.body.chars().count()).sum();
         assert!(total >= 20_000 * 9 / 10, "窗口应基本覆盖全部原文，实得 {total} 字");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 真机事故 2026-11-22：5,974 条导入标题全是裸 UUID（`538e6914-d5c6-…（2）`）。
+    /// 那是客户端生成的会话 id，列在列表页上一屏全是十六进制，分不清哪条讲什么。
+    #[test]
+    fn session_title_prefers_human_words_over_machine_id() {
+        let uuid = "538e6914-d5c6-486e-8635-a90ef475b1c9";
+        // 会话里有 `我：…`：用那句话当标题
+        let raw = concat!(
+            r#"{"role":"user","content":"仪表盘为什么打不开，日志里没有报错"}"#,
+            "\n",
+            r#"{"role":"assistant","content":"根因是索引库的全局 Mutex 被 rebuild 独占。"}"#
+        );
+        let title = title_from_session(Some(uuid), raw);
+        assert!(!title.contains("538e6914"), "不能拿裸 UUID 当标题：{title}");
+        assert!(title.starts_with("仪表盘为什么打不开"), "{title}");
+
+        // 会话里没有说话（只有工具行）：退到工作目录末级名
+        let raw = concat!(
+            "Workspace Folder: D:\\Personal\\Desktop\\agent2api-main\n",
+            r#"{"type":"tool","content":"ls -la 输出…"}"#
+        );
+        let title = title_from_session(Some(uuid), raw);
+        assert_eq!(title, "agent2api-main");
+
+        // 什么都没有：给一个能读的兜底，不是 UUID
+        let title = title_from_session(Some(uuid), "{}");
+        assert_eq!(title, "会话记录");
+
+        // 文件名本身像人话（`.md` 导入）：保留它
+        let title = title_from_session(Some("端口约定"), "");
+        assert_eq!(title, "端口约定");
     }
 
     #[test]

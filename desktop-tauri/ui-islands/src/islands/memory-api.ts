@@ -167,10 +167,26 @@ export type MemoryStatus = {
    * 与 `inject` 成对：一个证明「记忆读进去了」，一个证明「新记忆写回来了」。
    * 只有前者时用户的感觉是「它记得老东西，但新东西永远不进来」。
    *
-   * `skipped` 的含义是「走了留存逻辑但判定不值得记」（寒暄 / 太短 / 重复），
-   * 不是「出错」—— 逐轮写会把库灌成流水账，跳过才是常态。
+   * `skipped` 的含义是「走了留存逻辑但这一轮没有落库」，不是「出错」——
+   * 逐轮写会把库灌成流水账，跳过才是常态。
+   *
+   * `skippedBy` 把跳过拆成原因。真机事故：仪表盘显示 `count=0 / skipped=4`，
+   * 而同期 89 个请求里 82 个带工具调用 —— 只报总数会让「工具轮被正常跳过」
+   * 读成「留存坏了」。分项之和恒等于 `skipped`。
    */
-  retain?: { enabled: boolean; count: number; skipped: number }
+  retain?: {
+    enabled: boolean
+    count: number
+    skipped: number
+    skippedBy?: {
+      toolTurn?: number
+      tooShort?: number
+      gate?: number
+      duplicate?: number
+      noUser?: number
+      disabled?: number
+    }
+  }
   tables?: Record<string, number>
   config: MemoryConfig
   revision: number

@@ -171,8 +171,12 @@ function Dashboard({ status, onGo, onChanged }: DashboardProps): React.ReactElem
           <div className='mm-metric-sub'>
             {status.retain?.enabled === false
               ? t('开关已关')
-              : t('已跳过 {n} 轮（寒暄 / 太短 / 重复）', {
+              : t('已跳过 {n} 轮：工具轮 {tool} · 太短 {short} · 未过闸 {gate} · 重复 {dup}', {
                   n: num(status.retain?.skipped ?? 0),
+                  tool: num(status.retain?.skippedBy?.toolTurn ?? 0),
+                  short: num(status.retain?.skippedBy?.tooShort ?? 0),
+                  gate: num(status.retain?.skippedBy?.gate ?? 0),
+                  dup: num(status.retain?.skippedBy?.duplicate ?? 0),
                 })}
           </div>
         </MetricCard>

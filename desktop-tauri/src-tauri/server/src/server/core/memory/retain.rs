@@ -171,8 +171,43 @@ fn strip_client_wrappers(text: &str) -> String {
         };
         out.replace_range(start..end, "");
     }
+    // ── 客户端的「工具回执」不是用户的话 ────────────────────────
+    // 真机事故：库里出现 `**我**：Attached image(s) from tool result:`，
+    // 5 条，标题也就是这一句。来源是客户端把工具结果塞进 `role=user`：
+    // 附件占位、图片回执、命令回显，都走这条通道。它们没有任何用户语义，
+    // 留下来只会让注入命中一句「有张图」。
+    //
+    // 只剔**整行就是回执**的那种（strip 之后完全等于已知回执），不做前缀
+    // 匹配：用户完全可能写「Attached image(s) from tool result 这条为什么进库了」
+    // —— 那是真问题，不能跟着一起删。
+    let mut kept: Vec<&str> = Vec::new();
+    for line in out.split('\n') {
+        let probe = line.trim().trim_end_matches(':').trim();
+        if TOOL_ECHO_LINES
+            .iter()
+            .any(|echo| probe.eq_ignore_ascii_case(echo))
+        {
+            continue;
+        }
+        kept.push(line);
+    }
+    if kept.len() != out.split('\n').count() {
+        out = kept.join("\n");
+    }
     out.trim().to_string()
 }
+
+/// 整行即等于这些字符串时，这一行是客户端工具回执，不是用户的话。
+///
+/// 只列**见过真机原文**的形状（见 `.workbuddy/tmp` 里的核对记录）。
+/// 不在这里凭空加「看起来像」的句子：多列一条就可能把用户的真话吃掉。
+const TOOL_ECHO_LINES: &[&str] = &[
+    "Attached image(s) from tool result",
+    "Attached image from tool result",
+    "Attached images from tool result",
+    "Attached file(s) from tool result",
+    "Attached file from tool result",
+];
 
 /// 助手侧文本：最近一条 assistant 消息的正文（不含工具调用块）。
 pub fn assistant_text(messages: &[Value]) -> String {
@@ -429,13 +464,55 @@ fn seen_recently(key: u64) -> bool {
 static RETAIN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RETAIN_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// 跳过原因分项。
+///
+/// ── 为什么一个总数不够 ──────────────────────────────────────
+/// 真机事故：新包跑起来后仪表盘显示 `count=0 / skipped=4`，而同期网关处理了
+/// 89 个请求、其中 82 个带工具调用。看上去像「留存几乎没触发」，实际是
+/// **工具轮被静默跳过、也算一次 skipped** —— 分母被压在 4，等于把最主要的
+/// 跳过来源藏起来了。用户要的是「看得见」，那就得看得见「为什么没记」。
+///
+/// 分项口径（互斥，一个请求只落一格）：
+/// | 键 | 含义 |
+/// |---|---|
+/// | `toolTurn` | 响应里有工具调用，中间轮，本就不该记 |
+/// | `tooShort` | 回答太短 / 空回答 |
+/// | `gate` | 有回答但没命中「值得记」的形状（寒暄、过程旁白） |
+/// | `duplicate` | 与库里已有条目相同 / 10 分钟内重复 |
+/// | `noUser` | 剥掉客户端包装后用户侧为空（纯控制消息） |
+/// | `disabled` | 留存开关关着 |
+static RETAIN_SKIP_TOOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RETAIN_SKIP_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RETAIN_SKIP_GATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RETAIN_SKIP_DUP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RETAIN_SKIP_NOUSER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RETAIN_SKIP_DISABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 记一次跳过，同时把总数 +1。
+///
+/// 总数与分项必须一起动：只加总数会让分项之和永远小于总数（对不上账），
+/// 只加分项又会让仪表盘那个大数字落后。
+fn note_skip(counter: &std::sync::atomic::AtomicU64) {
+    use std::sync::atomic::Ordering;
+    counter.fetch_add(1, Ordering::Relaxed);
+    RETAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn stats() -> Value {
     use std::sync::atomic::Ordering;
     serde_json::json!({
         "enabled": settings().enabled,
         "count": RETAIN_COUNT.load(Ordering::Relaxed),
-        // 「跳过」= 走了留存逻辑但判定不值得记（寒暄 / 太短 / 重复）
+        // 「跳过」= 走了留存逻辑但这一轮没有落库。分项见 `skippedBy`。
         "skipped": RETAIN_SKIPPED.load(Ordering::Relaxed),
+        "skippedBy": {
+            "toolTurn": RETAIN_SKIP_TOOL.load(Ordering::Relaxed),
+            "tooShort": RETAIN_SKIP_SHORT.load(Ordering::Relaxed),
+            "gate": RETAIN_SKIP_GATE.load(Ordering::Relaxed),
+            "duplicate": RETAIN_SKIP_DUP.load(Ordering::Relaxed),
+            "noUser": RETAIN_SKIP_NOUSER.load(Ordering::Relaxed),
+            "disabled": RETAIN_SKIP_DISABLED.load(Ordering::Relaxed),
+        },
     })
 }
 
@@ -465,6 +542,7 @@ pub fn remember_turn(
 ) -> Option<String> {
     let settings = settings();
     if !settings.enabled {
+        note_skip(&RETAIN_SKIP_DISABLED);
         return None;
     }
     // ── 工具循环里的中间轮不算「一轮」────────────────────────────
@@ -478,8 +556,7 @@ pub fn remember_turn(
     // 两者都以 `tool` 消息结尾。响应里有工具调用 = 模型还要接着跑，这一轮
     // 还没结束，不写。真正的收尾那一轮响应里没有工具调用，才会落库。
     if continued {
-        use std::sync::atomic::Ordering;
-        RETAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        note_skip(&RETAIN_SKIP_TOOL);
         return None;
     }
     let user = user_text(messages);
@@ -490,15 +567,30 @@ pub fn remember_turn(
         Some(given) if !given.trim().is_empty() => Some(given.to_string()),
         _ => cwd_of(messages),
     };
+    // ── 用户侧被剥空了就别记 ────────────────────────────────────
+    // 真机事故：`**我**：Attached image(s) from tool result:` 这类条目进了库 ——
+    // 那是客户端把工具回执塞在 `role=user` 里，剥掉包装后一个字都不剩，
+    // 却被当成「用户说了什么」写下去，标题也就成了那句回执。
+    // 空用户侧的条目对「下次怎么做」零贡献，还要挤占注入名额。
+    if user.trim().is_empty() {
+        note_skip(&RETAIN_SKIP_NOUSER);
+        return None;
+    }
     if !worth_keeping(&user, answer, settings.min_chars) {
-        use std::sync::atomic::Ordering;
-        RETAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        // `worth_keeping` 内部已经先判了 `min_chars` —— 这里不再单独判，
+        // 否则「回答太短」会被拆成两个分支、两套计数，分项就对不上账。
+        // 两处必须用**同一个表达式**（`answer.chars().count()`，不 trim ——
+        // `worth_keeping` 里就是它），否则纯空白回答会被分成两种原因。
+        if answer.chars().count() < settings.min_chars {
+            note_skip(&RETAIN_SKIP_SHORT);
+        } else {
+            note_skip(&RETAIN_SKIP_GATE);
+        }
         return None;
     }
     let key = dedupe_key(&user, answer);
     if seen_recently(key) {
-        use std::sync::atomic::Ordering;
-        RETAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        note_skip(&RETAIN_SKIP_DUP);
         return None;
     }
     let body = compose_body(&user, answer, interrupted);
@@ -537,13 +629,13 @@ pub fn remember_turn(
                 .unwrap_or("")
                 .to_string();
             // 被 hash 去重挡掉（库里已有完全相同的一条）不算「新写入」，
-            // 但也不算跳过 —— 它本来就是重复，计数上归到 skipped 更诚实。
+            // 但也不算「闸门拒绝」—— 它本来就是重复，归到 duplicate 更诚实。
             let duplicate = value
                 .get("duplicate")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             if duplicate {
-                RETAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                note_skip(&RETAIN_SKIP_DUP);
                 return None;
             }
             RETAIN_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -717,6 +809,71 @@ mod tests {
             "content": "<task-notification><status>completed</status></task-notification>\n继续处理旧库里的错误条目"
         })];
         assert_eq!(user_text(&messages), "继续处理旧库里的错误条目");
+    }
+
+    #[test]
+    fn tool_echo_lines_are_not_user_words() {
+        // 真机库 2026-11-22：5 条 `**我**：Attached image(s) from tool result:`。
+        // 这是客户端把工具回执塞进 role=user 的形状，剥掉外壳后一个字都不剩。
+        // 留着它等于让注入命中一句「有张图」。
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "Attached image(s) from tool result:"
+        })];
+        assert_eq!(user_text(&messages), "");
+
+        // 回执 + 真话混在一起：只留真话
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "Attached image(s) from tool result:\n这张图里的预算提示为什么还在？"
+        })];
+        assert_eq!(user_text(&messages), "这张图里的预算提示为什么还在？");
+
+        // 用户在**讨论**这句回执本身（不是回执）：不能吃掉
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "Attached image(s) from tool result 这条为什么进库了"
+        })];
+        assert_eq!(
+            user_text(&messages),
+            "Attached image(s) from tool result 这条为什么进库了"
+        );
+    }
+
+    #[test]
+    fn skip_counters_give_a_reason_for_every_dropped_turn() {
+        // 真机事故：新包跑起来后仪表盘是 `count=0 / skipped=4`，而同期 89 个请求
+        // 里 82 个带工具调用。只报一个总数等于把最主要的跳过来源藏起来 ——
+        // 「看得见」要求总数与分项之和一致，且每个丢弃都说得清原因。
+        let before = stats();
+        let total_before = before["skipped"].as_u64().unwrap();
+        let tool_before = before["skippedBy"]["toolTurn"].as_u64().unwrap();
+
+        // 工具轮：不计入任何内容判据，只记 toolTurn
+        remember_turn(
+            &vec![serde_json::json!({ "role": "user", "content": "改注入" })],
+            "先看文件。",
+            None,
+            None,
+            false,
+            true,
+        );
+
+        let after = stats();
+        let total_after = after["skipped"].as_u64().unwrap();
+        let tool_after = after["skippedBy"]["toolTurn"].as_u64().unwrap();
+        // 计数是进程级静态量，测试并行时别的用例也可能 +1 —— 用 `>=` 而不是
+        // `==`，否则这条断言会随调度顺序偶发失败（那种测试比不写更糟）。
+        assert!(total_after > total_before, "总数必须跟着动");
+        assert!(tool_after > tool_before, "原因必须记进 toolTurn");
+
+        // 分项之和不能超过总数（每格互斥）
+        let by = &after["skippedBy"];
+        let sum: u64 = ["toolTurn", "tooShort", "gate", "duplicate", "noUser", "disabled"]
+            .iter()
+            .map(|key| by[*key].as_u64().unwrap())
+            .sum();
+        assert!(sum <= total_after, "分项之和 {sum} 不该超过总数 {total_after}");
     }
 
     #[test]

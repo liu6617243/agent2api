@@ -192,11 +192,15 @@ impl TurnCapture {
             self.absorb(&line);
             self.tail.clear();
         }
-        if self.text.trim().is_empty() {
-            // 流里一帧正文都没取到（工具调用型回答、纯推理回答）：
-            // 写下去就是一条只有「用户说了什么」的空记忆，没有价值。
-            return;
-        }
+        // ── 空正文也要交给留存去分类 ────────────────────────────
+        // 早先这里有一道 `text.trim().is_empty() → return`：理由是「没有正文
+        // 就没有价值」。行为上是对的（工具调用轮确实不该写），但它把**计数**
+        // 一并跳过了 —— 真机数字因此对不上账：89 个请求里 82 个带工具调用，
+        // 仪表盘只显示 skipped=4，读起来像「留存根本没跑」。
+        //
+        // 分类逻辑本来就该只有一处（`remember_turn`）：`continued=true` → 记
+        // `toolTurn`，`continued=false` 且正文太短 → 记 `tooShort`。这里只负责
+        // 把「这一轮事实上是什么」原样交过去。
         let messages = self.messages;
         let session = self.session;
         let text = self.text;

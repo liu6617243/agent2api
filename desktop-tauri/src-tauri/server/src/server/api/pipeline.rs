@@ -1096,7 +1096,10 @@ pub fn answer_text_anthropic(body: &Value) -> String {
 /// 时它要摸 55 MB 的 `.md`，几百毫秒。挂在响应已经下发之后的位置上，直接在
 /// tokio worker 里做会把线程卡住 —— 而那时的用户正在等下一句。
 pub fn retain_answer(source: &TurnSource, answer: &str, interrupted: bool) {
-    if source.is_empty() || answer.trim().is_empty() {
+    // 只有「没有请求快照」才真正无从判断 —— 空回答仍要交给 `remember_turn`：
+    // 它会记成 `tooShort`。早先这里连空回答一起 return，仪表盘上就少了一格，
+    // 「为什么会话没进库」也就无从查起（理由见 `stream_retain::finish`）。
+    if source.is_empty() {
         return;
     }
     let session = source.session.clone();
@@ -1121,6 +1124,8 @@ pub fn retain_answer(source: &TurnSource, answer: &str, interrupted: bool) {
 /// 来了怎么办」必须只有一处 —— 否则四五个调用点各写一遍「有工具调用就
 /// 不写记忆」，迟早有一处漏掉，那一处就继续往库里灌执行旁白。
 pub fn retain_tool_turn(source: &TurnSource) {
+    // 空快照 = 这条路径根本没拿到请求（模型测试 / 后台路由），不是「留存的判断
+    // 结果」，不该进计数。真正的工具轮一定带快照 —— 它来自真实请求体。
     if source.is_empty() {
         return;
     }
