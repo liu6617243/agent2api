@@ -73,7 +73,12 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
     return <Panel loading error=''>{null}</Panel>
   }
 
-  const l2Ratio = status.live > 0 ? Math.round((status.l2 / status.live) * 100) : 0
+  // `candidates` 是本轮新加的字段（旧后端 + 新界面会读到 undefined）。
+  // 所有「有效记忆」口径都要先扣掉草稿：草稿既不进检索也不进注入，把它算进
+  // 分母只会让「沉淀占比」凭空变低，让「有效记忆」凭空变多。
+  const drafts = status.candidates ?? 0
+  const effective = Math.max(0, status.live - drafts)
+  const l2Ratio = effective > 0 ? Math.round((status.l2 / effective) * 100) : 0
   const pending = status.review?.pending ?? 0
   /** 积压阈值（配置项 `dedup.pendingWarnThreshold`，后端默认 50）。
    *
@@ -98,7 +103,7 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
       <MetricGrid>
         <MetricCard>
           <MetricLabel>{t('有效记忆')}</MetricLabel>
-          <MetricValue>{num(status.live)}</MetricValue>
+          <MetricValue>{num(effective)}</MetricValue>
           {/* 分层用「两个大数字 + 各自标签」并排，不用「沉淀 X · 流水 Y」一行：
               后者把两个不同的量塞进一句里，读的时候要先在心里拆开才知道谁是谁；
               并排之后左边永远是普通、右边永远是深层，扫一眼就能比。
@@ -109,7 +114,7 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
           <div className='mm-metric-pair'>
             <div>
               <span className='mm-mp-value'>
-                {status.l1}<i className='mm-mp-unit'>{t('条')}</i>
+                {status.l1 - (status.candidates ?? 0)}<i className='mm-mp-unit'>{t('条')}</i>
               </span>
               <span className='mm-mp-label'>{t('普通记忆')}</span>
             </div>
@@ -120,6 +125,14 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
               <span className='mm-mp-label'>{t('深层记忆')}</span>
             </div>
           </div>
+          {/* 草稿单列一行：它们在 l1 里，但没被确认、进不了检索与注入。
+              不写这一行的话，上面那个「普通记忆」会把草稿算进去 —— 用户以为
+              自己有一百多条记忆，实际能搜到的只有其中一部分。 */}
+          {(status.candidates ?? 0) > 0 ? (
+            <div className='mm-metric-sub'>
+              {t('另有 {n} 条自动抽取草稿待确认（不进检索与注入）', { n: status.candidates })}
+            </div>
+          ) : null}
         </MetricCard>
         <MetricCard>
           <MetricLabel>{t('沉淀占比')}</MetricLabel>

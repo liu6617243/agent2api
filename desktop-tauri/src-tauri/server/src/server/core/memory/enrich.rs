@@ -262,7 +262,9 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
         // 落盘前按正文再比一次（判据见 `similar_l1_candidate`，只比 auto-extract
         // 的 l1 候选，不碰人写的流水）。命中就算「又确认了一次」。
         if let Some(existing) = super::similar_l1_candidate(project, kind, body) {
-            if super::reinforce_entry(&existing, &cue).is_ok() {
+            // 带正文一起强化：候选被同一件事的另一个措辞覆盖时，留信息量更大的那份。
+            // 只加锚点的话，先落盘的那份半截候选会一直代表这件事，直到它升 l2。
+            if super::reinforce_entry_with(&existing, &cue, Some(body), Some(title.as_str())).is_ok() {
                 reinforced += 1;
             }
             continue;
@@ -581,8 +583,12 @@ pub fn build_profile(sub: Option<&str>, force: bool) -> Outcome {
     let min = config::usize_of("deep.personaMinMemories").max(5);
     let all = store::load_all();
     let live: Vec<&model::MemoryEntry> = all.iter().filter(|entry| entry.is_live()).collect();
-    if live.len() < min {
-        return Outcome::Skipped(format!("记忆只有 {} 条，未达画像门槛 {min}", live.len()));
+    // 门槛按**真记忆**算：草稿不算「这个人身上已经积累的事实」。否则一个刚装上
+    // 的库跑了几轮抽取就凑够 5 条草稿，画像立刻开始生成 —— 素材全是模型自己
+    // 编的，画出来的「画像」也是模型的自我复读。
+    let real = live.iter().filter(|entry| !super::is_auto_draft(entry)).count();
+    if real < min {
+        return Outcome::Skipped(format!("记忆只有 {real} 条，未达画像门槛 {min}"));
     }
     // 本次要重写的那几类旧结论。别的类的条目一个字都不动。
     let existing: Vec<&model::MemoryEntry> = live
@@ -596,16 +602,30 @@ pub fn build_profile(sub: Option<&str>, force: bool) -> Outcome {
         .collect();
     if !force && !existing.is_empty() {
         let newest = existing.iter().map(|entry| entry.updated_at).max().unwrap_or(0);
-        let fresh = live.iter().filter(|entry| entry.updated_at > newest).count();
+        let fresh = live
+            .iter()
+            .filter(|entry| entry.updated_at > newest)
+            .filter(|entry| !super::is_auto_draft(entry))
+            .count();
         if fresh < min {
             return Outcome::Skipped(format!("画像之后只有 {fresh} 条新记忆，未达门槛 {min}"));
         }
     }
     // 素材：重要度高 + 类型上是「关于这个人/这件事」的
+    //
+    // ── 草稿不能当画像素材 ─────────────────────────────────────
+    // 画像产物是 `layer = l2` + `kind = profile`，而 `inject::rule_candidate`
+    // 对画像无条件放行（`kind` 命中就进「必须遵守」块）。也就是说：一条还没被
+    // 确认的草稿，只要被喂进画像、再被模型写成一条 profile，它就绕过了整条
+    // 准入模型，直接变成之后每一次请求里的硬约束。这条链路比「草稿进检索」
+    // 严重一档 —— 检索是模型按需读，硬约束是每次都被塞进 system prompt。
+    //
+    // 所以素材池必须与检索/注入同一口径：还在 l1 的 auto-extract 产物不参与。
     let mut material: Vec<&model::MemoryEntry> = live
         .iter()
         .copied()
         .filter(|entry| entry.kind != MemoryKind::Profile)
+        .filter(|entry| !super::is_auto_draft(entry))
         .collect();
     material.sort_by(|left, right| {
         let score = |entry: &model::MemoryEntry| {

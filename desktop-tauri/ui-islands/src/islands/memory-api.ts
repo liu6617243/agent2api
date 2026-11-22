@@ -124,6 +124,14 @@ export type MemoryStatus = {
   live: number
   l1: number
   l2: number
+  /**
+   * `l1` 的子集：自动抽取写下、还没攒够强化次数的候选（草稿）。
+   *
+   * 后端把 `l1` 与它分开数，是因为两者语义不同：`l1` 里剩的是用户自己的流水，
+   * 候选不进检索、不进注入、不进核心记忆。仪表盘上若混在一起显示，用户会以为
+   * 那些草稿已经是系统认下的记忆。
+   */
+  candidates: number
   deleted: number
   superseded: number
   /** 本地自然日（零点起）新增的条数，只算 live。 */
@@ -219,6 +227,14 @@ export type ListParams = {
   includeSuperseded?: boolean
   includeDeleted?: boolean
   includeExpired?: boolean
+  /**
+   * 是否包含「未升级的抽取候选」。
+   *
+   * auto-extract 的产物先落 l1 当草稿，攒够强化次数才升 l2。默认（不传）
+   * 后端会把草稿过滤掉——检索、注入、核心记忆都只认沉淀后的结论。
+   * 只有浏览页 / 待确认队列这种「要看草稿本身」的界面才显式传 true。
+   */
+  includeCandidates?: boolean
   limit?: number
   /** 跳过前 N 条。分页用：`offset = page * pageSize` */
   offset?: number
@@ -234,6 +250,8 @@ export type MemoryHeat = {
   days: number
   total: number
   activeDays: number
+  /** 同期自动抽取写下的草稿条数。只画正式记忆，草稿不进格子。 */
+  candidates?: number
   /** 今天（`YYYY-MM-DD`），前端据此对齐网格右端 */
   end: string
 }
@@ -1067,6 +1085,17 @@ export function restoreEntry(id: string): Promise<{ id: string }> {
 
 export function purgeEntry(id: string): Promise<{ id: string }> {
   return api('POST', '/api/memory/purge', { id })
+}
+
+/**
+ * 人工采纳一条草稿：直接升成 l2 沉淀结论。
+ *
+ * 与 `updateEntry(id, { layer: 'l2' })` 不是一回事 —— 那条是通用字段改写，
+ * 不清容器路径、也不带「我认了」的语义；这条是专门的正向裁决，后端会追加一个
+ * `manual:<id>` 证据锚点并记审计日志。
+ */
+export function promoteDraft(id: string): Promise<{ id: string; promoted: boolean; layer: string }> {
+  return api('POST', '/api/memory/promote', { id })
 }
 
 export function purgeTrash(days?: number): Promise<{ removed: number; keepDays: number }> {

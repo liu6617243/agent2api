@@ -671,7 +671,7 @@ fn run_inner(task: &str, project: Option<&str>, manual: bool) -> Outcome {
         "classify" => classify_pending(project),
         "cleanup" => cleanup(manual),
         "health" => health_check(),
-        "extract" => extract(project),
+        "extract" => extract(project, manual),
         "summarize" => enrich::summarize(&[], task_batch("summarize")),
         "tag" => enrich::tag(&[], false, task_batch("tag")),
         "distill" => enrich::distill(project, 0),
@@ -1218,7 +1218,14 @@ fn health_check() -> Outcome {
 /// 再写一条。现在把已有 l2 与抽取产物的标题 + id 一起给它，并区分
 /// `new` / `reinforce`：能复述成清单里某条的就是 reinforce，追加证据、
 /// 计数 +1，不再新建。这一条比任何排序算法都重要 —— 重复在生成端就被拦住。
-fn extract(project: Option<&str>) -> Outcome {
+///
+/// ── 为什么还要「攒够 N 条才跑」───────────────────────────────
+/// 时间间隔只管「别太勤」，管不了「素材够不够」。2 小时一轮、每轮 3 条，
+/// 每天仍有 36 条产出，而一天的流水只有几十条 —— 每轮都拿同一批素材重抽一遍，
+/// 结论自然换着措辞反复出现。`deep.extractThresholdCount` 加的是内容闸门：
+/// 距上次抽取之后新增的流水不足 N 条，本轮直接跳过。手动「立即执行」不受限，
+/// 用户点了按钮就该有反应。
+fn extract(project: Option<&str>, manual: bool) -> Outcome {
     if !config::bool_of("deep.enabled") {
         return Outcome::Skipped("深层记忆已关闭".into());
     }
@@ -1239,6 +1246,25 @@ fn extract(project: Option<&str>) -> Outcome {
     recent.truncate(batch);
     if recent.len() < 3 {
         return Outcome::Skipped("最近流水太少，不值得抽取".into());
+    }
+    // ── 内容闸门：上次抽取之后攒下来的流水够不够 ──────────────
+    //
+    // 时间到点不等于「有东西可抽」。上一轮刚把最近 20 条压成 3 条候选，隔两
+    // 小时再看，那 20 条还是最新的 20 条 —— 模型会在同一批素材上再抽一遍，
+    // 输出必然是同义改写。所以按 `updated_at > 上次抽取时刻` 数一遍新增流水，
+    // 不足 `deep.extractThresholdCount` 就跳过。首轮（上次 = 0）不设闸门。
+    //
+    // 手动执行同样放行：用户点「立即执行」是明确要看结果，用阈值挡回去只会
+    // 让它看起来像坏了。
+    let since = last_of("extract");
+    if !manual && since > 0 {
+        let floor = config::number("deep.extractThresholdCount").max(3.0) as usize;
+        let fresh = recent.iter().filter(|entry| entry.updated_at > since).count();
+        if fresh < floor {
+            return Outcome::Skipped(format!(
+                "距上次抽取后新增流水 {fresh} 条，不足 {floor} 条，本轮跳过"
+            ));
+        }
     }
     // 已有结论清单：l2（真沉淀）+ 抽取产物（还没升上去的候选）。两类都要喂，
     // 否则「候选 vs 候选」的重复识别不出来。
@@ -1376,7 +1402,9 @@ fn extract(project: Option<&str>) -> Outcome {
         // 不碰人写的流水 —— 那条界线不能越。
         let candidate_kind = super::MemoryKind::parse(kind);
         if let Some(existing) = super::similar_l1_candidate(project, candidate_kind, body) {
-            if let Ok(upgraded) = super::reinforce_entry(&existing, &cue) {
+            // 正文一起比：同一件事的两份候选，留信息量更大的那份。只加锚点会让
+            // 先落盘的半截版本一直代表这件事，直到它凑够次数升 l2 为止。
+            if let Ok(upgraded) = super::reinforce_entry_with(&existing, &cue, Some(body), Some(title.as_str())) {
                 reinforced += 1;
                 if upgraded {
                     promoted += 1;

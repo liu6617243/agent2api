@@ -31,6 +31,7 @@
 //! GET  /api/memory/sync/preview 本地同步包清单（不下发内容）
 //! POST /api/memory/write       写入一条记忆
 //! POST /api/memory/update      更新标题/正文/标签/重要度/层/有效期
+//! POST /api/memory/promote     人工采纳一条自动抽取草稿（l1 → l2）
 //! POST /api/memory/delete      进回收站
 //! POST /api/memory/restore     从回收站恢复
 //! POST /api/memory/purge       彻底删除（回收站里再删一次）
@@ -163,6 +164,9 @@ pub async fn get_list(State(_state): State<ServerState>, Query(params): Query<Ha
         include_superseded: flag(&params, "includeSuperseded").unwrap_or(false),
         include_deleted: flag(&params, "includeDeleted").unwrap_or(false),
         include_expired: flag(&params, "includeExpired").unwrap_or(false),
+        // 自动抽取的候选默认不出现在列表里（它们是草稿，不是记忆）。浏览页要
+        // 看得见才能确认，所以那边显式传 `includeCandidates=1`。
+        include_candidates: flag(&params, "includeCandidates").unwrap_or(false),
         limit: number(&params, "limit").unwrap_or_else(|| memory_config::usize_of("ui.pageSize").max(1)),
         // 分页偏移。不传 = 第一页；传了也由 `search_page` 自己夹到 [0, total]，
         // 页面数变少后停在末页不会拿到空表以外的错误。
@@ -607,6 +611,14 @@ pub async fn post_update(State(_state): State<ServerState>, body: Bytes) -> Resp
 
 pub async fn post_delete(State(_state): State<ServerState>, body: Bytes) -> Response {
     with_id(body, memory::remove)
+}
+
+/// `POST /api/memory/promote` —— 人工采纳一条自动抽取草稿，直接升成 l2。
+///
+/// 与 `update` 的区别见 `memory::promote_draft` 的注释：这是「这条我认了」这
+/// 一个语义，不是通用字段改写。单开一个端点，界面才能给一个说得清的按钮。
+pub async fn post_promote(State(_state): State<ServerState>, body: Bytes) -> Response {
+    with_id(body, memory::promote_draft)
 }
 
 pub async fn post_restore(State(_state): State<ServerState>, body: Bytes) -> Response {

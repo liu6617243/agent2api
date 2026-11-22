@@ -52,7 +52,7 @@ use serde_json::Value;
 
 use super::config;
 use super::model::{
-    estimate_tokens, truncate_chars, MemoryEntry, MemoryKind, Layer, AUTO_EXTRACT_AGENT,
+    estimate_tokens, truncate_chars, MemoryEntry, MemoryKind, Layer,
 };
 use super::store;
 
@@ -817,13 +817,14 @@ fn relevance(
     // 类型加成：踩坑与决策是「下次做同样的事会踩到」的那一类，比日常流水值钱。
     //
     // ── 自动抽取的候选不享受这一档 ─────────────────────────────
-    // 类型是模型自己填的：它把一条流水写成 `pitfall`，这里就白送 1.5 分，于是
-    // 「一个标题命中 2.0 + 踩坑 1.5 + importance 0.6 = 4.1」直接越过 [`floor_for`]
-    // 给候选定的 3.4 —— 那一档的意图是「必须路径命中或两条独立线索」，实际被
-    // 类型加成淹没了（真机复现：单标题命中即可放行）。类型加成的前提是「有人
-    // 认定这是一条踩坑」，而 auto-extract 的产物还没有人认定过；等它被 reinforce
-    // 升到 l2 之后，这条限制自然失效。
-    if entry.agent.as_deref() != Some(AUTO_EXTRACT_AGENT) {
+    // 类型是模型自己填的：它把一条流水写成 `pitfall`，这里就白送 1.5 分。
+    // 类型加成的前提是「有人认定这是一条踩坑」，而 auto-extract 的产物还没有人
+    // 认定过。
+    //
+    // 现在 [`floor_for`] 已经把候选整条挡在池外，这一句成了第二道保险 —— 留着
+    // 是因为 `relevance()` 还被注入预览（`preview`）单独调用，那条路径的过滤链
+    // 与正式注入不完全相同，不能假设上游一定挡过。
+    if !super::is_auto_draft(entry) {
         score += match entry.kind {
             MemoryKind::Pitfall => 1.5,
             MemoryKind::Decision => 1.0,
@@ -865,21 +866,22 @@ fn floor_for(entry: &MemoryEntry) -> Option<f64> {
     if !entry.is_live() {
         return None;
     }
+    // ── 草稿一律不进注入 ────────────────────────────────────────
+    //
+    // 上一版给候选单独设了 3.4 档（「路径命中或两条线索才进」），想的是「提高
+    // 门槛就够了」。真机复盘发现不够：注入是**每一轮请求都自动发生**的动作，
+    // 模型没有任何提示说明「这一段里混了没被确认的草稿」。一条草稿只要标题里
+    // 出现当前项目路径，就能稳定地每轮被塞进 system prompt，而用户永远不知道
+    // 它从哪来 —— 这比「检索搜到草稿」严重一档，因为检索是模型主动发起的。
+    //
+    // 所以这里直接排除，与 `core_text` / `digest_text` / `search::keep` 同一口径。
+    // 草稿要变成注入内容只有一条正路：被反复确认升成 l2，或人在浏览页点「采纳」。
+    if super::is_auto_draft(entry) {
+        return None;
+    }
     // 沉淀层本身就是结论，标题/摘要里出现线索就够
     if entry.layer == Layer::L2 {
         return Some(2.0);
-    }
-    // 自动抽取产出、还没被反复确认的 l1：它是一次模型调用的产物，不是人写下
-    // 的结论。按下面「l1 里的要求/踩坑/决策天然是结论」那条 2.0 放行，结果是
-    // 同一件事被抽出几份不同措辞，同时挤进注入预算（真机取证：132 条 l2 里
-    // 五组同义结论各占 3-6 条）。这里要求「路径命中」或「两条独立线索」
-    // （3.4 档）；被 reinforce 到升 l2 之后自然回到上面那条 2.0。
-    //
-    // 光给门槛不够：候选的类型是模型自己填的，`pitfall` 会白拿 1.5 分类型加成，
-    // 2.0 + 1.5 + importance 就轻松越过 3.4。所以 [`relevance`] 里对候选关掉了
-    // 类型加成 —— 两处要一起看，改一处等于没改。
-    if entry.agent.as_deref() == Some(AUTO_EXTRACT_AGENT) {
-        return Some(3.4);
     }
     // l1 里「要求 / 踩坑 / 决策 / 画像」这几类天然是「下次要用」的；加星与高
     // importance 是有人主动抬过 —— 两种都按结论对待
@@ -960,10 +962,24 @@ fn group_key(entry: &MemoryEntry) -> String {
     format!("text:{}", head.to_lowercase())
 }
 
+/// 这条记忆够不够格进「必须遵守」。
+///
+/// ── 为什么候选一律不够格 ────────────────────────────────────
+/// 硬约束块的判据原本只有「置顶 或 type ∈ {preference, profile}」。而候选的
+/// `type` 是模型自己填的 —— 它把一条流水写成 `preference`，这条草稿就变成了
+/// 「必须遵守」，被塞进之后每一次请求的 system prompt 里。这比 l2 泛滥严重
+/// 得多：l2 泛滥只是多占名额，草稿当命令是**直接给模型下错指令**。
+///
+/// 所以这里加一条硬前置：还在 l1 的 auto-extract 产物不参与。升到 l2 之后
+/// （说明它被反复确认过）自然放行 —— `agent` 字段不清，但那时它已经是结论。
 fn rule_candidate(entry: &MemoryEntry) -> bool {
-    entry.is_live()
-        && (entry.pinned
-            || matches!(entry.kind, MemoryKind::Preference | MemoryKind::Profile))
+    if !entry.is_live() {
+        return false;
+    }
+    if super::is_auto_draft(entry) {
+        return false;
+    }
+    entry.pinned || matches!(entry.kind, MemoryKind::Preference | MemoryKind::Profile)
 }
 
 /// 渲染一行。

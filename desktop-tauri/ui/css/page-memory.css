@@ -1242,6 +1242,16 @@
   border: 1px solid var(--ok-bd);
   padding: 1px 6px;
 }
+/* 草稿 = 琥珀（--warn）：与「远程缺省」共用一套「不是错、但要你看一眼」的语义。
+   为什么必须和「普通」区分开：l1 候选和 l1 流水在层级上都属于 l1，但前者是
+   模型草稿（不参与检索与注入），后者是用户自己的原始记录。写成都叫「普通」
+   会让人以为草稿已经是系统认下的记忆。 */
+.mm-pill.draft {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border: 1px solid var(--warn-bd);
+  padding: 1px 6px;
+}
 
 .mm-pt-muted { color: var(--text-3); font-size: 11.5px; }
 /* 「查看 (N)」这种次级动作：做成可点的文字，不占按钮的视觉重量 */

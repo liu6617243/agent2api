@@ -2,7 +2,7 @@ import * as React from 'react'
 import { Badge, Button, Checkbox, Input, Switch, Textarea } from '@ui'
 import { t } from '../i18n'
 import * as m from './memory-api'
-import { agentText, Empty, num, Panel, Section, stamp, StateBadge, timeText, fullTime, useLoad } from './memory-shared'
+import { agentText, Empty, isDraft, num, Panel, Section, stamp, StateBadge, timeText, fullTime, useLoad } from './memory-shared'
 
 /**
  * 记忆浏览：四个视图（列表 / 热力图 / 待确认 / 回收站）+ 常显筛选条 + 详情抽屉。
@@ -114,6 +114,15 @@ function Browse({
   const [selected, setSelected] = React.useState<m.MemoryEntry | null>(null)
   const [timeline, setTimeline] = React.useState<m.MemoryTimelineItem[]>([])
   const [draft, setDraft] = React.useState<m.WritePayload | null>(null)
+  /**
+   * 「编辑」正在改的那条记忆 id。null = 对话框是「新建」。
+   *
+   * 为什么要单独记一个 id：对话框只有一份（`draft` 是 `WritePayload`，形状
+   * 属于写入接口），早先「编辑」把原条目填进这份表单再保存，走的是
+   * `writeEntry` —— 也就是**又写了一条新记忆**，原文不动。用户点一次「编辑」
+   * 改个错字，库里就多一条近乎重复的条目，正是这一轮在消灭的东西。
+   */
+  const [editing, setEditing] = React.useState<string | null>(null)
   const [error, setError] = React.useState('')
   const [busy, setBusy] = React.useState('')
   /**
@@ -146,6 +155,9 @@ function Browse({
       starred: starred || undefined,
       pinned: pinned || undefined,
       includeSuperseded: includeSuperseded || undefined,
+      // 浏览页是「看全部」的地方：未升级的抽取草稿也要出现在列表里，
+      // 否则用户看不到它们、也就无从裁决。检索/注入等出口仍然默认排除草稿。
+      includeCandidates: true,
       limit: pageSize,
       offset: page * pageSize,
     }),
@@ -261,11 +273,28 @@ function Browse({
     setBusy('__save__')
     setError('')
     try {
-      await m.writeEntry(draft)
+      // 两个分支语义不同，不能合并：编辑是「改这一条」，写入是「新建一条」。
+      // 编辑走 `updateEntry` 才不会凭空多出一条（详见 `editing` 的说明）。
+      if (editing) {
+        await m.updateEntry(editing, {
+          body: draft.content,
+          title: draft.title,
+          type: draft.type,
+          layer: draft.layer,
+          project: draft.project ?? '',
+          tags: draft.tags,
+          importance: draft.importance,
+        })
+      } else {
+        await m.writeEntry(draft)
+      }
       setDraft(null)
+      setEditing(null)
       list.reload()
       review.reload()
       onChanged()
+      // 编辑的目标就是正在看的那条：重新拉一次，抽屉里的正文不能停在旧版本
+      if (editing) await openEntry(editing)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
@@ -383,7 +412,7 @@ function Browse({
           type='button'
           size='sm'
           className='mm-cta-solid'
-          onClick={() => setDraft({ content: '', type: 'daily', project: project || undefined })}
+          onClick={() => { setEditing(null); setDraft({ content: '', type: 'daily', project: project || undefined }) }}
         >
           ＋ {t('新增一条记忆')}
         </Button>
@@ -603,9 +632,17 @@ function Browse({
                             </span>
                           </td>
                           <td className='mm-bt-layer'>
-                            <span className={`mm-pill${item.layer === 'l2' ? ' l2' : ' muted'}`}>
-                              {item.layer === 'l2' ? t('深层') : t('普通')}
-                            </span>
+                            {/* 草稿优先于层级显示：一条 l1 候选写「普通」会被读成
+                                「已经入库的低层记忆」，写「草稿」才是它真实的身份。 */}
+                            {isDraft(item) ? (
+                              <span className='mm-pill draft' title={t('自动抽取的草稿，还没被反复确认，不会进入检索与注入')}>
+                                {t('草稿')}
+                              </span>
+                            ) : (
+                              <span className={`mm-pill${item.layer === 'l2' ? ' l2' : ' muted'}`}>
+                                {item.layer === 'l2' ? t('深层') : t('普通')}
+                              </span>
+                            )}
                           </td>
                           <td className='mm-bt-link' onClick={event => {
                             event.stopPropagation()
@@ -861,9 +898,15 @@ function Browse({
 
             <div className='mm-drawer-meta'>
               <Badge variant='secondary' shape='tag'>{selected.typeLabel}</Badge>
-              <Badge variant={selected.layer === 'l2' ? 'brand' : 'outline'} shape='tag'>
-                {selected.layer === 'l2' ? t('深层') : t('普通')}
-              </Badge>
+              {isDraft(selected) ? (
+                <Badge variant='warning' shape='tag' title={t('自动抽取的草稿，还没被反复确认，不会进入检索与注入')}>
+                  {t('草稿')}
+                </Badge>
+              ) : (
+                <Badge variant={selected.layer === 'l2' ? 'brand' : 'outline'} shape='tag'>
+                  {selected.layer === 'l2' ? t('深层') : t('普通')}
+                </Badge>
+              )}
               <span>{selected.project ?? t('通用（general）')}</span>
               <span>{agentText(selected.agent)}</span>
               <span>{stamp(selected.createdAt)}</span>
@@ -899,6 +942,17 @@ function Browse({
                 </>
               ) : (
                 <>
+                  {/* 草稿只有「认了」这一个正向动作：模型抽出来、还没被反复确认的
+                      东西，用户看一眼就知道对不对。缺了这个按钮，草稿就只能等模型
+                      下次再抽到一次才升层 —— 人的判断排在机器后面。 */}
+                  {isDraft(selected) ? (
+                    <Button type='button' size='sm' onClick={() => void act(selected.id, async () => {
+                      await m.promoteDraft(selected.id)
+                      await openEntry(selected.id)
+                    })}>
+                      {t('采纳为结论')}
+                    </Button>
+                  ) : null}
                   <Button type='button' size='sm' variant='ghost' onClick={() => void act(selected.id, async () => {
                     await m.updateEntry(selected.id, { starred: !selected.starred })
                     await openEntry(selected.id)
@@ -911,24 +965,31 @@ function Browse({
                   })}>
                     {selected.pinned ? t('取消置顶') : t('置顶')}
                   </Button>
-                  <Button type='button' size='sm' variant='ghost' onClick={() => setDraft({
-                    content: '',
-                    title: `${t('更新')}：${selected.title}`,
-                    type: selected.type,
-                    project: selected.project ?? undefined,
-                    supersedes: [selected.id],
-                  })}>
+                  <Button type='button' size='sm' variant='ghost' onClick={() => {
+                    // 「取代」是**新建一条**并把旧的标失效，不能落进 editing 分支
+                    setEditing(null)
+                    setDraft({
+                      content: '',
+                      title: `${t('更新')}：${selected.title}`,
+                      type: selected.type,
+                      project: selected.project ?? undefined,
+                      supersedes: [selected.id],
+                    })
+                  }}>
                     {t('写一条取代它')}
                   </Button>
-                  <Button type='button' size='sm' variant='ghost' onClick={() => setDraft({
-                    content: selected.body ?? '',
-                    title: selected.title,
-                    type: selected.type,
-                    layer: selected.layer,
-                    project: selected.project ?? undefined,
-                    tags: selected.tags,
-                    importance: selected.importance,
-                  })}>
+                  <Button type='button' size='sm' variant='ghost' onClick={() => {
+                    setEditing(selected.id)
+                    setDraft({
+                      content: selected.body ?? '',
+                      title: selected.title,
+                      type: selected.type,
+                      layer: selected.layer,
+                      project: selected.project ?? undefined,
+                      tags: selected.tags,
+                      importance: selected.importance,
+                    })
+                  }}>
                     {t('编辑')}
                   </Button>
                   <Button type='button' size='sm' variant='destructive' onClick={() => void act(selected.id, async () => {
@@ -966,7 +1027,16 @@ function Browse({
                 <div className='mm-muted'>{t('这条结论是从下列记忆推出来的。')}</div>
                 <div className='mm-tags'>
                   {selected.evidence.map(id => (
-                    <button key={id} type='button' className='mm-link' onClick={() => void openEntry(id)}>{id}</button>
+                    // 证据锚点分两种：真实记忆 id（点得开），以及强化计数用的
+                    // 合成指纹 `distill:<id>` / `derived:<id>`。后者不是记忆，
+                    // 做成链接只会点出一片空。渲染成纯文本标签，并说明来源。
+                    evidenceLinkable(id) ? (
+                      <button key={id} type='button' className='mm-link' onClick={() => void openEntry(id)}>{id}</button>
+                    ) : (
+                      <span key={id} className='mm-pill muted' title={t('这是强化计数用的锚点，不是一条独立记忆')}>
+                        {evidenceLabel(id)}
+                      </span>
+                    )
                   ))}
                 </div>
               </div>
@@ -990,8 +1060,12 @@ function Browse({
         <div className='mm-dialog-mask' role='dialog' aria-modal='true'>
           <div className='mm-dialog'>
             <div className='mm-dialog-head'>
-              <strong>{draft.supersedes?.length ? t('写一条取代旧记忆') : t('新建记忆')}</strong>
-              <Button type='button' size='sm' variant='ghost' onClick={() => setDraft(null)}>{t('取消')}</Button>
+              <strong>
+                {draft.supersedes?.length
+                  ? t('写一条取代旧记忆')
+                  : editing ? t('编辑这条记忆') : t('新建记忆')}
+              </strong>
+              <Button type='button' size='sm' variant='ghost' onClick={() => { setDraft(null); setEditing(null) }}>{t('取消')}</Button>
             </div>
             <div className='mm-dialog-body'>
               <label className='mm-label'>{t('标题')}</label>
@@ -1064,7 +1138,7 @@ function Browse({
               ) : null}
             </div>
             <div className='mm-dialog-foot'>
-              <Button type='button' variant='ghost' onClick={() => setDraft(null)}>{t('取消')}</Button>
+              <Button type='button' variant='ghost' onClick={() => { setDraft(null); setEditing(null) }}>{t('取消')}</Button>
               <Button type='button' onClick={() => void saveDraft()}>{busy === '__save__' ? t('保存中…') : t('保存')}</Button>
             </div>
           </div>
@@ -1569,6 +1643,11 @@ function HeatView({
             total: num(data?.total ?? 0),
             active: data?.activeDays ?? 0,
           })}
+          {/* 草稿不进格子：这张图回答的是「我哪天写了东西」。同期由自动抽取
+              写下的条数单独说一句，否则用户会发现「库里比图上多」。 */}
+          {(data?.candidates ?? 0) > 0
+            ? t('（另有 {n} 条自动抽取草稿未计入）', { n: num(data?.candidates ?? 0) })
+            : ''}
         </span>
         <span className='mm-heat-legend'>
           {t('少')}
@@ -1662,6 +1741,27 @@ function DayPanel({
       ) : null}
     </div>
   )
+}
+
+/**
+ * 证据锚点里哪些是**真实记忆 id**。
+ *
+ * `evidence` 现在的语义是「支撑这条结论的原始记忆 / 某次确认」。真实 id 形如
+ * `<项目>-<类型>-<短哈希>`，点得开；而蒸馏与近似合并自己写进去的是
+ * `distill:<id>` / `derived:<哈希前缀>` —— 那是**强化计数用的指纹**，库里
+ * 没有这条记忆。把它们也渲染成链接，用户点一下只会拿到空结果，还以为数据坏了。
+ */
+function evidenceLinkable(id: string): boolean {
+  return !id.startsWith('distill:') && !id.startsWith('derived:') && !id.startsWith('manual:')
+}
+
+/** 伪锚点的可读文案：把前缀翻译成人话，后面的 id 保留，便于对账。 */
+function evidenceLabel(id: string): string {
+  if (id.startsWith('distill:')) return t('蒸馏自 {id}', { id: id.slice('distill:'.length) })
+  if (id.startsWith('derived:')) return t('同源确认 {id}', { id: id.slice('derived:'.length) })
+  // 人工采纳自己也是「确认了一次」，锚点指回自己 —— 渲染成链接会变成自指。
+  if (id.startsWith('manual:')) return t('人工采纳')
+  return id
 }
 
 function reviewLabel(type: string): string {

@@ -49,11 +49,24 @@ export function stamp(timestamp: number | null | undefined): string {
 const AGENT_LABELS: Record<string, string> = {
   manual: '手动',
   import: '导入',
+  'auto-extract': '自动抽取',
 }
 
 export function agentText(agent: string | null | undefined): string {
   if (!agent) return '—'
   return AGENT_LABELS[agent] ?? agent
+}
+
+/**
+ * 这条是不是「还没敲定的草稿」。
+ *
+ * auto-extract 的产物先落 l1，累够强化次数才升 l2。在 l1 这一段时间里它就是
+ * 草稿：能看、能批、能被后续素材强化，但**不能**被当成既定事实引用。后端已经
+ * 在检索 / 注入 / 核心记忆 / digest 里把这些出口堵住了，界面同样要标出来，
+ * 否则用户在列表里看到一条漂亮的结论，会以为系统已经认了它。
+ */
+export function isDraft(entry: { layer: string; agent: string | null }): boolean {
+  return entry.layer === 'l1' && entry.agent === 'auto-extract'
 }
 
 /** 绝对时间（悬停提示用）。 */

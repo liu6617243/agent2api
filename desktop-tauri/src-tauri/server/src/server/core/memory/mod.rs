@@ -570,11 +570,21 @@ pub fn heat(days: usize, tz_minutes: i64) -> Value {
     let offset = tz_minutes.clamp(-840, 840) * 60_000;
     let since = now - (span as i64) * 86_400_000;
     let mut buckets: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut draft_buckets: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for entry in store::snapshot().iter().filter(|item| item.is_live()) {
         if entry.created_at < since {
             continue;
         }
-        *buckets.entry(search::format_date(entry.created_at + offset)).or_insert(0) += 1;
+        let day = search::format_date(entry.created_at + offset);
+        // 热力图是「我哪天写了东西」的自我认知，不是产出统计。抽取草稿是模型
+        // 在后台写的，把它算进去会让这张图从「我的写作节律」变成「机器跑了多少轮」——
+        // 用户点开某一天，会看到一堆他从没写过的条目。所以正式记忆画格子，
+        // 草稿单独给一个计数（界面用一行小字说明），两者不混。
+        if is_auto_draft(entry) {
+            *draft_buckets.entry(day).or_insert(0) += 1;
+        } else {
+            *buckets.entry(day).or_insert(0) += 1;
+        }
     }
     let items: Vec<Value> = buckets
         .iter()
@@ -587,6 +597,9 @@ pub fn heat(days: usize, tz_minutes: i64) -> Value {
         "total": total,
         // 「活跃天」= 至少写过一条的天数，不是跨度天数 —— 图例上的数字
         "activeDays": buckets.len(),
+        // 同期由自动抽取写下的草稿条数（不进格子，只用来解释「为什么库里条数
+        // 比图上的总数多」）。
+        "candidates": draft_buckets.values().sum::<usize>(),
         "end": search::format_date(now + offset),
     })
 }
@@ -620,9 +633,14 @@ pub fn get_for(ids: &[String], body_limit: usize, agent: Option<&str>) -> Value 
             value["truncated"] = Value::Bool(truncated);
         }
         // 相关记忆：同项目、同类别或共享标签的前 3 条（排除自己）
+        //
+        // 草稿不进「相关」：`memory_get` 是模型读一条时顺手拿到的上下文，它
+        // 没有「这是草稿」这个提示，看到一行 `[知识] xxx（3 天前）` 只会当成
+        // 既定事实引用。要让它读草稿，得显式走检索并传 `includeCandidates`。
         let mut related: Vec<(&MemoryEntry, usize)> = all
             .iter()
             .filter(|other| other.id != entry.id && other.is_live())
+            .filter(|other| !is_auto_draft(other))
             .map(|other| {
                 let mut score = 0usize;
                 if other.project == entry.project && entry.project.is_some() {
@@ -819,11 +837,20 @@ pub fn projects() -> Value {
             let mut entries: Vec<&MemoryEntry> = all
                 .iter()
                 .filter(|entry| entry.is_live())
+                .filter(|entry| !is_auto_draft(entry))
                 .filter(|entry| entry_project_slug(entry) == project.slug)
                 .collect();
             entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
             let l1 = entries.iter().filter(|entry| entry.layer == Layer::L1).count();
             let l2 = entries.iter().filter(|entry| entry.layer == Layer::L2).count();
+            // 草稿单独数：项目卡上的 `count` 是「这个项目有多少条真记忆」。
+            // 把未确认的抽取草稿算进去，用户会以为这个项目已经积累了一堆结论，
+            // 而检索里搜不到其中任何一条。
+            let candidates = all
+                .iter()
+                .filter(|entry| entry.is_live() && is_auto_draft(entry))
+                .filter(|entry| entry_project_slug(entry) == project.slug)
+                .count();
             let latest = entries.first().map(|entry| entry.updated_at).unwrap_or(project.updated_at);
             json!({
                 "slug": project.slug,
@@ -837,6 +864,7 @@ pub fn projects() -> Value {
                 "count": entries.len(),
                 "l1": l1,
                 "l2": l2,
+                "candidates": candidates,
                 "updatedAt": latest,
                 "updatedText": search::relative_time(latest, now),
                 "agents": project_agents(&entries),
@@ -854,13 +882,20 @@ pub fn projects() -> Value {
     let general_entries: Vec<&MemoryEntry> = all
         .iter()
         .filter(|entry| entry.is_live())
+        .filter(|entry| !is_auto_draft(entry))
         .filter(|entry| entry_project_slug(entry) == store::GLOBAL_SLUG)
         .collect();
+    let general_candidates = all
+        .iter()
+        .filter(|entry| entry.is_live() && is_auto_draft(entry))
+        .filter(|entry| entry_project_slug(entry) == store::GLOBAL_SLUG)
+        .count();
     let general = json!({
         "slug": store::GLOBAL_SLUG,
         "count": general_entries.len(),
         "l1": general_entries.iter().filter(|entry| entry.layer == Layer::L1).count(),
         "l2": general_entries.iter().filter(|entry| entry.layer == Layer::L2).count(),
+        "candidates": general_candidates,
         "latest": general_entries
             .iter()
             .map(|entry| entry.updated_at)
@@ -871,7 +906,21 @@ pub fn projects() -> Value {
     json!({ "items": items, "general": general })
 }
 
-/// 一条记忆归属的项目 slug。
+/// 这条是不是「自动抽取写下、还没攒够强化次数的草稿」。
+///
+/// ── 为什么收成一个判据 ───────────────────────────────────────
+/// 「候选」这个概念现在要在七八处判断：检索过滤、核心记忆、digest、注入门槛、
+/// 体检、项目统计、仪表盘计数、前端标识。各处各写一遍 `layer == L1 &&
+/// agent == auto-extract`，改一处忘一处 —— 真机已经出现过「检索排除了、注入
+/// 没排除」的漏网。收成一条之后，语义变了只改这里。
+///
+/// 「还在 l1」是关键：升到 l2 之后它就是正式结论了，`agent` 字段仍留着
+/// `auto-extract`（那是来源标记，不是身份），这时候不该再被当草稿藏起来。
+pub(crate) fn is_auto_draft(entry: &MemoryEntry) -> bool {
+    entry.layer == Layer::L1 && entry.agent.as_deref() == Some(model::AUTO_EXTRACT_AGENT)
+}
+
+/// 项目列表 / 项目卡（含通用汇总）。
 ///
 /// 没有 `project` 字段的条目属于「通用」（`_global`）—— 早先这里直接拿
 /// `Option::as_deref()` 比较，导致通用项目的计数恒为 0（`None != Some("_global")`）。
@@ -1013,7 +1062,13 @@ pub fn merge_project(from: &str, into: &str) -> Result<Value, String> {
 pub fn profile_view() -> Value {
     ensure_index_once();
     let all = store::snapshot();
-    let live: Vec<&MemoryEntry> = all.iter().filter(|entry| entry.is_live()).collect();
+    // 与 `enrich::build_profile` 同一口径：草稿不是「这个人身上已确认的事实」，
+    // 既不算门槛、也不算素材。两边口径不一致时，界面会显示「素材 20 条、可以
+    // 生成」，点下去却被告知「记忆只有 3 条，未达门槛 5」。
+    let live: Vec<&MemoryEntry> = all
+        .iter()
+        .filter(|entry| entry.is_live() && !is_auto_draft(entry))
+        .collect();
     let profiles: Vec<&MemoryEntry> = live
         .iter()
         .copied()
@@ -1146,6 +1201,11 @@ pub fn status_with(with_tables: bool) -> Value {
         .count();
     let l1 = entries.iter().filter(|entry| entry.is_live() && entry.layer == Layer::L1).count();
     let l2 = entries.iter().filter(|entry| entry.is_live() && entry.layer == Layer::L2).count();
+    // 草稿（auto-extract 的 l1 候选）单独数出来：它在 `l1` 里，但语义上和
+    // 用户自己写的流水完全不同 —— 它不参与检索、不进注入、不进核心记忆。
+    // 仪表盘若把它算进「普通记忆」，用户看到的是一个虚高的数字，而那个数字
+    // 对应的东西点不进任何地方（检索搜不到、注入里也没有）。
+    let candidates = entries.iter().filter(|entry| entry.is_live() && is_auto_draft(entry)).count();
     let index_count = index::global().try_count();
     // 「今日新增 / 昨日」按**本地自然日**切：用户看的「今天」是他自己的今天，
     // 按 UTC 切会让东八区早上 8 点前的写入落到前一天（热力图那条注释踩过同一个坑）。
@@ -1159,6 +1219,9 @@ pub fn status_with(with_tables: bool) -> Value {
         "live": live,
         "l1": l1,
         "l2": l2,
+        // 「草稿」是 l1 的子集（见上面的注释），单列给仪表盘用：
+        // 界面要能说清「这 N 条是模型草稿，还没被确认」，而不是混进普通记忆。
+        "candidates": candidates,
         "deleted": deleted,
         "superseded": superseded,
         "today": today,
@@ -1257,6 +1320,12 @@ fn daily_counts(entries: &[MemoryEntry]) -> (usize, usize) {
     let mut today_count = 0;
     let mut yesterday_count = 0;
     for entry in entries.iter().filter(|entry| entry.is_live()) {
+        // 与 `status()` 的 `l1` / `candidates` 同一口径：草稿不算「今天写了」。
+        // 仪表盘上「今日新增 12 / 有效记忆 30」如果一边含草稿一边不含，用户拿
+        // 这两个数字相减会对不上，进而怀疑统计坏了。
+        if is_auto_draft(entry) {
+            continue;
+        }
         if entry.created_at >= today_start {
             today_count += 1;
         } else if entry.created_at >= yesterday_start {
@@ -2151,6 +2220,12 @@ pub fn dedup_scan() -> Value {
 
     // ── 第一轮：精确 hash 分组 ────────────────────────────────
     // 每组保留**最新**的那条（它是用户最可能还在引用的一条），其余作为候选。
+    //
+    // ── 草稿不能当「保留方」───────────────────────────────────
+    // 排序只看 `updated_at`，而抽取草稿总是最新的（它是刚从流水里压出来的）。
+    // 于是一条草稿抄了用户三天前写的一句话，分组里草稿排第一，用户原文被当成
+    // 「多余的旧条」入队 —— 批准后，人写的记忆被一条没人确认过的草稿取代。
+    // 所以排序键先按「是不是草稿」分层：真记忆永远排在草稿前面。
     let mut by_hash: std::collections::HashMap<String, Vec<&MemoryEntry>> =
         std::collections::HashMap::new();
     for entry in &live {
@@ -2167,16 +2242,27 @@ pub fn dedup_scan() -> Value {
             continue;
         }
         let mut sorted = group.clone();
-        sorted.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
+        sorted.sort_by_key(|entry| (is_auto_draft(entry), std::cmp::Reverse(entry.updated_at)));
         let keep = sorted[0];
         for other in sorted.iter().skip(1) {
             exact += 1;
             // 载荷形状与写入路径一致（`candidate` + `score`），
             // 这样 `review_resolve` 的 `dedup` 分支不用为巡检再加一条路径。
+            //
+            // ── `keep` 必须显式写 ────────────────────────────────
+            // `review_resolve` 在载荷**没有** `keep` 键时按「新条取代候选」处理
+            // （`apply_dedup(target, candidate)`，target 是被取代的一方）。而这里
+            // 的 `candidate` 恰恰是**要保留**的那条，`target` 才是多余的 —— 不写
+            // `keep` 就会把幸存者标成「已被取代」，批准一条巡检建议等于埋掉正主。
             index::global().enqueue(
                 "dedup",
                 &other.id,
-                &json!({ "candidate": keep.id, "score": 1.0, "foundBy": "scan" }),
+                &json!({
+                    "candidate": keep.id,
+                    "score": 1.0,
+                    "foundBy": "scan",
+                    "keep": "candidate",
+                }),
                 1.0,
             );
             queued += 1;
@@ -2220,7 +2306,14 @@ pub fn dedup_scan() -> Value {
                 index::global().enqueue(
                     "dedup",
                     &other.id,
-                    &json!({ "candidate": keep.id, "score": score, "foundBy": "scan" }),
+                    &json!({
+                        "candidate": keep.id,
+                        "score": score,
+                        "foundBy": "scan",
+                        // 与第一轮同一条理由：`keep` 缺失时 `review_resolve` 会把
+                        // 关系倒过来，批准后埋掉的是要留的那条。
+                        "keep": "candidate",
+                    }),
                     score,
                 );
                 near += 1;
@@ -2304,6 +2397,10 @@ pub fn review_resolve(id: i64, approve: bool) -> Result<Value, String> {
                     // 把 `target`（新写的）并进去；其余（含老载荷没这个键）沿用
                     // 「新条取代候选」的旧语义。裁决错了会把一份完整结论埋掉，
                     // 所以这里不能靠猜。
+                    //
+                    // 生产端必须显式写 `keep`：`dedup_scan` 两轮入队原来都漏了这个
+                    // 键，而它给的 `candidate` 恰恰是要保留的那条 —— 按旧语义处理
+                    // 会把幸存者标成「已被取代」。
                     let keep_candidate = row
                         .payload
                         .get("keep")
@@ -2411,6 +2508,30 @@ fn apply_supersede(new_id: &str, old_id: &str) -> Result<(), String> {
 /// 一文件。`entry_path` 见到非空 `path` 就直接沿用它，不清空的话「升级」只会
 /// 改 layer 字段、文件还留在 l1 容器里，下一轮扫描又把它当流水。
 pub(super) fn reinforce_entry(target: &str, cue: &str) -> Result<bool, String> {
+    reinforce_entry_with(target, cue, None, None)
+}
+
+/// 强化一条既有结论；如果**这次产出的正文信息量更大**，顺手把正文吸收进来。
+///
+/// ── 为什么要吸收，不能只追加一个锚点 ────────────────────────
+/// 近似判重命中时的原做法是「给旧条目加一个 evidence 锚点、正文一个字不动」。
+/// 这在「同一件事换个说法」时没问题，但在「旧的那条是三天前的一句半截结论、
+/// 今天蒸馏出带根因带路径的完整版」时，结果是**新写出来的内容被直接丢掉**，
+/// 库里永远停在那句半截结论 —— 整理越勤，记忆越旧。AgentHub 那边同一处的解法
+/// 是按 `informationScore` 决定留谁；这里换成「不换 id、只换更全的正文」，
+/// 既补上内容，又不打断图边、注入统计、人工裁决记录里对旧 id 的引用。
+///
+/// ── 判据为什么在 `information_score` 上，而不是比长度 ────────
+/// 长度只是其中一项。新正文更长但没有任何标签、没有代码块、把日志整段贴进来时，
+/// `information_score` 不会跟着涨，于是不会被吸收 —— 挡住「灌水版替换结论版」。
+/// 具体做法是克隆一条探针、只换正文，让两边的标签/证据/时间完全一致，
+/// 于是分差只反映正文本身。
+pub(super) fn reinforce_entry_with(
+    target: &str,
+    cue: &str,
+    incoming_body: Option<&str>,
+    incoming_title: Option<&str>,
+) -> Result<bool, String> {
     let Some(before) = store::load_all().into_iter().find(|entry| entry.id == target) else {
         return Err(format!("强化目标不存在：{target}"));
     };
@@ -2418,6 +2539,22 @@ pub(super) fn reinforce_entry(target: &str, cue: &str) -> Result<bool, String> {
         return Err(format!("强化目标已失效：{target}"));
     }
     let mut entry = before.clone();
+    if let Some(body) = incoming_body.map(str::trim).filter(|body| !body.is_empty()) {
+        if should_absorb(&entry, body) {
+            entry.body = body.to_string();
+            // 哈希要跟着正文走，否则精确去重会把这条当成「另一条内容」，
+            // 下一次同内容派生又新建一条 —— 这层判重就白设了。
+            let (redacted, _) = redact::apply(&entry.body);
+            entry.hash = model::content_hash(redacted.trim());
+            if let Some(title) = incoming_title.map(str::trim).filter(|title| !title.is_empty()) {
+                entry.title = truncate_chars(title, 80);
+            }
+            crate::server::logging::verbose(
+                "[Memory]",
+                &format!("强化 {target} 时吸收了信息量更大的新正文"),
+            );
+        }
+    }
     if !cue.is_empty() && !entry.evidence.iter().any(|known| known.as_str() == cue) {
         entry.evidence.push(cue.to_string());
         // 上限 20：证据链是给人看「凭什么」的，不是越长越好
@@ -2438,6 +2575,56 @@ pub(super) fn reinforce_entry(target: &str, cue: &str) -> Result<bool, String> {
     }
     index::global().upsert(&entry)?;
     Ok(ready)
+}
+
+/// 人工采纳一条草稿：把它直接升成 l2 结论。
+///
+/// ── 为什么必须有这条路径 ─────────────────────────────────────
+/// 新的准入模型把「反复确认」交给了流水（`evidence` 攒够 2 条才升层），但那只
+/// 覆盖「同一件事被不同批流水反复抽到」这一种情况。真实场面里更常见的是：
+/// 用户打开浏览页，看见一条草稿，一眼就知道「对，就是这个，我早就想让它记住」。
+/// 这时候让他等模型下次再抽到一次，等于把人的判断排在机器后面 —— 而人是唯一
+/// 的负向真值入口，正向判断同样该算数。
+///
+/// 反过来，如果只给「拒绝」，草稿就只能靠时间自然堆积，用户会开始怀疑这套
+/// 东西到底有没有在动。
+///
+/// ── 为什么不做成 `update(id, {layer:"l2"})` ─────────────────
+/// `update()` 的换层是「按 patch 改字段」，它不会清 `path`、也不管这条是不是
+/// 草稿；走那条路的调用方（含 MCP `memory_update`）还可能顺手改正文、改项目，
+/// 一次调用做四件事。人工采纳的语义只有一个：**这条我认了**。单开一个函数，
+/// 前端就能给一个明确的按钮，审计日志也能说清是谁认的。
+pub fn promote_draft(id: &str) -> Result<Value, String> {
+    let Some(before) = store::load_all().into_iter().find(|entry| entry.id == id) else {
+        return Err(format!("找不到记忆 {id}"));
+    };
+    if !before.is_live() {
+        return Err("这条记忆已失效，先恢复再采纳".into());
+    }
+    if before.layer == Layer::L2 {
+        // 幂等：重复点不该报错，也不该再写一次盘
+        return Ok(json!({ "id": id, "promoted": false, "layer": "l2" }));
+    }
+    let mut entry = before.clone();
+    // 人工采纳本身算一次确认。锚点带 `manual:` 前缀，与流水 id 区分开 ——
+    // 前端据此不把它渲染成可点链接（库里没有这条记忆）。
+    let cue = format!("manual:{id}");
+    if !entry.evidence.iter().any(|known| known.as_str() == cue) {
+        entry.evidence.push(cue);
+    }
+    entry.layer = Layer::L2;
+    // 与 `reinforce_entry_with` 同一条理由：不清 path 的话只会改 layer 字段，
+    // 文件还留在 l1 容器里，下一轮扫描又把它当流水读回来。
+    entry.path.clear();
+    entry.updated_at = model::now_ms();
+    store::move_save(&before, &entry)?;
+    index::global().upsert(&entry)?;
+    bump_revision();
+    crate::server::logging::log(
+        "[Memory]",
+        &format!("人工采纳草稿 {id} → l2"),
+    );
+    Ok(json!({ "id": id, "promoted": true, "layer": "l2", "entry": entry.to_json(true) }))
 }
 
 /// 在**自动抽取的 l1 候选**里找一条讲同一件事的，返回它的 id。
@@ -2634,7 +2821,12 @@ fn apply_derived(payload: &Value) -> Result<(), String> {
             .first()
             .cloned()
             .unwrap_or_else(|| format!("derived:{}", &digest[..12]));
-        match reinforce_entry(&existing, &cue) {
+        // ── 正文也要一起比 ──────────────────────────────────────
+        // 只追加锚点会让「旧的那条是半截结论、今天蒸馏出完整版」这种情况把新
+        // 内容直接丢掉。`reinforce_entry_with` 在信息量真的更大时把正文吸收进来，
+        // 否则一个字都不动（同一件事换个说法时，旧措辞更稳）。
+        let title = payload.get("title").and_then(Value::as_str);
+        match reinforce_entry_with(&existing, &cue, Some(body), title) {
             Ok(_) => {
                 crate::server::logging::verbose(
                     "[Memory]",
@@ -2686,6 +2878,18 @@ fn apply_derived(payload: &Value) -> Result<(), String> {
         index::global().link(&new_id, source, "derived");
     }
     Ok(())
+}
+
+/// 这次的正文该不该覆盖既有条目的正文。
+///
+/// 单独一个函数是为了可测：`reinforce_entry_with` 要读写真实记忆根，而这条
+/// 判据本身是纯的（只比两条正文的信息量）。判错的两种代价不对称 ——
+/// 该吸收没吸收 = 老结论一直半截；不该吸收却吸收 = 把一份完整结论换成灌水版，
+/// 所以判据宁可保守：**必须严格更高**才换，平手保留原文（原措辞已被引用过）。
+fn should_absorb(existing: &MemoryEntry, candidate: &str) -> bool {
+    let mut probe = existing.clone();
+    probe.body = candidate.to_string();
+    model::information_score(&probe) > model::information_score(existing)
 }
 
 /// 把一条记忆标记为「被另一条取代」。
@@ -2750,6 +2954,12 @@ pub fn health(limit: usize) -> Value {
     let limit = limit.clamp(1, 200);
     let mut stale: Vec<Value> = Vec::new();
     for entry in entries.iter().filter(|entry| entry.is_live()) {
+        // 候选不参与体检：它带着从流水继承的 `files`（`schedule.rs` 里抽取时
+        // 抄了素材的文件锚点），于是每跑一轮就多几条「可能过时」——而这些条目
+        // 本身还没被确认，让人去复核一堆草稿等于制造噪音。升到 l2 后再进体检。
+        if is_auto_draft(entry) {
+            continue;
+        }
         if entry.files.is_empty() {
             continue;
         }
@@ -2912,6 +3122,23 @@ mod tests {
     }
 
     #[test]
+    fn absorb_takes_the_richer_body_and_keeps_the_short_one_otherwise() {
+        // 场景一：旧的是「同上，已修复」，新的是带根因带路径的完整版 —— 必须吸收。
+        let mut thin = MemoryEntry::draft("a", "发布脚本版本号", MemoryKind::Pitfall, "同上，已修复。");
+        thin.tags = vec!["发布".into()];
+        let rich = "根因是 `scripts/deliver.mjs` 读 `process.env.VERSION`，而 CI 只写了 \
+                    `GITHUB_REF_NAME`；两处对齐后 `node scripts/deliver.mjs` 能打出 \
+                    3.5.0-beta.1。不要在读不到时回落到 1.0.0。";
+        assert!(should_absorb(&thin, rich), "半截结论必须被完整版覆盖");
+
+        // 场景二：新的只是把同一句话换个说法、还更短 —— 保留原文，别把措辞洗一遍。
+        let mut full = MemoryEntry::draft("b", "t", MemoryKind::Decision, "x".repeat(600));
+        full.tags = vec!["a".into(), "b".into()];
+        let shorter = "x".repeat(80);
+        assert!(!should_absorb(&full, &shorter), "更短的改写不该覆盖原文");
+    }
+
+    #[test]
     fn keeper_prefers_the_richer_existing_entry() {
         // `dedup_keeper` 要查真实记忆根（`snapshot()`），单测环境不保证有，
         // 所以这里验的是它的**判据**：信息量高的一方必须在比较里胜出。
@@ -2932,5 +3159,46 @@ mod tests {
             (information_score(&same_a) - information_score(&same_b)).abs() < 1e-9,
             "内容等量时必须真的打成平手，否则「平手留新的」这条规则永远走不到"
         );
+    }
+
+    #[test]
+    fn draft_is_recognised_by_layer_and_agent_together() {
+        // 判据是「还在 l1 **且** 来源是 auto-extract」两件事同时成立。
+        // 少任何一条都会误伤：只看 agent 会把升上去的 l2 结论继续当草稿藏起来
+        // （它已经是结论了），只看 layer 会把人写的 l1 流水也当草稿。
+        let mut draft = MemoryEntry::draft("a", "t", MemoryKind::Knowledge, "body");
+        draft.agent = Some(model::AUTO_EXTRACT_AGENT.to_string());
+        draft.layer = Layer::L1;
+        assert!(is_auto_draft(&draft));
+
+        // 升到 l2 之后不再算草稿 —— `agent` 字段保留来源，但身份变了
+        draft.layer = Layer::L2;
+        assert!(!is_auto_draft(&draft));
+
+        // 人写的 l1 流水不是草稿
+        let mut manual = MemoryEntry::draft("b", "t", MemoryKind::Daily, "body");
+        manual.agent = Some("manual".to_string());
+        assert!(!is_auto_draft(&manual));
+    }
+
+    #[test]
+    fn promoted_draft_clears_path_so_it_leaves_the_l1_container() {
+        // 升级必须清 `path`：`entry_path` 见到非空 path 就直接沿用，不清的话
+        // 只改了 layer 字段、文件还留在 `l1/<agent>/<date>.md` 那个多节容器里，
+        // 下一轮扫描又把它当流水读回来 —— 升级等于没发生。
+        let mut draft = MemoryEntry::draft("a", "t", MemoryKind::Knowledge, "body");
+        draft.agent = Some(model::AUTO_EXTRACT_AGENT.to_string());
+        draft.layer = Layer::L1;
+        draft.project = Some("demo".into());
+        let before = store::rel(&store::entry_path(&draft, false));
+        assert!(before.contains("/l1/"), "草稿本该落在 l1 容器里，实际 {before}");
+
+        // 模拟 `promote_draft` 的两步：改层 + 清 path
+        let mut promoted = draft.clone();
+        promoted.layer = Layer::L2;
+        promoted.path.clear();
+        let after = store::rel(&store::entry_path(&promoted, false));
+        assert!(after.contains("/l2/"), "升层后必须落到 l2 目录，实际 {after}");
+        assert_ne!(before, after);
     }
 }

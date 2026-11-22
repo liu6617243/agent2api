@@ -88,7 +88,8 @@ fn spec_tools() -> Vec<Value> {
                     "pinned": { "type": "boolean" },
                     "limit": { "type": "number", "description": "Default 30, max 500." },
                     "includeSuperseded": { "type": "boolean", "description": "Also return entries replaced by a newer one." },
-                    "includeExpired": { "type": "boolean", "description": "Also return entries whose validTo has passed." }
+                    "includeExpired": { "type": "boolean", "description": "Also return entries whose validTo has passed." },
+                    "includeCandidates": { "type": "boolean", "description": "Also return auto-extract drafts that have not been confirmed yet. Off by default: a draft is a model guess, not an established fact — do not cite one as truth." }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -463,6 +464,9 @@ fn dispatch(name: &str, args: &Value, agent: Option<&str>) -> Result<Value, Call
                 include_superseded: bool_arg(args, "includeSuperseded").unwrap_or(false),
                 include_deleted: false,
                 include_expired: bool_arg(args, "includeExpired").unwrap_or(false),
+                // 候选（模型抽出来、还没被反复确认的草稿）不给模型看：它会当
+                // 既定事实引用。模型要看草稿得显式要，正常情况下不该有这个念头。
+                include_candidates: bool_arg(args, "includeCandidates").unwrap_or(false),
                 // 不传 limit 时用 `search.finalTopK`（默认 8）。以前写死 30，
                 // 那条「最终返回条数」旋钮同样是死键。
                 limit: number_arg(args, "limit").unwrap_or(settings.final_top_k),

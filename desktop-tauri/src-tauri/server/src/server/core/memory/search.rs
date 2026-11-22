@@ -56,6 +56,17 @@ pub struct Query {
     pub include_deleted: bool,
     /// 包含已过有效期（`valid_to`）的记忆
     pub include_expired: bool,
+    /// 包含「自动抽取的候选」（`agent == auto-extract` 且还在 l1）。
+    ///
+    /// ── 为什么默认不含 ───────────────────────────────────────
+    /// 候选是模型对流水的一次压缩，还没被反复确认过，也没被人看过。它出现在
+    /// 「检索结果」里就是冒充结论 —— 模型会把它当成既定事实引用，而它可能只是
+    /// 一次措辞漂亮的猜测。默认排除，`memory_search` / `memory_core` / `digest`
+    /// 这些给模型看的出口一律走默认值。
+    ///
+    /// 界面上的「浏览」页要能看见它们（否则用户不知道有草稿待确认），所以那边
+    /// 显式传 `true`；`待确认` 页同理。
+    pub include_candidates: bool,
     pub limit: usize,
     /// 跳过前 N 条。分页用：`offset = page * limit`
     pub offset: usize,
@@ -152,6 +163,20 @@ fn keep(row: &IndexRow, query: &Query) -> bool {
         return false;
     }
     if row.superseded_by.is_some() && !query.include_superseded {
+        return false;
+    }
+    // ── 自动抽取的候选：默认不是「记忆」，是草稿 ────────────────
+    //
+    // 判据放在 `keep()` 里而不是每个调用方各写一遍：`memory_search` / `memory_core`
+    // / 页面列表 / 项目统计都走这条，逐个加等于迟早漏一个（真机已经漏了四处）。
+    // 只有显式要草稿的入口（浏览页、待确认页）才传 `include_candidates: true`。
+    //
+    // 「还在 l1」是关键限定：候选被 reinforce 升到 l2 之后就是正式结论了，
+    // `agent` 字段仍留着 `auto-extract`，但那时候它该被检索到。
+    if !query.include_candidates
+        && row.layer == "l1"
+        && row.agent.as_deref() == Some(super::model::AUTO_EXTRACT_AGENT)
+    {
         return false;
     }
     // 写入时间窗（热力图点某天）。端点由前端按本地日历算好传进来，
@@ -431,6 +456,16 @@ pub fn core_text(entries: &[MemoryEntry], project: Option<&str>, max_tokens: usi
     let mut lines: Vec<(f64, String)> = Vec::new();
 
     for entry in entries.iter().filter(|entry| entry.is_live()) {
+        // ── 候选不进核心记忆 ────────────────────────────────────
+        //
+        // 下面那条「画像 / 偏好可以破层」是给人写的偏好留的口子。但候选的
+        // `type` 是模型自己填的，它写 `preference` 就能借这个口子进核心块 ——
+        // 于是一条「还没人确认过的草稿」被当成「必须遵守」喂给模型。
+        //
+        // 判据与 `keep()` 同一口径：还在 l1 的 auto-extract 产物一律不是结论。
+        if super::is_auto_draft(entry) {
+            continue;
+        }
         let is_profile = matches!(
             entry.kind,
             MemoryKind::Profile | MemoryKind::Preference
@@ -488,7 +523,12 @@ pub fn core_text(entries: &[MemoryEntry], project: Option<&str>, max_tokens: usi
 pub fn digest_text(entries: &[MemoryEntry], max_lines: usize) -> String {
     let now = now_ms();
     let limit = if max_lines == 0 { 200 } else { max_lines.min(1000) };
-    let live: Vec<&MemoryEntry> = entries.iter().filter(|entry| entry.is_live()).collect();
+    // 候选不算「有效记忆」：这个数是给模型看的规模感，混进草稿会虚高
+    // （真机 132 条里有 100 多条是候选，报出来的「有效条数」等于骗人）。
+    let live: Vec<&MemoryEntry> = entries
+        .iter()
+        .filter(|entry| entry.is_live() && !super::is_auto_draft(entry))
+        .collect();
     let mut out = String::new();
     out.push_str(&format!("# 记忆索引（{} 条有效）\n", live.len()));
 

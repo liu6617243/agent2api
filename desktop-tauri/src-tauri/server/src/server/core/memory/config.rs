@@ -259,6 +259,14 @@ static SCHEMA: &[Knob] = &[
     range(knob("deep.batchSize", Kind::Number, Tier::Advanced, "深层记忆", "单次处理条数", "50"), 5.0, 500.0),
     range(knob_d("deep.distillMaxPerProject", Kind::Number, Tier::Internal, "深层记忆", "单项目蒸馏素材上限",
         "一次蒸馏喂给模型多少条素材（按重要度取前 N 条）", "60"), 20.0, 1000.0),
+    // ── 抽取的「攒够再跑」闸门 ────────────────────────────────
+    // 只靠时间间隔不够：2 小时一轮 × 每轮 3 条 = 每天仍然能产 36 条结论，
+    // 而真机一天的流水只有几十条 —— 等于每轮都在同一批素材上重复抽取。
+    // AgentHub 的 `extract.thresholdCount` 是同一个问题同一份解：新增流水攒够
+    // N 条才值得跑一次，否则这一轮必然只是把上次说过的话再说一遍。
+    range(knob_d("deep.extractThresholdCount", Kind::Number, Tier::Advanced, "深层记忆",
+        "抽取闸门：新增流水条数", "距上次抽取之后新增的流水不足这个数就跳过本轮（手动执行不受限）", "20"),
+        3.0, 500.0),
 
     // ===== 双时间轴 =====
     knob("timeline.enabled", Kind::Bool, Tier::Advanced, "双时间轴", "启用双时间轴", "true"),
