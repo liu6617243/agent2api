@@ -34,11 +34,13 @@ type DashboardProps = {
    * 「显示 41 条待确认，但不知道去哪处理」。跳页签必须带视图。
    */
   onReview?: () => void
+  /** 打开某条记忆（过时清单里的「打开」用它跳到浏览页详情抽屉）。 */
+  onOpenEntry?: (id: string) => void
   /** 重建索引会改条数，重建完让外层刷新一次 status。 */
   onChanged?: () => void
 }
 
-function Dashboard({ status, onGo, onReview, onChanged }: DashboardProps): React.ReactElement {
+function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: DashboardProps): React.ReactElement {
   const auto = useLoad(() => m.loadAuto(), [])
   const health = useLoad(() => m.loadHealth(20), [])
   const sync = useLoad(() => m.loadSync(), [])
@@ -246,6 +248,22 @@ function Dashboard({ status, onGo, onReview, onChanged }: DashboardProps): React
                   <Badge variant='secondary' shape='tag'>{row.type}</Badge>
                   <Badge variant='outline' shape='tag'>{row.layer}</Badge>
                   <span className='mm-muted'>{t('写下于 {when}', { when: row.updatedText })}</span>
+                  {/* ── 这里是「修复路径」──────────────────────────
+                      以前清单只给标题和文件名，看到了也没法动手 —— 用户的原话
+                      是「没给我修复路径」。处置动作本来就只有两个：读完文件后
+                      要么改这条记忆（确认仍成立就保存一次，`updated_at` 会跟进，
+                      提醒自然消失），要么把它删掉/标记失效。两条路都从「打开
+                      这条记忆」开始，所以这里必须能点进去。 */}
+                  {onOpenEntry ? (
+                    <Button
+                      type='button'
+                      size='sm'
+                      variant='link'
+                      onClick={() => onOpenEntry(row.id)}
+                    >
+                      {t('打开')}
+                    </Button>
+                  ) : null}
                 </div>
                 <div className='mm-stale-files'>
                   {row.files.map(file => (
@@ -256,6 +274,9 @@ function Dashboard({ status, onGo, onReview, onChanged }: DashboardProps): React
                 </div>
               </div>
             ))}
+            <div className='mm-muted' style={{ marginTop: 6 }}>
+              {t('处理方式：点「打开」读完那条记忆锚定的文件 —— 结论仍成立就保存一次（提醒会消失），已经不成立就改掉或删除。这不是待确认队列，不需要裁决。')}
+            </div>
           </div>
         ) : null}
       </Section>

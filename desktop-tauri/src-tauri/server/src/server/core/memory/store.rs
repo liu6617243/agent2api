@@ -379,6 +379,29 @@ pub fn rel(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"))
 }
 
+/// 这个 `files` 条目是不是**记忆库自己的容器文件**。
+///
+/// ── 真机事故（2026-11-22）─────────────────────────────────
+/// 体检报了「6 条记忆可能过时」，点开清单发现 6 条锚定的都是同一个文件：
+/// `general/l1/gateway/2026-11-22.md`。那不是代码，是**记忆库自己的流水容器** ——
+/// 每写一条新记忆它的 mtime 都会变，于是这 6 条永远显示「过时」，用户既没法
+/// 复核也没法消除。
+///
+/// 成因是派生：l2 结论从 l1 流水蒸馏时会继承来源条目的 `files`（为了让请求级
+/// 注入的路径命中对 l2 也有效），而来源是导入的会话流水，它的 `files` 里恰好
+/// 写着容器路径（那天的对话就在聊记忆库布局）。
+///
+/// 判据只看形状，不 stat：以 `general/` `projects/` `trash/` `archive/` 开头
+/// 且以 `.md` 结尾。两个条件都要满足 —— 记忆根下面这些前缀里只有记忆文件本身，
+/// 而仓库里被引用的文档不会以这些前缀出现在记忆根下。
+pub fn internal_file(relative: &str) -> bool {
+    let normalized = relative.replace('\\', "/");
+    let Some(first) = normalized.split('/').next() else {
+        return false;
+    };
+    matches!(first, "general" | "projects" | "trash" | "archive") && normalized.ends_with(".md")
+}
+
 /// 一条记忆相对 memory 根的路径。`deleted` 为真时落 `trash/`。
 ///
 /// 已有 `entry.path` 时以它为准确认落点（记忆可能在 general 与 projects 之间
@@ -1900,6 +1923,24 @@ mod tests {
         assert_eq!(slugify("a/b c"), "a-b-c");
         assert_eq!(slugify("中文项目"), GLOBAL_SLUG);
         assert_eq!(slugify("  "), GLOBAL_SLUG);
+    }
+
+    #[test]
+    fn internal_file_only_matches_memory_containers() {
+        // 真机那 6 条「可能过时」锚定的就是第一种：记忆库自己的流水容器。
+        // 它每写一条新记忆都会变 mtime，当锚定文件会永久误报。
+        assert!(internal_file("general/l1/gateway/2026-11-22.md"));
+        assert!(internal_file("projects/agent2api-main/2026-11-22.md"));
+        assert!(internal_file("trash/m1.md"));
+        // 仓库里真正被引用的文件一个都不能误判，否则体检就对它们静音了
+        assert!(!internal_file("scripts/deliver.mjs"));
+        assert!(!internal_file("desktop-tauri/src-tauri/server/src/server/api/chat.rs"));
+        // 前缀对但扩展名不是 .md：不是记忆容器
+        assert!(!internal_file("general/notes.txt"));
+        // 扩展名对但前缀不对：可能是仓库里的普通文档
+        assert!(!internal_file("docs/memory.md"));
+        assert!(!internal_file("general.md"));
+        assert!(!internal_file(""));
     }
 
     #[test]

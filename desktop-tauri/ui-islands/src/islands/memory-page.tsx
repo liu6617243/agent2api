@@ -371,6 +371,7 @@ function MemoryPage(): React.ReactElement {
                 status={status}
                 onGo={next => switchTab(next as Tab)}
                 onReview={openReview}
+                onOpenEntry={openEntryFromProject}
                 onChanged={afterChange}
               />
             </TabBoundary>

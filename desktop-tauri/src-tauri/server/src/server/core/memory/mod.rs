@@ -2447,11 +2447,19 @@ fn apply_derived(payload: &Value) -> Result<(), String> {
                 continue;
             };
             for file in &entry.files {
+                // 容器路径（`general/l1/**.md`）不是锚定文件：继承过来会让体检
+                // 永久报「这条过时」。语义上它属于「来源」，由 `evidence` 记。
+                if store::internal_file(file) {
+                    continue;
+                }
                 if !out.iter().any(|known| known == file) {
                     out.push(file.clone());
                 }
             }
             for file in inject::harvest_paths(&entry.body) {
+                if store::internal_file(&file) {
+                    continue;
+                }
                 if !out.iter().any(|known| known == &file) {
                     out.push(file);
                 }
@@ -2586,6 +2594,12 @@ pub fn health(limit: usize) -> Value {
         }
         let mut touched: Vec<Value> = Vec::new();
         for file in &entry.files {
+            // 记忆库自己的容器不是「被引用的代码」：`general/l1/gateway/2026-11-22.md`
+            // 每写一条新记忆 mtime 就变，拿它当锚定文件会**永久**报「可能过时」。
+            // 真机 6 条全部是这个成因（l2 从 l1 派生时继承了来源容器路径）。
+            if store::internal_file(file) {
+                continue;
+            }
             // `files` 是相对路径，但相对的是**记忆根**还是**项目目录**？
             // 约定是相对记忆根（与 `path` 同口径），同时对「相对 cwd」的写法宽容：
             // 两种都试，任一命中就算改动过。

@@ -2512,7 +2512,14 @@ fn run_core(
                 // 这里抽的是**正文里写过的仓库路径**（`src/server/api/chat.rs`
                 // 这种带目录的串），不是会话文件自身的路径：前者才是「这次改动
                 // 涉及哪些文件」，后者只说明这段对话存在哪个 jsonl 里。
-                files: super::inject::harvest_paths(&candidate.body),
+                //
+                // 记忆库自己的容器（`general/l1/gateway/2026-11-22.md`）要滤掉：
+                // 那段对话如果正好在聊记忆布局，正文里就会写这个路径，锚上之后
+                // 体检会永久报「这条可能过时」（容器每次写新记忆都会变 mtime）。
+                files: super::inject::harvest_paths(&candidate.body)
+                    .into_iter()
+                    .filter(|file| !store::internal_file(file))
+                    .collect(),
                 supersedes: Vec::new(),
                 pinned: Some(false),
                 starred: Some(false),
