@@ -127,6 +127,7 @@ fn strip_client_wrappers(text: &str) -> String {
     const WRAPPERS: &[(&str, &str)] = &[
         ("<conversation_history_summary>", "</conversation_history_summary>"),
         ("<system-reminder>", "</system-reminder>"),
+        ("<task-notification>", "</task-notification>"),
         ("<environment_context>", "</environment_context>"),
     ];
     let mut out = text.to_string();
@@ -679,6 +680,24 @@ mod tests {
         ];
         let text = user_text(&messages);
         assert_eq!(text.trim(), "继续", "工具回显不该进用户侧：{text}");
+    }
+
+    #[test]
+    fn task_notifications_are_not_user_words() {
+        // 真机库 2026-11-22：两条后台任务通知被写成「**我**：<task-notification>…」，
+        // 标题也变成 `<task-notification>`。通知是客户端给模型的控制消息，
+        // 不是用户原话；即使剥离标签后还剩 TaskOutput 指令，整轮也不该留存。
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "<task-notification>\n<task-id>PW8w98</task-id>\n<status>completed</status>\n</task-notification>\nUse the TaskOutput tool to retrieve the full output."
+        })];
+        assert_eq!(user_text(&messages), "");
+
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "<task-notification><status>completed</status></task-notification>\n继续处理旧库里的错误条目"
+        })];
+        assert_eq!(user_text(&messages), "继续处理旧库里的错误条目");
     }
 
     #[test]
