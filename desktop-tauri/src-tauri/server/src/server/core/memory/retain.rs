@@ -124,13 +124,32 @@ pub fn user_text(messages: &[Value]) -> String {
 /// 所以这里按客户端自己的标签剔：那些块是**客户端**写的，不是用户说的。
 /// 只剔整块命中包装标签的段落，正常的一句话不受影响。
 fn strip_client_wrappers(text: &str) -> String {
+    let mut out = text.to_string();
+    // 后台任务通知和紧随其后的工具操作指令是**同一个控制块**。只剥 XML 标签
+    // 会留下 `Use the TaskOutput tool…`，它仍会被当成用户原话写进 l1。
+    // 用户确实可能在通知后追加自己的话，因此只删已知的指令段，不误删追加内容。
+    while let Some(start) = out.find("<task-notification>") {
+        let rest = &out[start + "<task-notification>".len()..];
+        let mut end = match rest.find("</task-notification>") {
+            Some(at) => start + "<task-notification>".len() + at + "</task-notification>".len(),
+            None => out.len(),
+        };
+        let tail = &out[end..];
+        let instruction = tail.trim_start();
+        const TASK_FOLLOW_UP: &[&str] = &[
+            "Use the TaskOutput tool ",
+            "IMPORTANT: Before responding, ",
+        ];
+        if TASK_FOLLOW_UP.iter().any(|prefix| instruction.starts_with(prefix)) {
+            end = out.len();
+        }
+        out.replace_range(start..end, "");
+    }
     const WRAPPERS: &[(&str, &str)] = &[
         ("<conversation_history_summary>", "</conversation_history_summary>"),
         ("<system-reminder>", "</system-reminder>"),
-        ("<task-notification>", "</task-notification>"),
         ("<environment_context>", "</environment_context>"),
     ];
-    let mut out = text.to_string();
     for (open, close) in WRAPPERS {
         while let Some(start) = out.find(open) {
             let rest = &out[start + open.len()..];
