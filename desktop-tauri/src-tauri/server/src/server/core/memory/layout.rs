@@ -261,9 +261,21 @@ pub fn detect_identity(cwd: &str) -> Option<Remote> {
 }
 
 /// 从 cwd 往上找最近的 git 根。找不到返回 `None`。
+///
+/// `cwd` 可能是**文件路径**（留存兜底从 user-context 里抠的是
+/// `.../src/lib.rs` 这类存在文件，不是目录）。`git -C <文件>` 直接
+/// `fatal: cannot change to ...`（exit 128），所以先落到父目录再交给 git。
+/// 目录原样透传，行为不变。
 pub fn find_git_root(cwd: &str) -> Option<String> {
+    let path = std::path::Path::new(cwd);
+    let base = if path.is_file() {
+        path.parent().map(|p| p.to_path_buf())
+    } else {
+        Some(path.to_path_buf())
+    };
+    let base = base?;
     let output = std::process::Command::new("git")
-        .args(["-C", cwd, "rev-parse", "--show-toplevel"])
+        .args(["-C", &base.to_string_lossy(), "rev-parse", "--show-toplevel"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -625,5 +637,27 @@ mod tests {
         // 按字节算会让中文的相似度全部偏低（每个汉字 3 字节）
         assert!(edit_ratio("记忆", "记忆") > 0.99);
         assert!(edit_ratio("记忆中枢", "记忆中心") > 0.6);
+    }
+
+    #[test]
+    fn file_path_can_still_find_git_root() {
+        // 真机 2026-11-22 / CI run 44991426164：留存兜底拿到的是存在的**文件**
+        // （`.../src/lib.rs`），`git -C <文件>` 直接 exit 128，导致
+        // `cwd_falls_back_to_real_project_path_when_patterns_hit_prose` 在
+        // CI 上必红。文件要先落到父目录，目录行为不变。
+        let here = env!("CARGO_MANIFEST_DIR");
+        let file = format!("{here}/src/lib.rs");
+        assert!(
+            std::path::Path::new(&file).is_file(),
+            "测试前提：{file} 应当是存在的文件",
+        );
+        let root = find_git_root(&file).expect("从文件路径也应能找到仓库根");
+        assert!(
+            std::path::Path::new(&root).join(".git").exists(),
+            "找到的应是仓库根: {root}",
+        );
+        // 目录调用保持原行为
+        let dir_root = find_git_root(here).expect("从 crate 目录应能找到仓库根");
+        assert_eq!(root, dir_root, "文件与所在目录应指向同一个仓库根");
     }
 }
