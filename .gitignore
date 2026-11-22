@@ -86,3 +86,6 @@ desktop-tauri/mobile/ios/DerivedData/
 # probe*.txt 是一次性抓取输出、memory/ 是本机的助手记忆。
 .workbuddy/*
 !.workbuddy/*.md
+
+# 本机跑测试/调试时在仓库根留下的空数据库（正常路径是 {config_dir}/agent2api.db）
+/agent2api.db

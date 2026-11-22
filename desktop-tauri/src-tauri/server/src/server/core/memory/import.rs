@@ -640,7 +640,13 @@ fn line_to_turn(line: &str) -> Option<(String, String, Option<i64>)> {
     let raw = parts.join("\n");
     let text = if speaker == "我" {
         // 用户侧：真实原话埋在信封里，必须**抽出来**而不是整条判定
-        human_words(&raw)?
+        let said = human_words(&raw)?;
+        // 用户说「继续」「好的」也是明确的话，不能按长度丢掉。
+        // 真正决定「这条值不值得留成记忆」的是下游的窗口级 `MIN_BODY_CHARS`。
+        if said.chars().count() < 2 {
+            return None;
+        }
+        said
     } else {
         let cleaned = strip_client_blocks(&raw);
         let cleaned = cleaned.trim().to_string();
@@ -649,9 +655,6 @@ fn line_to_turn(line: &str) -> Option<(String, String, Option<i64>)> {
         }
         cleaned
     };
-    if text.chars().count() < 8 {
-        return None;
-    }
     let created = parse_time(&value);
     Some((speaker.to_string(), text, created))
 }
@@ -701,7 +704,20 @@ fn human_words(raw: &str) -> Option<String> {
     }
     if !said.is_empty() {
         let joined = said.join("\n\n");
-        return if joined.chars().count() < 8 { None } else { Some(joined) };
+        // ── 短句也是原话 ────────────────────────────────────────
+        // 旧实现卡 `< 8 字`，理由是「太短不像一句话」。真机 2026-11-22 扫出的
+        // leftover 里有一批真实用户话就是这么短：
+        //
+        // ```text
+        //   <user_query>吸收</user_query>
+        //   <user_query>好的，更新</user_query>
+        //   <user_query>请继续执行任务</user_query>
+        // ```
+        //
+        // 「吸收」「好的，更新」都是**用户明确表达的诉求**，丢掉等于漏记需求。
+        // 门槛改成 `< 2 字`（空内容不算话），长度过滤交给下游的窗口级
+        // `MIN_BODY_CHARS`（12 字）—— 那才是「这条记忆值不值得留」的判断点。
+        return if joined.chars().count() < 2 { None } else { Some(joined) };
     }
     // ── 闭标签残片开头：不是人话 ────────────────────────────────
     // 真机 5 条的形状是 `</user_query>Please continue with…` —— 开标签被客户端
@@ -712,9 +728,31 @@ fn human_words(raw: &str) -> Option<String> {
     }
     // ── 兜底必须「像一句话」，不能是代码回显 ────────────────────
     // 真机剩 3 条兜底里 2 条是 `"),\n  (""),\n  ...];` 这种代码中段（客户端把
-    // 工具结果回显塞进了 user 角色）。兜底本来就是为了兼容「直接写纯文本的客户端」，
-    // 判据取：含汉字 + 不以代码符号起头 + 不是 `looks_like_fragment` 的碎片。
-    if !fallback.chars().any(is_cjk) || looks_like_fragment(fallback) {
+    // 工具结果回显塞进了 user 角色）。
+    //
+    // ⚠️ 这里**不能**用碎片判据 —— 无论是旧的窗口级 `looks_like_fragment`
+    // 还是新的发言级 `looks_like_code_message`，对**单条用户原话**都太严：
+    // 用户真的会说「端口固定 3065」这种短句，窗口级判据（要求整窗有一句
+    // 20 字以上的人话）会把它们全判成碎片 —— CI 上
+    // `cursor_reads_only_appended_bytes` 就是被这条打红的。
+    //
+    // 单条原话只要求两件事：**有一个字的汉字**（说明是人打的字，不是日志/代码），
+    // 且**不是从代码符号起头**。
+    if !fallback.chars().any(is_cjk) {
+        return None;
+    }
+    let first = fallback.lines().next().unwrap_or("").trim();
+    let starts_code = first.starts_with("</")
+        || first.starts_with('}')
+        || first.starts_with('{')
+        || first.starts_with("&& ")
+        || first.starts_with("|| ")
+        || first.starts_with('$')
+        || first.ends_with("\");")
+        || first.ends_with("},")
+        || first.ends_with("),")
+        || first.ends_with("=>");
+    if starts_code {
         return None;
     }
     Some(fallback.to_string())
@@ -759,6 +797,25 @@ fn strip_client_blocks(raw: &str) -> String {
         ("<cb_summary>", "</cb_summary>"),
         ("<task-notification>", "</task-notification>"),
         ("<antml:function_calls", "</antml:function_calls>"),
+        // ── 客户端把「上一轮」原样回灌进本轮消息 ──────────────────
+        // 真机 2026-11-22 统计（65 个会话 / 20 万行）：
+        //   <previous_tool_call>        14106 对
+        //   <previous_assistant_message> 6263 对
+        //   <previous_user_message>       527 对
+        //   <image_local_path>             531 对
+        //
+        // 三条都**不是**本轮内容：
+        //   * `<previous_user_message>` 里**嵌套着一份 `<user_query>`** ——
+        //     那是上一轮的用户原话。不剥掉它，`human_words` 会把历史提问
+        //     当成这一轮用户说的话，时间线全错。
+        //   * `<previous_tool_call>` 里是工具调用参数回显，真机上 7 条
+        //     `RefreshToken ng":"` 碎片就是从这儿来的（用户消息里嵌着
+        //     `Tool: Edit / Arguments: {...}` 的 JSON 残片）。
+        //   * `<image_local_path>` 是客户端写的本机图片路径。
+        ("<previous_user_message>", "</previous_user_message>"),
+        ("<previous_assistant_message>", "</previous_assistant_message>"),
+        ("<previous_tool_call>", "</previous_tool_call>"),
+        ("<image_local_path>", "</image_local_path>"),
     ];
     let mut text = raw.to_string();
     // 反复扫：信封套信封（`<system-reminder>` 里嵌 `<identity_context>`）时，
@@ -1104,11 +1161,16 @@ fn declared_project_of(raw: &str) -> Option<String> {
         //   1. 只吃到引号/换行/尖括号/竖线这类**绝不可能是路径**的字符；
         //   2. 再按冒号截一刀 —— 冒号在 Windows 路径里只出现在盘符（`C:`，下标 1），
         //      出现在更后面一律意味着「说明性文字开始了」。
+        //
+        // ⚠️ 只截**下标 ≥ 2** 的冒号。盘符冒号在 `C:` 的下标 1，截掉它整条路径
+        // 就只剩一个 `C`（`project_name_of_path` 判长度不足 → 返回 None），
+        // 于是 `Workspace Folder: C:\Users\me\WorkBuddy\2026-09-23-…` 整条失效，
+        // 项目名退化成来源目录名 `projects`（真机上 3162 条全进了假项目）。
         let rough: String = rest
             .chars()
             .take_while(|ch| !matches!(ch, '"' | '\n' | '\r' | '<' | '>' | '|' | '\u{0}'))
             .collect();
-        let path = match rough.char_indices().skip(1).find(|(_, ch)| *ch == ':') {
+        let path = match rough.char_indices().skip(2).find(|(_, ch)| *ch == ':') {
             Some((at, _)) => &rough[..at],
             None => rough.as_str(),
         };
@@ -1269,9 +1331,28 @@ fn from_transcript_at(
                 first_user = Some(candidate.chars().take(60).collect());
             }
         }
+        // ── 整条发言是纯代码 / 工具输出 → 不参与打包 ──────────────
+        // 判据在**发言**级，不在窗口级：一条发言要么是「话」（哪怕很长、
+        // 中间夹着代码），要么整体就是代码块 / diff / 日志。前者该全留，
+        // 后者该整条扔掉。旧实现把这个判断放在窗口级，于是同一条发言被切成
+        // 三窗之后，三个窗各自判断、结论不一致 —— 也就是「碎片」的来源。
+        if looks_like_code_message(&text) {
+            return true;
+        }
         let formatted = format!("**{speaker}**：{text}");
-        for piece in split_long(&formatted, CHUNK_CHARS) {
-            segments.push((piece, created));
+        // ── 切开的每一片都带说话人前缀 ──────────────────────────
+        // 一条 5 万字的发言按 8000 字切开，第 2、3 片原本是从半句话开始的
+        // 裸文本。补上前缀之后，每一片都是「谁在说」的合法对话片段：注入侧
+        // 读到的永远是 `**助手**：…`，不会突然冒出一段没头没尾的代码。
+        for (index, piece) in split_long(&formatted, CHUNK_CHARS).into_iter().enumerate() {
+            if index == 0 {
+                segments.push((piece, created));
+            } else {
+                // 续片：`split_long` 返回的是纯文本切片，重新贴上前缀
+                let head = format!("**{speaker}**（续）：");
+                let body = piece.strip_prefix(&formatted).map(str::to_string).unwrap_or(piece);
+                segments.push((format!("{head}{body}"), created));
+            }
         }
         true
     }) {
@@ -1351,17 +1432,16 @@ fn from_transcript_at(
         };
         let skip = if body.chars().count() < MIN_BODY_CHARS {
             Some("窗口内容太短".to_string())
-        } else if looks_like_fragment(&body) {
-            // ── 为什么要在「写进库」这一步拦碎片 ──────────────────
-            // 真机 2026-11-22：5973 条导入记忆里抽查 30 条，绝大多数是从
-            // 代码行中间开始的碎片（`move("weekly");`、`ng":"  # ① 有…`）。
-            // 光靠 `split_long` 找行边界不够 —— 一条 5 万字的 assistant 消息
-            // 里全是代码，每 8000 字一个切点，切点两边都是代码。
-            //
-            // 判据：窗口**首行**就是代码 / 标记 / 命令，或者整窗没有自然语言
-            // 句子。这类窗口留着的唯一作用是让注入把 shell 脚本当经验塞给模型。
-            Some("窗口是代码/工具切片".to_string())
         } else {
+            // ── 窗口级不再判「碎片」────────────────────────────────
+            // 碎片判断已经上移到**发言级**（`looks_like_code_message`）：
+            // 一条发言整体是代码就整条不进 segments，进 segments 的每一片都
+            // 带 `**我**：` / `**助手**：` 前缀。所以到这里的窗口一定由对话
+            // 片段组成，不需要再按「首行是不是代码」二次猜测。
+            //
+            // 真机教训（2026-11-22）：在窗口级判碎片会让同一条发言的相邻窗口
+            // 结论不一致 —— 取决于切点落在代码行还是中文注释上。库里的
+            // 「半行代码碎片」正是这么来的。
             sensitive_hit(&body).map(|label| format!("含{label}"))
         };
         out.push(Pending {
@@ -1378,75 +1458,97 @@ fn from_transcript_at(
     (out, next)
 }
 
-/// 这一窗内容是不是「代码 / 工具输出的切片」，而不是一段人话。
+/// 这一条**发言**整体是不是代码块 / diff / 日志，而不是一段人话。
 ///
-/// ── 这道闸现在只管一件事：`split_long` 切出来的裸中段 ────────
-/// 窗口有两种来源：
+/// ── 判据为什么要落在「发言」这一级，而不是「窗口」────────────────
+/// 这是本次修的一个真实错误。窗口是按 8000 字切出来的容器，一条 5 万字的
+/// assistant 消息会跨好几个窗口。旧实现把判断放在窗口级，于是：
 ///
-///   1. `pack_windows` 按**轮次**打包 —— 每片是 `**我**：…` 或 `**助手**：…`，
-///      天然带说话人前缀。这类窗口**必然**是对话，不该判碎片（哪怕用户问的是
-///      「这段代码哪里错」，窗里全是代码，那也是有效对话）。
-///   2. `split_long` 把一条超长发言从中间切开 —— 中段是**裸文本**，没有说话人
-///      前缀，可能从半行代码起头。这类才是要拦的。
+///   * 「用户贴一段代码问哪里错了」→ 窗口首行是 `fn main() {` → 整窗判碎片被扔；
+///   * 同一段代码的续窗首行碰巧是中文注释 → 又留下来。
 ///
-/// 早先没有这个豁免，`looks_like_fragment` 会按「首行以 `{` / `}` / `;` 结尾」
-/// 把「用户贴代码问问题」的整窗判成碎片 —— 而真机上 assistant 消息 p50 只有
-/// 61 字、p99 1890 字，绝大多数窗口首行就是一句短结论，反而幸免；真正该拦的
-/// 裸中段却因为首行碰巧是中文注释而漏过。判据挂错了对象。
+/// 同一个东西一会儿留一会儿扔，取决于切点落在哪 —— 这就是库里 5973 条
+/// 「半行代码碎片」的真正成因。
 ///
-/// 判据（仅对裸中段生效，命中任一即判碎片）：
+/// 正确的粒度是**发言**：一条消息要么是话（哪怕夹杂代码，也是「在讨论」），
+/// 要么整体就是一段机器产出。前者保留、后者丢弃，与切点无关。
 ///
-///   1. **首行**以代码/标记起头：`{` `}` `$` `> ` 或者以 `</` 起头（标签闭合残片）
-///   2. 首行是「半行代码」：有 `");` `},` `),` 这类结尾，且没有句末标点
-///   3. 整窗没有一句话：没有 `。！？` 也没有 `. ` + 至少 20 个汉字的连续段落
-fn looks_like_fragment(body: &str) -> bool {
-    let text = body.trim();
-    if text.is_empty() {
+/// ── 判据 ────────────────────────────────────────────────────
+/// 先问「这是不是人在说话」，是就保留（哪怕满屏代码，那也是在讨论代码）；
+/// 确认不是人话之后，再看它是不是机器产出。
+///
+/// ── 判据顺序（很关键）────────────────────────────────────────
+///   1. **断掉的 JSON 键尾**（`ng":"` 这种）→ 机器产出。
+///      这条必须排在最前：它里面也有汉字（「① 有 RefreshToken → 走 App 式续期」），
+///      按软证据会被人话规则放过 —— 而它恰好是库里最典型的碎片形状。
+///   2. **围栏外面**有中文句子 → 人在说话。
+///      必须是「围栏外面」：真机仿真（2026-11-22）打出来的反例是助手结论
+///      「**重大发现**：TRAE SOLO CN 有**自己原生的记忆系统**！\n\n```\n…目录树…```」
+///      —— 正文有一半是代码围栏，早先版本被「围栏过半」判成机器产出，
+///      **整条结论被丢掉**。而「助手的结论附带一段代码」是正常对话形态，
+///      结论本身才是要记的东西。
+///      反过来，纯代码块里带中文注释（「// 这是注释。」）围栏外面是空的，
+///      照样判机器产出 —— 两边都不误伤。
+///   3. 代码围栏占一大半 → 机器产出。
+///   4. 首行是代码/命令/标签残片（`{` `}` `</` `$` `&& ` `|| ` `diff --git` …）
+///      → 机器产出。**这条是硬信号**，不看汉字多少。
+///      理由：人写的话不会以 `}` / `</` / `$ ` 起头；真要贴代码，代码前面
+///      一定有一句说明（那句说明会带句末标点，被第 2 条接住）。
+///      反例要注意：「`}\n\n继续`」这种「先贴一段代码、再补一句人话」——
+///      人话是**另一行**，不是这条消息的第一行，所以照样判机器产出。
+///   5. 有连续 2 个以上汉字 → 人在说话（「继续」「好的」这种短句也算）。
+///   6. 有一行像英文自然语言 → 人在说话。
+///   7. 都不命中 → 整段找不到一句自然语言 → 机器产出。
+fn looks_like_code_message(text: &str) -> bool {
+    let body = text.trim();
+    if body.is_empty() {
         return true;
     }
-    // ── 豁免：带说话人前缀的窗口是对话，不判碎片 ──────────────
-    // `pack_windows` 拼出来的窗口每条发言都以 `**我**：` / `**助手**：` 起头。
-    // 只要窗里有一行是这样的，这就是一段真对话（哪怕内容是代码）。
-    if text.lines().any(|line| {
-        let line = line.trim_start();
-        line.starts_with("**我**：")
-            || line.starts_with("**助手**：")
-            || line.starts_with("我：")
-            || line.starts_with("助手：")
-    }) {
+    // ── 1) 断掉的 JSON 键尾：硬证据 ───────────────────────────
+    let first = body.lines().next().unwrap_or("").trim();
+    if looks_like_json_tail(first) {
+        return true;
+    }
+    // ── 2) 围栏外面有人话 → 人在说话 ──────────────────────────
+    let prose = prose_outside_fences(body);
+    let cjk_run = longest_cjk_run(&prose);
+    if cjk_run >= 2 && (prose.contains('。') || prose.contains('！') || prose.contains('？')) {
         return false;
     }
-    let first = text.lines().next().unwrap_or("").trim();
-    // 1) 首行是标签闭合残片 / JSON 尾巴 / shell 提示
-    if first.starts_with("</")
+    // ── 3) 代码围栏占了一半以上 ──────────────────────────────
+    let fence_chars: usize = body
+        .split("```")
+        .enumerate()
+        .filter(|(index, _)| index % 2 == 1)
+        .map(|(_, part)| part.chars().count())
+        .sum();
+    if fence_chars * 2 > body.chars().count() {
+        return true;
+    }
+    // ── 4) 首行是代码形状 → 机器产出（硬信号，不看汉字多少）──
+    let starts_code = first.starts_with("</")
         || first.starts_with('}')
         || first.starts_with('{')
         || first.starts_with("&& ")
         || first.starts_with("|| ")
         || first.starts_with('$')
-    {
+        || first.starts_with("diff --git")
+        || first.starts_with("+++ ")
+        || first.starts_with("--- ");
+    if starts_code {
         return true;
     }
-    // 2) 首行是半行代码：以代码符号结尾且没有中文句末标点
-    let ends_like_code = first.ends_with("\");")
-        || first.ends_with("},")
-        || first.ends_with("),")
-        || first.ends_with(";")
-        || first.ends_with("=>")
-        || first.ends_with('\\')
-        || first.ends_with('`');
-    let has_sentence_punct = first.contains('。') || first.contains('！') || first.contains('？');
-    if ends_like_code && !has_sentence_punct {
-        return true;
-    }
-    // 3) 整窗没有自然语言：没有任何中文句末标点，且英文字母/中文都在代码块里
-    let has_cjk_sentence = text.contains('。') || text.contains('！') || text.contains('？');
-    if has_cjk_sentence {
+    // ── 5) 成句中文 → 人在说话 ────────────────────────────────
+    if cjk_run >= 2 {
         return false;
     }
-    // 没有中文句末标点时，看有没有「一段连续的自然语言」。判据取「至少一行
-    // 以汉字或英文字母起头、长度 ≥ 20、且不以分号/花括号/反引号结尾」。
-    for line in text.lines().take(40) {
+    // 汉字总量同样只看围栏外面 —— 纯代码块里满地注释汉字不算「人在说话」。
+    let cjk_total = prose.chars().filter(|ch| is_cjk(*ch)).count();
+    if cjk_total >= 8 {
+        return false;
+    }
+    // ── 6) 英文自然语言 ────────────────────────────────────────
+    for line in body.lines().take(60) {
         let line = line.trim();
         if line.chars().count() < 20 {
             continue;
@@ -1454,18 +1556,94 @@ fn looks_like_fragment(body: &str) -> bool {
         let starts_wordy = line
             .chars()
             .next()
-            .map(|c| c.is_alphabetic() || is_cjk(c))
+            .map(|ch| ch.is_alphabetic() || is_cjk(ch))
             .unwrap_or(false);
         let ends_code = line.ends_with(';')
             || line.ends_with('{')
             || line.ends_with('}')
             || line.ends_with(',')
-            || line.ends_with('`');
-        if starts_wordy && !ends_code {
+            || line.ends_with(')')
+            || line.ends_with(']')
+            || line.ends_with('`')
+            || line.ends_with('\\')
+            || line.ends_with('>');
+        // 「像散文」的条件：至少 3 个英文单词、字母总数 ≥ 12。
+        // 只看「首字母是字母」会把 `println!("hi")` 这种也当散文。
+        let words = line
+            .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+            .filter(|token| token.chars().any(|ch| ch.is_alphabetic()))
+            .count();
+        let letters = line.chars().filter(|ch| ch.is_alphabetic()).count();
+        if starts_wordy && !ends_code && words >= 3 && letters >= 12 {
             return false;
         }
     }
+    // ── 7) 找不到一句自然语言 ──────────────────────────────────
     true
+}
+
+/// 连续汉字的最长长度（用来识别「这是一句中文」而不是「代码里夹了几个汉字」）。
+fn longest_cjk_run(text: &str) -> usize {
+    let mut best = 0usize;
+    let mut run = 0usize;
+    for ch in text.chars() {
+        if is_cjk(ch) {
+            run += 1;
+            if run > best {
+                best = run;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    best
+}
+
+/// 把代码围栏（``` … ```）里的内容抠掉，只留「围栏外面」的人话。
+///
+/// ── 为什么需要这一步 ──────────────────────────────────────────
+/// 助手的结论经常是「一句结论 + 一段代码」。判「这句话是不是人话」时，
+/// 必须**只看结论那一部分**：不然结论里附带的代码会把整条拖成「机器产出」。
+///
+/// 反过来也成立：纯代码块里带中文注释（「// 这里用缓存，避免重复请求。」），
+/// 围栏外面是空的 —— 抠掉围栏之后就没有任何中文句子了，照样判机器产出。
+///
+/// 没闭合的围栏（客户端截断）也算：`split` 出来奇数段，最后一段是「围栏内」。
+fn prose_outside_fences(body: &str) -> String {
+    let parts: Vec<&str> = body.split("```").collect();
+    // 偶数下标 = 围栏外；奇数下标 = 围栏内。未闭合时最后一段是奇数下标，
+    // 自然被当成围栏内 —— 正是我们要的行为。
+    parts
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| index % 2 == 0)
+        .map(|(_, part)| *part)
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
+/// 首行是不是**被切断的 JSON 键尾**：`ng":"`、`refreshToken":"` 这种。
+///
+/// 真机 2026-11-22 扫到 7 条 `RefreshToken ng":"` 碎片 —— 那是客户端把工具
+/// 参数 JSON 塞进消息里、被切在一半留下的残渣。形状固定：标识符 + `"` + `:`。
+fn looks_like_json_tail(first: &str) -> bool {
+    let bytes = first.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut index = 0usize;
+    if !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') {
+        return false;
+    }
+    index += 1;
+    while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_') {
+        index += 1;
+    }
+    // 标识符后面必须紧跟 `"` + `:`，中间不能有空格
+    if index + 1 >= bytes.len() {
+        return false;
+    }
+    bytes[index] == b'"' && bytes[index + 1] == b':'
 }
 
 /// 把一段超长文本按 `limit` 字数切开（相邻片重叠 `CHUNK_OVERLAP/2`）。
@@ -1517,9 +1695,10 @@ fn split_long(text: &str, limit: usize) -> Vec<String> {
 /// 优先级：`\n\n`（段落）> `\n`（行）> `。！？.!?`（句）> `None`（交给硬切）。
 ///
 /// 切在代码块中间会产出「从半行代码开始」的碎片，但退到段落边界往往要退很远
-/// （整段代码可能几万字）。折中：行边界照收 —— 后面 `looks_like_fragment`
-/// 会在导入时把「首行是代码」的窗口整条跳过，比在这里硬退更可控
-/// （宁可留一条，也不要一次退掉整个窗口）。
+/// （整段代码可能几万字）。折中：行边界照收 —— 碎片判断已经上移到**发言级**
+/// （`looks_like_code_message`）：整条发言是机器产出就整条不进 segments，
+/// 进 segments 的每一片都会补上 `**我**：` / `**助手**：` 前缀。所以这里不必
+/// 为了「切在句子中间」退很远（宁可切在行边界，也不一次退掉整个窗口）。
 fn pick_break(chars: &[char], from: usize, to: usize) -> Option<usize> {
     // 段落优先：`\n\n`
     let mut i = to.saturating_sub(1);
@@ -3386,28 +3565,99 @@ mod tests {
         assert!(!is_harness_noise("把 qoder 签到修好"));
     }
 
+    /// 发言级碎片判据：机器产出的整条发言不进记忆，人话一律进。
+    ///
+    /// ── 为什么样本不再是「带说话人前缀的窗口」────────────────────
+    /// 旧判据是**窗口级**的，样本长这样：`"}\n\n**助手**：继续"` —— 那是把
+    /// 一整窗内容喂给判据。现在判据落在**发言级**，输入是**一条消息的正文**
+    /// （还没有 `**我**：` 前缀），所以样本要换成消息形状。
+    ///
+    /// 这条测试守的是两个方向：机器产出别混进来，人话别被误伤。
     #[test]
     fn code_slices_are_not_memories() {
-        // 真机 2026-11-22 抽查到的真形状，全部应判碎片
+        // 真机 2026-11-22 抽查到的真形状 —— 整条就是机器产出
         for body in [
+            // 断掉的 JSON 键尾（真机上 7 条 `RefreshToken ng":"` 就是这个）
             "ng\":\"                # ① 有 RefreshToken → 走 App 式续期（抓包 16/17）",
+            // 中途被切开的 JS 语句
             "move(\"weekly\");\n         entry.remove(\"weeklyTime\");",
+            // 标签闭合残片
             "</result>\n</previous_tool_call>",
-            "}\n\n**助手**：继续",
+            // 首行是花括号
+            "}\n\n继续",
+            // shell 环境变量
             "$PATH\"\\nIMG=\"C:/Users/me/a.jpg\"",
-            "- 禁用控件；\n   - 保留值，允许导入导出配置兼容。",
         ] {
-            assert!(looks_like_fragment(body), "应当判碎片: {}", &body[..30.min(body.len())]);
+            assert!(
+                looks_like_code_message(body),
+                "应当判机器产出: {}",
+                &body[..30.min(body.len())]
+            );
         }
         // 正常人话不能误伤 —— 这几条是库里的真记忆
         for body in [
-            "**我**：动第一批，第二批和第三批我还没理解是什么意思，需要你解释\n\n**助手**：现在开始写第一批。第一件事：把 information_score 加进 model.rs。",
-            "**助手**：## 诊断结果：AutoClaw 国内版上游的预校验拒收（406 空响应体），不是账号问题",
-            "**助手**：实测确认：titleBoost=3 确实把「标题命中」翻到了「正文命中」前面。",
-            "**我**：qoder签到有问题，供应商目录里没有qoder，但点击统一签到后，还是会去签qoder",
+            "动第一批，第二批和第三批我还没理解是什么意思，需要你解释。",
+            "## 诊断结果：AutoClaw 国内版上游的预校验拒收（406 空响应体），不是账号问题",
+            "实测确认：titleBoost=3 确实把「标题命中」翻到了「正文命中」前面。",
+            "qoder签到有问题，供应商目录里没有qoder，但点击统一签到后，还是会去签qoder",
+            // 短句也算人话 —— 旧窗口级判据会把这些全判成碎片
+            "端口固定 3065",
+            "继续",
         ] {
-            assert!(!looks_like_fragment(body), "不该判碎片: {}", &body[..30.min(body.len())]);
+            assert!(
+                !looks_like_code_message(body),
+                "不该判机器产出: {}",
+                &body[..30.min(body.len())]
+            );
         }
+    }
+
+    /// 「一句结论 + 一段代码」必须整条留下 —— 这是真机上被误杀的一类。
+    ///
+    /// ── 真机反例（2026-11-22 仿真）──────────────────────────────
+    /// 助手的结论几乎都是这个形状：
+    ///
+    /// ```text
+    /// **重大发现**：TRAE SOLO CN 有**自己原生的记忆系统**！
+    ///
+    /// ```
+    /// ~/.trae-cn/memory/
+    /// ├── user_profile.md
+    /// …
+    /// ```
+    /// ```
+    ///
+    /// 正文有一半是代码围栏，早先版本把「围栏占一半以上」排在「有没有人话」
+    /// 之前，于是这条**结论被整条丢掉**（真机 341 条误杀里的一批）。
+    ///
+    /// 修法：判「有没有人话」时**只看围栏外面**。反过来也成立 ——
+    /// 纯代码块里带中文注释，围栏外面是空的，照样判机器产出。
+    #[test]
+    fn conclusion_with_code_block_is_kept_but_pure_code_is_not() {
+        let conclusion = concat!(
+            "**重大发现**：TRAE SOLO CN 有**自己原生的记忆系统**！\n\n",
+            "```\n~/.trae-cn/memory/\n├── user_profile.md\n",
+            "├── projects/<项目>/\n```"
+        );
+        assert!(
+            !looks_like_code_message(conclusion),
+            "结论带代码围栏不该被整条丢掉"
+        );
+
+        // 纯代码块 + 中文注释：围栏外面没人话 → 机器产出
+        let pure_code =
+            "```rust\n// 这里用缓存，避免重复请求。\nfn get(k: &str) -> String { k.into() }\n```";
+        assert!(
+            looks_like_code_message(pure_code),
+            "纯代码块不该进记忆"
+        );
+
+        // 未闭合的围栏（客户端截断）也按围栏内处理
+        let truncated = "```rust\nlet x = 1;\nlet y = 2;";
+        assert!(
+            looks_like_code_message(truncated),
+            "未闭合围栏里的代码不该进记忆"
+        );
     }
 
     #[test]
