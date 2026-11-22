@@ -52,24 +52,20 @@ const CHUNK_CHARS: usize = 8_000;
 /// 在两个窗口里都能被检索到 —— 否则一句话恰好被切在中间，两个窗口都不完整。
 const CHUNK_OVERLAP: usize = 600;
 
-/// 单个会话文件最多读进内存的字节数，而且在**尾部**读。
+/// 单次尾部读的字节上限（**仅测试用**；生产路径已改成流式读，见 [`for_each_line`]）。
 ///
-/// ── 为什么必须有这条硬上限 ──────────────────────────────────
-/// 会话记录是追加写的：一段聊了一整天的对话，`.jsonl` 能涨到接近 1 GB
-/// （2026-11-21 实测本机正在进行的那个会话就是 955 MB）。早先 `from_transcript`
-/// 用 `read_to_string` 把整份文件读进来再切窗口，于是每轮增量导入都要读 955 MB、
-/// 切出上千个窗口。后果不是「慢一点」，而是**面板整页打不开**：
+/// ── 历史：这条上限曾经把 87% 的真实记录挡在库外 ──────────────
+/// 会话记录是追加写的，`.jsonl` 能涨到 1 GB（2026-11-21 实测本机某个会话 955 MB）。
+/// 早先 `from_transcript` 用 `read_to_string` 整份读，于是加了「只读尾部 8 MB」的
+/// 上限来避免面板卡死。但这个折中的代价是**内容丢失**：2026-11-22 实测本机
+/// 65 个会话共 1.53 GB，只读进 13%（198 MB）；1.04 GB 那个会话里 489 条用户
+/// 提问只捞到 5 条（1%）。用户看到的现象就是「导入了 2341 条，可我的真实记录
+/// 远不止这些」。
 ///
-///   * 那 955 MB 的读 + 切分把磁盘和 CPU 占满几分钟，同时导入还在不停写索引；
-///   * 写索引会让记忆快照缓存失效，面板首屏的 `GET /api/memory/config`
-///     又要重新解析 55 MB `.md` 才能算出 `status()`；
-///   * 两件事叠在一起，桌面壳 60 秒超时，用户看到的就是
-///     「等待本地代理响应超时」+ 记忆中枢永远「正在获取…」。
-///
-/// ── 为什么读尾部而不是砍掉超长文件 ──────────────────────────
-/// 增量导入只关心**新追加**的内容：老内容上一轮已经入过库，内容 hash 去重本来
-/// 也会把它们判成重复。所以从文件尾部取 8 MB（≈ 二十多万字，够几轮增量）就够了，
-/// 既覆盖新内容，又把单次读盘从 955 MB 压到 8 MB。
+/// 现在改成 [`for_each_line`] 流式逐行读：峰值内存只跟单行大小有关，与文件
+/// 总大小无关，所以**生产路径不再需要这条上限**。常量留着只服务
+/// `read_tail`（测试里用 64 字节覆盖「文件远大于上限」分支）。
+#[cfg(test)]
 const MAX_TRANSCRIPT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// 一条记忆正文的下限：太短的（「ok」「继续」）不是记忆，是噪声。
@@ -641,24 +637,198 @@ fn line_to_turn(line: &str) -> Option<(String, String, Option<i64>)> {
     };
     let mut parts: Vec<String> = Vec::new();
     collect_text(&value, &mut parts);
-    let text = parts.join("\n").trim().to_string();
+    let raw = parts.join("\n");
+    let text = if speaker == "我" {
+        // 用户侧：真实原话埋在信封里，必须**抽出来**而不是整条判定
+        human_words(&raw)?
+    } else {
+        let cleaned = strip_client_blocks(&raw);
+        let cleaned = cleaned.trim().to_string();
+        if cleaned.chars().count() < 8 || is_harness_noise(&cleaned) {
+            return None;
+        }
+        cleaned
+    };
     if text.chars().count() < 8 {
-        return None;
-    }
-    // 注入信封不是对话：判据是「整段以标签开头」，只截断正文里的标签不算
-    if is_harness_noise(&text) {
         return None;
     }
     let created = parse_time(&value);
     Some((speaker.to_string(), text, created))
 }
 
+/// 从一条用户消息里抽出「人真正打的字」。
+///
+/// ── 根因：真机上根本没有「裸的用户原话」──────────────────────
+/// 2026-11-22 扫本机 65 个 WorkBuddy 会话文件（1.5 GB，2464 条用户消息），
+/// 形状分布是：
+///
+/// ```text
+///  1009  <system-reminder …> … </system-reminder> + <user_query>真话</user_query>
+///   617  <task-notification>…</task-notification>          后台任务回执
+///   335  <conversation_history_summary>…</…>               客户端压缩的摘要
+///   300  Please continue with the conversation based on…   续跑指令
+///   195  <system-reminder …> 独立一段（只有环境信息，没有话）
+///     7  <cb_summary>…</cb_summary>                        另一种摘要
+///     1  <user_query>…</user_query>                        只有话
+/// ```
+///
+/// 也就是说：**用户的每一句话都被客户端包在 `<user_query>` 里，外面还套着几千字的
+/// 环境信封**。旧实现只有「整段以信封开头 → 整条丢弃」这一条判据，于是 1009 条
+/// 真实诉求被全部丢弃；侥幸没被丢的，落库的是几千字的 `<user_info>` / `<identity_context>`
+/// / `SOUL.md` 模板 —— 库里 5973 条导入记忆的用户侧全是机器模板，一条人话都没有。
+///
+/// ── 为什么要先剥摘要块再抽 `user_query` ──────────────────────
+/// 有 7 条 `<user_query>` 是**嵌在 `<conversation_history_summary>` 内部**的（摘要
+/// 复述历史时把当年的提问也抄了一遍）。直接全文搜 `user_query` 会把「上一轮的历史
+/// 提问」当成「这一轮用户在说话」，时间线全错。所以顺序必须是：先整块删掉客户端
+/// 摘要 / 回执 / 环境信封，再在剩下的文本里找 `<user_query>`。
+///
+/// ── 兜底 ────────────────────────────────────────────────────
+/// 剥完还没有 `<user_query>`，但剩下的文本本身够长、且不再以信封标签开头 —— 说明
+/// 这个客户端就是直接写纯文本（Claude Code / Codex 的某些形态）。这时整段就是原话。
+fn human_words(raw: &str) -> Option<String> {
+    let stripped = strip_client_blocks(raw);
+    let mut said: Vec<String> = Vec::new();
+    let mut rest = stripped.as_str();
+    while let Some(at) = rest.find("<user_query>") {
+        let after = &rest[at + "<user_query>".len()..];
+        let Some(end) = after.find("</user_query>") else { break };
+        let text = after[..end].trim();
+        if text.chars().count() >= 1 {
+            said.push(text.to_string());
+        }
+        rest = &after[end + "</user_query>".len()..];
+    }
+    if !said.is_empty() {
+        let joined = said.join("\n\n");
+        return if joined.chars().count() < 8 { None } else { Some(joined) };
+    }
+    // ── 闭标签残片开头：不是人话 ────────────────────────────────
+    // 真机 5 条的形状是 `</user_query>Please continue with…` —— 开标签被客户端
+    // 写坏/截断，闭标签落到了行首。这种残渣一律丢弃，它前面根本没有内容。
+    let fallback = skip_leading_close_tags(stripped.trim());
+    if fallback.is_empty() || is_harness_noise(fallback) {
+        return None;
+    }
+    // ── 兜底必须「像一句话」，不能是代码回显 ────────────────────
+    // 真机剩 3 条兜底里 2 条是 `"),\n  (""),\n  ...];` 这种代码中段（客户端把
+    // 工具结果回显塞进了 user 角色）。兜底本来就是为了兼容「直接写纯文本的客户端」，
+    // 判据取：含汉字 + 不以代码符号起头 + 不是 `looks_like_fragment` 的碎片。
+    if !fallback.chars().any(is_cjk) || looks_like_fragment(fallback) {
+        return None;
+    }
+    Some(fallback.to_string())
+}
+
+/// 是不是汉字（CJK 统一表意文字基本区 + 扩展 A）。
+fn is_cjk(ch: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&ch) || ('\u{3400}'..='\u{4dbf}').contains(&ch)
+}
+
+/// 吃掉行首连续的 `</名字>` 残片，返回剩下的正文。
+fn skip_leading_close_tags(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    loop {
+        if !rest.starts_with("</") {
+            return rest;
+        }
+        let Some(gt) = rest.find('>') else { return rest };
+        // 只认「`</` + 名字 + `>`」这种紧贴形态，中间不能有空格（有空格就是在写正文）
+        let name = &rest[2..gt];
+        if name.is_empty() || name.contains(char::is_whitespace) {
+            return rest;
+        }
+        rest = rest[gt + 1..].trim_start();
+    }
+}
+
+/// 整块删掉客户端注入的成对标签块（含内容）。
+///
+/// 只删**成对**的：有开标签就必须找到对应闭标签才删。缺闭标签时原样保留 ——
+/// 半截标签更可能是正文里在讨论这个标签，删了会把真实讨论吃掉。
+///
+/// 名单只收真机上出现过的、且**内容一定不是人话**的那几类：环境信封、两种客户端
+/// 摘要、后台任务回执、图片回执、工具调用壳。
+fn strip_client_blocks(raw: &str) -> String {
+    // (开标签, 闭标签)。开标签带属性，所以只比前缀，闭标签要比全。
+    const PAIRS: &[(&str, &str)] = &[
+        ("<system-reminder", "</system-reminder>"),
+        ("<environment_context", "</environment_context>"),
+        ("<environment-context", "</environment-context>"),
+        ("<conversation_history_summary", "</conversation_history_summary>"),
+        ("<cb_summary>", "</cb_summary>"),
+        ("<task-notification>", "</task-notification>"),
+        ("<antml:function_calls", "</antml:function_calls>"),
+    ];
+    let mut text = raw.to_string();
+    // 反复扫：信封套信封（`<system-reminder>` 里嵌 `<identity_context>`）时，
+    // 删掉外层一次就够；但同一段里可能有多组并列信封，所以循环到不再变化。
+    loop {
+        let before = text.len();
+        for (open, close) in PAIRS {
+            let mut from = 0usize;
+            let mut out = String::with_capacity(text.len());
+            let mut changed = false;
+            while let Some(at) = text[from..].find(open) {
+                let start = from + at;
+                let after_open = start + open.len();
+                let Some(rel_end) = text[after_open..].find(close) else { break };
+                let end = after_open + rel_end + close.len();
+                out.push_str(&text[from..start]);
+                changed = true;
+                from = end;
+            }
+            if changed {
+                out.push_str(&text[from..]);
+                text = out;
+            }
+        }
+        if text.len() == before {
+            break;
+        }
+    }
+    text
+}
+
 /// 客户端注入的上下文信封（不是对话内容）。与 AgentHub `isHarnessNoise` 同口径。
+///
+/// ── 这个判定现在只管「剥完还是信封」的残渣 ────────────────────
+/// 用户侧的真实原话由 [`human_words`] 从 `<user_query>` 里抽出来，剥块由
+/// [`strip_client_blocks`] 做。走到这里还没干净的情况只剩两种：
+///
+///   1. 助手侧整段就是一段客户端控制消息（`<task-notification>` 之类被写进
+///      assistant 角色的怪文件）；
+///   2. 用户侧剥完之后只剩一个孤零零的开标签（闭标签缺失，`strip_client_blocks`
+///      故意不删），实质没有内容。
+///
+/// 判据仍是「整段以此开头」：只截断正文里的标签不算（正文里讨论标签本身
+/// 是合法的，`system_reminder_with_attributes_is_stripped` 里有这条用例）。
 fn is_harness_noise(text: &str) -> bool {
+    const ENVELOPES: &[&str] = &[
+        "<system-reminder",
+        "<environment_context",
+        "<environment-context",
+        // 客户端压缩出来的会话摘要 —— 不是用户说的话
+        "<conversation_history_summary",
+        "<cb_summary>",
+        "<summary>",
+        "<session",
+        // 客户端控制消息
+        "<task-notification",
+        "Please continue with the conversation based on",
+        // 工具回执尾巴（`<task-notification>` 块被剥掉之后剩下的就是这几句）
+        "Use the TaskOutput tool with task_id=",
+        "IMPORTANT: Before responding, scroll back to the user's request",
+        "The user cancelled this task.",
+        // 工具回执
+        "Attached image(s) from tool result:",
+        "<antml:function_calls",
+        "<function_calls>",
+        "<tool_call>",
+        "<tool_calls>",
+    ];
     let trimmed = text.trim_start();
-    trimmed.starts_with("<system-reminder")
-        || trimmed.starts_with("<environment_context")
-        || trimmed.starts_with("<environment-context")
+    ENVELOPES.iter().any(|prefix| trimmed.starts_with(prefix))
 }
 
 /// 从一行 JSON 里尽力取「原始发生时间」的毫秒时间戳。
@@ -774,71 +944,64 @@ fn push_unique(out: &mut Vec<String>, text: &str) {
     out.push(trimmed.to_string());
 }
 
-/// 读会话记录：从 `from` 字节开始，最多读 [`MAX_TRANSCRIPT_BYTES`]，返回正文与
-/// **下一个游标位置**。
+/// 按行流式读会话记录：从 `from` 字节开始逐行回调，返回**下一个游标**。
 ///
-/// ── 为什么必须是「从上次的位置接着读」而不是「每轮读尾部」────────────
-/// 尾部读仍然每轮把最后 8 MB 重新解析一遍。当前会话是边聊边写的，mtime 每几秒
-/// 变一次，于是每轮增量任务都要为同一段内容付一次 8 MB 的 IO + 解析 + 上千次
-/// hash 去重。AgentHub 的做法是 per-file 字节游标（`readNewLines(fd, fromByte)`）：
-/// 读过的地方不再读。这里对齐同一口径 —— 游标之前的字节一个都不碰。
+/// ── 为什么不能「一次 read_to_end 再 split」──────────────────
+/// 真机 2026-11-22 实测：本机 `~/.workbuddy/projects` 65 个会话文件共 **1.53 GB**，
+/// 其中单个会话 1.04 GB。旧实现用 `read_from` 一次读进 `String`，于是被
+/// `MAX_TRANSCRIPT_BYTES`（8 MB）挡住 —— **整体只读进 13%**（198 MB / 1528 MB），
+/// 1.04 GB 那个会话只读了尾部 8 MB：489 条用户提问只捞到 5 条（1%）。
+/// 用户看到的现象就是「导入了 2341 条，可我的真实记录远不止这些」。
 ///
-/// ── 三个边界 ────────────────────────────────────────────────
-/// 1. `from == 0` 且文件超过上限：只读尾部。这类文件是「升级前就在的老会话」，
-///    前面几十万行要么早已入库、要么是无关历史；从 0 读只会白付一次整份 IO。
+/// 流式读之后上限只受「单来源最多读多少文件」约束，不再按字节丢内容。
+///
+/// ── 三个边界（与旧 `read_from` 同口径）────────────────────────
+/// 1. `from == 0`：从文件头开始读，一个字节都不跳。
 /// 2. 文件变短（被轮转/截断）：`from > len` → 回到 0 重读，不能原地空转。
 /// 3. 末尾没有换行（正在写的最后一行）：游标停在最后一个完整行的末尾，下一轮
 ///    重读这一行。宁可多读一行，不能吞掉半行 JSON。
 ///
-/// 用 `from_utf8_lossy` 而不是 `read_to_string`：截断点可能落在一个多字节字符
-/// 中间，而「整个文件读不出来」比「有一个替换符」糟糕得多。
-fn read_from(path: &Path, from: u64, max_bytes: u64) -> std::io::Result<(String, u64)> {
-    use std::io::{Read, Seek, SeekFrom};
+/// 用 `from_utf8_lossy` 而不是 `read_line` 到 `String`：截断点可能落在一个多字节
+/// 字符中间，而「整个文件读不出来」比「有一个替换符」糟糕得多。
+fn for_each_line(
+    path: &Path,
+    from: u64,
+    mut visit: impl FnMut(&str) -> bool,
+) -> std::io::Result<u64> {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
-    let start = if from == 0 || from > len {
-        len.saturating_sub(max_bytes)
-    } else {
-        from
-    };
+    let start = if from > len { 0 } else { from };
     file.seek(SeekFrom::Start(start))?;
-    let want = (len - start).min(max_bytes);
-    let mut buffer = Vec::with_capacity(want as usize);
-    file.take(want).read_to_end(&mut buffer)?;
-
-    // 起点落在行中间才需要丢第一段：`from` 本身永远是「上一个完整行的末尾 +
-    // 1」，也就是行首；只有「首次读尾部」（start 被改成 len - max）才可能切进
-    // 半行。这两种情况必须分开 —— 全都丢的话，每次增量都会少掉游标后的第一行。
-    //
-    // `start == 0` 永远不丢：文件变短（`from > len`）时 start 会被拉回 0，
-    // 那是文件开头而不是半行。CI 上 `cursor_restarts_when_file_shrinks` 就是
-    // 因为漏了这个条件把唯一一行当成残片丢掉的。
-    let mid_line = start > 0 && start != from;
-    let body_start = if mid_line {
-        buffer
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|at| at + 1)
-            .unwrap_or(buffer.len())
-    } else {
-        0
-    };
-    // 只消费到最后一个完整行为止。
-    let last_nl = buffer.iter().rposition(|byte| *byte == b'\n');
-    let (body_end, next) = match last_nl {
-        Some(at) if at + 1 > body_start => (at + 1, start + at as u64 + 1),
-        _ => (buffer.len(), start + buffer.len() as u64),
-    };
-    let text = String::from_utf8_lossy(&buffer[body_start..body_end]).into_owned();
-    Ok((text, next.min(len)))
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let mut buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut cursor = start;
+    loop {
+        buffer.clear();
+        let read = reader.read_until(b'\n', &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        // 没读到换行 = 这是正在写的半行，不消费它（游标停在本行开头）
+        if buffer.last() != Some(&b'\n') {
+            break;
+        }
+        let line = String::from_utf8_lossy(&buffer);
+        cursor += read as u64;
+        if !visit(line.trim_end_matches(['\n', '\r'])) {
+            break;
+        }
+    }
+    Ok(cursor.min(len))
 }
 
-/// 读会话记录（从 0 开始，兼容旧调用）。见 [`read_from`]。
+/// 读会话记录（从 0 开始，兼容旧调用）。见 [`for_each_line`]。
 #[cfg(test)]
 fn read_transcript(path: &Path) -> std::io::Result<String> {
     read_tail(path, MAX_TRANSCRIPT_BYTES)
 }
+
 
 /// [`read_transcript`] 的本体，上限可注入 —— 测试用 64 字节就能覆盖
 /// 「文件远大于上限」这条分支，不必真造一个 9 MB 的文件。
@@ -894,6 +1057,17 @@ fn from_transcript(path: &Path, project: Option<String>) -> Vec<Pending> {
 /// 差异极大：`~/.workbuddy/projects/<编码后的工作区>/` 里，来源末级恒为
 /// `projects`，于是几千条不同项目的对话全被归进同一个 `projects` 项目。
 ///
+/// ── 为什么入参必须是**解码后**的文本 ─────────────────────────
+/// 真机 2026-11-22 发现：拿原始 JSONL 行去扫会得到 `nNote:` 这种项目名。
+/// 原因是 jsonl 里换行是 `\` + `n` 两个字符，`Workspace Folder: C:\\Users\\…\\demo\nNote:`
+/// 后面的 `\n` 被当成了目录名的第一个字符，`split('\\')` 之后就落出 `nNote:`。
+/// 全部 55 个会话都会被归进同一个假项目 `nNote:` —— 和当年 `projects` 那个事故
+/// 一模一样的形状。
+///
+/// 修法是让调用方传**已 `serde_json` 解码**的正文（`line_to_turn` 里那份），
+/// 解码之后换行是真换行，`split` 天然截断。`raw_head` 只在 `for_each_line`
+/// 里拼接解码后的文本，所以这里不需要再解一次。
+///
 /// ── 认哪些声明 ───────────────────────────────────────────────
 /// | 客户端 | 声明形态 |
 /// |---|---|
@@ -921,32 +1095,50 @@ fn declared_project_of(raw: &str) -> Option<String> {
         let rest = rest.trim_start_matches(|ch: char| {
             matches!(ch, ':' | '"' | '=' | '>' | ' ' | '\t')
         });
-        // 路径到引号 / 换行 / 尖括号为止
-        let path = rest
-            .split(|ch: char| matches!(ch, '"' | '\n' | '\r' | '<' | '>'))
-            .next()
-            .unwrap_or("")
+        // ── 路径到「不可能是路径字符」为止 ──────────────────────
+        // 早先只按 `"` `\n` `<` `>` 截断。真机上 `Workspace Folder: C:\a\demo\nNote:`
+        // 因为解析后换行是真换行，看着没事；但有些客户端把整段信封压成一行，
+        // 声明后面紧跟 `Note: Prefer using…`，于是尾巴会被一起吃进目录名。
+        //
+        // 两刀：
+        //   1. 只吃到引号/换行/尖括号/竖线这类**绝不可能是路径**的字符；
+        //   2. 再按冒号截一刀 —— 冒号在 Windows 路径里只出现在盘符（`C:`，下标 1），
+        //      出现在更后面一律意味着「说明性文字开始了」。
+        let rough: String = rest
+            .chars()
+            .take_while(|ch| !matches!(ch, '"' | '\n' | '\r' | '<' | '>' | '|' | '\u{0}'))
+            .collect();
+        let path = match rough.char_indices().skip(1).find(|(_, ch)| *ch == ':') {
+            Some((at, _)) => &rough[..at],
+            None => rough.as_str(),
+        };
+        let path = path
             .trim()
             .trim_end_matches(|ch: char| matches!(ch, '\\' | '/' | '。' | '.' | ','));
-        if path.is_empty() {
-            continue;
+        if let Some(name) = project_name_of_path(path) {
+            return Some(name);
         }
-        // 末级目录名：Windows 反斜杠与 Unix 正斜杠都算分隔符。
-        // ⚠️ 这里不能用 `?`：`declared_project_of` 返回 Option，`?` 会直接
-        // 结束整个函数（而不是「跳过这个 key 看下一个」）—— 第一个 key 命中但
-        // 末尾带斜杠时，后面所有 key 就再也不会被检查了。
-        let Some(name) = path.rsplit(|ch| ch == '\\' || ch == '/').find(|part| !part.trim().is_empty())
-        else {
-            continue;
-        };
-        let name = name.trim();
-        // 盘符（`C:`）、纯数字、单字符都不像项目名 —— 宁可退回来源名
-        if name.len() < 3 || name.ends_with(':') || name.chars().all(|ch| ch.is_ascii_digit()) {
-            continue;
-        }
-        return Some(name.to_string());
     }
     None
+}
+
+/// 从一条路径里取「像项目名」的末级目录名。
+///
+/// Windows 反斜杠与 Unix 正斜杠都算分隔符。以下都不像项目名，返回 `None`
+/// 让调用方继续看下一个候选：盘符（`C:`）、纯数字、单字符、空。
+fn project_name_of_path(path: &str) -> Option<String> {
+    let name = path
+        .rsplit(|ch| ch == '\\' || ch == '/')
+        .find(|part| !part.trim().is_empty())?
+        .trim();
+    if name.len() < 3 || name.ends_with(':') || name.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    // 名字里出现冒号 / 尖括号 / 引号：说明这不是路径，是「路径 + 说明性文字」粘在一起
+    if name.contains([':', '<', '>', '"', '\n', '\r']) {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// 导入条目的标题基数：优先会话里第一句像「事情」的话，退回文件名。
@@ -1032,9 +1224,58 @@ fn from_transcript_at(
         .file_stem()
         .map(|stem| stem.to_string_lossy().to_string())
         .filter(|stem| !stem.is_empty());
-    // 只读游标之后的新增部分：见 `read_from` 的说明。
-    let (raw, next) = match read_from(path, from, MAX_TRANSCRIPT_BYTES) {
-        Ok(pair) => pair,
+    // ── 流式读，顺手攒片段 ──────────────────────────────────────
+    // 不再把整份会话读进内存（见 `for_each_line`）：1 GB 的会话文件按行过一遍，
+    // 峰值内存只跟单行大小有关。片段数可能上万，但每条都是几百字的短文本。
+    let mut segments: Vec<(String, Option<i64>)> = Vec::new();
+    // 开头 40 KB 的**解码后**正文（`declared_project_of` 只扫这一段）。
+    // 必须是解码后的：原始 JSONL 里换行是 `\n` 两个字符，会把下一行的
+    // `Note:` 粘到路径末尾，产出 `nNote:` 这种假项目名（见 `declared_project_of`）。
+    let mut raw_head = String::new();
+    // ── 工作目录优先取**字段**，不靠从正文里捞 ──────────────────
+    // 真机 2026-11-22：WorkBuddy 的 jsonl 每行都带顶层 `"cwd"` 字段，
+    // 值就是 `C:\Users\me\WorkBuddy\2026-10-04-17-09-08`。字段级取值不会被
+    // 正文里的 `Note: Prefer using…` 尾巴污染，比 `Workspace Folder:` 文本匹配
+    // 稳得多（后者要靠「路径何时结束」的启发式）。文本匹配留着做其它客户端的兜底。
+    let mut cwd_field: Option<String> = None;
+    // 标题基数的来源优先级见 `title_from_session`：第一条用户原话 > 工作目录名 > 会话名
+    let mut first_user: Option<String> = None;
+    let next = match for_each_line(path, from, |line| {
+        if line.trim().is_empty() {
+            return true;
+        }
+        // 先攒头部：`declared_project_of` 只扫开头 40 KB，而工作目录就写在第一条
+        // 用户消息的环境信封里 —— 那条 `line_to_turn` 往往返回 None（整段是信封），
+        // 所以拼接必须在解析**之前**做，且拼的是**解码后**的文本（不是裸 JSONL）。
+        if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
+            if cwd_field.is_none() {
+                if let Some(cwd) = value.get("cwd").and_then(Value::as_str) {
+                    if !cwd.trim().is_empty() {
+                        cwd_field = Some(cwd.trim().to_string());
+                    }
+                }
+            }
+            if raw_head.chars().count() < 40_000 {
+                let mut parts: Vec<String> = Vec::new();
+                collect_text(&value, &mut parts);
+                raw_head.push_str(&parts.join("\n"));
+                raw_head.push('\n');
+            }
+        }
+        let Some((speaker, text, created)) = line_to_turn(line) else { return true };
+        if speaker == "我" && first_user.is_none() {
+            let candidate = text.lines().next().unwrap_or("").trim();
+            if candidate.chars().count() >= 6 {
+                first_user = Some(candidate.chars().take(60).collect());
+            }
+        }
+        let formatted = format!("**{speaker}**：{text}");
+        for piece in split_long(&formatted, CHUNK_CHARS) {
+            segments.push((piece, created));
+        }
+        true
+    }) {
+        Ok(cursor) => cursor,
         Err(error) => {
             return (
                 vec![Pending {
@@ -1051,9 +1292,6 @@ fn from_transcript_at(
             )
         }
     };
-    // 收成「一段发言一行」的片段：`(格式化正文, 该段原始时间)`。超长单段先单独切碎，
-    // 保证后面按窗口打包时每片都不会撑爆窗口。
-    let mut segments: Vec<(String, Option<i64>)> = Vec::new();
     // ── 项目名要按会话自己声明的工作目录修正 ────────────────────
     // 真机事故：导入把 `~/.workbuddy/projects` 这份来源的末级目录名
     // (`projects`) 当成项目名，3162 条全部落进一个叫 `projects` 的假项目，
@@ -1066,20 +1304,18 @@ fn from_transcript_at(
     // 「这个客户端把会话存在哪」）。
     //
     // 只在会话自己**说了**的时候才改：没说就沿用来源名，不能凭空造。
-    let declared_project = declared_project_of(&raw);
+    //
+    // 取值优先级：顶层 `cwd` 字段（结构化，最准）> 正文里的声明（其它客户端）。
+    let declared_project = cwd_field
+        .as_deref()
+        .and_then(project_name_of_path)
+        .or_else(|| declared_project_of(&raw_head));
     let project = declared_project.or(project);
-    for line in raw.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some((speaker, text, created)) = line_to_turn(line) {
-            let formatted = format!("**{speaker}**：{text}");
-            for piece in split_long(&formatted, CHUNK_CHARS) {
-                segments.push((piece, created));
-            }
-        }
-    }
-    let title_base = title_from_session(session.as_deref(), &raw);
+    // 标题优先用流式过程中抓到的第一条用户原话（可能在 40 KB 之后），退到
+    // `title_from_session` 的「工作目录名 > 会话名」兜底。
+    let title_base = first_user
+        .or_else(|| Some(title_from_session(session.as_deref(), &raw_head)))
+        .unwrap_or_else(|| "会话记录".to_string());
     let total_chars: usize = segments.iter().map(|(text, _)| text.chars().count()).sum();
     if segments.is_empty() || total_chars < MIN_BODY_CHARS {
         return (
@@ -1115,6 +1351,16 @@ fn from_transcript_at(
         };
         let skip = if body.chars().count() < MIN_BODY_CHARS {
             Some("窗口内容太短".to_string())
+        } else if looks_like_fragment(&body) {
+            // ── 为什么要在「写进库」这一步拦碎片 ──────────────────
+            // 真机 2026-11-22：5973 条导入记忆里抽查 30 条，绝大多数是从
+            // 代码行中间开始的碎片（`move("weekly");`、`ng":"  # ① 有…`）。
+            // 光靠 `split_long` 找行边界不够 —— 一条 5 万字的 assistant 消息
+            // 里全是代码，每 8000 字一个切点，切点两边都是代码。
+            //
+            // 判据：窗口**首行**就是代码 / 标记 / 命令，或者整窗没有自然语言
+            // 句子。这类窗口留着的唯一作用是让注入把 shell 脚本当经验塞给模型。
+            Some("窗口是代码/工具切片".to_string())
         } else {
             sensitive_hit(&body).map(|label| format!("含{label}"))
         };
@@ -1132,6 +1378,96 @@ fn from_transcript_at(
     (out, next)
 }
 
+/// 这一窗内容是不是「代码 / 工具输出的切片」，而不是一段人话。
+///
+/// ── 这道闸现在只管一件事：`split_long` 切出来的裸中段 ────────
+/// 窗口有两种来源：
+///
+///   1. `pack_windows` 按**轮次**打包 —— 每片是 `**我**：…` 或 `**助手**：…`，
+///      天然带说话人前缀。这类窗口**必然**是对话，不该判碎片（哪怕用户问的是
+///      「这段代码哪里错」，窗里全是代码，那也是有效对话）。
+///   2. `split_long` 把一条超长发言从中间切开 —— 中段是**裸文本**，没有说话人
+///      前缀，可能从半行代码起头。这类才是要拦的。
+///
+/// 早先没有这个豁免，`looks_like_fragment` 会按「首行以 `{` / `}` / `;` 结尾」
+/// 把「用户贴代码问问题」的整窗判成碎片 —— 而真机上 assistant 消息 p50 只有
+/// 61 字、p99 1890 字，绝大多数窗口首行就是一句短结论，反而幸免；真正该拦的
+/// 裸中段却因为首行碰巧是中文注释而漏过。判据挂错了对象。
+///
+/// 判据（仅对裸中段生效，命中任一即判碎片）：
+///
+///   1. **首行**以代码/标记起头：`{` `}` `$` `> ` 或者以 `</` 起头（标签闭合残片）
+///   2. 首行是「半行代码」：有 `");` `},` `),` 这类结尾，且没有句末标点
+///   3. 整窗没有一句话：没有 `。！？` 也没有 `. ` + 至少 20 个汉字的连续段落
+fn looks_like_fragment(body: &str) -> bool {
+    let text = body.trim();
+    if text.is_empty() {
+        return true;
+    }
+    // ── 豁免：带说话人前缀的窗口是对话，不判碎片 ──────────────
+    // `pack_windows` 拼出来的窗口每条发言都以 `**我**：` / `**助手**：` 起头。
+    // 只要窗里有一行是这样的，这就是一段真对话（哪怕内容是代码）。
+    if text.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("**我**：")
+            || line.starts_with("**助手**：")
+            || line.starts_with("我：")
+            || line.starts_with("助手：")
+    }) {
+        return false;
+    }
+    let first = text.lines().next().unwrap_or("").trim();
+    // 1) 首行是标签闭合残片 / JSON 尾巴 / shell 提示
+    if first.starts_with("</")
+        || first.starts_with('}')
+        || first.starts_with('{')
+        || first.starts_with("&& ")
+        || first.starts_with("|| ")
+        || first.starts_with('$')
+    {
+        return true;
+    }
+    // 2) 首行是半行代码：以代码符号结尾且没有中文句末标点
+    let ends_like_code = first.ends_with("\");")
+        || first.ends_with("},")
+        || first.ends_with("),")
+        || first.ends_with(";")
+        || first.ends_with("=>")
+        || first.ends_with('\\')
+        || first.ends_with('`');
+    let has_sentence_punct = first.contains('。') || first.contains('！') || first.contains('？');
+    if ends_like_code && !has_sentence_punct {
+        return true;
+    }
+    // 3) 整窗没有自然语言：没有任何中文句末标点，且英文字母/中文都在代码块里
+    let has_cjk_sentence = text.contains('。') || text.contains('！') || text.contains('？');
+    if has_cjk_sentence {
+        return false;
+    }
+    // 没有中文句末标点时，看有没有「一段连续的自然语言」。判据取「至少一行
+    // 以汉字或英文字母起头、长度 ≥ 20、且不以分号/花括号/反引号结尾」。
+    for line in text.lines().take(40) {
+        let line = line.trim();
+        if line.chars().count() < 20 {
+            continue;
+        }
+        let starts_wordy = line
+            .chars()
+            .next()
+            .map(|c| c.is_alphabetic() || is_cjk(c))
+            .unwrap_or(false);
+        let ends_code = line.ends_with(';')
+            || line.ends_with('{')
+            || line.ends_with('}')
+            || line.ends_with(',')
+            || line.ends_with('`');
+        if starts_wordy && !ends_code {
+            return false;
+        }
+    }
+    true
+}
+
 /// 把一段超长文本按 `limit` 字数切开（相邻片重叠 `CHUNK_OVERLAP/2`）。
 ///
 /// ── 快路径为什么必须在前 ────────────────────────────────────
@@ -1146,18 +1482,70 @@ fn split_long(text: &str, limit: usize) -> Vec<String> {
     }
     let chars: Vec<char> = text.chars().collect();
     let total = chars.len();
-    let step = limit.saturating_sub(CHUNK_OVERLAP / 2).max(1);
+    // 重叠预算的一半作为「往前找切点」的回退纵深：切点最多退到这里，再退就
+    // 把重叠吃掉大半。
+    let min_step = limit.saturating_sub(CHUNK_OVERLAP / 2).max(1);
     let mut out: Vec<String> = Vec::new();
     let mut start = 0usize;
     while start < total {
-        let end = (start + limit).min(total);
+        let hard_end = (start + limit).min(total);
+        // ── 切点必须是「句子/行边界」，不能是字符中间 ──────────────
+        // 真机事故（2026-11-22）：按 8000 字硬切，切点落在代码行中间，
+        // 于是库里出现大量以 `ng":"                # ① 有 RefreshToken`、
+        // `move("weekly");`、`- 禁用控件；` 起头的碎片 —— 这些碎片注入时
+        // 会被当成「相关经验」。
+        //
+        // 回退顺序：段落空行 > 换行 > 句末标点 > 硬切（保底）。
+        // 只往前退到 `min_step`，保证每次至少推进 `limit - step` 个字，
+        // 不会退到原地打转。
+        let end = if hard_end < total {
+            pick_break(&chars, start + min_step, hard_end).unwrap_or(hard_end)
+        } else {
+            hard_end
+        };
         out.push(chars[start..end].iter().collect());
         if end >= total {
             break;
         }
-        start += step;
+        start = if end > start { end } else { start + min_step };
     }
     out
+}
+
+/// 在 `[from, to)` 里从后往前找最合适的切点，返回切点下标（切点本身归下一段）。
+///
+/// 优先级：`\n\n`（段落）> `\n`（行）> `。！？.!?`（句）> `None`（交给硬切）。
+///
+/// 切在代码块中间会产出「从半行代码开始」的碎片，但退到段落边界往往要退很远
+/// （整段代码可能几万字）。折中：行边界照收 —— 后面 `looks_like_fragment`
+/// 会在导入时把「首行是代码」的窗口整条跳过，比在这里硬退更可控
+/// （宁可留一条，也不要一次退掉整个窗口）。
+fn pick_break(chars: &[char], from: usize, to: usize) -> Option<usize> {
+    // 段落优先：`\n\n`
+    let mut i = to.saturating_sub(1);
+    while i > from {
+        if chars[i] == '\n' && i >= 1 && chars[i - 1] == '\n' {
+            return Some(i + 1);
+        }
+        i -= 1;
+    }
+    // 行边界
+    let mut i = to.saturating_sub(1);
+    while i > from {
+        if chars[i] == '\n' {
+            return Some(i + 1);
+        }
+        i -= 1;
+    }
+    // 句末标点（中英文）
+    let mut i = to.saturating_sub(1);
+    while i > from {
+        if matches!(chars[i], '。' | '！' | '？' | '.' | '!' | '?') {
+            return Some(i + 1);
+        }
+        i -= 1;
+    }
+    None
 }
 
 /// 按 `CHUNK_CHARS` 把片段序列打包成若干窗口（每个窗口是一串片段下标）。
@@ -2973,5 +3361,229 @@ mod tests {
         assert!(!first.get("duplicate").and_then(Value::as_bool).unwrap_or(false));
         let second = writer.write(make()).expect("第二次不该报错");
         assert!(second.get("duplicate").and_then(Value::as_bool).unwrap_or(false), "同批同内容应判重复");
+    }
+
+    #[test]
+    fn client_envelopes_are_not_user_words() {
+        // 真机 2026-11-22：导入 5973 条里 546 条用户侧是
+        // `<conversation_history_summary>`，162 条 `<cb_summary>`，99 条
+        // `Please continue…`。旧名单只认 `<system-reminder>` /
+        // `<environment_context>`，于是这些全被当成用户原话写进库。
+        for text in [
+            "<conversation_history_summary>\nSummary:\n1. Primary Request…",
+            "<cb_summary>\nSummary of the conversation so far:",
+            "<system-reminder data-role=\"user-context\">\n<user_info>",
+            "<environment_context>cwd=/x</environment_context>",
+            "<task-notification>\n<task-id>x</task-id>",
+            "Please continue with the conversation based on the summarized context above.",
+            "Attached image(s) from tool result:",
+            "<antml:function_calls>",
+        ] {
+            assert!(is_harness_noise(text), "应当判成客户端信封: {}", &text[..30.min(text.len())]);
+        }
+        // 正文里**提到**这些标签不算信封（讨论标签本身是合法的）
+        assert!(!is_harness_noise("我在改 strip_paired_tag，让它认 <system-reminder data-role> 这种带属性的开标签。"));
+        assert!(!is_harness_noise("把 qoder 签到修好"));
+    }
+
+    #[test]
+    fn code_slices_are_not_memories() {
+        // 真机 2026-11-22 抽查到的真形状，全部应判碎片
+        for body in [
+            "ng\":\"                # ① 有 RefreshToken → 走 App 式续期（抓包 16/17）",
+            "move(\"weekly\");\n         entry.remove(\"weeklyTime\");",
+            "</result>\n</previous_tool_call>",
+            "}\n\n**助手**：继续",
+            "$PATH\"\\nIMG=\"C:/Users/me/a.jpg\"",
+            "- 禁用控件；\n   - 保留值，允许导入导出配置兼容。",
+        ] {
+            assert!(looks_like_fragment(body), "应当判碎片: {}", &body[..30.min(body.len())]);
+        }
+        // 正常人话不能误伤 —— 这几条是库里的真记忆
+        for body in [
+            "**我**：动第一批，第二批和第三批我还没理解是什么意思，需要你解释\n\n**助手**：现在开始写第一批。第一件事：把 information_score 加进 model.rs。",
+            "**助手**：## 诊断结果：AutoClaw 国内版上游的预校验拒收（406 空响应体），不是账号问题",
+            "**助手**：实测确认：titleBoost=3 确实把「标题命中」翻到了「正文命中」前面。",
+            "**我**：qoder签到有问题，供应商目录里没有qoder，但点击统一签到后，还是会去签qoder",
+        ] {
+            assert!(!looks_like_fragment(body), "不该判碎片: {}", &body[..30.min(body.len())]);
+        }
+    }
+
+    #[test]
+    fn split_long_cuts_at_line_boundaries() {
+        // 8000 字硬切会落在代码行中间。这里构造一行一行的文本，切完每片
+        // 都应当是「完整的行前缀」，不能从半行开始。
+        let mut text = String::new();
+        for i in 0..500 {
+            text.push_str(&format!("第 {i} 行：这是一段用来测试切点位置的说明文字，需要足够长才有意义。\n"));
+        }
+        let parts = split_long(&text, 800);
+        assert!(parts.len() > 1, "应当被切成多片");
+        for part in &parts {
+            // 每片都应以换行结尾（或在最后），不应停在半句话中间
+            let first = part.lines().next().unwrap_or("");
+            assert!(first.starts_with("第 "), "每片首行应是完整的一行: {first}");
+        }
+    }
+
+    /// 用户原话埋在 `<system-reminder>` 信封里的 `<user_query>` 中 —— 必须抽出来。
+    ///
+    /// ── 真机根因（2026-11-22）──────────────────────────────────
+    /// 扫本机 65 个 WorkBuddy 会话（1.53 GB，2464 条用户消息）形状分布：
+    ///
+    /// ```text
+    ///  1009  <system-reminder …> 几千字环境信息 + <user_query>真话</user_query>
+    ///   617  <task-notification>…</task-notification>
+    ///   335  <conversation_history_summary>…</…>
+    ///   300  Please continue with the conversation based on…
+    ///   195  <system-reminder …> 独立一段（只有环境信息）
+    ///   1    <user_query>…</user_query>
+    /// ```
+    ///
+    /// 旧实现只有「整段以信封开头 → 整条丢弃」，于是 **1009 条真实诉求全部丢弃**；
+    /// 侥幸落库的是几千字 `<user_info>` / `SOUL.md` 模板，5973 条导入记忆里
+    /// 一条人话都没有。这条测试把「抽」这件事钉死。
+    #[test]
+    fn user_words_are_lifted_out_of_the_envelope() {
+        let raw = concat!(
+            "<system-reminder data-role=\"user-context\">\n",
+            "<user_info>\nOS Version: win32\nWorkspace Folder: C:\\Work\\demo\n</user_info>\n",
+            "<identity_context>\n## SOUL.md\nYou're not a chatbot. You're becoming someone.\n</identity_context>\n",
+            "</system-reminder>\n",
+            "<user_query>导入过程中如果切换标签界面，导入任务好像会被中断</user_query>"
+        );
+        let got = human_words(raw).expect("应能抽出用户原话");
+        assert_eq!(got, "导入过程中如果切换标签界面，导入任务好像会被中断");
+        assert!(!got.contains("SOUL.md"), "环境信封不能进正文：{got}");
+        assert!(!got.contains("win32"), "环境信封不能进正文：{got}");
+
+        // 摘要块里的 `user_query` 是「历史提问」，不是这一轮用户在说话
+        let raw = concat!(
+            "<conversation_history_summary>\nSummary:\n上一轮用户问：",
+            "<user_query>三天前的旧问题不该被当成这一轮</user_query>\n",
+            "</conversation_history_summary>\n",
+            "<user_query>这一轮的真问题是什么</user_query>"
+        );
+        assert_eq!(human_words(raw).as_deref(), Some("这一轮的真问题是什么"));
+
+        // 只有环境信封、没有话：直接丢
+        let raw = concat!(
+            "<system-reminder data-role=\"user-context\">\n<current_time>2026-11-22</current_time>\n",
+            "</system-reminder>"
+        );
+        assert_eq!(human_words(raw), None, "只有信封没有话，不该产出用户侧");
+
+        // 续跑指令不是用户原话
+        assert_eq!(
+            human_words("Please continue with the conversation based on the summarized context above."),
+            None
+        );
+
+        // 工具回执尾巴（`<task-notification>` 剥掉之后剩下的提示语）
+        assert_eq!(
+            human_words(concat!(
+                "<task-notification>\n<task-id>b1l36p</task-id>\n</task-notification>\n\n",
+                "Use the TaskOutput tool with task_id=\"b1l36p\" to retrieve the full output if you need to act on it."
+            )),
+            None
+        );
+
+        // 闭标签残片开头（客户端把开标签写坏了）
+        assert_eq!(
+            human_words("</user_query>Please continue with the conversation based on the summarized context above."),
+            None
+        );
+
+        // 直接写纯文本的客户端（Claude Code / Codex 某些形态）：兜底认它
+        assert_eq!(
+            human_words("端口固定 3065，网关和客户端都要改这里").as_deref(),
+            Some("端口固定 3065，网关和客户端都要改这里")
+        );
+
+        // 兜底不能把代码回显当人话
+        assert_eq!(human_words("),\n  (\"\"),\n  (\"\"),\n];\nlet mut out = text.to_string();"), None);
+    }
+
+    /// 1 GB 的会话文件必须能被完整读到，不能只读尾部 8 MB。
+    ///
+    /// ── 真机根因（2026-11-22）──────────────────────────────────
+    /// `~/.workbuddy/projects` 65 个会话共 1.53 GB，其中一个 1.04 GB。
+    /// 旧 `read_from` 硬上限 `MAX_TRANSCRIPT_BYTES`（8 MB）且「首次读尾部」，
+    /// 于是整体只读进 13%（198 MB / 1528 MB）；1.04 GB 那个会话里 489 条
+    /// 用户提问只捞到 5 条（1%）。
+    ///
+    /// 这条测试造一个远超 8 MB 的文件，要求首行和末行都被读到。
+    #[test]
+    fn huge_transcript_is_read_in_full_not_just_the_tail() {
+        let dir = std::env::temp_dir()
+            .join(format!("mem-import-huge-{}", crate::server::logging::now_ms()));
+        std::fs::create_dir_all(&dir).ok();
+        let file = dir.join("huge.jsonl");
+
+        // 每行 ~1 KB × 20000 行 ≈ 20 MB，足够越过 8 MB 上限
+        let mut text = String::with_capacity(21 * 1024 * 1024);
+        text.push_str(r#"{"role":"user","content":"第一行：网关端口固定 3065，不要改"}"#);
+        text.push('\n');
+        for index in 0..20_000 {
+            let pad = "x".repeat(900);
+            text.push_str(&format!(
+                r#"{{"role":"tool","content":"filler {index} {pad}"}}"#
+            ));
+            text.push('\n');
+        }
+        text.push_str(r#"{"role":"user","content":"最后一行：把 qoder 签到修好"}"#);
+        text.push('\n');
+        std::fs::write(&file, &text).ok();
+        assert!(
+            std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0) > MAX_TRANSCRIPT_BYTES,
+            "测试文件必须大于旧的 8 MB 上限"
+        );
+
+        let windows = from_transcript(&file, Some("huge".to_string()));
+        let joined: String = windows.iter().map(|item| item.body.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("第一行：网关端口固定 3065"), "文件开头不能被丢掉");
+        assert!(joined.contains("最后一行：把 qoder 签到修好"), "文件末尾不能被丢掉");
+        assert!(
+            windows.iter().all(|item| item.skip.is_none()),
+            "全部窗口都该可导入，实得跳过原因：{:?}",
+            windows.iter().filter_map(|item| item.skip.clone()).collect::<Vec<_>>()
+        );
+
+        // 游标必须走到文件末尾，下一轮不会重读这 20 MB
+        let cursor = for_each_line(&file, 0, |_| true).expect("流式读应成功");
+        assert_eq!(cursor, std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0), "游标应停在文件末尾");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 标题优先取第一条用户原话，且必须是从信封里抽出来的那句。
+    #[test]
+    fn window_title_uses_the_real_user_sentence() {
+        let dir = std::env::temp_dir()
+            .join(format!("mem-import-title-{}", crate::server::logging::now_ms()));
+        std::fs::create_dir_all(&dir).ok();
+        let file = dir.join("538e6914-d5c6-486e-8635-a90ef475b1c9.jsonl");
+        std::fs::write(
+            &file,
+            concat!(
+                r#"{"role":"user","content":"<system-reminder data-role=\"user-context\"><user_info>Workspace Folder: C:\\Work\\demo</user_info></system-reminder><user_query>仪表盘的记忆库读数为什么一直是 0</user_query>"}"#,
+                "\n",
+                r#"{"role":"assistant","content":"根因是索引库的全局 Mutex 被 rebuild 独占。"}"#,
+                "\n"
+            ),
+        )
+        .ok();
+
+        let windows = from_transcript(&file, Some("projects".to_string()));
+        assert_eq!(windows.len(), 1, "短会话应只有一个窗口");
+        let title = &windows[0].title;
+        assert!(title.starts_with("仪表盘的记忆库读数"), "标题应是用户原话：{title}");
+        assert!(!title.contains("538e6914"), "不能拿裸 UUID 当标题：{title}");
+        assert!(!title.contains("user_info"), "不能拿信封当标题：{title}");
+        // 项目名按会话自己声明的工作目录修正，不是来源末级目录 `projects`
+        assert_eq!(windows[0].project.as_deref(), Some("demo"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
