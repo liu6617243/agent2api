@@ -76,9 +76,13 @@ const POLL = 15_000
 // 缺 `workflow` scope，GitHub 直接拒：
 //   refusing to allow a Personal Access Token to create or update workflow
 //   `.github/workflows/rust-tests.yml` without `workflow` scope
-// 后来走 `scripts/push-workflows.mjs`（Contents API PUT）把它真删了，见 §62。
-// 这里的跳过逻辑保留成**安全网**：matrix 万一被上游重放带回来、或者在
-// GitHub 网页上被改回去，交付仍然不会被 macOS 挡住。
+// 后来试过两条路，都堵在同一个 scope 上：
+//   · `node scripts/push-workflows.mjs`（Contents API PUT）→ 403，同一个 token；
+//     GET 能读（200），PUT 才要 `workflow` scope。
+//   · 删 matrix 的那个 commit 暂存在本地分支 `ci/rust-tests-no-macos`，
+//     等有 workflow scope 的凭据再落（`git push origin ci/rust-tests-no-macos`
+//     之后网页开 PR，或用带 scope 的 token 直接推）。
+// 所以这里的跳过逻辑是**当前唯一生效**的手段，不要删。
 //
 // 想恢复三平台判定：`A2A_SKIP_OS= node scripts/deliver.mjs`（空串 = 不跳过）。
 const SKIP_OS = (process.env.A2A_SKIP_OS ?? 'macos')
