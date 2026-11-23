@@ -21,16 +21,29 @@
 //   ok     全部成功（或只剩 skipped / neutral）
 //
 // code 永远不自动重跑；infra / soft 可以自动重跑 —— 它们没有代码证据。
+//
+// ── ignore：整类 job 不算数（2026-11-24）───────────────────────────
+// 本 fork 只出一个 Windows 安装包，macOS job 没有任何产出去处，却经常排队
+// 半小时以上、或者分到 runner 后 0 个步骤被判 cancelled。调用方可以传
+// `ignore: ['(macos-latest)']` 把它整个排除在判定之外 —— 排除的是「这个平台的
+// 结论」，不是「失败可以不管」：其它平台仍然逐条按上面的判据判。
 // ─────────────────────────────────────────────────────────────────────
 
 const OK_CONCLUSIONS = new Set(['success', 'skipped', 'neutral'])
 
-export function jobVerdict(jobs) {
+/** job 名里含任一 pattern 就当它不存在（见上面 ignore 那段）。 */
+export function ignoredJob(job, ignore = []) {
+  const name = String(job?.name || '')
+  return (ignore || []).some((pattern) => pattern && name.includes(pattern))
+}
+
+export function jobVerdict(jobs, { ignore = [] } = {}) {
   const real = [] // 有失败步骤 —— 代码问题
   const infra = [] // 一个步骤都没跑
   const soft = [] // 跑过步骤，但被取消
 
   for (const job of jobs || []) {
+    if (ignoredJob(job, ignore)) continue
     const steps = job.steps || []
     const badStep = steps.find((s) => s.conclusion === 'failure')
     if (badStep) {
