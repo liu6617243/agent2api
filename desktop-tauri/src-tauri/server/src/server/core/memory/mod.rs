@@ -873,8 +873,21 @@ pub fn projects() -> Value {
                 .filter(|entry| entry_project_slug(entry) == project.slug)
                 .collect();
             entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-            let l1 = entries.iter().filter(|entry| entry.layer == Layer::L1).count();
-            let l2 = entries.iter().filter(|entry| entry.layer == Layer::L2).count();
+            // 与 `status()` 同一口径：画像（`kind = Profile`）是派生品，不混进
+            // 「流水 / 沉淀」两个数字。项目卡上那个 `L2: N` 若含画像，用户每点一次
+            // 「重生成画像」，通用项目那张卡的 L2 就涨十几条，而沉淀一条没多 ——
+            // 与仪表盘「深层记忆」是同一种误导，只是换了个位置。
+            // 恒等式：`l1 + l2 + profile == count`（三者都从 `entries` 里数，
+            // 而 `entries` 已排掉草稿，所以这里不需要再扣）。
+            let profile = entries.iter().filter(|entry| entry.kind == MemoryKind::Profile).count();
+            let l1 = entries
+                .iter()
+                .filter(|entry| entry.layer == Layer::L1 && entry.kind != MemoryKind::Profile)
+                .count();
+            let l2 = entries
+                .iter()
+                .filter(|entry| entry.layer == Layer::L2 && entry.kind != MemoryKind::Profile)
+                .count();
             // 草稿单独数：项目卡上的 `count` 是「这个项目有多少条真记忆」。
             // 把未确认的抽取草稿算进去，用户会以为这个项目已经积累了一堆结论，
             // 而检索里搜不到其中任何一条。
@@ -896,6 +909,9 @@ pub fn projects() -> Value {
                 "count": entries.len(),
                 "l1": l1,
                 "l2": l2,
+                // 画像单列（见上面 `l1` / `l2` 的注释）。老前端没有这个字段的
+                // 消费方，多一个键不影响任何现有渲染。
+                "profile": profile,
                 "candidates": candidates,
                 "updatedAt": latest,
                 "updatedText": search::relative_time(latest, now),
@@ -925,8 +941,16 @@ pub fn projects() -> Value {
     let general = json!({
         "slug": store::GLOBAL_SLUG,
         "count": general_entries.len(),
-        "l1": general_entries.iter().filter(|entry| entry.layer == Layer::L1).count(),
-        "l2": general_entries.iter().filter(|entry| entry.layer == Layer::L2).count(),
+        // 与列表里那张卡同一口径（画像单列，见上面 `profile` 的注释）。
+        "l1": general_entries
+            .iter()
+            .filter(|entry| entry.layer == Layer::L1 && entry.kind != MemoryKind::Profile)
+            .count(),
+        "l2": general_entries
+            .iter()
+            .filter(|entry| entry.layer == Layer::L2 && entry.kind != MemoryKind::Profile)
+            .count(),
+        "profile": general_entries.iter().filter(|entry| entry.kind == MemoryKind::Profile).count(),
         "candidates": general_candidates,
         "latest": general_entries
             .iter()
@@ -1280,8 +1304,42 @@ pub fn status_with(with_tables: bool) -> Value {
         .iter()
         .filter(|entry| entry.superseded_by.is_some() && entry.deleted_at.is_none())
         .count();
-    let l1 = entries.iter().filter(|entry| entry.is_trusted() && entry.layer == Layer::L1).count();
-    let l2 = entries.iter().filter(|entry| entry.is_trusted() && entry.layer == Layer::L2).count();
+    // ── 画像不算「深层记忆」─────────────────────────────────────
+    //
+    // 画像（`kind = Profile`）是模型从深层记忆里归纳出的**派生品**。它自己也
+    // 落在 l2 层（复用演化链、回收站、置顶那一套机制），但语义上和「流水反复
+    // 确认后沉淀的结论」完全不是一回事：后者要攒够 `PROMOTE_AFTER_REINFORCE`
+    // 条证据才升层，前者一次生成就有十几条。
+    //
+    // 混在一个计数器里的后果是真机实测到的：仪表盘报「深层记忆 68」，用户问
+    // 「怎么一轮对话涨了 16 条」—— 而那 16 条全是刚生成的画像。数字本身没错，
+    // 但它回答的不是用户问的那个问题，而且会让「反复出现才固化」这条承诺看起来
+    // 是假的。
+    //
+    // 所以拆成两个数：`l2` 只数真沉淀，`profile` 单独给画像。
+    //
+    // 恒等式：`l1 + l2 + profile == trusted + 未被反驳的草稿`。
+    //
+    // 为什么右边不是直接写 `candidates`：`candidates` 的口径是 `is_live() && 草稿`，
+    // **含被判错的草稿**；而左边三个桶都走 `is_trusted()`，把被判错的排掉了。
+    // 一条草稿被标成「这条错了」之后，`candidates` 仍数它、左边不数它 ——
+    // 右边会凭空多 1。正常库里没有「被判错的草稿」（草稿不进检索，用户看不到、
+    // 也就无从反驳），但恒等式不能靠这个巧合成立，所以写成精确口径。
+    // 真机核对（全部草稿可信时两者重合）：164 + 68 + 0 = 232，228 + 4 = 232。
+    let profile = entries
+        .iter()
+        .filter(|entry| entry.is_trusted() && entry.kind == MemoryKind::Profile)
+        .count();
+    let l1 = entries
+        .iter()
+        .filter(|entry| entry.is_trusted() && entry.layer == Layer::L1)
+        .filter(|entry| entry.kind != MemoryKind::Profile)
+        .count();
+    let l2 = entries
+        .iter()
+        .filter(|entry| entry.is_trusted() && entry.layer == Layer::L2)
+        .filter(|entry| entry.kind != MemoryKind::Profile)
+        .count();
     // 草稿（auto-extract 的 l1 候选）单独数出来：它在 `l1` 里，但语义上和
     // 用户自己写的流水完全不同 —— 它不参与检索、不进注入、不进核心记忆。
     // 仪表盘若把它算进「普通记忆」，用户看到的是一个虚高的数字，而那个数字
@@ -1305,8 +1363,7 @@ pub fn status_with(with_tables: bool) -> Value {
     // 相减」的设计都有这个毛病 —— 桶之间有交集，而展示层看不到交集。
     //
     // 所以由这里直接给出答案：活着、没被反驳、且不是自动抽取草稿。前端只显示，
-    // 不再做任何加减。仪表盘的分母与 `l2Ratio` 的分子都该是它，否则「沉淀占比」
-    // 会因为分子含错、分母不含错而算出超过 100% 的数。
+    // 不再做任何加减。
     let trusted = entries
         .iter()
         .filter(|entry| entry.is_trusted() && !is_auto_draft(entry))
@@ -1324,14 +1381,17 @@ pub fn status_with(with_tables: bool) -> Value {
         "live": live,
         "l1": l1,
         "l2": l2,
+        // 画像单列（见上面 `l2` 的说明），不混进「深层记忆」。
+        "profile": profile,
         // 「草稿」是 l1 的子集（见上面的注释），单列给仪表盘用：
         // 界面要能说清「这 N 条是模型草稿，还没被确认」，而不是混进普通记忆。
         "candidates": candidates,
         // 被判定为错的条数（`live` 的子集，见上面的注释）。前端用它把
         // 「有效记忆」修正成 `live - candidates - refuted`。
         "refuted": refuted,
-        // 真正能当事实用的条数：`live` 扣掉草稿与被反驳。它与 `l1 + l2` 相等
-        // （`l1`/`l2` 也只数可信条目），前端拿它当分母算沉淀占比不会超过 100%。
+        // 真正能当事实用的条数：`live` 扣掉草稿与被反驳。恒等式是
+        // `l1 + l2 + profile == trusted + 未被反驳的草稿` —— `l1` 含草稿、
+        // `trusted` 排掉草稿，差的正好是草稿（精确口径见上面 `profile` 那段）。
         "trusted": trusted,
         "deleted": deleted,
         "superseded": superseded,

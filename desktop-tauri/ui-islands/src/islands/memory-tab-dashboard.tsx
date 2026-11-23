@@ -8,10 +8,19 @@ import { Empty, Panel, Section, StateBadge, num, timeText, useLoad } from './mem
  * 仪表盘：一眼看全「记忆库现在什么状态」。
  *
  * ── 这一页要回答的四个问题 ──────────────────────────────────
- *   1. 有多少条？分层比例对不对（l2 太少说明从没蒸馏过）；
+ *   1. 有多少条？流水与沉淀各多少（l2 太少说明从没蒸馏过）；
  *   2. 今天有没有新东西进来？（数字不动 = 没人在用，或 Agent 没接上）
  *   3. 有没有积压要人裁决的？（待确认队列是这套系统唯一需要人工的地方）
  *   4. 同步与体检有没有异常？
+ *
+ * ── 为什么没有「沉淀占比」这一格（2026-11-23）──────────────
+ * 原来有一张 `l2 / trusted` 的百分比卡。它的问题不在算法（分子分母都已是可信
+ * 口径），而在**分母里混着画像**：画像一次生成十几条、全部落 l2，于是每点一次
+ * 「重生成画像」，沉淀占比就凭空跳几个点，而沉淀本身一条没多。用户看到的
+ * 「沉淀」和他理解的「反复确认后固化下来的结论」不是一回事。
+ *
+ * 现在后端把画像从 `l1` / `l2` 里摘出来单列（`status.profile`），仪表盘也就不再
+ * 需要那个百分比 —— 两个绝对数字并排比比例更直接，也不会被派生品带偏。
  *
  * ── 为什么把「待确认」放这么显眼 ────────────────────────────
  * 记忆的自动化默认全关，唯一会「卡住」的就是待确认队列：AI 提了建议没人批，
@@ -74,8 +83,8 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
   }
 
   // `candidates` 是本轮新加的字段（旧后端 + 新界面会读到 undefined）。
-  // 所有「有效记忆」口径都要先扣掉草稿：草稿既不进检索也不进注入，把它算进
-  // 分母只会让「沉淀占比」凭空变低，让「有效记忆」凭空变多。
+  // 草稿既不进检索也不进注入，把它算进「有效记忆」只会让那个数字虚高 ——
+  // 用户以为能搜到，实际一条也搜不到。
   const drafts = status.candidates ?? 0
   // `refuted` 是「被判错但仍活着」的条数，仍算在 `live` 里。它和草稿一样
   // 不进检索 / 注入 / 核心记忆。
@@ -85,8 +94,10 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
   // 前端做 `live - drafts - refuted` 会把那条扣两次，数字少一条且没人看得出。
   // 老后端没有这个字段时回落到旧算式，保证升级过渡期页面不崩。
   const trusted = status.trusted ?? Math.max(0, status.live - drafts - refuted)
-  // 分子也用可信口径：`l2` 已由后端只数可信条目，所以占比不会超过 100%。
-  const l2Ratio = trusted > 0 ? Math.round((status.l2 / trusted) * 100) : 0
+  // 画像条数。它**不在** `l1` / `l2` 之内（后端已单列，见 `status()` 的说明），
+  // 所以下面「普通记忆 / 深层记忆」两个数字都不含它 —— 这正是要的效果：
+  // 重生成一次画像，那两个数字不该动。
+  const profiles = status.profile ?? 0
   const pending = status.review?.pending ?? 0
   /** 积压阈值（配置项 `dedup.pendingWarnThreshold`，后端默认 50）。
    *
@@ -133,6 +144,16 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
               <span className='mm-mp-label'>{t('深层记忆')}</span>
             </div>
           </div>
+          {/* 画像单列一行：它是深层记忆的**下游产物**，不是深层记忆本身。
+              混进上面那个数字会让「深层记忆」在每次重生成画像时凭空涨十几条，
+              而用户对那个词的理解是「反复确认后固化下来的结论」—— 两者语义
+              完全不同（见后端 `status()` 里 `profile` 字段的说明）。
+              为 0 时不占位，避免给没做过画像的库添噪音。 */}
+          {profiles > 0 ? (
+            <div className='mm-metric-sub'>
+              {t('另有 {n} 条画像（由深层记忆提炼，不算沉淀）', { n: profiles })}
+            </div>
+          ) : null}
           {/* 草稿单列一行：它们在 l1 里，但没被确认、进不了检索与注入。
               不写这一行的话，上面那个「普通记忆」会把草稿算进去 —— 用户以为
               自己有一百多条记忆，实际能搜到的只有其中一部分。 */}
@@ -147,15 +168,6 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
               {t('已纠错 {n} 条（不进检索与注入）', { n: refuted })}
             </div>
           ) : null}
-        </MetricCard>
-        <MetricCard>
-          <MetricLabel>{t('沉淀占比')}</MetricLabel>
-          <MetricValue>{l2Ratio}%</MetricValue>
-          <div className='mm-metric-sub'>
-            {l2Ratio < 15
-              ? t('偏低：打开「蒸馏」任务让结论沉下来')
-              : t('比例健康')}
-          </div>
         </MetricCard>
         <MetricCard>
           <MetricLabel>{t('待确认')}</MetricLabel>

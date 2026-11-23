@@ -566,6 +566,20 @@ function InjectPreview(): React.ReactElement {
                   ? t('这句话里没抽出任何线索（路径、标识符、中文四字组都算）：这次不会注入任何记忆。')
                   : t('没有命中：线索抽到了，但库里没有一条够格 —— 宁可不给，也不给错的。')}
           </div>
+          {/* 三段各有各的钱包：把三个上限摊开，用户才知道「被预算挤掉」该调哪一个。
+              只显示总上限时，画像段被挤掉和 preference 被挤掉在界面上长得一样。 */}
+          <div className='mm-cfg-card-note'>
+            {t('三段预算：必须遵守 {a} · 相关经验 {b} · 长期画像 {c}（合计 {sum} / 上限 {max}）', {
+              a: result.settings.rulesTokens,
+              b: result.settings.experienceTokens,
+              c: result.settings.profileTokens ?? 0,
+              sum:
+                result.settings.rulesTokens +
+                result.settings.experienceTokens +
+                (result.settings.profileTokens ?? 0),
+              max: result.settings.maxTokens,
+            })}
+          </div>
           {result.probes.length > 0 ? (
             <div className='mm-cfg-card-note'>
               {t('线索：')}
@@ -611,6 +625,16 @@ function InjectPreview(): React.ReactElement {
                   <code style={{ flex: '0 0 auto' }}>{hit.score.toFixed(1)}</code>
                   <span style={{ flex: '0 0 auto', opacity: 0.7 }}>
                     /{hit.floor.toFixed(1)} · {hit.layer}
+                  </span>
+                  {/* 三段各有各的钱包：标出这条花的是哪一份钱。没有这个标记时，
+                      「过线但没进块」只能笼统归因成「预算不够」，用户不知道该
+                      调 experienceTokens 还是 profileTokens。 */}
+                  <span style={{ flex: '0 0 auto', opacity: 0.7 }}>
+                    {hit.section === 'profile'
+                      ? t('画像')
+                      : hit.section === 'rules'
+                        ? t('必须遵守')
+                        : t('经验')}
                   </span>
                   <span style={{ flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {/* 标题可能是裸 UUID（导入器拼的占位名），那种情况下显示真正

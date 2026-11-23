@@ -12,12 +12,24 @@
 //!
 //! ── 为什么不是「把记忆全塞进去」────────────────────────────
 //! 几千条全塞是灾难：烧 token、稀释注意力、还会让模型拿三周前的结论去改刚重构
-//! 的代码。所以注入分两段，各有硬预算：
+//! 的代码。所以注入分三段，各有硬预算：
 //!
 //! | 段 | 内容 | 依据 |
 //! |---|---|---|
-//! | 必须遵守 | `pinned` + `preference` + `profile` | 用户亲手钉的、或者明确是「长期要求」的 |
+//! | 必须遵守 | `pinned` + `preference` | 用户亲手钉的、或者明确是「长期要求」的 |
 //! | 相关经验 | 命中本次请求里的**具体线索**的 pitfall / decision / knowledge | 路径、标识符、命令名 |
+//! | 长期画像 | `kind = profile` | 关于「你是谁」的长期参考，**不是命令** |
+//!
+//! ── 为什么画像要单开一段、单给预算（2026-11-23）─────────────
+//! 原来画像与经验共用一个 `experienceTokens` 池子，按得分排序谁高谁先拿钱。
+//! 画像条目的分数是生成时写死的 `importance = 0.9`，再加类型加成 1.0 与
+//! `layer = l2` 的 0.2 —— 稳赢。真机实测：16 条画像全部命中时能吃下 910 token，
+//! 而池子只有 340，于是「相关经验」段被画像占满，preference / 踩坑 / 决策一条
+//! 都进不来。
+//!
+//! 语义上也不该混：经验是「这件事以前怎么做过」（可执行），画像是「你是什么样
+//! 的人」（可参考）。前者该抢着进，后者只该给最相关的一两条。共用一个钱包时
+//! 这个区别表达不出来，所以拆成三段、三个钱包，谁也别动谁的。
 //!
 //! ── 为什么用「线索命中」而不是语义检索 ──────────────────────
 //! 用户的原话是「做一件事时会自然回忆以前是否做过」。人回忆的触发点很具体：
@@ -63,6 +75,15 @@ use super::store;
 pub const MARKER: &str = "<agent2api-memory>";
 const MARKER_END: &str = "</agent2api-memory>";
 
+/// 画像段最多几条。
+///
+/// 硬编码 2 而不是跟着 `inject.maxItems`（默认 6）走：画像是「你是什么样的人」
+/// 的背景，不是待办清单。默认预算 140 token 除以实测 56.9 token/条 ≈ 2.4 条，
+/// 上限 2 让「预算调大」不会悄悄变成「推 6 条性格描述」—— 想推更多得显式改
+/// `inject.profileTokens`，同时仍然受这里限制。多给的那点预算宁可变成长度
+/// 更完整的两条，而不是塞进第三、第四条不相关的。
+const PROFILE_MAX_ITEMS: usize = 2;
+
 /// 一次注入的全部旋钮。
 #[derive(Debug, Clone, Copy)]
 pub struct Settings {
@@ -73,6 +94,8 @@ pub struct Settings {
     pub rules_tokens: usize,
     /// 「相关经验」那一段的预算
     pub experience_tokens: usize,
+    /// 「长期画像」那一段的预算
+    pub profile_tokens: usize,
     /// 经验最多几条
     pub max_items: usize,
     /// 是否用 `files` 字段做路径精确命中
@@ -84,24 +107,94 @@ impl Default for Settings {
         Self {
             enabled: true,
             max_tokens: 600,
-            rules_tokens: 260,
-            experience_tokens: 340,
+            rules_tokens: 200,
+            experience_tokens: 260,
+            profile_tokens: 140,
             max_items: 6,
             path_match: true,
         }
     }
 }
 
+/// 把三段预算夹进总预算。
+///
+/// ── 为什么是「按比例缩」而不是「各自 `.min(max)`」──────────────
+/// 各自夹的写法在两段时代就埋着雷：`maxTokens = 200` 时两段各被夹到 200，
+/// 加起来 400，超了 —— 全靠 `build()` 里那道全局闸兜底，而全局闸是 `break`，
+/// 意味着**后一段永远拿不到钱**（顺序决定生死）。两段时还能靠顺序碰巧对，
+/// 三段时就是「画像段永远 0」，且界面上三个数字看起来都合法。
+///
+/// 按比例缩的好处：`maxTokens` 说多少就花多少，三段各自按原始配比拿到份额，
+/// 谁都不会因为排在后面而被饿死。余数按小数部分从大到小补，补到刚好等于
+/// `max` 为止 —— 用整数乘除而不是浮点，避免 `usize` 与 `f64` 互转的精度问题。
+fn split_budget(
+    rules: usize,
+    experience: usize,
+    profile: usize,
+    max: usize,
+) -> (usize, usize, usize) {
+    let parts = [rules, experience, profile];
+    let sum: usize = rules.saturating_add(experience).saturating_add(profile);
+    if sum <= max {
+        return (rules, experience, profile);
+    }
+    if max == 0 {
+        return (0, 0, 0);
+    }
+    let mut out = [0usize; 3];
+    let mut remainders: Vec<(usize, usize)> = Vec::with_capacity(3);
+    let mut assigned = 0usize;
+    for (index, part) in parts.iter().copied().enumerate() {
+        // `u128` 只为防溢出：260 * 4000 在 usize 里装得下，但比例算法以后可能
+        // 被复用到更大的数上，这里多写一层不花钱。
+        let numerator = (part as u128) * (max as u128);
+        let share = (numerator / sum as u128) as usize;
+        out[index] = share;
+        assigned += share;
+        remainders.push(((numerator % sum as u128) as usize, index));
+    }
+    remainders.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    let mut leftover = max.saturating_sub(assigned);
+    for (_, index) in remainders {
+        if leftover == 0 {
+            break;
+        }
+        // 原本配比就是 0 的段不参与补位：用户把它关掉了，不是「份额小」。
+        if parts[index] == 0 {
+            continue;
+        }
+        out[index] += 1;
+        leftover -= 1;
+    }
+    (out[0], out[1], out[2])
+}
+
 /// 读当前生效的注入设置。
+///
+/// ── `maxTokens` 管的是三段之和，不含块头 ─────────────────────
+/// 块头（[`header()`]）是每轮都一样的固定文案，约 70 token。原来它被算进总预算，
+/// 于是「三段配比之和 = maxTokens」时必然超，而 `build()` 的全局闸是 `break` ——
+/// 排在最后的那段永远拿不到钱。两段时代这个偏差只有 70 token，看不出来；三段
+/// 时代它直接决定画像段是不是 0。
+///
+/// 所以现在 `maxTokens` 的口径是「三段之和」，块头单独算。用户配 200/260/140
+/// 配到 600，三段就真的各拿 200/260/140，不必猜「为什么我配的数没生效」。
 pub fn settings() -> Settings {
     let max_tokens = config::usize_of("inject.maxTokens").min(4000);
+    // 配比之和超过总预算时按比例缩（见 [`split_budget`]）：这样「总预算」是
+    // 真上限，且三段谁都不会因为排序靠后而被饿死。
+    let (rules_tokens, experience_tokens, profile_tokens) = split_budget(
+        config::usize_of("inject.rulesTokens"),
+        config::usize_of("inject.experienceTokens"),
+        config::usize_of("inject.profileTokens"),
+        max_tokens,
+    );
     Settings {
         enabled: config::bool_of("inject.enabled"),
         max_tokens,
-        // 两段预算各自夹到总预算内：用户把总预算调到 200 时，两段加起来也不能
-        // 超过它 —— 否则「总预算」就成了一个说了不算的数字。
-        rules_tokens: config::usize_of("inject.rulesTokens").min(max_tokens),
-        experience_tokens: config::usize_of("inject.experienceTokens").min(max_tokens),
+        rules_tokens,
+        experience_tokens,
+        profile_tokens,
         max_items: config::usize_of("inject.maxItems").clamp(1, 20),
         path_match: config::bool_of("inject.pathMatch"),
     }
@@ -974,6 +1067,22 @@ fn group_key(entry: &MemoryEntry) -> String {
 ///
 /// 所以这里加一条硬前置：还在 l1 的 auto-extract 产物不参与。升到 l2 之后
 /// （说明它被反复确认过）自然放行 —— `agent` 字段不清，但那时它已经是结论。
+///
+/// ── 画像为什么必须钉住才放行（2026-11-23）───────────────────
+/// 原来的判据把 `Profile` 和 `Preference` 并列无条件放行，理由是「画像就是
+/// 关于这个人的长期事实」。真机把这条推翻了：一次画像生成产出 16 条，
+/// 全部 `importance = 0.9`、`updated_at` 最新，按 `pinned → importance →
+/// updated_at` 排序时它们整批排在 preference 前面，把 420 token 的
+/// `inject.rulesTokens` 预算吃掉一大半。
+///
+/// 实测注入预览里 7 条硬约束有 3 条是画像，而「改完先别推送，等确认」这类
+/// 用户亲手定的规矩被挤出去了。**画像描述的是「你是什么样的人」，不是
+/// 「你要求我怎么做」** —— 前者是参考，后者才是命令。语义不同就不该共用
+/// 同一个无条件通道。
+///
+/// AgentHub 那边更彻底：画像只在 `coreMemory()`（MCP 的 L0 主动披露）里出现，
+/// 根本不进请求级自动注入。这里留一条窄门：用户把某条画像钉住，等于说
+/// 「这条我认，按它来」，那时它才配进硬约束块。
 fn rule_candidate(entry: &MemoryEntry) -> bool {
     // 「必须遵守」是每轮自动注入的最强指令，被反驳的结论绝不能混进来。
     if !entry.is_trusted() {
@@ -982,7 +1091,11 @@ fn rule_candidate(entry: &MemoryEntry) -> bool {
     if super::is_auto_draft(entry) {
         return false;
     }
-    entry.pinned || matches!(entry.kind, MemoryKind::Preference | MemoryKind::Profile)
+    // 画像只有被用户钉住才算命令（见上面那段说明）
+    if entry.kind == MemoryKind::Profile {
+        return entry.pinned;
+    }
+    entry.pinned || entry.kind == MemoryKind::Preference
 }
 
 /// 渲染一行。
@@ -1158,6 +1271,7 @@ fn cache_key(settings: &Settings, probes: &[String], cjk: Option<&CjkClues>) -> 
     feed(&settings.max_tokens.to_le_bytes());
     feed(&settings.rules_tokens.to_le_bytes());
     feed(&settings.experience_tokens.to_le_bytes());
+    feed(&settings.profile_tokens.to_le_bytes());
     feed(&settings.max_items.to_le_bytes());
     feed(&[settings.path_match as u8]);
     // 记忆被写过（`store::invalidate` 代际 +1）就换一个键：注入结果是快照的
@@ -1215,7 +1329,12 @@ fn build(settings: &Settings, probes: &[String], cjk: Option<&CjkClues>) -> Opti
     });
 
     let mut body = String::new();
-    let mut used = estimate_tokens(&header());
+    // ── `used` 只数三段之和，不含块头 ──────────────────────────
+    // 块头是每轮固定的 ~70 token。原来把它算进总预算，等于用户配的
+    // `rulesTokens + experienceTokens` 永远比 `maxTokens` 少 70 才不超 ——
+    // 而这个偏差从不报错，只表现为「最后一段拿不到钱」。三段时代它会直接
+    // 让画像段恒为 0，所以口径改成「`maxTokens` = 三段之和」。
+    let mut used = 0usize;
     let mut rule_ids: Vec<&str> = Vec::new();
     let mut rules_text = String::new();
     let mut rules_used = 0usize;
@@ -1252,6 +1371,10 @@ fn build(settings: &Settings, probes: &[String], cjk: Option<&CjkClues>) -> Opti
     let mut scored: Vec<(f64, &MemoryEntry)> = entries
         .iter()
         .filter(|entry| !rule_ids.contains(&entry.id.as_str()))
+        // 画像不进经验池：它有自己的第三段（见下方「长期画像」）。留在这里的话，
+        // 它的 `importance = 0.9` + 类型加成 1.0 会稳赢所有 preference / 踩坑，
+        // 把 `experienceTokens` 吃光 —— 那正是这次要修的问题。
+        .filter(|entry| entry.kind != MemoryKind::Profile)
         .filter_map(|entry| {
             let floor = floor_for(entry)?;
             let extra = derived.as_ref().and_then(|index| index.get(&entry.id));
@@ -1299,8 +1422,11 @@ fn build(settings: &Settings, probes: &[String], cjk: Option<&CjkClues>) -> Opti
         if experience_used + cost > settings.experience_tokens {
             continue;
         }
+        // 全局闸：`split_budget` 已保证三段之和 ≤ `maxTokens`，这里是第二道保险。
+        // 用 `continue` 而不是 `break` —— 三段各有各的钱包，某一段超了不该让后面
+        // 那一段连尝试的机会都没有（`break` 会让「排在最后的画像段恒为 0」）。
         if used + experience_used + cost > settings.max_tokens {
-            break;
+            continue;
         }
         experience_text.push_str(&rendered);
         experience_text.push('\n');
@@ -1312,6 +1438,80 @@ fn build(settings: &Settings, probes: &[String], cjk: Option<&CjkClues>) -> Opti
     if !experience_text.is_empty() {
         body.push_str("\n## 相关经验\n");
         body.push_str(&experience_text);
+        used += experience_used + 2;
+    }
+
+    // ── 第三段：长期画像 ────────────────────────────────────────
+    //
+    // 与「相关经验」同样的判据（`floor_for` + `relevance`），只是钱从
+    // `profileTokens` 出。共用判据的理由：这一段的目标不是「把画像全推给模型」，
+    // 而是「这次聊到的事，跟你本人的习惯有没有关系」—— 聊别的项目时硬塞两条
+    // 「你要因果链」纯属噪音。
+    //
+    // 为什么必须按相关度而不是「按 importance 取前 N」：画像 16 条的 importance
+    // 全是生成时写死的 0.9，按 importance 排等于按 `updated_at` 排 —— 那跟本次
+    // 请求毫无关系，等于每轮固定推同样两条。
+    //
+    // ── 为什么要重新算一遍而不是复用 `scored` ──────────────────
+    // `scored` 已经滤掉了画像（那是为了让经验段干净）。这里只对画像重跑同一套
+    // 打分：`floor_for` 给画像 2.0 的门槛（与 preference 同档，它天然是结论），
+    // `relevance` 给画像 1.0 的类型加成 —— 与经验段用的是同一把尺子，只是钱包不同。
+    let mut scored_profiles: Vec<(f64, &MemoryEntry)> = entries
+        .iter()
+        .filter(|entry| entry.kind == MemoryKind::Profile)
+        .filter(|entry| !rule_ids.contains(&entry.id.as_str()))
+        .filter_map(|entry| {
+            let floor = floor_for(entry)?;
+            let extra = derived.as_ref().and_then(|index| index.get(&entry.id));
+            let score = relevance(entry, probes, settings.path_match, extra, cjk);
+            (score >= floor).then_some((score, entry))
+        })
+        .collect();
+    scored_profiles.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(right.1.updated_at.cmp(&left.1.updated_at))
+    });
+    let mut profile_text = String::new();
+    let mut profile_used = 0usize;
+    let mut profile_picked = 0usize;
+    // 预算小（默认 140 ≈ 2 条），所以去重必须做：16 条画像里常有「先确认既定
+    // 语义再动手」与「先算投入产出再决定动作」这种同组表述，两条占满预算就白给了。
+    let mut profile_groups: Vec<String> = Vec::new();
+    let mut profile_lines: Vec<String> = Vec::new();
+    for (_, entry) in &scored_profiles {
+        if profile_picked >= PROFILE_MAX_ITEMS {
+            break;
+        }
+        let group = group_key(entry);
+        if profile_groups.iter().any(|known| known == &group) {
+            continue;
+        }
+        let rendered = line(entry, 56);
+        if profile_lines.iter().any(|known| known == &rendered) {
+            continue;
+        }
+        let cost = estimate_tokens(&rendered) + 1;
+        if profile_used + cost > settings.profile_tokens {
+            continue;
+        }
+        if used + profile_used + cost > settings.max_tokens {
+            continue;
+        }
+        profile_text.push_str(&rendered);
+        profile_text.push('\n');
+        profile_used += cost;
+        profile_picked += 1;
+        profile_groups.push(group);
+        profile_lines.push(rendered);
+    }
+    if !profile_text.is_empty() {
+        body.push_str("\n## 长期画像\n");
+        body.push_str(&profile_text);
+        // 这里不再累加 `used`：画像段是最后一段，之后没人读它。写上去只会得到
+        // 一条 `unused_assignments` 警告，而这条警告在 CI 里会被当成新问题排查。
     }
 
     if body.trim().is_empty() {
@@ -1735,8 +1935,11 @@ fn append_native(
 /// ── 为什么要额外回一份 `hits` ──────────────────────────────
 /// 只回拼好的 `text` 时，「没命中」和「命中了但被预算挤掉」在界面上长得一样。
 /// `hits` 把每条候选的**得分与门槛**一起摊开：`score >= floor` 却不在 `text`
-/// 里，就是被预算挤掉了（该调 `inject.experienceTokens`）；`score < floor` 才是
-/// 真的没命中（该补记忆或换线索）。这两种情况的处置完全相反。
+/// 里，就是被预算挤掉了；`score < floor` 才是真的没命中（该补记忆或换线索）。
+/// 这两种情况的处置完全相反。
+///
+/// 每条还带一个 `section`：三段各有各的钱包，被挤掉时必须能说清是被哪一个
+/// 挤掉的 —— 否则用户不知道该调 `experienceTokens` 还是 `profileTokens`。
 pub fn preview(request_text: &str) -> Value {
     let settings = settings();
     // 注入块与候选命中**必须**用同一份请求文本。以前这里塞的是一句占位中文
@@ -1806,6 +2009,16 @@ pub fn preview(request_text: &str) -> Value {
                     "title": entry.title,
                     "type": entry.kind.as_str(),
                     "layer": if entry.layer == Layer::L2 { "l2" } else { "l1" },
+                    // 这条候选花的是哪个钱包。三段各有各的预算，界面上必须能分开说
+                    // 「被 `experienceTokens` 挤掉」还是「被 `profileTokens` 挤掉」——
+                    // 混成一句「被预算挤掉」时，用户不知道该调哪一个旋钮。
+                    "section": if entry.kind == MemoryKind::Profile {
+                        "profile"
+                    } else if rule_candidate(entry) {
+                        "rules"
+                    } else {
+                        "experience"
+                    },
                     "score": (score * 100.0).round() / 100.0,
                     "floor": floor,
                     "pass": pass,
@@ -1826,6 +2039,7 @@ pub fn preview(request_text: &str) -> Value {
             "maxTokens": settings.max_tokens,
             "rulesTokens": settings.rules_tokens,
             "experienceTokens": settings.experience_tokens,
+            "profileTokens": settings.profile_tokens,
             "maxItems": settings.max_items,
             "pathMatch": settings.path_match,
         },
@@ -2492,6 +2706,114 @@ mod tests {
             cache_key(&settings, &probes, Some(&one)),
             cache_key(&settings, &probes, Some(&one)),
             "同一份中文线索必须算出同一个键，否则缓存永远不命中"
+        );
+    }
+
+    // ── 「必须遵守」的准入：画像不等于命令（2026-11-23）─────────────
+
+    /// 造一条**够格走到 `rule_candidate` 判据**的条目。
+    ///
+    /// `MemoryEntry::draft()` 按 kind 推层级（profile 会落 l2），这里显式钉成 l2：
+    /// 要验证的是「画像即便已经在沉淀层，也不该自动变成命令」—— l1 的画像在
+    /// `floor_for` 那层就被挡了，走不到这条判据。
+    fn rule_probe(kind: MemoryKind) -> MemoryEntry {
+        let mut item = MemoryEntry::draft("probe", "标题", kind, "正文");
+        item.layer = Layer::L2;
+        item
+    }
+
+    #[test]
+    fn profile_is_not_a_rule_unless_pinned() {
+        // 真机事故：一次画像生成 16 条，importance 全 0.9、updated_at 最新，
+        // 按 `pinned → importance → updated_at` 排序整批排在 preference 前面，
+        // `inject.rulesTokens = 420` 的预算被吃掉一大半 —— 注入预览里 7 条硬
+        // 约束有 3 条是画像，而「改完先别推送，等确认」这类用户亲手定的规矩
+        // 被挤了出去。
+        //
+        // 语义上本来就不该共用通道：画像说「你是什么样的人」（参考），
+        // preference 说「你要求我怎么做」（命令）。
+        let unpinned = rule_probe(MemoryKind::Profile);
+        assert!(!rule_candidate(&unpinned), "没钉住的画像不该进「必须遵守」");
+
+        let mut pinned = unpinned.clone();
+        pinned.pinned = true;
+        assert!(rule_candidate(&pinned), "钉住等于用户说「按它来」，那时才配进");
+    }
+
+    #[test]
+    fn preference_is_still_a_rule_without_pinning() {
+        // 收窄画像时不能顺手把 preference 一起收掉：它本来就该无条件进硬约束块。
+        assert!(rule_candidate(&rule_probe(MemoryKind::Preference)));
+    }
+
+    #[test]
+    fn refuted_entries_never_become_rules() {
+        // 被判定为错的条目连 pinned 都救不回来 —— 这条闸在最前面。
+        let mut pinned = rule_probe(MemoryKind::Preference);
+        pinned.pinned = true;
+        pinned.refuted_at = Some(crate::server::logging::now_ms());
+        assert!(!rule_candidate(&pinned), "被反驳的结论不能当命令");
+    }
+
+    // ── 三段预算切分（2026-11-23）────────────────────────────────
+
+    #[test]
+    fn budget_fits_when_sum_is_under_max() {
+        // 配比之和没超总预算：原样返回，一个 token 都不许改 —— 用户配多少就是多少。
+        assert_eq!(split_budget(200, 260, 140, 600), (200, 260, 140));
+        // 配比之和小于总预算时同样原样返回，不把余量摊掉（余量是留给块头的）
+        assert_eq!(split_budget(100, 100, 100, 400), (100, 100, 100));
+    }
+
+    #[test]
+    fn budget_scales_proportionally_when_over() {
+        // 800 配比压到 600：三段按比例各让 25%，谁都不会被饿死。
+        let (rules, experience, profile) = split_budget(260, 340, 200, 600);
+        assert_eq!(rules + experience + profile, 600, "缩完必须正好等于总预算");
+        assert!(profile > 0, "排在最后的那段不能变成 0：{profile}");
+        assert!(rules > profile, "配比大的段缩完仍应更大：{rules} vs {profile}");
+    }
+
+    #[test]
+    fn budget_never_starves_the_last_segment() {
+        // 这是「各自 .min(max)」那个写法的回归钉：`max = 200` 时两段各夹到 200，
+        // 加起来 400 超了，而 `build()` 的全局闸是 `break` —— 排在最后的画像段
+        // 永远拿不到钱，界面上三个数字却都合法。
+        let (rules, experience, profile) = split_budget(260, 340, 200, 200);
+        assert_eq!(rules + experience + profile, 200);
+        assert!(profile > 0, "总预算再小，画像段也该分到一份：{profile}");
+    }
+
+    #[test]
+    fn budget_keeps_disabled_segment_at_zero() {
+        // 用户把某段设成 0 = 关掉它。按比例缩时不能给它「补位」，否则关了又回来。
+        let (rules, experience, profile) = split_budget(260, 340, 0, 400);
+        assert_eq!(profile, 0, "配比 0 的段不参与补位");
+        assert_eq!(rules + experience, 400);
+    }
+
+    #[test]
+    fn budget_handles_zero_max() {
+        // `maxTokens = 0` 是「整块关掉」。任何一段都不许拿到钱，也不能除零。
+        assert_eq!(split_budget(260, 340, 200, 0), (0, 0, 0));
+    }
+
+    #[test]
+    fn profile_has_its_own_wallet() {
+        // 三段之和必须等于总预算，且画像段独立存在 —— 这条钉住「画像不再和
+        // 相关经验抢同一个 `experienceTokens`」。
+        let settings = Settings {
+            enabled: true,
+            max_tokens: 600,
+            rules_tokens: 200,
+            experience_tokens: 260,
+            profile_tokens: 140,
+            max_items: 6,
+            path_match: true,
+        };
+        assert_eq!(
+            settings.rules_tokens + settings.experience_tokens + settings.profile_tokens,
+            settings.max_tokens
         );
     }
 }

@@ -99,6 +99,13 @@ export type MemoryProject = {
   count: number
   l1: number
   l2: number
+  /**
+   * 画像条数（`kind = profile`）。**不在 `l1` / `l2` 之内**，与 `status.profile`
+   * 同一口径。恒等式：`l1 + l2 + profile == count`。
+   *
+   * 老后端没有这个字段（`undefined`），前端按 0 处理。
+   */
+  profile?: number
   updatedAt: number
   updatedText: string
   /** 写入过本项目记忆的 Agent（去重，按最近写入优先） */
@@ -112,6 +119,8 @@ export type MemoryGeneral = {
   count: number
   l1: number
   l2: number
+  /** 画像条数，口径同 `MemoryProject.profile`。 */
+  profile?: number
   latest: number
   agents: string[]
 }
@@ -137,6 +146,21 @@ export type MemoryStatus = {
   live: number
   l1: number
   l2: number
+  /**
+   * 画像条数（`kind = profile`）。**不在 `l1` / `l2` 之内**。
+   *
+   * 画像落在 l2 层（复用演化链、回收站、置顶那套机制），但语义上和「流水
+   * 反复确认后沉淀的结论」不是一回事：后者要攒够 `PROMOTE_AFTER_REINFORCE`
+   * 条证据才升层，前者一次生成就有十几条。混在一个计数器里的后果是每做一次
+   * 画像，「深层记忆」就凭空涨十几条。
+   *
+   * 恒等式：`l1 + l2 + profile == trusted + 未被反驳的草稿`（`l1` 含草稿，
+   * `trusted` 排掉草稿，差的正好是草稿；`candidates` 含被判错的草稿，所以
+   * 只在「没有草稿被反驳」时与它重合）。
+   *
+   * 老后端没有这个字段（`undefined`），前端按 0 处理。
+   */
+  profile?: number
   /**
    * `l1` 的子集：自动抽取写下、还没攒够强化次数的候选（草稿）。
    *
@@ -964,6 +988,14 @@ export type InjectHit = {
   title: string
   type: string
   layer: 'l1' | 'l2'
+  /**
+   * 这条候选花的是哪个钱包。
+   *
+   * 三段各有各的预算，所以「被预算挤掉」必须能说清是被哪一个挤掉的 ——
+   * 混成一句「被预算挤掉」时，用户不知道该调 `experienceTokens` 还是
+   * `profileTokens`。
+   */
+  section: 'rules' | 'experience' | 'profile'
   /** 相关度得分（路径命中 3.0 / 线索命中 2.0 + 类型与重要度加成） */
   score: number
   /** 这条要过多少分才能进注入块（l2 与结论类 2.0，普通流水 3.3） */
@@ -989,6 +1021,13 @@ export type InjectPreview = {
     maxTokens: number
     rulesTokens: number
     experienceTokens: number
+    /**
+     * 「长期画像」那一段的预算。
+     *
+     * 旧后端没有这个字段（`undefined`）—— 调用方按 0 处理，界面上就不会
+     * 显示一个不存在的钱包。
+     */
+    profileTokens?: number
     maxItems: number
     pathMatch: boolean
   }

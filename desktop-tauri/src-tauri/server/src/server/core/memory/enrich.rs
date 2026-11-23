@@ -632,11 +632,22 @@ pub fn build_profile(sub: Option<&str>, force: bool) -> Outcome {
     // 严重一档 —— 检索是模型按需读，硬约束是每次都被塞进 system prompt。
     //
     // 所以素材池必须与检索/注入同一口径：还在 l1 的 auto-extract 产物不参与。
+    //
+    // ── 为什么再收窄成「l2 或高重要度」（2026-11-23，对齐 AgentHub）──
+    // 原来是「全部可信非草稿条目按 importance 排，截 `deep.batchSize` 条」。
+    // 本机实测：214 条素材池里前 50 条恰好全是 l2，所以没出过事 —— 但这是
+    // 排序碰巧，不是判据。一旦 l1 里出现几条 importance 0.9 的导入流水，
+    // 它们就会挤掉真结论进画像 prompt，画出来的「画像」是某次会话的转述。
+    //
+    // AgentHub 的原判据是 `layer = 'l2' OR importance >= 4`（importance 满分
+    // 5，即 >= 0.8）。这里照抄：画像的输入必须是「已经沉淀过的结论」或
+    // 「有人主动抬过高重要度的条目」，不是任意流水。
     let mut material: Vec<&model::MemoryEntry> = live
         .iter()
         .copied()
         .filter(|entry| entry.kind != MemoryKind::Profile)
         .filter(|entry| !super::is_auto_draft(entry))
+        .filter(|entry| entry.layer == Layer::L2 || entry.importance >= 0.8)
         .collect();
     material.sort_by(|left, right| {
         let score = |entry: &model::MemoryEntry| {
@@ -660,13 +671,35 @@ pub fn build_profile(sub: Option<&str>, force: bool) -> Outcome {
         .collect::<Vec<_>>()
         .join("\n");
     let example = scope.unwrap_or(super::PROFILE_SUBS[0].0);
+    // 证据要求在 prompt 与代码里必须是**同一句话**。
+    //
+    // 原来 prompt 无条件写「证据不足 2 条的结论不要输出」，而代码侧
+    // `deep.evidenceRequired=false` 时会放行无证据条目 —— 两边不一致的后果是
+    // 用户关掉这个旋钮之后，模型仍然只产出带 2 条证据的结论（它照 prompt 做），
+    // 于是「关掉了」这件事在结果上看不出来，用户以为开关坏了。
+    //
+    // 代码侧的门槛只有两档：`PROMOTE_AFTER_REINFORCE`（2）或 0。prompt 照抄这两档。
+    let need_evidence = config::bool_of("deep.evidenceRequired");
+    let evidence_rule = if need_evidence {
+        // 三个位置参数全用 `{}`：混用位置参数与命名参数也能编，但本机没有 cargo，
+        // 少一个参数只会在 CI 里炸一次，不值得为省两个字符冒这个险。
+        format!(
+            "硬性要求：每条结论必须带 {}~{} 个下面真实存在的条目 id 作为证据；\n\
+             证据不足 {} 条的结论不要输出；不要编造 id（编造的会被丢弃）。",
+            model::PROMOTE_AFTER_REINFORCE,
+            5,
+            model::PROMOTE_AFTER_REINFORCE
+        )
+    } else {
+        "（证据链要求已关闭：evidence 可留空，但若给出就必须是下面真实存在的 id。）".to_string()
+    };
 
     let ask = format!(
         "以下是某位工程师自己的记忆条目。请归纳出下列每一类的画像结论，每类 1-4 条，每条一句话。\n\
          {outline}\n\n\
          每一类必须正交：一条结论只属于一类，不要换个说法把同一条写进两类。\n\
-         每条必须给出支撑它的条目 id（evidence）。证据不足就少写几条，不要凑。\n\
-         输出 JSON：{{\"items\":[{{\"sub\":\"{example}\",\"title\":\"不超过 30 字\",\"body\":\"一句话\",\"evidence\":[\"id\"]}}]}}\n\n\
+         {evidence_rule}\n\
+         输出 JSON：{{\"items\":[{{\"sub\":\"{example}\",\"title\":\"不超过 30 字\",\"body\":\"一句话\",\"evidence\":[\"id\",\"id\"]}}]}}\n\n\
          条目：\n{}",
         material
             .iter()
@@ -720,17 +753,51 @@ pub fn build_profile(sub: Option<&str>, force: bool) -> Outcome {
 
     let mut written = 0usize;
     let mut superseded_pins = 0usize;
+    // 本次素材的真实 id 集合：证据必须落在这个集合里。
+    //
+    // ── 为什么不能只判「非空」（2026-11-23）────────────────────
+    // 原判据是 `evidence.is_empty()` —— 模型随手编一个 id 也算「有证据」。
+    // 画像比普通条目更该校验：它的产物会被注入到每一次请求，一条「凭空的
+    // 结论」比一条「凭空的流水」危害大得多。
+    //
+    // AgentHub 的做法是 `_renderProfileSection` 里 `.filter((id) => validIds.has(id))`，
+    // prompt 里同时写死「每条结论必须带 2~5 个真实存在的记忆 id」。这里对齐：
+    // 先按素材池过滤掉编造的 id，再要求至少 2 条 —— 与草稿升 l2 的
+    // `PROMOTE_AFTER_REINFORCE` 同一口径，不搞两套标准。
+    // `(*entry).id.as_str()` 而不是 `entry.id.as_str()`：`material` 的元素是
+    // `&MemoryEntry`，`iter()` 给出的是 `&&MemoryEntry`。不解这一层的话，
+    // `.as_str()` 借的是循环变量的临时引用，`HashSet<&str>` 存不下。
+    let material_ids: HashSet<&str> = material.iter().map(|entry| (*entry).id.as_str()).collect();
     for item in items.iter().take(24) {
         let body = item.get("body").and_then(Value::as_str).unwrap_or("").trim();
         if body.chars().count() < 8 {
             continue;
         }
+        // 只留真实存在于素材池里的 id：模型编出来的、或者从 prompt 别处抄来的
+        // 都不算数。`HashSet<&str>` 借的是 `material`，两者生命周期一致。
         let evidence: Vec<String> = item
             .get("evidence")
             .and_then(Value::as_array)
-            .map(|items| items.iter().filter_map(|id| id.as_str().map(str::to_string)).collect())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|id| id.as_str())
+                    .filter(|id| material_ids.contains(*id))
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default();
-        if config::bool_of("deep.evidenceRequired") && evidence.is_empty() {
+        // 门槛：与 `PROMOTE_AFTER_REINFORCE` 一致。`deep.evidenceRequired` 关掉
+        // 时退回**原行为**（完全不要求证据），不是「只要求 1 条」——
+        // 那个旋钮的文案是「画像结论必须附证据链」，关掉它就是「别管证据」。
+        // 顺手多要一条等于偷偷改用户的设置，而且只会在下一次画像时暴露成
+        // 「怎么少了好几条」。
+        let required = if config::bool_of("deep.evidenceRequired") {
+            model::PROMOTE_AFTER_REINFORCE
+        } else {
+            0
+        };
+        if evidence.len() < required {
             continue;
         }
         let sub = super::profile_sub(item.get("sub").and_then(Value::as_str).unwrap_or(""));

@@ -220,7 +220,18 @@ function Projects({
                       <div className='mm-pt-stats-cell'>
                         <span className='mm-mono'>{t('{n} 条', { n: item.count })}</span>
                         <span className='mm-pt-dot'>·</span>
+                        {/* `item.l2` 已不含画像（后端与 `status()` 同口径）。
+                            画像有就多一枚灰 pill：它确实属于这个项目，但不算沉淀，
+                            混进 `L2:` 那个数字会让每次重生成画像都把这一格顶上去。 */}
                         <span className='mm-pill l2'>L2: {item.l2}</span>
+                        {(item.profile ?? 0) > 0 ? (
+                          <span
+                            className='mm-pill muted'
+                            title={t('画像：由深层记忆提炼的派生条目，不算沉淀')}
+                          >
+                            {t('画像 {n}', { n: item.profile ?? 0 })}
+                          </span>
+                        ) : null}
                         <span className='mm-pt-time'>{item.updatedText || timeText(item.updatedAt)}</span>
                       </div>
                     </td>
