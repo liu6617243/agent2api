@@ -98,15 +98,17 @@ pub fn l2_dir_for(kind: &str) -> &'static str {
 
 /// 从相对路径反推层级（`.../l1/...` 或 `.../l2/...`）。
 ///
-/// ── 为什么需要这条：路径是层级的事实来源 ──────────────────────
+/// ── 为什么需要这条：路径是层级的第二事实来源 ──────────────────
 /// `layout::memory_rel_path` 把层级写进路径（`[projects/<slug>|general]/l1| l2/...`），
-/// 而 `to_markdown` 刻意**不**写 `layer: l1`（l1 是缺省值，省一行 diff）。
-/// 两件事合起来的后果：显式声明 `layer: l1` 的 knowledge 存盘后字段缺失，
-/// 重新加载时只能「按类别猜」，猜成 l2 —— 同一条记忆于是分身两处：
-/// 磁盘与索引说 l1，内存条目说 l2（注入按 l2 给 2.0 的进门分，
-/// `status` 把它算进深层记忆）。
+/// 而 `to_markdown` 现在虽然一律写 `layer:`，**存量文件**里仍有大量写于旧版本、
+/// 缺 `layer` 的条目。`from_markdown` 拿不到字段时先看路径，比按类别猜准得多：
+/// 一条躺在 `/l1/` 目录里的 `knowledge` 就是 l1 笔记，不该因为类别名里有「知识」
+/// 两个字就被算进深层记忆。
 ///
-/// 迁移 AgentHub 的 l1 笔记时真机撞到 22 条，这条判据就是那次修出来的。
+/// 历史代价：早先判层顺序是「显式字段 > 类别」，于是显式 l1 的 knowledge 重载后
+/// 变成 l2 —— 磁盘与索引说 l1、内存条目说 l2（注入按 l2 给 2.0 的进门分，
+/// `status` 把它算进深层记忆）。迁移 AgentHub 时真机撞到 22 条。
+///
 /// 拿不到 `l1` / `l2` 段（手写文件放在 `notes/` 之类的位置）才回退到按类别推断。
 pub fn layer_of_path(relative: &str) -> Option<Layer> {
     relative.split(['/', '\\']).find_map(|segment| match segment {
@@ -688,10 +690,22 @@ impl MemoryEntry {
         out.push_str(&format!("id: {}\n", yaml_scalar(&self.id)));
         out.push_str(&format!("title: {}\n", yaml_scalar(&self.title)));
         out.push_str(&format!("type: {}\n", self.kind.as_str()));
-        // `l1` 是缺省值：不写出来，让存量文件的 diff 保持最小
-        if self.layer != Layer::L1 {
-            out.push_str(&format!("layer: {}\n", self.layer.as_str()));
-        }
+        // `layer` 一律写出来，**不留缺省值**。
+        //
+        // 早先这里是「l1 是缺省值，不写出来，让存量文件的 diff 保持最小」。代价是
+        // 「层级」这一个事实在文件里根本不存在，任何一次「读盘 → 改一个字段 → 存盘」
+        // 都得靠**推断**：先看路径，路径没有 l1/l2 段时就按类别猜。两条推断都出过事——
+        //
+        // ① 类别猜：`type: decision` / `knowledge` / `insight` 的 l1 笔记被猜成 l2。
+        //    AgentHub 迁移的 32 条 typed l1 里 22 条 knowledge 撞在这上面；
+        // ② 路径猜：`tag` / `summarize` 这类「只改一个字段」的任务走
+        //    `entry_path` 重算落点，旧二进制算出的 l2 路径随后被当成事实写下去，
+        //    文件真的从 `/l1/` 搬进了 `/l2/` —— 一次性、不可逆的误分类。
+        //
+        // 写一行 `layer:` 的代价是每个文件的 frontmatter 多 9 字节；收益是「层级」变成
+        // 磁盘上可核验的事实，与 `type` 同级。判层顺序随之简化为：
+        // **显式字段 > 路径 > 类别**，前两条都不再依赖谁来猜。
+        out.push_str(&format!("layer: {}\n", self.layer.as_str()));
         if let Some(project) = &self.project {
             out.push_str(&format!("project: {}\n", yaml_scalar(project)));
         }
@@ -799,15 +813,17 @@ impl MemoryEntry {
                     .unwrap_or_else(|| "未命名记忆".to_string())
             }),
             kind,
-            // 没写 `layer` 时按类别推断：决策/知识/洞见/画像天然是沉淀层。
-            // 这比一律当 l1 更准 —— 存量文件里的 `type: decision` 本就该进核心记忆。
+            // 层级三档优先级：**显式字段 > 路径 > 类别**。
             //
-            // ── 但路径先说话 ────────────────────────────────────
-            // `to_markdown` 刻意不写 `layer: l1`（缺省值，省一行 diff），于是
-            // 「显式写成 l1 的 knowledge」存盘后字段缺失、只能靠类别猜 —— 猜成 l2。
-            // 结果同一个条目：索引行说 l1、内存条目说 l2，注入按 l2 给 2.0 的
-            // 进门分，`status` 把它算进深层记忆，而磁盘上它躺在 `/l1/` 目录里。
-            // 迁移 AgentHub 的 l1 笔记时真机撞到过 22 条。
+            // 新版 `to_markdown` 一律写 `layer:`，所以正常路径走第一档，读盘即事实。
+            // 后两档只服务两种存量/外来文件：
+            //   ① 旧版本写出的文件（frontmatter 缺 `layer`，因为 l1 曾是缺省值）；
+            //   ② 手写 .md / 从别的系统搬来的文件。
+            //
+            // 为什么路径必须排在类别前面：一条躺在 `/l1/` 里的 `knowledge` 就是
+            // l1 笔记，按类别猜成 l2 会让它同时拿到 l2 的注入分与深层统计 ——
+            // 而文件位置是**上一次写入时按 layer 算出来的**，它比类别名更能代表
+            // 写入者的意图。迁移 AgentHub 时真机撞到过 22 条这种分身。
             layer: match get("layer") {
                 Some(raw) => Layer::parse(&raw),
                 None => layer_of_path(path).unwrap_or_else(|| {
@@ -1066,9 +1082,9 @@ mod tests {
 
     /// 显式 l1 的 knowledge 必须能原样读回 l1。
     ///
-    /// `to_markdown` 不写 `layer: l1`（缺省值），于是这条只能靠路径判 —— 早先按
-    /// 类别猜，knowledge 一律猜成 l2，落盘位置与内存层级分家。AgentHub 迁移时
-    /// 22 条 l1 笔记就是这么被算进「深层记忆」的。
+    /// 两版实现都测：现在 `to_markdown` 会写出 `layer: l1`（第一道保险）；
+    /// 存量文件缺这一行时靠路径判（第二道保险）。任一条失效都会让 l1 笔记被算进
+    /// 「深层记忆」，而那种错只会以「注入里怎么突然多了些流水」的形式出现。
     #[test]
     fn explicit_l1_knowledge_survives_reload() {
         let mut entry = sample();
@@ -1076,9 +1092,32 @@ mod tests {
         entry.layer = Layer::L1;
         entry.path = "projects/agenthub/l1/agenthub-migrate/2026-10-04-x.md".into();
         let text = entry.to_markdown();
-        assert!(!text.contains("layer:"), "l1 是缺省值，不该写进 frontmatter");
+        assert!(
+            text.contains("layer: l1"),
+            "层级必须落进 frontmatter，否则下一次读盘只能靠推断：{text}"
+        );
         let back = MemoryEntry::from_markdown(&text, "fallback", &entry.path);
+        assert_eq!(back.layer, Layer::L1);
+
+        // 存量文件（旧版本写出、没有 layer 行）只能靠路径 —— 同样必须读回 l1
+        let legacy = text.replace("layer: l1\n", "");
+        assert!(!legacy.contains("layer:"));
+        let back = MemoryEntry::from_markdown(&legacy, "fallback", &entry.path);
         assert_eq!(back.layer, Layer::L1, "路径说是 l1，读回来不能变成 l2");
+    }
+
+    /// 反过来：`layer: l2` 的条目即使文件被放到 l1 目录，也必须读成 l2。
+    ///
+    /// 这正是「磁盘位置被误算」时暴露出来的形状 —— 字段说 l2、目录说 l1。
+    /// 显式字段优先级最高，所以内存里的身份不会跟着目录漂。
+    #[test]
+    fn explicit_layer_wins_over_path() {
+        let mut entry = sample();
+        entry.kind = MemoryKind::Decision;
+        entry.layer = Layer::L2;
+        entry.path = "general/l1/auto-extract/2026-11-23-x.md".into();
+        let back = MemoryEntry::from_markdown(&entry.to_markdown(), "fallback", &entry.path);
+        assert_eq!(back.layer, Layer::L2, "显式 layer 不能被目录覆盖");
     }
 
     /// 路径里没有层级段（手写笔记放在任意目录）才回退到「按类别推断」。
