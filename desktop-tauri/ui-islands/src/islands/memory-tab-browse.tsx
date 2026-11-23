@@ -918,6 +918,12 @@ function Browse({
                 {selected.tags.map(value => <Badge key={value} variant='outline' shape='tag'>{value}</Badge>)}
               </div>
             ) : null}
+            {/* 后端在显式 `memoryGet(id)` 时会给草稿附一句 `layerCaveat`。
+                读到的模型有可能直接采信正文，所以这句提示要在人能看到的界面上
+                也出现一次 —— 界面上「草稿」只是个小标签，容易被当成装饰。 */}
+            {selected.layerCaveat ? (
+              <div className='mm-muted mm-draft-caveat'>{selected.layerCaveat}</div>
+            ) : null}
             {selected.files.length ? (
               <div className='mm-files'>
                 {selected.files.map(file => <code key={file}>{file}</code>)}
@@ -1015,6 +1021,9 @@ function Browse({
                     <span className='mm-timeline-date'>{item.validFromText}</span>
                     <button type='button' className='mm-link' onClick={() => void openEntry(item.id)}>{item.title}</button>
                     <span className='mm-timeline-type'>{item.typeLabel}</span>
+                    {/* 草稿不进演化链（后端已过滤），唯一会出现的草稿是「当前这条自己」。
+                        标出来是为了不让用户把「模型猜的」当成「当年确认过的」。 */}
+                    {item.draft ? <span className='mm-pill draft'>{t('草稿')}</span> : null}
                     {item.current ? <Badge variant='brand' shape='tag'>{t('当前')}</Badge> : null}
                   </div>
                 ))}

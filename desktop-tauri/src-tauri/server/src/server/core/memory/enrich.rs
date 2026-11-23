@@ -116,10 +116,10 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
         // 事被改写两遍，正是这一轮要消灭的重复。它们只作为「已有结论清单」出现，
         // 走 reinforce 那条路。
         .filter(|entry| entry.agent.as_deref() != Some(model::AUTO_EXTRACT_AGENT))
-        .filter(|entry| match project {
-            Some(slug) => entry.project.as_deref() == Some(slug),
-            None => true,
-        })
+        // 项目口径统一走 `super::in_scope`：`entry.project` 是 slug，而调用方
+        // 传的是原始名字（`aimod-cc/Agent2API`），直接比字符串会让过滤静默
+        // 失效 —— 素材池看起来「一条都没有」，任务每轮都跳过。
+        .filter(|entry| super::in_scope(entry.project.as_deref(), project))
         .cloned()
         .collect();
     if source.len() < 5 {
@@ -147,10 +147,7 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
             entry.layer == Layer::L2
                 || entry.agent.as_deref() == Some(model::AUTO_EXTRACT_AGENT)
         })
-        .filter(|entry| match project {
-            Some(slug) => entry.project.as_deref() == Some(slug),
-            None => true,
-        })
+        .filter(|entry| super::in_scope(entry.project.as_deref(), project))
         .cloned()
         .collect();
     known.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));

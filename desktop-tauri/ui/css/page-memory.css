@@ -1253,6 +1253,17 @@
   padding: 1px 6px;
 }
 
+/* 草稿正文下的那句「可以当线索，别当结论引用」。
+   用左侧细条而不是整块背景：它是一句提醒，不是错误提示 —— 背景太重会让
+   用户以为这条记忆坏了，而它只是「还没被确认」。 */
+.mm-draft-caveat {
+  border-left: 2px solid var(--warn-bd);
+  padding: 4px 0 4px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  margin: 8px 0;
+}
+
 .mm-pt-muted { color: var(--text-3); font-size: 11.5px; }
 /* 「查看 (N)」这种次级动作：做成可点的文字，不占按钮的视觉重量 */
 .mm-pt-link {

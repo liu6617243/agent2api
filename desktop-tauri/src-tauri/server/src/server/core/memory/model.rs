@@ -52,8 +52,27 @@ pub enum Layer {
 }
 
 impl Layer {
+    /// 宽松解析：任何不是 `l2` 的输入都当 `l1`。
+    ///
+    /// ── 为什么这条要宽松，而 `try_parse` 要严格 ──────────────────
+    /// 这里读的是**磁盘上的 frontmatter**。文件可能被邮件/同步工具转码、
+    /// 被人手改过、被旧版本写过。读到 `layer: L3` 或 `layer: ` 时把整条记忆
+    /// 拒绝加载，等于让一条脏 frontmatter 把整个容器炸掉 —— 兜底成 l1 是最
+    /// 小伤害：条目仍在，用户能在浏览页看到并改回去。
+    ///
+    /// 但 `update()` 的 patch 输入是**用户/接口的意图**，不是既成事实。那里
+    /// 拼错"l2"必须报错，不能静默降层（用 `try_parse`）。
     pub fn parse(raw: &str) -> Self {
         if raw.trim().eq_ignore_ascii_case("l2") { Layer::L2 } else { Layer::L1 }
+    }
+
+    /// 严格解析：只认 `l1` / `l2`（大小写与首尾空白宽容），其余返回 `None`。
+    pub fn try_parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "l1" => Some(Layer::L1),
+            "l2" => Some(Layer::L2),
+            _ => None,
+        }
     }
 
     pub fn as_str(self) -> &'static str {

@@ -626,6 +626,22 @@ pub fn get_for(ids: &[String], body_limit: usize, agent: Option<&str>) -> Value 
             continue;
         };
         let mut value = entry.to_json(true);
+        // ── 显式读一条草稿时要自报身份 ──────────────────────────
+        //
+        // 调用方点名 `memory_get(id)` 是有意要看这一条，挡掉它反而会让模型以为
+        // 「记忆丢了」，转而凭印象编。所以这里放行，但把 `draft: true` +
+        // `layerCaveat` 一起塞进返回体：读到的模型/前端必须知道这不是既定事实。
+        //
+        // 相关记忆（下面的 `related`）不享受这个待遇 —— 那是顺手带出来的上下文，
+        // 调用方根本没点名，多给一条草稿只会被当成事实引用。
+        if is_auto_draft(entry) {
+            value["draft"] = Value::Bool(true);
+            value["layerCaveat"] = Value::String(
+                "这条是自动抽取的候选，尚未被后续流水确认，也没有人采纳过。\
+                 可以当成线索，不要当成已经成立的结论引用。"
+                    .to_string(),
+            );
+        }
         if body_limit > 0 {
             let body = truncate_chars(&entry.body, body_limit);
             let truncated = body.chars().count() < entry.body.chars().count();
@@ -736,12 +752,22 @@ pub fn timeline(id: &str) -> Value {
     }
     let now = crate::server::logging::now_ms();
     json!({
-        "items": chain.into_iter().map(|entry| json!({
+        // 草稿不进演化链：这是「结论怎么一步步变成现在这样」的账本，链上的每一
+        // 节都会被当成「曾经成立过的结论」。而草稿是模型的一时猜测，从未成立过 ——
+        // 把它挂进链里，用户会以为这件事当年被正式确认过。
+        //
+        // 注意这里过滤的是**链上其他节点**，不是 `target` 本身：显式点开一条草稿
+        // 时，它自己应该出现在链里（否则页面全空，用户以为坏了），只是别的草稿
+        // 不该混进来。
+        "items": chain.into_iter()
+            .filter(|entry| entry.id == target.id || !is_auto_draft(entry))
+            .map(|entry| json!({
             "id": entry.id,
             "title": entry.title,
             "type": entry.kind.as_str(),
             "typeLabel": entry.kind.label(),
             "layer": entry.layer.as_str(),
+            "draft": is_auto_draft(entry),
             "validFrom": entry.valid_from,
             "validTo": entry.valid_to,
             "updatedAt": entry.updated_at,
@@ -931,6 +957,55 @@ fn entry_project_slug(entry: &MemoryEntry) -> String {
         .as_deref()
         .map(store::slugify)
         .unwrap_or_else(|| store::GLOBAL_SLUG.to_string())
+}
+
+/// 这条记忆是否属于调用方指定的项目。
+///
+/// ── 为什么不能直接比字符串 ──────────────────────────────────
+/// `entry.project` 写盘前经过 `classify_explicit → sanitize_slug`，永远是 slug
+/// 形式（`aimod-cc-agent2api`）。而 `project` 参数来自三处**原始名字**：
+/// 接口 `{"project":"aimod-cc/Agent2API"}`、项目页 `item.slug`（恰好是 slug）、
+/// 自动 tick 的 `None`。直接 `entry.project.as_deref() == Some(slug)` 时，凡是
+/// 非 slug 形式的名字**永远匹配不上任何条目**。
+///
+/// 症状不是报错，而是「过滤条件静默失效」：素材池空 → `extract` 以为流水太少
+/// 直接跳过；已有结论清单空 → 模型看不到老话题，同一件事每轮都当新的抽一遍；
+/// 候选互判重失效 → 重复 l2 又回来了。日志里一切正常，是最难查的一类 bug。
+///
+/// ── `None` 的语义 ──────────────────────────────────────────
+/// `None` = 「自动 tick 没指定项目」，只比**通用**条目（`project` 为 `None`，
+/// 磁盘上落在 `general/`），**不是**「所有项目」。跨项目合并会把两个项目的结论
+/// 搓成一条 —— 那种错比重复难修得多。所以不做 `None => true` 的放宽。
+///
+/// 注意 `_global` 与 `general` 不是同一个项目：`slugify` 对空串兜底成 `_global`
+/// （→ `general/` 目录），而真的有个项目叫 `general` 时 slug 就是 `general`
+/// （→ `projects/general/`）。两者必须分开，不能拿「目录名」当判据。
+pub(super) fn project_matches(entry_project: Option<&str>, wanted: Option<&str>) -> bool {
+    let actual = entry_project
+        .map(store::slugify)
+        .unwrap_or_else(|| store::GLOBAL_SLUG.to_string());
+    let target = wanted
+        .map(store::slugify)
+        .unwrap_or_else(|| store::GLOBAL_SLUG.to_string());
+    actual == target
+}
+
+/// 素材池口径：`None` = 「不限定项目」= 全部项目都收。
+///
+/// 与 `project_matches` 的差别是 `None` 的含义，这一点必须分开写，不能合并：
+/// 素材池（`extract` / `distill` 的输入、`supersede_recent` 的扫描范围）传
+/// `None` 是「自动 tick 不知道项目，就全看」；而强化目标 / 候选判重传 `None`
+/// 是「这次只处理通用项目」，**绝不能**因此跨到别的项目里去比正文 —— 那会把
+/// 两个项目的结论搓成一条。
+///
+/// `Some` 的分支两处一致：都先把两边归一到 slug 再比。不归一化的话
+/// `{"project":"aimod-cc/Agent2API"}` 这类原始名字会永远匹配不上任何条目，
+/// 过滤条件静默失效（素材池空 → 任务以为没东西可做；清单空 → 重复重新长出来）。
+pub(super) fn in_scope(entry_project: Option<&str>, scope: Option<&str>) -> bool {
+    match scope {
+        None => true,
+        Some(_) => project_matches(entry_project, scope),
+    }
 }
 
 /// 项目下所有条目的写入方（去重、首次出现顺序）。
@@ -1786,6 +1861,34 @@ fn dedup_keeper(entry: &MemoryEntry, candidate_id: &str) -> DedupKeeper {
     }
 }
 
+/// 一条记忆与另一条的「整体近似度」：正文 Dice、正文编辑距离、标题相似度三项加权。
+///
+/// ── 为什么必须只有这一份实现 ────────────────────────────────
+/// 判重有两个入口，判的都是同一件事「这两条是不是在讲同一件事」：
+///   ① `write_inner` 落地新条目时（`near_duplicate`）
+///   ② `apply_derived` 落蒸馏结论前（先看能不能改成强化既有结论）
+/// 早先这里各写了一套：① 用 `dice/wEdit/wTitle` 加权，② 用 `dice+edit` 的均值
+/// 且不读标题。两边同阈值（0.72）却不同算法，于是同一条结论可以「②判无关 →
+/// 新建」，紧接着「①判近似 → 入队」（`review.autoConfirmDedup` 开着时当场标
+/// superseded，把刚落地的那条埋掉）。症状是「明明合并过，怎么又出来两条」，
+/// 且两处日志分别看都自洽 —— 只有把两份算法并排放才能发现。
+///
+/// 抽成一个纯函数之后，两处口径永远一致；想改判据只改这里。
+fn pair_similarity(entry: &MemoryEntry, other: &MemoryEntry) -> f64 {
+    let w_dice = config::number("dedup.l2.wDice");
+    let w_edit = config::number("dedup.l2.wEdit");
+    let w_title = config::number("dedup.l2.wTitle");
+    let dice = dice_coefficient(&entry.body, &other.body);
+    let chars = entry.body.chars().count().max(other.body.chars().count()).max(1);
+    let edit = 1.0 - (levenshtein(&entry.body, &other.body) as f64) / chars as f64;
+    let title_score = similarity(&entry.title, &other.title);
+    // 三项各算各的再加权：早先这里把 Dice 与编辑距离都算成了 `similarity()`
+    // 的均值，等于同一个数用了两遍，权重配置（wDice / wEdit）实际没生效
+    let score = (dice * w_dice + edit * w_edit + title_score * w_title)
+        / (w_dice + w_edit + w_title).max(0.001);
+    score.clamp(0.0, 1.0)
+}
+
 /// L2 近似重复的候选：词面相似度（Dice + 编辑距离）超过 `dedup.l2.candidateThreshold`。
 ///
 /// 为什么不用向量：这里不想为了「找相似标题」引入 embedding 模型与一次额外
@@ -1793,9 +1896,6 @@ fn dedup_keeper(entry: &MemoryEntry, candidate_id: &str) -> DedupKeeper {
 /// 阈值之上只产建议（`review_queue`），裁决由人做。
 fn near_duplicate(entry: &MemoryEntry) -> Option<(String, f64)> {
     let threshold = config::number("dedup.l2.candidateThreshold");
-    let w_dice = config::number("dedup.l2.wDice");
-    let w_edit = config::number("dedup.l2.wEdit");
-    let w_title = config::number("dedup.l2.wTitle");
     let mut best: Option<(String, f64)> = None;
     // 快照先绑到局部变量：`for other in store::snapshot().iter()` 虽然临时值会
     // 活到循环结束（只调一次），但读代码的人得先知道这条临时值生命周期规则才能
@@ -1808,14 +1908,7 @@ fn near_duplicate(entry: &MemoryEntry) -> Option<(String, f64)> {
         if other.kind != entry.kind {
             continue;
         }
-        let dice = dice_coefficient(&entry.body, &other.body);
-        let chars = entry.body.chars().count().max(other.body.chars().count()).max(1);
-        let edit = 1.0 - (levenshtein(&entry.body, &other.body) as f64) / chars as f64;
-        let title_score = similarity(&entry.title, &other.title);
-        // 三项各算各的再加权：早先这里把 Dice 与编辑距离都算成了 `similarity()`
-        // 的均值，等于同一个数用了两遍，权重配置（wDice / wEdit）实际没生效
-        let score = (dice * w_dice + edit * w_edit + title_score * w_title)
-            / (w_dice + w_edit + w_title).max(0.001);
+        let score = pair_similarity(entry, other);
         if score < threshold {
             continue;
         }
@@ -1938,8 +2031,42 @@ pub fn update(id: &str, patch: &Value) -> Result<Value, String> {
     if let Some(kind) = patch.get("type").and_then(Value::as_str) {
         entry.kind = MemoryKind::parse(kind);
     }
-    if let Some(layer) = patch.get("layer").and_then(Value::as_str) {
-        entry.layer = Layer::parse(layer);
+    // 这一轮是不是「人工把一条 l1 抬成了 l2」。必须在换层字段的处理里就地记下，
+    // 不能事后拿 `previous.layer` 比 —— 那个克隆发生在改动之后，永远等于新层。
+    let mut promoted_by_hand = false;
+    // ── 换层：这是 `update()` 里唯一能凭一个 HTTP 请求造出 l2 的字段 ──────
+    //
+    // 三处收紧，缺一不可：
+    //
+    // ① 严格解析。`Layer::parse` 把任何非 "l2" 的输入吞成 l1 —— 前端多传一个
+    //    空格之外的东西（"L2 " 能过、拼成 "l3" 不能）就把一条沉淀结论静默
+    //    降成流水、塞回 l1 容器。读磁盘时兜底成 l1 是止损，读意图时必须报错。
+    //
+    // ② l1 → l2 追加 `manual:` 锚点。`promote_draft` 与 `reinforce_entry_with`
+    //    都留这个锚点，`update` 不留的话，界面上「被确认 N 次」会少算这一次，
+    //    同一件事走两条路得到两种证据记录。
+    //
+    // ③ 升层也过一遍近似判重。`write_inner` 的 `near_duplicate` 只在
+    //    「新条目落地」时跑；`update` 直接把一条 l1 抬成 l2，等于绕过整个
+    //    准入。这里不改判重结论（人工改层就是要改），只把命中记进日志并
+    //    入队 —— 让下一次裁决能看到「你刚手升的这条其实和 X 是同一件事」。
+    if let Some(layer) = patch.get("layer") {
+        let Some(raw) = layer.as_str() else {
+            return Err("layer 必须是字符串 \"l1\" 或 \"l2\"".into());
+        };
+        let Some(target) = Layer::try_parse(raw) else {
+            return Err(format!("未知层级 {raw:?}（只接受 l1 / l2）"));
+        };
+        // 原层必须在**改之前**记下来：下面的 `previous` 是改完才克隆的，
+        // 拿它比「是不是刚升上来的」永远成立不了（那是个恒假的判断）。
+        if target == Layer::L2 && entry.layer != Layer::L2 {
+            promoted_by_hand = true;
+            let cue = format!("manual:{id}");
+            if !entry.evidence.iter().any(|known| known.as_str() == cue) {
+                entry.evidence.push(cue);
+            }
+        }
+        entry.layer = target;
     }
     if let Some(tags) = patch.get("tags").and_then(Value::as_array) {
         entry.tags = dedup(tags.iter().filter_map(|tag| tag.as_str().map(str::to_string)).collect());
@@ -1993,6 +2120,48 @@ pub fn update(id: &str, patch: &Value) -> Result<Value, String> {
     entry.path = store::rel(&store::entry_path(&entry, false));
     store::move_save(&previous, &entry)?;
     index::global().upsert(&entry)?;
+    // ── 手动升 l2 的旁路：只提示，不阻止 ────────────────────────────
+    //
+    // 人工改层是明确意图，不该被自动判重拦住（拦住的话用户点两次都不生效）。
+    // 但把「刚手升的这条其实和 X 是同一件事」留在裁决队列里，下一次整理才
+    // 看得见 —— 否则这条旁路就成了重复条目的合法入口。
+    //
+    // 只在「升到 l2」时做，且不入队 l1：l1 之间重复是常态（流水本来就该重复）。
+    if entry.layer == Layer::L2
+        && promoted_by_hand
+        && config::bool_of("dedup.enabled")
+        && config::bool_of("dedup.l2.enabled")
+    {
+        if let Some((candidate, score)) = near_duplicate(&entry) {
+            // 谁活下来仍按信息量裁决，而不是「刚手升的那条必赢」—— 用户把一条
+            // 半截流水抬成 l2，库里那条完整结论不该因此被埋。
+            //
+            // `keep` 的取值空间与 `write_inner` 保持一致：`"candidate"` 表示
+            // 载荷里的 `candidate` 活、队列条目（`row.target`，这里是刚手升的
+            // 这条）被取代；其余（含 `"new"`）表示反过来。`review_resolve` 只认
+            // `"candidate"`，所以这里必须显式写，不能靠默认值猜。
+            let keep = if dedup_keeper(&entry, &candidate) == DedupKeeper::Candidate {
+                "candidate"
+            } else {
+                "new"
+            };
+            index::global().enqueue(
+                "dedup",
+                &entry.id,
+                &json!({
+                    "candidate": candidate,
+                    "score": score,
+                    "keep": keep,
+                    "origin": "manual-promote",
+                }),
+                score,
+            );
+            crate::server::logging::log(
+                "[Memory]",
+                &format!("手动升层 {} → l2，与 {candidate} 近似（{score:.2}），已入队待裁决", entry.id),
+            );
+        }
+    }
     bump_revision();
     Ok(json!({ "entry": entry.to_json(true) }))
 }
@@ -2273,12 +2442,10 @@ pub fn dedup_scan() -> Value {
     // 只对 l2 跑：l1 流水里「同一个决定说过两遍」很常见，合并它会丢掉时间线。
     let mut near = 0usize;
     if config::bool_of("dedup.l2.enabled") {
-        // 权重与阈值都走配置：巡检与写入路径必须用**同一条判据**，否则
-        // 「写入时没判成重复、巡检却判成」这种不一致会让用户怀疑两边都在乱来。
-        let w_dice = config::number("dedup.l2.wDice");
-        let w_edit = config::number("dedup.l2.wEdit");
-        let w_title = config::number("dedup.l2.wTitle");
-        let weight_sum = (w_dice + w_edit + w_title).max(0.001);
+        // 阈值走配置，打分走 `pair_similarity` —— 巡检、写入、派生三个入口必须
+        // 用**同一条判据**。早先这里自己又写了一遍加权（与 `near_duplicate`
+        // 数值相同但独立维护），任何一方改权重就会让「写入时没判成重复、巡检
+        // 却判成」这种不一致出现，用户会怀疑两边都在乱来。
         let threshold = config::number("dedup.l2.candidateThreshold");
         let l2: Vec<&MemoryEntry> = live.iter().filter(|entry| entry.layer == Layer::L2).collect();
         // 上限 400 条：两两比较是 O(n²)，400 条 = 8 万次比较，几秒钟的量级；
@@ -2289,11 +2456,7 @@ pub fn dedup_scan() -> Value {
                 if l2[i].kind != l2[j].kind {
                     continue;
                 }
-                let dice = dice_coefficient(&l2[i].body, &l2[j].body);
-                let chars = l2[i].body.chars().count().max(l2[j].body.chars().count()).max(1);
-                let edit = 1.0 - (levenshtein(&l2[i].body, &l2[j].body) as f64) / chars as f64;
-                let title = similarity(&l2[i].title, &l2[j].title);
-                let score = (dice * w_dice + edit * w_edit + title * w_title) / weight_sum;
+                let score = pair_similarity(l2[i], l2[j]);
                 if score < threshold {
                     continue;
                 }
@@ -2692,11 +2855,13 @@ pub(super) fn similar_l1_candidate(
     body: &str,
 ) -> Option<String> {
     let threshold = config::number("dedup.l2.candidateThreshold");
+    // 项目口径交给 `project_matches`：三处（这里 / extract / distill）必须用
+    // 同一个判据，否则「候选互判重」和「已有结论清单」会各自失效。
     store::snapshot()
         .iter()
         .filter(|entry| entry.is_live() && entry.layer == Layer::L1)
         .filter(|entry| entry.agent.as_deref() == Some(model::AUTO_EXTRACT_AGENT))
-        .filter(|entry| entry.project.as_deref() == project)
+        .filter(|entry| project_matches(entry.project.as_deref(), project))
         .filter(|entry| entry.kind == kind)
         .filter(|entry| {
             // 与 `apply_derived` 同一道粗筛：长度差一倍以上不可能是同一件事，
@@ -2832,29 +2997,40 @@ fn apply_derived(payload: &Value) -> Result<(), String> {
     // 带 `evidence` —— 按**键名**区分，不按条数：蒸馏的一条结论也可能引用两三条
     // 流水，按条数会把它们误判成合并。
     let is_merge = payload.get("sources").map(|value| !value.is_null()).unwrap_or(false);
+    // 判据统一走 `pair_similarity`（与 `near_duplicate` 同一份实现）：两处同阈值
+    // 却不同算法时，同一条结论会「这里判无关就新建 → 那边判近似就入队」，重复
+    // 换个马甲又长回来。
+    let target_project = payload.get("project").and_then(Value::as_str);
+    let target_kind = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .map(MemoryKind::parse);
     let near = if is_merge {
         None
     } else {
         snapshot
             .iter()
             .filter(|other| other.is_live() && other.layer == Layer::L2)
-            .filter(|other| other.project.as_deref() == payload.get("project").and_then(Value::as_str))
-            .filter(|other| {
-                payload
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .map(|kind| other.kind == MemoryKind::parse(kind))
-                    .unwrap_or(true)
-            })
-            // 长度先粗筛：`similarity()` 是 O(n·m) 的字符二元组比对，一次蒸馏最多
-            // 20 条结论 × 上百条 l2，不做粗筛就是几亿次比较。长度差一倍以上不可能
-            // 是同一件事 —— 这是免费且不会误杀的前置条件。
+            .filter(|other| project_matches(other.project.as_deref(), target_project))
+            .filter(|other| target_kind.map(|kind| other.kind == kind).unwrap_or(true))
+            // 长度先粗筛：`pair_similarity` 是 O(n·m) 的字符二元组比对，一次蒸馏
+            // 最多 20 条结论 × 上百条 l2，不做粗筛就是几亿次比较。长度差一倍以上
+            // 不可能是同一件事 —— 这是免费且不会误杀的前置条件。
             .filter(|other| {
                 let (left, right) = (body.chars().count(), other.body.chars().count());
                 let (short, long) = if left < right { (left, right) } else { (right, left) };
                 short * 2 >= long
             })
-            .map(|other| (other.id.clone(), similarity(body, &other.body)))
+            // `pair_similarity` 收的是两条完整条目，而这里手上只有新结论的
+            // 正文与标题 —— 拼一个只用于打分的临时条目，不碰盘也不进索引。
+            .map(|other| {
+                let mut probe = other.clone();
+                probe.body = body.to_string();
+                if let Some(title) = payload.get("title").and_then(Value::as_str) {
+                    probe.title = title.to_string();
+                }
+                (other.id.clone(), pair_similarity(&probe, other))
+            })
             .filter(|(_, score)| *score >= config::number("dedup.l2.candidateThreshold"))
             .max_by(|left, right| left.1.partial_cmp(&right.1).unwrap_or(std::cmp::Ordering::Equal))
     };
@@ -3244,5 +3420,71 @@ mod tests {
         let after = store::rel(&store::entry_path(&promoted, false));
         assert!(after.contains("/l2/"), "升层后必须落到 l2 目录，实际 {after}");
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn project_scope_normalises_raw_names_to_slugs() {
+        // 真机症状：`{"project":"aimod-cc/Agent2API"}` 这类原始名字永远匹配不上
+        // 已 slug 化的 `entry.project`，于是素材池空、清单空、候选互判重失效
+        // —— 全都静默发生，日志里一切正常。判据必须两边都先归一。
+        assert!(project_matches(Some("aimod-cc-agent2api"), Some("aimod-cc/Agent2API")));
+        assert!(project_matches(Some("aimod-cc-agent2api"), Some("aimod-cc-agent2api")));
+        assert!(!project_matches(Some("aimod-cc-agent2api"), Some("other-project")));
+
+        // `None`（自动 tick）与 `_global`（项目页的「通用」卡）指同一批条目，必须
+        // 互相等价；而一个真名叫 `general` 的项目落在 `projects/general/`，
+        // 与通用目录不是一回事，不能被当成同一个。
+        assert!(project_matches(None, None));
+        assert!(project_matches(None, Some("_global")));
+        assert!(!project_matches(None, Some("general")));
+        assert!(!project_matches(Some("aimod-cc-agent2api"), None));
+
+        // `in_scope` 的 `None` 是「不限定项目」= 全部收（素材池语义），
+        // 与 `project_matches` 的「只比通用」不是一回事，不能合并。
+        assert!(in_scope(Some("aimod-cc-agent2api"), None));
+        assert!(in_scope(Some("aimod-cc-agent2api"), Some("aimod-cc/Agent2API")));
+        assert!(!in_scope(Some("aimod-cc-agent2api"), Some("other")));
+    }
+
+    #[test]
+    fn layer_try_parse_refuses_typos_instead_of_silently_demoting() {
+        // 读磁盘用宽松解析（脏 frontmatter 不能把整条记忆炸掉），读意图必须严格：
+        // 拼错 "l3" 静默降成 l1 会把一条沉淀结论塞回流水容器，用户完全看不出来。
+        assert_eq!(Layer::try_parse("l2"), Some(Layer::L2));
+        assert_eq!(Layer::try_parse(" L2 "), Some(Layer::L2));
+        assert_eq!(Layer::try_parse("l1"), Some(Layer::L1));
+        assert_eq!(Layer::try_parse("l3"), None);
+        assert_eq!(Layer::try_parse(""), None);
+        assert_eq!(Layer::try_parse("deep"), None);
+
+        // 宽松版对同一个输入仍兜底成 l1（磁盘兜底语义）
+        assert_eq!(Layer::parse("l3"), Layer::L1);
+    }
+
+    #[test]
+    fn pair_similarity_is_one_implementation_for_all_three_call_sites() {
+        // 三处判重（写入 / 派生 / 巡检）现在共用这一个函数。最低要求是它真的
+        // 把「同义改写」判高、把「不同事」判低 —— 三处同阈值同算法，才不会再出现
+        // 「这边判无关新建、那边判近似入队」。
+        let a = MemoryEntry::draft(
+            "a",
+            "发布脚本读不到版本号",
+            MemoryKind::Pitfall,
+            "根因是 deliver.mjs 读 process.env.VERSION，而 CI 只写了 GITHUB_REF_NAME。",
+        );
+        let b = MemoryEntry::draft(
+            "b",
+            "发布脚本读不到版本号",
+            MemoryKind::Pitfall,
+            "根因是 deliver.mjs 读 process.env.VERSION，而 CI 只写了 GITHUB_REF_NAME，两边对齐即可。",
+        );
+        let c = MemoryEntry::draft(
+            "c",
+            "签到按钮点了没反应",
+            MemoryKind::Pitfall,
+            "供应商目录里没有 qoder，统一签到却仍然会去签它；要按目录判断而不是按按钮判断。",
+        );
+        assert!(pair_similarity(&a, &b) > pair_similarity(&a, &c));
+        assert!(pair_similarity(&a, &a) > 0.99);
     }
 }

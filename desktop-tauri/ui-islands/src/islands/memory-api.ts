@@ -59,6 +59,13 @@ export type MemoryEntry = {
   path: string
   body?: string
   truncated?: boolean
+  /**
+   * 这条是自动抽取的草稿（`layer==l1 && agent=='auto-extract'`），尚未被确认成结论。
+   * 只在**显式** `memoryGet(id)` 时出现 —— 检索默认不返回草稿，相关记忆也不返回。
+   */
+  draft?: boolean
+  /** 与 `draft` 配套的人话解释，给模型读的：草稿可以当线索，不能当既定结论引用。 */
+  layerCaveat?: string
   related?: { id: string; title: string; type: string; layer?: string; line: string }[]
 }
 
@@ -206,6 +213,8 @@ export type MemoryTimelineItem = {
   type: string
   typeLabel: string
   layer: string
+  /** 这条链上节点是自动抽取草稿（还没被确认成结论）。链里会显示「草稿」标记。 */
+  draft?: boolean
   validFrom: number
   validTo: number | null
   updatedAt: number

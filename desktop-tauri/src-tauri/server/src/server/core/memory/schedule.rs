@@ -1237,10 +1237,9 @@ fn extract(project: Option<&str>, manual: bool) -> Outcome {
         .into_iter()
         .filter(|entry| entry.is_live() && entry.layer == super::Layer::L1)
         .filter(|entry| entry.agent.as_deref() != Some(super::model::AUTO_EXTRACT_AGENT))
-        .filter(|entry| match project {
-            Some(slug) => entry.project.as_deref() == Some(slug),
-            None => true,
-        })
+        // 项目口径统一走 `super::in_scope`（见那里的说明）：`entry.project`
+        // 是 slug，调用方传的是原始名字，直接比字符串会让过滤静默失效。
+        .filter(|entry| super::in_scope(entry.project.as_deref(), project))
         .collect();
     recent.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
     recent.truncate(batch);
@@ -1279,10 +1278,7 @@ fn extract(project: Option<&str>, manual: bool) -> Outcome {
             entry.layer == super::Layer::L2
                 || entry.agent.as_deref() == Some(super::model::AUTO_EXTRACT_AGENT)
         })
-        .filter(|entry| match project {
-            Some(slug) => entry.project.as_deref() == Some(slug),
-            None => true,
-        })
+        .filter(|entry| super::in_scope(entry.project.as_deref(), project))
         .collect();
     known.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
     known.truncate(60);
@@ -1491,10 +1487,7 @@ fn supersede_recent(project: Option<&str>) -> Outcome {
         .into_iter()
         .filter(|entry| entry.is_live() && entry.layer == super::Layer::L2)
         .filter(|entry| entry.kind != super::MemoryKind::Profile)
-        .filter(|entry| match project {
-            Some(slug) => entry.project.as_deref() == Some(slug),
-            None => true,
-        })
+        .filter(|entry| super::in_scope(entry.project.as_deref(), project))
         .collect();
     recent.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
     // 只查最近 5 条：老条目的失效关系早就被查过了（每次写入也会查一次）
@@ -1532,7 +1525,7 @@ fn consolidate(project: Option<&str>, manual: bool) -> Outcome {
     let mut items: Vec<super::model::MemoryEntry> = store::load_all()
         .into_iter()
         .filter(|entry| entry.is_live() && entry.layer == super::Layer::L2)
-        .filter(|entry| entry.project.as_deref() == Some(slug))
+        .filter(|entry| super::project_matches(entry.project.as_deref(), Some(slug)))
         .filter(|entry| entry.kind != super::MemoryKind::Profile)
         .collect();
     if items.len() < 4 {
