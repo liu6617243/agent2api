@@ -153,7 +153,7 @@ fn spec_tools() -> Vec<Value> {
         json!({
             "name": "memory_update",
             "title": "更新记忆",
-            "description": "Update an existing entry's title, body, tags, category, layer, importance, pin or validity. Prefer writing a new entry with `supersedes` when the fact itself changed.",
+            "description": "Update an existing entry's title, body, tags, category, importance, pin or validity. Cannot change `layer` — the layer is decided by repeated confirmation from real work logs, by a human confirming it in the UI, or by `type` at write time. Prefer writing a new entry with `supersedes` when the fact itself changed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -161,7 +161,6 @@ fn spec_tools() -> Vec<Value> {
                     "title": { "type": "string" },
                     "body": { "type": "string" },
                     "type": { "type": "string" },
-                    "layer": { "type": "string" },
                     "tags": { "type": "array", "items": { "type": "string" } },
                     "importance": { "type": "number" },
                     "pinned": { "type": "boolean" },
@@ -575,6 +574,26 @@ fn dispatch(name: &str, args: &Value, agent: Option<&str>) -> Result<Value, Call
         }
         "memory_update" => {
             let id = text_arg(args, "id").ok_or_else(|| CallError::Failed("缺少 id".into()))?;
+            // ── 模型不许自己改层级 ──────────────────────────────
+            //
+            // `update()` 的换层是「按 patch 改字段」，它现在会过判重、会补
+            // `manual:` 锚点 —— 但那个锚点的语义是「**人**认了这条」。让模型
+            // 调一下就把自己的草稿升成 l2，等于准入闸门（攒够两条确认才升层）
+            // 自我绕过：抽取写草稿 → 下一轮自己 `memory_update({layer:"l2"})`
+            // → 模型猜的东西变成「沉淀结论」，而且证据链里留着一个假的
+            // `manual:` 锚点。
+            //
+            // 层级只有三个正当来源：反复被流水确认（`reinforce_entry_with`）、
+            // 人在界面上采纳（`promote_draft` / 编辑里的层级字段）、按 `type`
+            // 默认推断（`memory_write` 新建）。都不是这个工具。
+            if args.get("layer").is_some() {
+                return Err(CallError::Failed(
+                    "memory_update 不能改 layer。层级由三件事决定：反复被流水确认、人在界面上采纳、\
+                     或按 type 在 memory_write 时默认推断。要表达「这是一条结论」，\
+                     用 memory_write 写一条新的（带 supersedes 指向旧的）。"
+                        .into(),
+                ));
+            }
             memory::update(&id, args).map_err(CallError::Failed)
         }
         "memory_recent" => Ok(memory::recent_for(
