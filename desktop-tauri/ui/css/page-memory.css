@@ -1253,6 +1253,41 @@
   padding: 1px 6px;
 }
 
+/* 「这条错了」：红色系，与草稿的警示黄区分开 —— 草稿是「还没确认」，
+   被反驳是「已确认是错的」，两者严重程度不同。 */
+.mm-pill.refuted {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border: 1px solid var(--danger-bd);
+  padding: 1px 6px;
+}
+
+.mm-refuted-note {
+  border-left: 2px solid var(--danger-bd);
+  padding: 4px 0 4px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  margin: 8px 0;
+  color: var(--text-2);
+}
+
+.mm-refuted-note .mm-refuted-reason {
+  margin-top: 4px;
+  color: var(--danger);
+}
+
+.mm-refuted-note .mm-link {
+  /* 项目里没有 --accent 这个旧别名（aliases.css 只有 --primary），
+     沿用现有 .mm-link 的品牌主色，避免新造设计 token。 */
+  color: var(--primary);
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
 /* 草稿正文下的那句「可以当线索，别当结论引用」。
    用左侧细条而不是整块背景：它是一句提醒，不是错误提示 —— 背景太重会让
    用户以为这条记忆坏了，而它只是「还没被确认」。 */

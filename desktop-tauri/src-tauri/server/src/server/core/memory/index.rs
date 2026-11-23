@@ -61,6 +61,10 @@ pub struct IndexRow {
     pub dedup_status: String,
     pub access_count: i64,
     pub last_hit_at: Option<i64>,
+    /// 被人判定为错的时间。`Some` = 这条不能当事实用（见 `MemoryEntry::is_refuted`）。
+    pub refuted_at: Option<i64>,
+    pub refuted_reason: String,
+    pub refuted_by: Option<String>,
     pub path: String,
     /// FTS5 给出的负分（越小越相关）。退化模式下恒 0，由调用方按命中数补分。
     pub rank: f64,
@@ -88,6 +92,9 @@ impl IndexRow {
             "dedupStatus": self.dedup_status,
             "accessCount": self.access_count,
             "lastHitAt": self.last_hit_at,
+            "refutedAt": self.refuted_at,
+            "refutedReason": self.refuted_reason,
+            "refutedBy": self.refuted_by,
             "summary": self.summary,
             "path": self.path,
         })
@@ -126,7 +133,7 @@ impl ReviewRow {
 
 // ── 表结构 ───────────────────────────────────────────────────
 
-/// `entries` 的列定义（顺序即写入顺序，`row_to_index` 按位置取值）。
+/// `entries` 的列定义（顺序即写入顺序；读取按列名，见 [`row_to_index`]）。
 ///
 /// 「索引表 vs 列自愈」两处都靠这张清单：新建库时按它建表，老库时按它补列。
 const ENTRY_COLUMNS: &[(&str, &str)] = &[
@@ -149,14 +156,26 @@ const ENTRY_COLUMNS: &[(&str, &str)] = &[
     ("dedup_status", "TEXT DEFAULT 'unique'"),
     ("access_count", "INTEGER DEFAULT 0"),
     ("last_hit_at", "INTEGER"),
+    // 「被人判定为错」三列。`refuted_at` 要能进 WHERE（检索默认跳过），所以
+    // 必须是独立列而不是塞进 body；`refuted_reason` 给列表行用（界面显示
+    // 「为什么错」），`refuted_by` 给演化链用。
+    ("refuted_at", "INTEGER"),
+    ("refuted_reason", "TEXT"),
+    ("refuted_by", "TEXT"),
     ("body", "TEXT"),
     ("path", "TEXT"),
 ];
 
-/// `entries` 的 `SELECT` 列序（与 [`ENTRY_COLUMNS`] 前 20 项一致，去掉 body）。
+/// `entries` 的 `SELECT` 列序（与 [`ENTRY_COLUMNS`] 一致，去掉 body）。
+///
+/// ── 为什么列序必须与 [`ENTRY_COLUMNS`] 严格对齐 ────────────────
+/// 下面的 `row_to_entry` 是按**下标**取列的。两处一旦错位，取出来的值会串位
+/// （`refuted_at` 拿到 `access_count` 的数字），而且不会报错 —— 症状是「分数
+/// 怪怪的」「有人的记忆莫名被标成错了」。加列必须同时改这三处：
+/// `ENTRY_COLUMNS` / `ENTRY_SELECT` / `upsert` 的 `INSERT` 与 `params![]`。
 const ENTRY_SELECT: &str = "id, project, agent, kind, layer, title, summary, tags, importance,
      pinned, starred, created_at, updated_at, valid_to, superseded_by, deleted_at,
-     dedup_status, access_count, last_hit_at, path";
+     dedup_status, access_count, last_hit_at, refuted_at, refuted_reason, refuted_by, path";
 
 pub struct MemoryIndex {
     conn: Mutex<Connection>,
@@ -625,7 +644,11 @@ impl MemoryIndex {
         let mut statement = conn.prepare(&sql).ok()?;
         let mapped = statement.query_map(params![expression], |row| {
             let mut item = row_to_index(row)?;
-            item.rank = row.get::<_, f64>(20)?;
+            // 按列名取：`bm25()` 的别名是 `rank`，不随 ENTRY_SELECT 变。
+            // 原来写死 `row.get(20)`，加列后读到的是 `refuted_reason`（TEXT），
+            // `get::<f64>` 会失败，整条 FTS 结果被 `flatten()` 静默丢掉 ——
+            // 症状是「搜索突然什么都搜不到」，而且没有报错。
+            item.rank = row.get::<_, f64>("rank")?;
             Ok(item)
         });
         let rows: Vec<IndexRow> = mapped.ok()?.flatten().collect();
@@ -641,7 +664,9 @@ impl MemoryIndex {
         };
         let mapped = statement.query_map([], |row| {
             let mut item = row_to_index(row)?;
-            let body: String = row.get::<_, Option<String>>(20)?.unwrap_or_default();
+            // 同上：按列名取 `body`。写死下标后加列会让这里读到 `refuted_reason`，
+            // 扫描检索就会拿「为什么错」当正文匹配，命中结果全是假的。
+            let body: String = row.get::<_, Option<String>>("body")?.unwrap_or_default();
             let haystack = normalize(&format!(
                 "{} {} {} {}",
                 item.title, item.summary, item.tags.join(" "), body
@@ -1625,31 +1650,49 @@ fn heal_columns(conn: &Connection) {
     }
 }
 
+/// ── 为什么这里按**列名**取值，不用下标 ────────────────────────────
+/// 原来是 `row.get(19)?` 这种下标写法，加一列就要同步改 5 处，漏一处的症状
+/// 是值串位（`refuted_at` 拿到 `access_count` 的数），而且编译期、运行期都
+/// 不报错 —— 只会表现为「分数怪怪的」「有记忆莫名被判错」。
+///
+/// 本次加 `refuted_*` 三列时就真的漏了两处（`search_fts` 的 rank、`search_scan`
+/// 的 body 还停在旧列号 20），说明靠人工纪律守不住。改成列名取值后，
+/// `ENTRY_COLUMNS` 怎么增删都不会影响这里，`rusqlite` 找不到列名会直接报错，
+/// 把静默串位变成显式失败。
 fn row_to_index(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexRow> {
-    let tags: String = row.get::<_, Option<String>>(7)?.unwrap_or_default();
+    let tags: String = row.get::<_, Option<String>>("tags")?.unwrap_or_default();
     Ok(IndexRow {
-        id: row.get(0)?,
-        project: row.get(1)?,
-        agent: row.get(2)?,
-        kind: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "other".into()),
-        layer: row.get::<_, Option<String>>(4)?.unwrap_or_else(|| "l1".into()),
-        title: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-        summary: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+        id: row.get("id")?,
+        project: row.get("project")?,
+        agent: row.get("agent")?,
+        kind: row
+            .get::<_, Option<String>>("kind")?
+            .unwrap_or_else(|| "other".into()),
+        layer: row
+            .get::<_, Option<String>>("layer")?
+            .unwrap_or_else(|| "l1".into()),
+        title: row.get::<_, Option<String>>("title")?.unwrap_or_default(),
+        summary: row.get::<_, Option<String>>("summary")?.unwrap_or_default(),
         tags: tags.split_whitespace().map(|tag| tag.to_string()).collect(),
-        importance: row.get::<_, Option<f64>>(8)?.unwrap_or(0.5),
-        pinned: row.get::<_, Option<i64>>(9)?.unwrap_or(0) != 0,
-        starred: row.get::<_, Option<i64>>(10)?.unwrap_or(0) != 0,
-        created_at: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
-        updated_at: row.get::<_, Option<i64>>(12)?.unwrap_or(0),
-        valid_to: row.get(13)?,
-        superseded_by: row.get(14)?,
-        deleted_at: row.get(15)?,
+        importance: row.get::<_, Option<f64>>("importance")?.unwrap_or(0.5),
+        pinned: row.get::<_, Option<i64>>("pinned")?.unwrap_or(0) != 0,
+        starred: row.get::<_, Option<i64>>("starred")?.unwrap_or(0) != 0,
+        created_at: row.get::<_, Option<i64>>("created_at")?.unwrap_or(0),
+        updated_at: row.get::<_, Option<i64>>("updated_at")?.unwrap_or(0),
+        valid_to: row.get("valid_to")?,
+        superseded_by: row.get("superseded_by")?,
+        deleted_at: row.get("deleted_at")?,
         dedup_status: row
-            .get::<_, Option<String>>(16)?
+            .get::<_, Option<String>>("dedup_status")?
             .unwrap_or_else(|| "unique".into()),
-        access_count: row.get::<_, Option<i64>>(17)?.unwrap_or(0),
-        last_hit_at: row.get(18)?,
-        path: row.get::<_, Option<String>>(19)?.unwrap_or_default(),
+        access_count: row.get::<_, Option<i64>>("access_count")?.unwrap_or(0),
+        last_hit_at: row.get("last_hit_at")?,
+        refuted_at: row.get("refuted_at")?,
+        refuted_reason: row
+            .get::<_, Option<String>>("refuted_reason")?
+            .unwrap_or_default(),
+        refuted_by: row.get("refuted_by")?,
+        path: row.get::<_, Option<String>>("path")?.unwrap_or_default(),
         rank: 0.0,
         hits: 0,
     })
@@ -1660,8 +1703,8 @@ fn write_row(conn: &Connection, entry: &MemoryEntry, fts: bool) -> rusqlite::Res
         "INSERT INTO entries
            (id, project, agent, kind, layer, title, summary, tags, importance, pinned, starred,
             created_at, updated_at, valid_to, superseded_by, deleted_at, dedup_status,
-            access_count, last_hit_at, body, path)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
+            access_count, last_hit_at, refuted_at, refuted_reason, refuted_by, body, path)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)
          ON CONFLICT(id) DO UPDATE SET
            project=excluded.project, agent=excluded.agent, kind=excluded.kind,
            layer=excluded.layer,
@@ -1671,6 +1714,8 @@ fn write_row(conn: &Connection, entry: &MemoryEntry, fts: bool) -> rusqlite::Res
            valid_to=excluded.valid_to,
            superseded_by=excluded.superseded_by, deleted_at=excluded.deleted_at,
            dedup_status=excluded.dedup_status,
+           refuted_at=excluded.refuted_at, refuted_reason=excluded.refuted_reason,
+           refuted_by=excluded.refuted_by,
            body=excluded.body, path=excluded.path",
         params![
             &entry.id,
@@ -1692,6 +1737,9 @@ fn write_row(conn: &Connection, entry: &MemoryEntry, fts: bool) -> rusqlite::Res
             entry.dedup_status.as_str(),
             entry.access_count as i64,
             entry.last_hit_at,
+            entry.refuted_at,
+            &entry.refuted_reason,
+            &entry.refuted_by,
             &entry.body,
             &entry.path,
         ],
@@ -1926,7 +1974,16 @@ mod tests {
             .unwrap()
             .flatten()
             .collect();
-        for required in ["layer", "valid_to", "dedup_status", "access_count", "last_hit_at"] {
+        for required in [
+            "layer",
+            "valid_to",
+            "dedup_status",
+            "access_count",
+            "last_hit_at",
+            "refuted_at",
+            "refuted_reason",
+            "refuted_by",
+        ] {
             assert!(names.iter().any(|name| name == required), "缺列 {required}：{names:?}");
         }
     }

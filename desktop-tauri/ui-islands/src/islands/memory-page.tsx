@@ -407,7 +407,10 @@ function MemoryPage(): React.ReactElement {
           {status ? (
             <Badge variant={status.config.enabled ? 'success' : 'outline'} shape='tag'>
               {status.config.enabled
-                ? t('{n} 条有效记忆', { n: status.live })
+                // 「有效记忆」用可信条数：`live` 含草稿与被判定为错的条目，
+                // 拿它当徽标会让用户看到一个搜不到的虚高数字（点进浏览页
+                // 数不出这么多条）。老后端无此字段时回落到 `live`。
+                ? t('{n} 条有效记忆', { n: status.trusted ?? status.live })
                 : t('记忆服务已关闭')}
             </Badge>
           ) : null}

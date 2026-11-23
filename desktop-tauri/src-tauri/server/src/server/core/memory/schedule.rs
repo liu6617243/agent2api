@@ -883,7 +883,8 @@ fn classify_pending(project: Option<&str>) -> Outcome {
     let unclassified: Vec<_> = entries
         .iter()
         // 画像不是「待归类」的东西：它按设计就不属于任何项目。
-        .filter(|entry| entry.is_live() && entry.project.is_none())
+        // 被反驳的结论也不必归类：给它打项目标签只会让错误看起来像正式归档。
+        .filter(|entry| entry.is_trusted() && entry.project.is_none())
         .filter(|entry| entry.kind != super::MemoryKind::Profile)
         .collect();
     if unclassified.is_empty() {
@@ -1235,7 +1236,8 @@ fn extract(project: Option<&str>, manual: bool) -> Outcome {
     // 「有据可依」—— 自我循环比重复更难看懂。
     let mut recent: Vec<super::model::MemoryEntry> = store::load_all()
         .into_iter()
-        .filter(|entry| entry.is_live() && entry.layer == super::Layer::L1)
+        // 被反驳的结论不是「流水素材」：它若混进来，下一轮会被重新抽成结论。
+        .filter(|entry| entry.is_trusted() && entry.layer == super::Layer::L1)
         .filter(|entry| entry.agent.as_deref() != Some(super::model::AUTO_EXTRACT_AGENT))
         // 项目口径统一走 `super::in_scope`（见那里的说明）：`entry.project`
         // 是 slug，调用方传的是原始名字，直接比字符串会让过滤静默失效。
@@ -1273,7 +1275,8 @@ fn extract(project: Option<&str>, manual: bool) -> Outcome {
     // new，由下一轮的 near_duplicate 兜底。
     let mut known: Vec<super::model::MemoryEntry> = store::load_all()
         .into_iter()
-        .filter(|entry| entry.is_live())
+        // 被否掉的结论不进「已有结论清单」，否则模型会去 reinforce 让它复活。
+        .filter(|entry| entry.is_trusted())
         .filter(|entry| {
             entry.layer == super::Layer::L2
                 || entry.agent.as_deref() == Some(super::model::AUTO_EXTRACT_AGENT)
@@ -1301,6 +1304,32 @@ fn extract(project: Option<&str>, manual: bool) -> Outcome {
     } else {
         catalog
     };
+    // ── 明确负向证据 ─────────────────────────────────────────
+    // 只把「对的」喂给模型不够：同一条错误结论会在下一轮被重新抽出来，因为
+    // 模型看不到「这个说法上次被否过」。真机上 l2 泛滥的一半成因就是这个 ——
+    // 同一件事反复换个说法冒出来。所以把被反驳的标题 + 理由一起喂进去，
+    // 让它在生成阶段就避让。
+    let mut refuted: Vec<super::model::MemoryEntry> = store::load_all()
+        .into_iter()
+        .filter(|entry| entry.is_live() && entry.is_refuted())
+        .filter(|entry| super::in_scope(entry.project.as_deref(), project))
+        .collect();
+    refuted.sort_by_key(|entry| std::cmp::Reverse(entry.refuted_at.unwrap_or(0)));
+    refuted.truncate(20);
+    let rejected = refuted
+        .iter()
+        .map(|entry| {
+            let reason = entry.refuted_reason.trim();
+            let hint = if reason.is_empty() {
+                "（未写理由）".to_string()
+            } else {
+                super::model::truncate_chars(reason, 60)
+            };
+            format!("- {} ← 理由：{}", super::model::truncate_chars(&entry.title, 40), hint)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rejected = if rejected.is_empty() { "（无）".to_string() } else { rejected };
     let material = recent
         .iter()
         .map(|entry| {
@@ -1320,6 +1349,9 @@ fn extract(project: Option<&str>, manual: bool) -> Outcome {
          一条都没有就输出 {{\"items\":[]}}。\n\n\
          ── 先比对已有结论，再决定动作 ─────────────────────────\n\
          已经有这些结论（id 只能从这里选，不要自己编）：\n{catalog}\n\n\
+         ── 明确负向证据 ─────────────────────────────────────\n\
+         被判定为错误的旧说法（不要再用同样的措辞或同样的结论重新生成；如果新素材确实推翻了这些判断，明确说明为什么）\n\
+         {rejected}\n\n\
          reinforce = 这批流水讲的事，上面清单里已经有了。target 填那条的 id，\n\
                      note 写这次补充或确认了什么。\n\
                      **哪怕措辞完全不同，只要是同一件事，就是 reinforce。**\n\
@@ -1485,7 +1517,8 @@ Answer in the same language as the input. Output strict JSON, no prose around it
 fn supersede_recent(project: Option<&str>) -> Outcome {
     let mut recent: Vec<super::model::MemoryEntry> = store::load_all()
         .into_iter()
-        .filter(|entry| entry.is_live() && entry.layer == super::Layer::L2)
+        // 已被反驳的 l2 不参与失效判定：错误结论没有资格去取代别人。
+        .filter(|entry| entry.is_trusted() && entry.layer == super::Layer::L2)
         .filter(|entry| entry.kind != super::MemoryKind::Profile)
         .filter(|entry| super::in_scope(entry.project.as_deref(), project))
         .collect();
@@ -1524,7 +1557,8 @@ fn consolidate(project: Option<&str>, manual: bool) -> Outcome {
     };
     let mut items: Vec<super::model::MemoryEntry> = store::load_all()
         .into_iter()
-        .filter(|entry| entry.is_live() && entry.layer == super::Layer::L2)
+        // 被反驳的结论不进合并池：合并会删掉原条目，等于把错误洗成一条新结论。
+        .filter(|entry| entry.is_trusted() && entry.layer == super::Layer::L2)
         .filter(|entry| super::project_matches(entry.project.as_deref(), Some(slug)))
         .filter(|entry| entry.kind != super::MemoryKind::Profile)
         .collect();

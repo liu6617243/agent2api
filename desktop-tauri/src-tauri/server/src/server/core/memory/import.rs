@@ -2226,7 +2226,11 @@ fn preview_inner(only: Option<&str>, limit: usize) -> Value {
     let mut known: std::collections::HashSet<String> = if dedup_on {
         store::load_all()
             .into_iter()
-            .filter(|entry| entry.is_live() && entry.layer == model::Layer::L1)
+            // `is_trusted` 而不是 `is_live`：被人判定为错的那条不占 hash。否则
+            // 「这条内容上次被否掉了，现在用户重新导入同一份」会被判成重复、
+            // 静默跳过 —— 预览说「跳过 1 条重复」，而库里其实没有任何一条
+            // 能当事实用的同内容条目。与 `BatchWriter::new` 预载 hash 同一口径。
+            .filter(|entry| entry.is_trusted() && entry.layer == model::Layer::L1)
             .map(|entry| entry.hash)
             .filter(|hash| !hash.is_empty())
             .collect()

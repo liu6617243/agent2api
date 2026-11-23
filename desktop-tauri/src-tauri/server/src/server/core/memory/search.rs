@@ -67,6 +67,11 @@ pub struct Query {
     /// 界面上的「浏览」页要能看见它们（否则用户不知道有草稿待确认），所以那边
     /// 显式传 `true`；`待确认` 页同理。
     pub include_candidates: bool,
+    /// 包含已被**人判定为错**的记忆（`refuted_at` 非空）。
+    ///
+    /// 默认不含：这类条目原文还留着（演化链、撤销都要用），但它不配当事实。
+    /// 界面要能看见它们才能撤销，所以浏览页显式传 `true` 并在行上打标记。
+    pub include_refuted: bool,
     pub limit: usize,
     /// 跳过前 N 条。分页用：`offset = page * limit`
     pub offset: usize,
@@ -163,6 +168,12 @@ fn keep(row: &IndexRow, query: &Query) -> bool {
         return false;
     }
     if row.superseded_by.is_some() && !query.include_superseded {
+        return false;
+    }
+    // 被人判定为错的条目默认不返回：它还在库里（可撤销、演化链完整），但已经
+    // 不配当事实。显式要它（浏览页要看、要撤销）才返回，且前端必须打出标记，
+    // 否则「一条已被否掉的结论」会以干净搜索结果的样子回到模型面前。
+    if row.refuted_at.is_some() && !query.include_refuted {
         return false;
     }
     // ── 自动抽取的候选：默认不是「记忆」，是草稿 ────────────────
@@ -389,6 +400,20 @@ pub fn compact_line(row: &IndexRow, now: i64) -> String {
     } else if matches!(row.valid_to, Some(until) if until > 0 && now > until) {
         parts.push("已失效".to_string());
     }
+    // ── 被判定为错：行内必须标出来 ──────────────────────────────
+    //
+    // 这条行文本是**模型读的那份**（`memory_search` 的 `lines`）。被反驳的条目
+    // 默认根本不会出现在这里（`keep()` 挡掉了），但两种情况下会：用户显式传
+    // `includeRefuted` 让你回看已纠错的历史，或者调用方是个不传该参数的界面。
+    // 一旦它进了这一行却没有任何标记，模型看到的就是一句「决策 · 端口固定 3065」
+    // —— 和一条正常结论长得一模一样，它会直接引用。所以标记必须在这里，
+    // 不能只靠「反正默认查不到」。
+    //
+    // 与「已过时」并列而不是替代：一条结论可以既被取代又被指认当年就错，
+    // 两个信息对模型都重要（前者说「有新的」，后者说「这个是错的」）。
+    if row.refuted_at.is_some() {
+        parts.push("已判错".to_string());
+    }
     parts.push(relative_time(row.updated_at, now));
     format!("{} · `{}`", parts.join(" · "), row.id)
 }
@@ -455,7 +480,9 @@ pub fn core_text(entries: &[MemoryEntry], project: Option<&str>, max_tokens: usi
     let budget = max_tokens.clamp(200, 4000);
     let mut lines: Vec<(f64, String)> = Vec::new();
 
-    for entry in entries.iter().filter(|entry| entry.is_live()) {
+    // 被反驳的结论不进核心记忆：这里是「会话开局可读的既定事实」，
+    // 一条被人明确否掉的判断混进来等于直接给模型下错指令。
+    for entry in entries.iter().filter(|entry| entry.is_trusted()) {
         // ── 候选不进核心记忆 ────────────────────────────────────
         //
         // 下面那条「画像 / 偏好可以破层」是给人写的偏好留的口子。但候选的
@@ -523,11 +550,12 @@ pub fn core_text(entries: &[MemoryEntry], project: Option<&str>, max_tokens: usi
 pub fn digest_text(entries: &[MemoryEntry], max_lines: usize) -> String {
     let now = now_ms();
     let limit = if max_lines == 0 { 200 } else { max_lines.min(1000) };
-    // 候选不算「有效记忆」：这个数是给模型看的规模感，混进草稿会虚高
-    // （真机 132 条里有 100 多条是候选，报出来的「有效条数」等于骗人）。
+    // 候选与被反驳的都不算「有效记忆」：这个数是给模型看的规模感，混进草稿
+    // 或被否掉的结论都会虚高（真机 132 条里有 100 多条是候选，报出来的
+    // 「有效条数」等于骗人）。
     let live: Vec<&MemoryEntry> = entries
         .iter()
-        .filter(|entry| entry.is_live() && !super::is_auto_draft(entry))
+        .filter(|entry| entry.is_trusted() && !super::is_auto_draft(entry))
         .collect();
     let mut out = String::new();
     out.push_str(&format!("# 记忆索引（{} 条有效）\n", live.len()));
@@ -667,6 +695,9 @@ mod tests {
             dedup_status: "unique".into(),
             access_count: 0,
             last_hit_at: None,
+            refuted_at: None,
+            refuted_reason: String::new(),
+            refuted_by: None,
             path: String::new(),
             rank: 0.0,
             hits: 0,
@@ -675,5 +706,49 @@ mod tests {
         assert!(line.contains("决策"), "类型要显示中文：{line}");
         assert!(line.contains("沉淀"), "l2 要标出来：{line}");
         assert!(line.contains("已失效"), "过期要标出来：{line}");
+    }
+
+    /// 被判定为错的条目，行文本里必须出现「已判错」。
+    ///
+    /// 这条行文本是模型读的那份。它默认查不到（`keep()` 挡了），但显式传
+    /// `includeRefuted` 时会返回 —— 那时若行上没标记，模型会把它当正常结论引用。
+    /// 标记漏掉的代价不是「界面少个字」，是「错误结论被当成事实写进下一轮回答」。
+    #[test]
+    fn compact_line_marks_refuted_entries() {
+        let now = 1_700_000_000_000;
+        let mut row = IndexRow {
+            id: "m1".into(),
+            project: None,
+            agent: None,
+            kind: "decision".into(),
+            layer: "l2".into(),
+            title: "端口固定 3065".into(),
+            summary: String::new(),
+            tags: vec![],
+            importance: 0.5,
+            pinned: false,
+            starred: false,
+            created_at: now,
+            updated_at: now,
+            valid_to: None,
+            superseded_by: None,
+            deleted_at: None,
+            dedup_status: "unique".into(),
+            access_count: 0,
+            last_hit_at: None,
+            refuted_at: None,
+            refuted_reason: String::new(),
+            refuted_by: None,
+            path: String::new(),
+            rank: 0.0,
+            hits: 0,
+        };
+        assert!(!compact_line(&row, now).contains("已判错"), "正常条目不该带这个标记");
+        row.refuted_at = Some(now);
+        // 即使同时被取代，两个标记都要在：一条结论可能既过时又当年就错。
+        row.superseded_by = Some("m2".into());
+        let line = compact_line(&row, now);
+        assert!(line.contains("已判错"), "被否掉的条目必须标出来：{line}");
+        assert!(line.contains("已过时"), "被取代也仍要标：{line}");
     }
 }

@@ -2,7 +2,7 @@ import * as React from 'react'
 import { Badge, Button, Checkbox, Input, Switch, Textarea } from '@ui'
 import { t } from '../i18n'
 import * as m from './memory-api'
-import { agentText, Empty, isDraft, num, Panel, Section, stamp, StateBadge, timeText, fullTime, useLoad } from './memory-shared'
+import { agentText, Empty, isDraft, isRefuted, num, Panel, Section, stamp, StateBadge, timeText, fullTime, useLoad } from './memory-shared'
 
 /**
  * 记忆浏览：四个视图（列表 / 热力图 / 待确认 / 回收站）+ 常显筛选条 + 详情抽屉。
@@ -143,6 +143,10 @@ function Browse({
   const [batch, setBatch] = React.useState<{ done: number; total: number } | null>(null)
   /** 批准前的一次确认（写操作，不能一键到底）。 */
   const [confirmApprove, setConfirmApprove] = React.useState(false)
+  /** 「这条错了」的理由输入是否展开。点按钮只展开、不立即提交（写操作要让人先说话）。 */
+  const [refuting, setRefuting] = React.useState(false)
+  /** 「这条错了」的理由。空串提交时按 undefined 处理（后端理由可空）。 */
+  const [refuteReason, setRefuteReason] = React.useState('')
 
   const list = useLoad(
     () => m.loadList({
@@ -158,6 +162,9 @@ function Browse({
       // 浏览页是「看全部」的地方：未升级的抽取草稿也要出现在列表里，
       // 否则用户看不到它们、也就无从裁决。检索/注入等出口仍然默认排除草稿。
       includeCandidates: true,
+      // 浏览页必须看得见被否掉的条目，否则用户没法撤销。检索/注入等出口
+      // 仍然默认排除被反驳的条目 —— 这里只是「能看见并处理」。
+      includeRefuted: true,
       limit: pageSize,
       offset: page * pageSize,
     }),
@@ -228,6 +235,9 @@ function Browse({
   const openEntry = React.useCallback(async (id: string) => {
     setBusy(id)
     setError('')
+    // 换一条就收起上一条的「这条错了」输入，理由不跟着串到别条上。
+    setRefuting(false)
+    setRefuteReason('')
     try {
       const payload = await m.loadEntry(id)
       const entry = payload.items[0] ?? null
@@ -643,6 +653,7 @@ function Browse({
                                 {item.layer === 'l2' ? t('深层') : t('普通')}
                               </span>
                             )}
+                            {isRefuted(item) ? <span className='mm-pill refuted'>{t('错误')}</span> : null}
                           </td>
                           <td className='mm-bt-link' onClick={event => {
                             event.stopPropagation()
@@ -898,6 +909,11 @@ function Browse({
 
             <div className='mm-drawer-meta'>
               <Badge variant='secondary' shape='tag'>{selected.typeLabel}</Badge>
+              {isRefuted(selected) ? (
+                <Badge variant='destructive' shape='tag' title={t('人已判定这条是错的，原文与演化链仍保留，可撤销')}>
+                  {t('已被判定为错')}
+                </Badge>
+              ) : null}
               {isDraft(selected) ? (
                 <Badge variant='warning' shape='tag' title={t('自动抽取的草稿，还没被反复确认，不会进入检索与注入')}>
                   {t('草稿')}
@@ -924,6 +940,23 @@ function Browse({
             {selected.layerCaveat ? (
               <div className='mm-muted mm-draft-caveat'>{selected.layerCaveat}</div>
             ) : null}
+            {isRefuted(selected) ? (
+              <div className='mm-refuted-note'>
+                <div>{t('这条已被判定为错误，不会进入检索、注入或画像。')}</div>
+                {selected.refutedReason?.trim() ? (
+                  <div className='mm-refuted-reason'>{t('理由')}：{selected.refutedReason}</div>
+                ) : null}
+                {selected.refutedBy ? (
+                  <div className='mm-refuted-by'>
+                    {t('已由')}{' '}
+                    <button type='button' className='mm-link' onClick={() => void openEntry(selected.refutedBy!)}>
+                      {selected.refutedBy}
+                    </button>{' '}
+                    {t('接替')}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
             {selected.files.length ? (
               <div className='mm-files'>
                 {selected.files.map(file => <code key={file}>{file}</code>)}
@@ -946,8 +979,53 @@ function Browse({
                     {t('彻底删除')}
                   </Button>
                 </>
+              ) : isRefuted(selected) ? (
+                <>
+                  {/* 已被人判错：只留「撤销」这一条路。撤销后条目恢复常态，
+                      那时候再谈采纳 / 星标 / 编辑 / 删除 —— 特别是草稿，采纳必然
+                      被后端拒绝，不该让用户点到一个注定失败的按钮。 */}
+                  <Button type='button' size='sm' onClick={() => void act(selected.id, async () => {
+                    await m.unrefuteMemory(selected.id)
+                    await openEntry(selected.id)
+                  })}>
+                    {t('撤销错误标记')}
+                  </Button>
+                </>
               ) : (
                 <>
+                  {/* 「这条错了」是写操作，不一键到底：先展开理由输入框，让人写完
+                      （理由可留空）再点确认。确认走 act() 的统一错误提示与刷新。 */}
+                  {refuting ? (
+                    <>
+                      <Input
+                        className='mm-refute-reason'
+                        value={refuteReason}
+                        placeholder={t('为什么错？（可留空）')}
+                        onChange={event => setRefuteReason(event.target.value)}
+                      />
+                      <Button type='button' size='sm' variant='destructive' onClick={() => void act(selected.id, async () => {
+                        await m.refuteMemory(selected.id, refuteReason.trim() || undefined)
+                        await openEntry(selected.id)
+                        setRefuting(false)
+                        setRefuteReason('')
+                      })}>
+                        {t('确认')}
+                      </Button>
+                      <Button type='button' size='sm' variant='ghost' onClick={() => {
+                        setRefuting(false)
+                        setRefuteReason('')
+                      }}>
+                        {t('取消')}
+                      </Button>
+                    </>
+                  ) : (
+                    <Button type='button' size='sm' variant='destructive' onClick={() => {
+                      setRefuteReason('')
+                      setRefuting(true)
+                    }}>
+                      {t('这条错了')}
+                    </Button>
+                  )}
                   {/* 草稿只有「认了」这一个正向动作：模型抽出来、还没被反复确认的
                       东西，用户看一眼就知道对不对。缺了这个按钮，草稿就只能等模型
                       下次再抽到一次才升层 —— 人的判断排在机器后面。 */}

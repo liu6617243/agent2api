@@ -863,7 +863,9 @@ fn relevance(
 /// 也就是说 l1 流水要靠「路径」或「多个线索互相印证」才能挤进来，一个泛词命中
 /// 进不来 —— 召回上去了，精度还在。
 fn floor_for(entry: &MemoryEntry) -> Option<f64> {
-    if !entry.is_live() {
+    // 被判定为错的条目与被取代的同样处理：它不能进请求级注入，那是每一轮都
+    // 自动发生、模型无法分辨真伪的通道。
+    if !entry.is_trusted() {
         return None;
     }
     // ── 草稿一律不进注入 ────────────────────────────────────────
@@ -973,7 +975,8 @@ fn group_key(entry: &MemoryEntry) -> String {
 /// 所以这里加一条硬前置：还在 l1 的 auto-extract 产物不参与。升到 l2 之后
 /// （说明它被反复确认过）自然放行 —— `agent` 字段不清，但那时它已经是结论。
 fn rule_candidate(entry: &MemoryEntry) -> bool {
-    if !entry.is_live() {
+    // 「必须遵守」是每轮自动注入的最强指令，被反驳的结论绝不能混进来。
+    if !entry.is_trusted() {
         return false;
     }
     if super::is_auto_draft(entry) {

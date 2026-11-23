@@ -110,7 +110,8 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
     let all = store::load_all();
     let mut source: Vec<model::MemoryEntry> = all
         .iter()
-        .filter(|entry| entry.is_live() && entry.layer == Layer::L1)
+        // 被反驳的结论不能当蒸馏素材：否则会被重新压成一条新结论，错误复活。
+        .filter(|entry| entry.is_trusted() && entry.layer == Layer::L1)
         // 素材池不喂 auto-extract 自己的候选：那些条目是「待确认的结论」，不是
         // 原始流水。拿它们再蒸馏一遍 = 模型对自己上一轮的输出做二次压缩，同一件
         // 事被改写两遍，正是这一轮要消灭的重复。它们只作为「已有结论清单」出现，
@@ -142,7 +143,8 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
     // 由后续的 near_duplicate 兜底。
     let mut known: Vec<model::MemoryEntry> = all
         .iter()
-        .filter(|entry| entry.is_live())
+        // 被否掉的结论不该被当成「这个老话题已经讲过」，否则模型会去 reinforce 它。
+        .filter(|entry| entry.is_trusted())
         .filter(|entry| {
             entry.layer == Layer::L2
                 || entry.agent.as_deref() == Some(model::AUTO_EXTRACT_AGENT)
@@ -354,7 +356,8 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
 pub fn tag(ids: &[String], force: bool, limit: usize) -> Outcome {
     let mut targets: Vec<model::MemoryEntry> = store::load_all()
         .into_iter()
-        .filter(|entry| entry.is_live())
+        // 不给一条被否掉的错误结论打标签、花 token：它不配进检索标签体系。
+        .filter(|entry| entry.is_trusted())
         .filter(|entry| ids.is_empty() || ids.contains(&entry.id))
         .filter(|entry| force || entry.tags.len() < 3)
         .collect();
@@ -426,7 +429,8 @@ pub fn tag(ids: &[String], force: bool, limit: usize) -> Outcome {
 pub fn summarize(ids: &[String], limit: usize) -> Outcome {
     let targets: Vec<model::MemoryEntry> = store::load_all()
         .into_iter()
-        .filter(|entry| entry.is_live() && entry.body.chars().count() >= 200)
+        // 摘要是「这条值得被记住」的信号，被反驳的结论不该拿到它。
+        .filter(|entry| entry.is_trusted() && entry.body.chars().count() >= 200)
         .filter(|entry| ids.is_empty() || ids.contains(&entry.id))
         .filter(|entry| entry.summary_text.trim().is_empty() || ids.contains(&entry.id))
         .into_iter()
@@ -486,7 +490,8 @@ pub fn detect_supersede(new_id: &str) -> Outcome {
         return Outcome::Skipped("双时间轴自动识别已关闭".into());
     }
     let all = store::load_all();
-    let Some(entry) = all.iter().find(|entry| entry.id == new_id && entry.is_live()).cloned() else {
+    // 新记忆本身若已被反驳，就不再拿它去判别人的失效：错误结论没有资格推翻别人。
+    let Some(entry) = all.iter().find(|entry| entry.id == new_id && entry.is_trusted()).cloned() else {
         return Outcome::Skipped(format!("找不到活着的记忆 {new_id}"));
     };
     if entry.layer != Layer::L2 {
@@ -494,7 +499,8 @@ pub fn detect_supersede(new_id: &str) -> Outcome {
     }
     let mut candidates: Vec<model::MemoryEntry> = all
         .into_iter()
-        .filter(|other| other.id != entry.id && other.is_live() && other.layer == Layer::L2)
+        // 旧结论也必须可信：不能让一条已被否掉的判断通过「被再次取代」而洗白。
+        .filter(|other| other.id != entry.id && other.is_trusted() && other.layer == Layer::L2)
         .filter(|other| other.kind == entry.kind)
         .filter(|other| other.project == entry.project)
         .collect();
@@ -586,7 +592,8 @@ pub fn build_profile(sub: Option<&str>, force: bool) -> Outcome {
     let scope: Option<&'static str> = sub.map(super::profile_sub);
     let min = config::usize_of("deep.personaMinMemories").max(5);
     let all = store::load_all();
-    let live: Vec<&model::MemoryEntry> = all.iter().filter(|entry| entry.is_live()).collect();
+    // 画像素材必须是可信事实：被反驳的结论进画像等于把错误写进「这个人是谁」。
+    let live: Vec<&model::MemoryEntry> = all.iter().filter(|entry| entry.is_trusted()).collect();
     // 门槛按**真记忆**算：草稿不算「这个人身上已经积累的事实」。否则一个刚装上
     // 的库跑了几轮抽取就凑够 5 条草稿，画像立刻开始生成 —— 素材全是模型自己
     // 编的，画出来的「画像」也是模型的自我复读。

@@ -392,6 +392,8 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/memory/write", post(api::memory::post_write))
         .route("/api/memory/update", post(api::memory::post_update))
         .route("/api/memory/promote", post(api::memory::post_promote))
+        .route("/api/memory/refute", post(api::memory::post_refute))
+        .route("/api/memory/unrefute", post(api::memory::post_unrefute))
         .route("/api/memory/delete", post(api::memory::post_delete))
         .route("/api/memory/restore", post(api::memory::post_restore))
         .route("/api/memory/purge", post(api::memory::post_purge))
@@ -1148,7 +1150,7 @@ pub fn gateway_router(state: ServerState) -> Router {
             "/mcp/vision",
             post(api::tool_runtime::mcp_vision).get(api::tool_runtime::mcp_unsupported),
         )
-        // 记忆中枢：16 个工具（记忆库是本机私有数据，鉴权与另外三个端点同口径，
+        // 记忆中枢：18 个工具（记忆库是本机私有数据，鉴权与另外三个端点同口径，
         // 由 handler 自己做 —— 见上方 `/mcp` 前缀的说明）。
         .route(
             "/mcp/memory",

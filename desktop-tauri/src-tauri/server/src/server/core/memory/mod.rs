@@ -350,7 +350,7 @@ fn ensure_index_once() {
                     &format!(
                         "记忆索引已重建：{count} 条（事实源 {} 条，其中有效 {} 条）",
                         entries.len(),
-                        entries.iter().filter(|entry| entry.is_live()).count()
+                        entries.iter().filter(|entry| entry.is_trusted()).count()
                     ),
                 ),
                 Err(error) => crate::server::logging::log(
@@ -395,7 +395,9 @@ fn ensure_index_once() {
 ///   3. **只按时间邻近连**（同项目内最近更新的若干条）。真正常被一起想起的记忆
 ///      是同一段时间写的，这比「共享一个词」准得多，而且成本是排序不是笛卡尔积。
 fn relink(entries: &[MemoryEntry]) {
-    let live: Vec<&MemoryEntry> = entries.iter().filter(|entry| entry.is_live()).collect();
+    // `is_trusted` 而不是 `is_live`：关联图是检索时「顺便提示一下相关记忆」用的，
+    // 把一条被人否掉的结论连进去，等于用它把用户引回错误。
+    let live: Vec<&MemoryEntry> = entries.iter().filter(|entry| entry.is_trusted()).collect();
     if live.is_empty() {
         return;
     }
@@ -571,6 +573,10 @@ pub fn heat(days: usize, tz_minutes: i64) -> Value {
     let since = now - (span as i64) * 86_400_000;
     let mut buckets: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut draft_buckets: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    // 这里刻意用 `is_live()` 而不是 `is_trusted()`：热力图回答的是「我哪天写了
+    // 东西」，是**写作节律**的自我认知，不是「哪些结论还能用」。一条记忆被人
+    // 判错之后，它仍然是「我那天写过的东西」，把它从格子里抹掉等于篡改历史 ——
+    // 用户会以为那天什么都没干，实际那天他写了一条错的。
     for entry in store::snapshot().iter().filter(|item| item.is_live()) {
         if entry.created_at < since {
             continue;
@@ -655,7 +661,7 @@ pub fn get_for(ids: &[String], body_limit: usize, agent: Option<&str>) -> Value 
         // 既定事实引用。要让它读草稿，得显式走检索并传 `includeCandidates`。
         let mut related: Vec<(&MemoryEntry, usize)> = all
             .iter()
-            .filter(|other| other.id != entry.id && other.is_live())
+            .filter(|other| other.id != entry.id && other.is_trusted())
             .filter(|other| !is_auto_draft(other))
             .map(|other| {
                 let mut score = 0usize;
@@ -862,7 +868,7 @@ pub fn projects() -> Value {
         .map(|project| {
             let mut entries: Vec<&MemoryEntry> = all
                 .iter()
-                .filter(|entry| entry.is_live())
+                .filter(|entry| entry.is_trusted())
                 .filter(|entry| !is_auto_draft(entry))
                 .filter(|entry| entry_project_slug(entry) == project.slug)
                 .collect();
@@ -907,7 +913,7 @@ pub fn projects() -> Value {
     // 但单独抽出来给顶部统计条用 —— 通用不是一张可维护的卡，不该混进列表。
     let general_entries: Vec<&MemoryEntry> = all
         .iter()
-        .filter(|entry| entry.is_live())
+        .filter(|entry| entry.is_trusted())
         .filter(|entry| !is_auto_draft(entry))
         .filter(|entry| entry_project_slug(entry) == store::GLOBAL_SLUG)
         .collect();
@@ -1142,7 +1148,7 @@ pub fn profile_view() -> Value {
     // 生成」，点下去却被告知「记忆只有 3 条，未达门槛 5」。
     let live: Vec<&MemoryEntry> = all
         .iter()
-        .filter(|entry| entry.is_live() && !is_auto_draft(entry))
+        .filter(|entry| entry.is_trusted() && !is_auto_draft(entry))
         .collect();
     let profiles: Vec<&MemoryEntry> = live
         .iter()
@@ -1274,13 +1280,37 @@ pub fn status_with(with_tables: bool) -> Value {
         .iter()
         .filter(|entry| entry.superseded_by.is_some() && entry.deleted_at.is_none())
         .count();
-    let l1 = entries.iter().filter(|entry| entry.is_live() && entry.layer == Layer::L1).count();
-    let l2 = entries.iter().filter(|entry| entry.is_live() && entry.layer == Layer::L2).count();
+    let l1 = entries.iter().filter(|entry| entry.is_trusted() && entry.layer == Layer::L1).count();
+    let l2 = entries.iter().filter(|entry| entry.is_trusted() && entry.layer == Layer::L2).count();
     // 草稿（auto-extract 的 l1 候选）单独数出来：它在 `l1` 里，但语义上和
     // 用户自己写的流水完全不同 —— 它不参与检索、不进注入、不进核心记忆。
     // 仪表盘若把它算进「普通记忆」，用户看到的是一个虚高的数字，而那个数字
     // 对应的东西点不进任何地方（检索搜不到、注入里也没有）。
     let candidates = entries.iter().filter(|entry| entry.is_live() && is_auto_draft(entry)).count();
+    // ── 被判定为错的条数：**包含在 `live` 里**，必须单列 ──────────
+    //
+    // 它没被取代、没进回收站、没过期，所以`is_live()` 为真 —— 但它不配当事实。
+    // 仪表盘若要报「有效记忆」，直接拿 `live` 就是一个虚高的数（真机上会出现
+    // 「132 条有效」其中 40 条已经被人否掉）。与 `candidates` 同一处理：单列
+    // 出来，前端做 `live - candidates - refuted` 才是真正能当事实用的条数。
+    //
+    // 用 `is_refuted()` 而不是 `!is_trusted()`：后者把回收站与已取代也算进来，
+    // 会和上面 `deleted` / `superseded` 两个数字重复计数。
+    let refuted = entries.iter().filter(|entry| entry.is_live() && entry.is_refuted()).count();
+    // ── 可信条数：真正能当事实用的那批 ──────────────────────────
+    //
+    // 「有效记忆」这个数字以前是前端拿 `live - candidates` 算的。加了 `refuted`
+    // 之后那条算术会**重复扣减**：一条被反驳的草稿同时落在 `candidates` 和
+    // `refuted` 两个桶里，前端减两次就少算一条。任何「先给三个桶、再让展示层
+    // 相减」的设计都有这个毛病 —— 桶之间有交集，而展示层看不到交集。
+    //
+    // 所以由这里直接给出答案：活着、没被反驳、且不是自动抽取草稿。前端只显示，
+    // 不再做任何加减。仪表盘的分母与 `l2Ratio` 的分子都该是它，否则「沉淀占比」
+    // 会因为分子含错、分母不含错而算出超过 100% 的数。
+    let trusted = entries
+        .iter()
+        .filter(|entry| entry.is_trusted() && !is_auto_draft(entry))
+        .count();
     let index_count = index::global().try_count();
     // 「今日新增 / 昨日」按**本地自然日**切：用户看的「今天」是他自己的今天，
     // 按 UTC 切会让东八区早上 8 点前的写入落到前一天（热力图那条注释踩过同一个坑）。
@@ -1297,6 +1327,12 @@ pub fn status_with(with_tables: bool) -> Value {
         // 「草稿」是 l1 的子集（见上面的注释），单列给仪表盘用：
         // 界面要能说清「这 N 条是模型草稿，还没被确认」，而不是混进普通记忆。
         "candidates": candidates,
+        // 被判定为错的条数（`live` 的子集，见上面的注释）。前端用它把
+        // 「有效记忆」修正成 `live - candidates - refuted`。
+        "refuted": refuted,
+        // 真正能当事实用的条数：`live` 扣掉草稿与被反驳。它与 `l1 + l2` 相等
+        // （`l1`/`l2` 也只数可信条目），前端拿它当分母算沉淀占比不会超过 100%。
+        "trusted": trusted,
         "deleted": deleted,
         "superseded": superseded,
         "today": today,
@@ -1353,7 +1389,7 @@ pub fn status_with(with_tables: bool) -> Value {
 /// 项目卡**：不分组、不算 l1/l2、不挑最新三条、不序列化。首屏只要一个数字。
 fn project_count(entries: &[MemoryEntry]) -> usize {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for entry in entries.iter().filter(|entry| entry.is_live()) {
+    for entry in entries.iter().filter(|entry| entry.is_trusted()) {
         let slug = entry_project_slug(entry);
         if slug != store::GLOBAL_SLUG {
             seen.insert(slug);
@@ -1506,7 +1542,9 @@ impl BatchWriter {
             Some(
                 store::snapshot()
                     .iter()
-                    .filter(|entry| entry.is_live() && entry.layer == Layer::L1)
+                    // 用 `is_trusted`：被人否掉的那条不该继续占着这个 hash。
+                    // 否则「同一段话重新写一遍」会被判成重复、条目标是那条错记忆。
+                    .filter(|entry| entry.is_trusted() && entry.layer == Layer::L1)
                     .map(|entry| entry.hash.clone())
                     .filter(|hash| !hash.is_empty())
                     .collect(),
@@ -1667,6 +1705,10 @@ fn write_inner(
         hash,
         access_count: 0,
         last_hit_at: None,
+        // 新写的条目不可能已经被判错：反驳是对既有条目的判断，只能走 refute_entry。
+        refuted_at: None,
+        refuted_reason: String::new(),
+        refuted_by: None,
         summary_text: String::new(),
         body: content,
         path: String::new(),
@@ -1816,7 +1858,7 @@ fn infer_title(content: &str) -> String {
 fn find_hash_duplicate(hash: &str) -> Option<MemoryEntry> {
     store::snapshot()
         .iter()
-        .filter(|entry| entry.is_live() && entry.hash == hash)
+        .filter(|entry| entry.is_trusted() && entry.hash == hash)
         // 只有 l1 走精确去重：l2 的两条结论可能一字不差但语境不同
         // （例如同一个决定在两个项目里各下了一次），合并会丢掉项目归属
         .find(|entry| entry.layer == Layer::L1)
@@ -1902,7 +1944,7 @@ fn near_duplicate(entry: &MemoryEntry) -> Option<(String, f64)> {
     // 确信它没在每轮重读 55 MB。绑出来是零成本的，且意图直接可读。
     let all = store::snapshot();
     for other in all.iter() {
-        if other.id == entry.id || !other.is_live() || other.layer != Layer::L2 {
+        if other.id == entry.id || !other.is_trusted() || other.layer != Layer::L2 {
             continue;
         }
         if other.kind != entry.kind {
@@ -2057,6 +2099,20 @@ pub fn update(id: &str, patch: &Value) -> Result<Value, String> {
         let Some(target) = Layer::try_parse(raw) else {
             return Err(format!("未知层级 {raw:?}（只接受 l1 / l2）"));
         };
+        // ── 被反驳的条目不许靠改层「复活」────────────────────────
+        //
+        // 这条与 `promote_draft` 里那道拒绝是同一条理由：改层说的是「它该在
+        // 哪一层」，而「它是不是错的」是另一条轴，改层回答不了。一条被判错的
+        // 结论若被抬成 l2，它仍然是错的，但界面上会显示「深层记忆」——
+        // 用户以为它已经洗白了，实际检索仍然跳过它（`is_trusted()` 拦着），
+        // 于是出现「我升了层，为什么还是搜不到」这种查不出原因的症状。
+        //
+        // 唯一的复活入口是 `unrefute_entry`：那是一个明确的、会被记日志的动作。
+        if target == Layer::L2 && entry.is_refuted() {
+            return Err(
+                "这条已被判定为错，不能靠改层复活；先撤销「这条错了」的判定".into(),
+            );
+        }
         // 原层必须在**改之前**记下来：下面的 `previous` 是改完才克隆的，
         // 拿它比「是不是刚升上来的」永远成立不了（那是个恒假的判断）。
         if target == Layer::L2 && entry.layer != Layer::L2 {
@@ -2380,9 +2436,12 @@ pub fn dedup_scan() -> Value {
             "scanned": 0, "exact": 0, "near": 0, "queued": 0,
         });
     }
+    // 巡检只扫「可以当事实用」的条目。被反驳的条目进来会有两个坏后果：① 它可能
+    // 被选成「留哪条」的正主，等于把一条被否掉的结论重新立为标准；② 它与真正
+    // 正确的结论之间的相似度会被反复入队，用户每次裁决都在处理同一桩旧账。
     let live: Vec<MemoryEntry> = store::snapshot()
         .iter()
-        .filter(|entry| entry.is_live())
+        .filter(|entry| entry.is_trusted())
         .cloned()
         .collect();
     let scanned = live.len();
@@ -2718,8 +2777,20 @@ pub(super) fn reinforce_entry_with(
     let Some(before) = store::load_all().into_iter().find(|entry| entry.id == target) else {
         return Err(format!("强化目标不存在：{target}"));
     };
-    if !before.is_live() {
-        return Err(format!("强化目标已失效：{target}"));
+    if !before.is_trusted() {
+        // 被人判定为错的条目不能再被「确认」。`reinforce` 会给 l1 追加一条
+        // evidence 锚点，攒够 `PROMOTE_AFTER_REINFORCE` 就升 l2 —— 允许强化一条
+        // 被否掉的候选，等于让流水自动把它顶回来：用户明确说过「这是错的」，
+        // 而模型又抽到同一批素材时，系统会替他把错误升成结论。这里必须挡住。
+        //
+        // 错误文案分开报，是因为两种失效的下一步动作完全不同：已失效（被取代 /
+        // 在回收站）要找回或恢复；被反驳要撤销反驳 —— 而撤销是人的判断，
+        // 不该由一次自动抽取隐式完成。
+        return Err(if before.is_refuted() {
+            format!("强化目标已被判定为错，先撤销反驳：{target}")
+        } else {
+            format!("强化目标已失效：{target}")
+        });
     }
     let mut entry = before.clone();
     let mut changed = false;
@@ -2814,6 +2885,12 @@ pub fn promote_draft(id: &str) -> Result<Value, String> {
     if !before.is_live() {
         return Err("这条记忆已失效，先恢复再采纳".into());
     }
+    // 被人判定为错的条目不能靠「采纳」翻身：采纳的语义是「这条我认了」，而它
+    // 已经被认过一次「这是错的」。要复活必须先撤销反驳（`unrefute`）—— 那是
+    // 一个明确的、会被记进演化链的动作。
+    if before.is_refuted() {
+        return Err("这条已被判定为不成立，先撤销反驳再采纳".into());
+    }
     if before.layer == Layer::L2 {
         // 幂等：重复点不该报错，也不该再写一次盘
         return Ok(json!({ "id": id, "promoted": false, "layer": "l2" }));
@@ -2846,6 +2923,144 @@ pub fn promote_draft(id: &str) -> Result<Value, String> {
     Ok(json!({ "id": id, "promoted": true, "layer": "l2", "entry": entry.to_json(true) }))
 }
 
+/// 人判定「这条记忆是错的」。
+///
+/// ── 为什么它是独立的一条轴，不是删除 / 降层 / supersede ─────────
+/// 这三条近路都不行，各有一个致命后果：
+///
+/// ① **删除**（进回收站）：原文和演化链一起被埋掉。用户想回顾「我当年为什么
+///    会信这条」时没有东西可看 —— 而这条记忆存在的价值之一恰恰是「我错过一次，
+///    别再错第二次」。回收站还有保留期，到期清理会把它彻底抹掉。
+///
+/// ② **降层**（l2 → l1）：l1 是 `extract` / `distill` 的**素材池**。降下去的错误
+///    结论下一轮就被重新抽出来，换个说法再攒证据升回 l2 —— 错误复活，而且这次
+///    「有据可依」，比原来更难推翻。
+///
+/// ③ **`superseded_by`**：那条轴讲的是「**事实变了**」——旧结论当年成立，只是被
+///    新结论顶掉。这里的语义是「**当年就错了**」，它从来没有成立过。混进同一条
+///    轴，演化链会讲出「v1 被 v2 取代」的假故事，而真相是「v1 是个错误，v2 是
+///    第一次说对」。两个轴可以同时成立，所以必须是两个字段（见 `MemoryEntry`
+///    上 `refuted_at` 的注释）。
+///
+/// ── 为什么落盘要清 pinned / starred ─────────────────────────
+/// `inject.rs` 的 `rule_candidate()` 用 `pinned` 直接判定「进必须遵守块」。一条
+/// 被否掉的结论若还留着置顶，它会绕过 `is_trusted()` 之外的所有排序，成为 system
+/// prompt 里的硬指令。`starred` 同理影响注入与排序权重。所以在反驳这一刻顺手
+/// 清掉 —— 撤销反驳时**不自动恢复**：那时候的置顶意图已经过期了（用户今天的
+/// 意图是「这条错了」），让他自己在撤销后重新置顶更诚实。
+///
+/// ── 为什么 `replacement` 可选 ──────────────────────────────
+/// 真实纠错顺序通常是「先发现这条错了」「过一会儿才写对的那条」。强制要求先有
+/// 接替者，用户就只能先造一条新记忆才能否掉旧的 —— 于是他会去用「删除」。
+pub fn refute_entry(id: &str, reason: &str, replacement: Option<&str>) -> Result<Value, String> {
+    let all = store::load_all();
+    let Some(before) = all.iter().find(|entry| entry.id == id).cloned() else {
+        return Err(format!("找不到记忆 {id}"));
+    };
+    // 已进回收站的条目不该被「反驳」：它在回收站里，界面上的动作是「恢复」或
+    // 「彻底删除」。「这条错了」这个判断说的是「内容不成立」，而回收站说的是
+    // 「这条我不要了」，两条不同的决定不能互相顶替。
+    if before.deleted_at.is_some() {
+        return Err("这条记忆在回收站里，先恢复再判定".into());
+    }
+    if before.is_refuted() {
+        // 幂等：重复点（或两个界面同时判）不该报错，也不该覆盖第一次的理由 ——
+        // 第一次那条通常是用户最清楚的时候写的。
+        return Ok(json!({
+            "id": id,
+            "refuted": true,
+            "already": true,
+            "entry": before.to_json(true),
+        }));
+    }
+    // 接替者必须真的存在，否则演化链上会留一条指向空气的边，`timeline()` 走到
+    // 那里会静默断掉（它找不到就 break），用户以为链断了。
+    if let Some(next) = replacement {
+        if !all.iter().any(|entry| entry.id == next) {
+            return Err(format!("接替条目 {next} 不存在"));
+        }
+        if next == id {
+            return Err("接替条目不能是它自己".into());
+        }
+    }
+    let mut entry = before.clone();
+    entry.refuted_at = Some(model::now_ms());
+    entry.refuted_reason = reason.trim().to_string();
+    entry.refuted_by = replacement.map(str::to_string);
+    // 见函数注释「为什么落盘要清 pinned / starred」。
+    entry.pinned = false;
+    if entry.kind == MemoryKind::Profile {
+        // 画像的置顶是靠 tag 记的（`PROFILE_PIN_TAG`），光清 `pinned` 不清 tag，
+        // 下一次 `build_profile` 会把这条被否决的画像当成「用户钉住的」再捡回来。
+        entry.tags.retain(|tag| tag != PROFILE_PIN_TAG);
+    }
+    entry.starred = false;
+    // `updated_at` 不动：它记的是「这条记忆最后一次被改动」，而反驳是**对它的
+    // 判断**变了，不是内容变了。推它会让热力图与画像新鲜度误以为「今天写了这条」。
+    // 反驳自己的时间在 `refuted_at` 里，界面要显示「多久前被判错」读那个。
+    store::save(&entry)?;
+    index::global().upsert(&entry)?;
+    // 演化链补一条边：接替者 → 被反驳者。kind 用 `refute` 与 `relates` /
+    // `derived` 区分开 —— 图上要能看出这条边是「纠错」还是「演进」。
+    if let Some(next) = &entry.refuted_by {
+        index::global().link(next, &entry.id, "refute");
+    }
+    bump_revision();
+    let detail = if entry.refuted_reason.is_empty() {
+        String::new()
+    } else {
+        format!("：{}", entry.refuted_reason)
+    };
+    crate::server::logging::log("[Memory]", &format!("判定记忆错误 {id}{detail}"));
+    Ok(json!({
+        "id": id,
+        "refuted": true,
+        "already": false,
+        "entry": entry.to_json(true),
+    }))
+}
+
+/// 撤销「这条错了」的判定：清掉三个字段，这条重新可以当事实用。
+///
+/// ── 为什么不保留历史 ───────────────────────────────────────
+/// 保留一列 `unrefuted_at` 会诱出「到底信哪一次」的歧义，而人已经明确说了
+/// 「撤销」。真正的审计痕迹在别处：`refute_entry` / 本函数各记一行 `[Memory]`
+/// 日志，演化链上那条 `refute` 边还在（不会被删），条目自己的 `refuted_at` 清空
+/// 之后，界面上一眼能看出「这条现在是正常的」。
+///
+/// ── 为什么不恢复 pinned / starred ──────────────────────────
+/// 反驳时清掉了它们（见 `refute_entry` 的注释）。撤销时「恢复」等于替用户做
+/// 一个他今天没做的决定 —— 他当初置顶是因为「这条重要」，后来判它错时那个
+/// 判断已经被推翻了。所以撤销只把「能不能当事实」还回来，权重让他自己重设。
+pub fn unrefute_entry(id: &str) -> Result<Value, String> {
+    let all = store::load_all();
+    let Some(before) = all.iter().find(|entry| entry.id == id).cloned() else {
+        return Err(format!("找不到记忆 {id}"));
+    };
+    if !before.is_refuted() {
+        return Ok(json!({
+            "id": id,
+            "refuted": false,
+            "already": true,
+            "entry": before.to_json(true),
+        }));
+    }
+    let mut entry = before.clone();
+    entry.refuted_at = None;
+    entry.refuted_reason.clear();
+    entry.refuted_by = None;
+    store::save(&entry)?;
+    index::global().upsert(&entry)?;
+    bump_revision();
+    crate::server::logging::log("[Memory]", &format!("撤销「判定为错」{id}"));
+    Ok(json!({
+        "id": id,
+        "refuted": false,
+        "already": false,
+        "entry": entry.to_json(true),
+    }))
+}
+
 /// 在**自动抽取的 l1 候选**里找一条讲同一件事的，返回它的 id。
 ///
 /// ── 为什么候选之间也要判重 ─────────────────────────────────
@@ -2871,7 +3086,9 @@ pub(super) fn similar_l1_candidate(
     // 同一个判据，否则「候选互判重」和「已有结论清单」会各自失效。
     store::snapshot()
         .iter()
-        .filter(|entry| entry.is_live() && entry.layer == Layer::L1)
+        // 被人否掉的候选不再参与判重：它不是「同一件事的另一种说法」，而是
+        // 「同样错过的那个说法」。再强化它只会把它攒够证据升上去。
+        .filter(|entry| entry.is_trusted() && entry.layer == Layer::L1)
         .filter(|entry| entry.agent.as_deref() == Some(model::AUTO_EXTRACT_AGENT))
         .filter(|entry| project_matches(entry.project.as_deref(), project))
         .filter(|entry| entry.kind == kind)
@@ -2980,7 +3197,9 @@ fn apply_derived(payload: &Value) -> Result<(), String> {
     let digest = model::content_hash(redacted_body.trim());
     if snapshot
         .iter()
-        .any(|entry| entry.is_live() && entry.layer == Layer::L2 && entry.hash == digest)
+        // 已被反驳的同内容 l2 不算「已存在」：那样的结论当年就是错的，今天再
+        // 蒸馏出一份同样的内容，应该落成一条新条目（而不是被静默跳过）。
+        .any(|entry| entry.is_trusted() && entry.layer == Layer::L2 && entry.hash == digest)
     {
         crate::server::logging::verbose(
             "[Memory]",
@@ -3022,7 +3241,7 @@ fn apply_derived(payload: &Value) -> Result<(), String> {
     } else {
         snapshot
             .iter()
-            .filter(|other| other.is_live() && other.layer == Layer::L2)
+            .filter(|other| other.is_trusted() && other.layer == Layer::L2)
             .filter(|other| project_matches(other.project.as_deref(), target_project))
             .filter(|other| target_kind.map(|kind| other.kind == kind).unwrap_or(true))
             // 长度先粗筛：`pair_similarity` 是 O(n·m) 的字符二元组比对，一次蒸馏
@@ -3185,7 +3404,7 @@ pub fn health(limit: usize) -> Value {
     let root = store::root();
     let limit = limit.clamp(1, 200);
     let mut stale: Vec<Value> = Vec::new();
-    for entry in entries.iter().filter(|entry| entry.is_live()) {
+    for entry in entries.iter().filter(|entry| entry.is_trusted()) {
         // 候选不参与体检：它带着从流水继承的 `files`（`schedule.rs` 里抽取时
         // 抄了素材的文件锚点），于是每跑一轮就多几条「可能过时」——而这些条目
         // 本身还没被确认，让人去复核一堆草稿等于制造噪音。升到 l2 后再进体检。
@@ -3498,5 +3717,65 @@ mod tests {
         );
         assert!(pair_similarity(&a, &b) > pair_similarity(&a, &c));
         assert!(pair_similarity(&a, &a) > 0.99);
+    }
+
+    /// 「被反驳」与「被取代」是两条独立的轴，不能互相顶替。
+    ///
+    /// 这条测的是**语义边界**：如果哪天有人把 `refuted` 并进 `superseded_by`
+    /// 省两个字段，下面的断言会立刻红 —— 那样做的后果是演化链讲出
+    /// 「v1 被 v2 取代」的假故事（真相是「v1 当年就是个错误」），而且撤销
+    /// 会退化成「从回收站恢复」。
+    #[test]
+    fn refuted_is_orthogonal_to_superseded_and_deleted() {
+        let mut entry = MemoryEntry::draft("a", "t", MemoryKind::Decision, "body");
+        // 被反驳：仍然活着、仍然在库里、没被取代
+        entry.refuted_at = Some(1);
+        assert!(entry.is_live(), "被反驳不等于失效");
+        assert!(entry.superseded_by.is_none(), "被反驳不等于被取代");
+        assert!(entry.deleted_at.is_none(), "被反驳不等于删除");
+        assert!(!entry.is_trusted(), "但它不能当事实用");
+
+        // 撤销反驳就恢复成正常事实 —— 不需要走「恢复」那条路
+        entry.refuted_at = None;
+        assert!(entry.is_trusted());
+
+        // 两条轴可以同时成立：既被改写（superseded）又被指认当年就错（refuted）
+        entry.superseded_by = Some("b".into());
+        entry.refuted_at = Some(1);
+        assert!(entry.is_refuted() && entry.superseded_by.is_some());
+        assert!(!entry.is_live() && !entry.is_trusted());
+    }
+
+    /// 「可信条数」的分母口径：被反驳的、草稿的都不算，而且**不重复扣减**。
+    ///
+    /// 这是仪表盘那个数字的契约。前端以前自己相减（`live - candidates - refuted`），
+    /// 一条被判错的草稿同时落在两个桶里会被扣两次 —— 数字少一条，页面上看不出
+    /// 任何异常，只是永远对不上浏览页的条数。所以口径挪到后端，这条测试钉住它。
+    #[test]
+    fn trusted_count_excludes_drafts_and_refuted_without_double_subtracting() {
+        let mut plain = MemoryEntry::draft("a", "t", MemoryKind::Decision, "b");
+        plain.layer = Layer::L2;
+        let mut draft = MemoryEntry::draft("b", "t", MemoryKind::Knowledge, "b");
+        draft.agent = Some(model::AUTO_EXTRACT_AGENT.to_string());
+        draft.layer = Layer::L1;
+        // 落在两个桶的交集里：既是草稿（l1 + auto-extract）又被判错
+        let mut draft_refuted = draft.clone();
+        draft_refuted.id = "c".into();
+        draft_refuted.refuted_at = Some(1);
+        let mut refuted = MemoryEntry::draft("d", "t", MemoryKind::Decision, "b");
+        refuted.layer = Layer::L2;
+        refuted.refuted_at = Some(1);
+
+        let all = [plain.clone(), draft.clone(), draft_refuted, refuted];
+        let trusted = all.iter().filter(|entry| entry.is_trusted() && !is_auto_draft(entry)).count();
+        assert_eq!(trusted, 1, "只有那条干净的 l2 能当事实用");
+
+        // 反证：旧的相减算式在含交集数据时会算错（少算一条）
+        let live = all.iter().filter(|entry| entry.is_live()).count();
+        let candidates = all.iter().filter(|entry| entry.is_live() && is_auto_draft(entry)).count();
+        let refuted_n = all.iter().filter(|entry| entry.is_live() && entry.is_refuted()).count();
+        assert_eq!((live, candidates, refuted_n), (4, 2, 2));
+        assert_eq!(live - candidates - refuted_n, 0, "相减会少算一条：交集被扣两次");
+        assert_ne!(live - candidates - refuted_n, trusted, "所以分母不能由前端算");
     }
 }

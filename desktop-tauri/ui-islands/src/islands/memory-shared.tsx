@@ -69,6 +69,11 @@ export function isDraft(entry: { layer: string; agent: string | null }): boolean
   return entry.layer === 'l1' && entry.agent === 'auto-extract'
 }
 
+/** 这条是否被人判定为「错了」。错条目仍在库里，但不能再当事实用。 */
+export function isRefuted(entry: { refutedAt?: number | null }): boolean {
+  return typeof entry.refutedAt === 'number' && entry.refutedAt > 0
+}
+
 /** 绝对时间（悬停提示用）。 */
 export function fullTime(timestamp: number | null | undefined): string {
   if (!timestamp) return '—'

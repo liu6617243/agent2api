@@ -77,8 +77,16 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
   // 所有「有效记忆」口径都要先扣掉草稿：草稿既不进检索也不进注入，把它算进
   // 分母只会让「沉淀占比」凭空变低，让「有效记忆」凭空变多。
   const drafts = status.candidates ?? 0
-  const effective = Math.max(0, status.live - drafts)
-  const l2Ratio = effective > 0 ? Math.round((status.l2 / effective) * 100) : 0
+  // `refuted` 是「被判错但仍活着」的条数，仍算在 `live` 里。它和草稿一样
+  // 不进检索 / 注入 / 核心记忆。
+  const refuted = status.refuted ?? 0
+  // 分母直接用后端给的 `trusted`（活着 + 没被反驳 + 不是草稿），**不在这里相减**：
+  // `candidates` 与 `refuted` 两桶有交集（一条被判错的草稿同时属于两边），
+  // 前端做 `live - drafts - refuted` 会把那条扣两次，数字少一条且没人看得出。
+  // 老后端没有这个字段时回落到旧算式，保证升级过渡期页面不崩。
+  const trusted = status.trusted ?? Math.max(0, status.live - drafts - refuted)
+  // 分子也用可信口径：`l2` 已由后端只数可信条目，所以占比不会超过 100%。
+  const l2Ratio = trusted > 0 ? Math.round((status.l2 / trusted) * 100) : 0
   const pending = status.review?.pending ?? 0
   /** 积压阈值（配置项 `dedup.pendingWarnThreshold`，后端默认 50）。
    *
@@ -103,7 +111,7 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
       <MetricGrid>
         <MetricCard>
           <MetricLabel>{t('有效记忆')}</MetricLabel>
-          <MetricValue>{num(effective)}</MetricValue>
+          <MetricValue>{num(trusted)}</MetricValue>
           {/* 分层用「两个大数字 + 各自标签」并排，不用「沉淀 X · 流水 Y」一行：
               后者把两个不同的量塞进一句里，读的时候要先在心里拆开才知道谁是谁；
               并排之后左边永远是普通、右边永远是深层，扫一眼就能比。
@@ -131,6 +139,12 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
           {(status.candidates ?? 0) > 0 ? (
             <div className='mm-metric-sub'>
               {t('另有 {n} 条自动抽取草稿待确认（不进检索与注入）', { n: status.candidates })}
+            </div>
+          ) : null}
+          {/* 被判错的条数：0 时隐藏，避免给大多数库添一行噪音。 */}
+          {refuted > 0 ? (
+            <div className='mm-metric-sub'>
+              {t('已纠错 {n} 条（不进检索与注入）', { n: refuted })}
             </div>
           ) : null}
         </MetricCard>

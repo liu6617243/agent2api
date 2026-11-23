@@ -32,6 +32,8 @@
 //! POST /api/memory/write       写入一条记忆
 //! POST /api/memory/update      更新标题/正文/标签/重要度/层/有效期
 //! POST /api/memory/promote     人工采纳一条自动抽取草稿（l1 → l2）
+//! POST /api/memory/refute      判定一条记忆是错的（保留条目与演化链，撤销可恢复）
+//! POST /api/memory/unrefute    撤销「这条错了」的判定
 //! POST /api/memory/delete      进回收站
 //! POST /api/memory/restore     从回收站恢复
 //! POST /api/memory/purge       彻底删除（回收站里再删一次）
@@ -167,6 +169,9 @@ pub async fn get_list(State(_state): State<ServerState>, Query(params): Query<Ha
         // 自动抽取的候选默认不出现在列表里（它们是草稿，不是记忆）。浏览页要
         // 看得见才能确认，所以那边显式传 `includeCandidates=1`。
         include_candidates: flag(&params, "includeCandidates").unwrap_or(false),
+        // 被判定为错的条目默认不出现在列表里。浏览页要看得见才能撤销，
+        // 所以那边显式传 `includeRefuted=1`，并在行上打红色标记。
+        include_refuted: flag(&params, "includeRefuted").unwrap_or(false),
         limit: number(&params, "limit").unwrap_or_else(|| memory_config::usize_of("ui.pageSize").max(1)),
         // 分页偏移。不传 = 第一页；传了也由 `search_page` 自己夹到 [0, total]，
         // 页面数变少后停在末页不会拿到空表以外的错误。
@@ -619,6 +624,41 @@ pub async fn post_delete(State(_state): State<ServerState>, body: Bytes) -> Resp
 /// 一个语义，不是通用字段改写。单开一个端点，界面才能给一个说得清的按钮。
 pub async fn post_promote(State(_state): State<ServerState>, body: Bytes) -> Response {
     with_id(body, memory::promote_draft)
+}
+
+/// `POST /api/memory/refute` —— 人判定「这条记忆是错的」。
+///
+/// ── 为什么不是 `delete`、不是「降层」、不是 `superseded` ──────
+/// 删掉会把原文和演化链一起埋掉，用户想回顾「当年为什么会信这条」就没得看；
+/// 降成 l1 更糟 —— l1 是蒸馏素材池，错误结论下一轮就被重新抽出来，错误复活；
+/// `superseded` 讲的是「事实变了」（旧结论当年是对的），而这里是「当年就错了」。
+/// 所以它是正交的一条轴：条目留着、位置不动、原文不删，只是所有「拿它当事实」
+/// 的出口一律跳过它。撤销就是把字段清掉，天然可恢复。
+pub async fn post_refute(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(error) => return errors::management_error(400, error.message),
+    };
+    let Some(id) = payload.get("id").and_then(Value::as_str) else {
+        return errors::management_error(400, "缺少 id");
+    };
+    // 理由允许为空（人能一键否掉一条明显胡说，但懒得写原因），
+    // 接替条目可选：大多数纠错场景里「新结论」还没写出来。
+    let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("");
+    let replacement = payload
+        .get("replacementId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    match memory::refute_entry(id, reason, replacement) {
+        Ok(value) => ok_json(value),
+        Err(message) => errors::management_error(400, message),
+    }
+}
+
+/// `POST /api/memory/unrefute` —— 撤销「这条错了」的判定。
+pub async fn post_unrefute(State(_state): State<ServerState>, body: Bytes) -> Response {
+    with_id(body, memory::unrefute_entry)
 }
 
 pub async fn post_restore(State(_state): State<ServerState>, body: Bytes) -> Response {

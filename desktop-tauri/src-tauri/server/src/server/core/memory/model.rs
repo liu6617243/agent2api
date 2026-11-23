@@ -280,6 +280,38 @@ pub struct MemoryEntry {
     /// 最近一次被命中的时间。热度的衰减基准。
     #[serde(default)]
     pub last_hit_at: Option<i64>,
+    /// 被**人**判定为不成立的时间。`Some` = 这条是错的，不能当事实用。
+    ///
+    /// ── 为什么是独立字段，不是「降层」或「进回收站」─────────────
+    /// 降层（l2 → l1）是最直觉的做法，但它有害：l1 是**蒸馏素材池**，降下去的
+    /// 错误结论下一轮就会被 `extract` / `distill` 重新抽出来，换个说法再升上来
+    /// —— 错误复活，而且这次「有据可依」。进回收站则把演化链和原文一起埋掉，
+    /// 用户想回顾「我当时为什么会信这条」就没得看了。
+    ///
+    /// 所以「被反驳」是一个**正交于 layer 的维度**：位置不动、原文不删、
+    /// 演化链完整，只是所有「拿它当事实」的出口（检索 / 注入 / 核心记忆 /
+    /// 画像素材 / 蒸馏素材 / 去重正主）一律跳过它。撤销就是把字段清回 `None`。
+    ///
+    /// 为什么不复用 `superseded_by`：那条轴是「**事实变了**」——旧结论当年是
+    /// 对的，只是被新结论顶掉。这条轴是「**当年就错了**」——它从来没有成立过。
+    /// 混在一起会让演化链讲出「v1 被 v2 取代」的假故事，而真相是「v1 是个错误，
+    /// v2 是第一次说对」。两个轴同时可能成立，所以必须是两个字段。
+    #[serde(default)]
+    pub refuted_at: Option<i64>,
+    /// 一句话说明为什么判定它错了（人写的，可为空）。
+    ///
+    /// 为什么必须留下来：`refuted_at` 只说「错了」，说不出「错在哪」。下次模型
+    /// 抽到同一批流水时，如果只有时间戳，它会重新生成一条一模一样的错误结论；
+    /// 有了这句话，它至少能看到「上次这条被否掉，理由是 X」。
+    #[serde(default)]
+    pub refuted_reason: String,
+    /// 反驳之后接替它的那条记忆 id（如果有）。有的话演化链上连一条边。
+    ///
+    /// 与 `superseded_by` 的区别：那个是「正文演进」，这个是「纠错」。
+    /// 两者可以同时存在 —— 一条结论可能既被改写（superseded_by）又被指认
+    /// 原本就错（refuted_by）。
+    #[serde(default)]
+    pub refuted_by: Option<String>,
     /// 模型生成的一句话摘要。空 = 还没生成（此时 `summary()` 回退到正文首段）。
     ///
     /// 为什么不直接覆盖 `body`：摘要会丢证据。原文是这条记忆存在的理由，
@@ -335,6 +367,9 @@ impl MemoryEntry {
             hash: content_hash(&body),
             access_count: 0,
             last_hit_at: None,
+            refuted_at: None,
+            refuted_reason: String::new(),
+            refuted_by: None,
             summary_text: String::new(),
             body,
             path: String::new(),
@@ -395,6 +430,29 @@ impl MemoryEntry {
         self.superseded_by.is_none() && self.deleted_at.is_none() && !self.is_expired(now_ms())
     }
 
+    /// 这条记忆是否被**人**判定为不成立。
+    ///
+    /// ── 为什么单独一个判据，而不是并进 `is_live()` ──────────────
+    /// 「被反驳」的条目**仍然是活的** —— 它没被取代、没删、没过期，演化链要能
+    /// 走回去，浏览页要能看得到、撤销得掉。`is_live()` 是「这条还在不在库里」，
+    /// 这个问题是「这条还配不配当事实」。两个问题混成一个，会让「反驳后想撤销」
+    /// 变成「从回收站恢复」，语义全乱。
+    ///
+    /// 所有「拿它当事实用」的出口都要调这个：检索 / 注入 / 核心记忆 / 摘要 /
+    /// 画像素材 / 蒸馏素材 / 去重时的正主选择。少一处，一条被人明确否掉的结论
+    /// 就会从那个口子继续冒充事实。
+    pub fn is_refuted(&self) -> bool {
+        self.refuted_at.is_some()
+    }
+
+    /// 可以当事实用的条目（活着、且没被反驳）。
+    ///
+    /// 这两个条件几乎总是要一起判 —— 于是给一个合并判据，减少「只写了
+    /// `is_live()` 忘了 `is_refuted()`」这类漏项。出口过滤优先用它。
+    pub fn is_trusted(&self) -> bool {
+        self.is_live() && !self.is_refuted()
+    }
+
     /// 是否已超过声明的有效期（`valid_to` 为 `None` 时永不过期）。
     pub fn is_expired(&self, now: i64) -> bool {
         matches!(self.valid_to, Some(until) if until > 0 && now > until)
@@ -429,6 +487,12 @@ impl MemoryEntry {
             "hash": self.hash,
             "accessCount": self.access_count,
             "lastHitAt": self.last_hit_at,
+            // 「被人判定为错」的三个字段：界面上要能显示红色标记 + 那句理由，
+            // 也要能一键撤销。名字用 `refuted*` 与 `superseded*` 区分开 ——
+            // 前者是「当年就错了」，后者是「事实变了」。
+            "refutedAt": self.refuted_at,
+            "refutedReason": self.refuted_reason,
+            "refutedBy": self.refuted_by,
             "summary": self.summary(180),
             "summaryText": self.summary_text,
             "chars": self.body.chars().count(),
@@ -670,6 +734,21 @@ impl MemoryEntry {
         if let Some(hit) = self.last_hit_at {
             out.push_str(&format!("last_hit_at: {hit}\n"));
         }
+        // 「被人判定为错」。只在真发生时才写，存量大头文件不受影响。
+        //
+        // 写在 `superseded_by` 之后而不是紧挨着它，是为了让 frontmatter 的
+        // 阅读顺序仍是「身份 → 时间轴 → 关系 → 附加物」：反驳属于关系那一类。
+        if let Some(at) = self.refuted_at {
+            out.push_str(&format!("refuted_at: {at}\n"));
+            if !self.refuted_reason.trim().is_empty() {
+                // 理由可能带引号/冒号，必须走 yaml_scalar 转义 —— 直接拼会把
+                // 一整行 frontmatter 解析坏，下次读出来理由被截断。
+                out.push_str(&format!("refuted_reason: {}\n", yaml_scalar(self.refuted_reason.trim())));
+            }
+            if let Some(by) = &self.refuted_by {
+                out.push_str(&format!("refuted_by: {}\n", yaml_scalar(by)));
+            }
+        }
         out.push_str("---\n\n");
         out.push_str(&self.body);
         if !out.ends_with('\n') {
@@ -728,6 +807,9 @@ impl MemoryEntry {
             hash: get("hash").filter(|v| !v.is_empty()).unwrap_or_else(|| content_hash(&body)),
             access_count: get("access_count").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
             last_hit_at: get("last_hit_at").and_then(|v| v.parse::<i64>().ok()).filter(|value| *value > 0),
+            refuted_at: get("refuted_at").and_then(|v| v.parse::<i64>().ok()).filter(|value| *value > 0),
+            refuted_reason: get("refuted_reason").unwrap_or_default(),
+            refuted_by: get("refuted_by").filter(|v| !v.is_empty()),
             summary_text: get("summary").unwrap_or_default(),
             body,
             path: path.to_string(),
@@ -907,6 +989,47 @@ mod tests {
         assert_eq!(back.access_count, 7);
         assert_eq!(back.last_hit_at, Some(1_700_000_500_000));
         assert_eq!(back.hash, entry.hash);
+    }
+
+    /// 「被人判定为错」三个字段必须能往返。
+    ///
+    /// 这条测的不是「多写了几行 frontmatter」，而是**撤销的可行性**：反驳之后
+    /// 撤销要能靠 `refuted_at` 判断「它现在是被否的状态」，而理由要能在界面上
+    /// 重新显示出来。任一字段漏了序列化，撤销就会变成「点一下没反应」。
+    #[test]
+    fn refuted_fields_round_trip_and_gate_trust() {
+        let mut entry = sample();
+        assert!(entry.is_trusted());
+        assert!(!entry.is_refuted());
+        entry.refuted_at = Some(1_700_000_900_000);
+        entry.refuted_reason = "这条讲的其实是 npm cache clean，不是 rm -rf".into();
+        entry.refuted_by = Some("m2".into());
+        let text = entry.to_markdown();
+        let back = MemoryEntry::from_markdown(&text, "fallback", &entry.path);
+        assert_eq!(back.refuted_at, Some(1_700_000_900_000));
+        assert_eq!(back.refuted_reason, entry.refuted_reason);
+        assert_eq!(back.refuted_by.as_deref(), Some("m2"));
+        // 关键语义：被反驳的条目**仍然是活的**（能看、能撤销、演化链走得回去），
+        // 但不能再当事实用。两个判据必须给出不同答案 —— 合成一个就会把
+        // 「撤销」做成「从回收站恢复」。
+        assert!(back.is_live());
+        assert!(back.is_refuted());
+        assert!(!back.is_trusted());
+    }
+
+    /// `refuted_at: 0` 是脏数据（历史文件或手工编辑），要当成「没被反驳」。
+    ///
+    /// 若把它当成 `Some(0)`，一条正常记忆会在界面上永久显示红色标记且撤销按钮
+    /// 有效 —— 用户点撤销会把它的三个字段清掉，看起来「修好了」，但下次同步又从
+    /// 另一台机器同步回来，症状复现且查不出原因。
+    #[test]
+    fn zero_refuted_at_is_treated_as_not_refuted() {
+        let mut entry = sample();
+        entry.refuted_at = Some(0);
+        let text = entry.to_markdown();
+        let back = MemoryEntry::from_markdown(&text, "fallback", &entry.path);
+        assert_eq!(back.refuted_at, None);
+        assert!(back.is_trusted());
     }
 
     /// `origin_path` 只在回收站文件里出现，且必须能往返 —— 恢复靠它回原处。

@@ -66,6 +66,12 @@ export type MemoryEntry = {
   draft?: boolean
   /** 与 `draft` 配套的人话解释，给模型读的：草稿可以当线索，不能当既定结论引用。 */
   layerCaveat?: string
+  /** 被人判定为「这条错了」的时间。有值 = 不能当事实用（原文仍保留，可撤销）。 */
+  refutedAt?: number | null
+  /** 为什么错（人写的一句话，可能为空） */
+  refutedReason?: string
+  /** 纠错后接替它的条目 id */
+  refutedBy?: string | null
   related?: { id: string; title: string; type: string; layer?: string; line: string }[]
 }
 
@@ -139,6 +145,15 @@ export type MemoryStatus = {
    * 那些草稿已经是系统认下的记忆。
    */
   candidates: number
+  /** 被判定为错的条数，不计入有效记忆 */
+  refuted: number
+  /**
+   * 真正能当事实用的条数：活着、没被反驳、也不是自动抽取草稿。
+   *
+   * 后端直接给出这个数而不是让前端做 `live - candidates - refuted` —— 那些桶之间
+   * 有交集（一条被反驳的草稿同时算草稿和被反驳），在前端相减会重复扣减。
+   */
+  trusted: number
   deleted: number
   superseded: number
   /** 本地自然日（零点起）新增的条数，只算 live。 */
@@ -244,6 +259,11 @@ export type ListParams = {
    * 只有浏览页 / 待确认队列这种「要看草稿本身」的界面才显式传 true。
    */
   includeCandidates?: boolean
+  /**
+   * 是否包含被人判定为「错了」的条目。默认（不传）后端不返回。
+   * 只有浏览页这种「要看得见、才能撤销」的界面才显式传 true。
+   */
+  includeRefuted?: boolean
   limit?: number
   /** 跳过前 N 条。分页用：`offset = page * pageSize` */
   offset?: number
@@ -898,7 +918,12 @@ export function resetConfig(keys?: string[]): Promise<{ config: MemoryConfig; va
 }
 
 export function loadList(params: ListParams): Promise<MemoryList> {
-  return api('GET', `/api/memory/list${query(params as Record<string, string | number | boolean | undefined>)}`)
+  return api('GET', `/api/memory/list${query({
+    ...params,
+    // 后端只认 `includeRefuted=1`。照 `includeCandidates: true` 的写法由调用方
+    // 传布尔值，这里统一转成后端约定的 '1'（query 会跳过 false / undefined）。
+    includeRefuted: params.includeRefuted ? '1' : undefined,
+  } as Record<string, string | number | boolean | undefined>)}`)
 }
 
 /** 每日写入量：浏览页热力图视图的数据源。
@@ -1105,6 +1130,26 @@ export function purgeEntry(id: string): Promise<{ id: string }> {
  */
 export function promoteDraft(id: string): Promise<{ id: string; promoted: boolean; layer: string }> {
   return api('POST', '/api/memory/promote', { id })
+}
+
+/**
+ * 把一条记忆判为「这条错了」。
+ *
+ * 不是删除：条目与演化链都留着，只是从检索 / 注入 / 核心记忆 / 画像素材里退出，
+ * 界面上打红标并显示理由。`reason` 是人写的一句话，`replacementId` 是纠错后
+ * 接替它的那条 —— 两者都可空。撤销走 `unrefuteMemory`。
+ */
+export function refuteMemory(
+  id: string,
+  reason?: string,
+  replacementId?: string,
+): Promise<{ id: string; refuted: boolean }> {
+  return api('POST', '/api/memory/refute', { id, reason, replacementId })
+}
+
+/** 撤销「这条错了」标记，让它重新当事实用。 */
+export function unrefuteMemory(id: string): Promise<{ id: string; refuted: boolean }> {
+  return api('POST', '/api/memory/unrefute', { id })
 }
 
 export function purgeTrash(days?: number): Promise<{ removed: number; keepDays: number }> {

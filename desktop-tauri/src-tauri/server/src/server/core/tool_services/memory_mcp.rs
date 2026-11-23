@@ -89,7 +89,8 @@ fn spec_tools() -> Vec<Value> {
                     "limit": { "type": "number", "description": "Default 30, max 500." },
                     "includeSuperseded": { "type": "boolean", "description": "Also return entries replaced by a newer one." },
                     "includeExpired": { "type": "boolean", "description": "Also return entries whose validTo has passed." },
-                    "includeCandidates": { "type": "boolean", "description": "Also return auto-extract drafts that have not been confirmed yet. Off by default: a draft is a model guess, not an established fact — do not cite one as truth." }
+                    "includeCandidates": { "type": "boolean", "description": "Also return auto-extract drafts that have not been confirmed yet. Off by default: a draft is a model guess, not an established fact — do not cite one as truth." },
+                    "includeRefuted": { "type": "boolean", "description": "Default false: entries a human marked as WRONG are excluded because they are not facts. Only pass true when the user explicitly asks to review corrected history, never to cite one as truth." }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -168,6 +169,34 @@ fn spec_tools() -> Vec<Value> {
                     "validTo": { "type": "number", "description": "0 or null clears the expiry." },
                     "evidence": { "type": "array", "items": { "type": "string" } }
                 },
+                "required": ["id"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+        }),
+        json!({
+            "name": "memory_refute",
+            "title": "标记记忆错误",
+            "description": "Mark an entry as WRONG. The entry stays in the store (history and undo are preserved), but every factual outlet — search, injection, core memory, digest, profile material, distillation source, dedup keeper — stops treating it as fact. Call this ONLY when the user explicitly says a stored memory is wrong; never on your own initiative. Prefer passing a short reason so the same wrong conclusion is not re-derived later.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Entry id to mark as wrong." },
+                    "reason": { "type": "string", "description": "One sentence: why it is wrong. Optional but strongly recommended." },
+                    "replacementId": { "type": "string", "description": "Id of the entry that replaces it, if one already exists. Optional." }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+        }),
+        json!({
+            "name": "memory_unrefute",
+            "title": "撤销错误标记",
+            "description": "Undo a previous memory_refute. The entry becomes a normal fact again. Idempotent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
                 "required": ["id"],
                 "additionalProperties": false
             },
@@ -466,6 +495,9 @@ fn dispatch(name: &str, args: &Value, agent: Option<&str>) -> Result<Value, Call
                 // 候选（模型抽出来、还没被反复确认的草稿）不给模型看：它会当
                 // 既定事实引用。模型要看草稿得显式要，正常情况下不该有这个念头。
                 include_candidates: bool_arg(args, "includeCandidates").unwrap_or(false),
+                // 被人判定为错的条目默认不返回：它不是事实，引用它会把错误结论
+                // 再传下去。只有用户要求回看已纠错的历史时才显式打开。
+                include_refuted: bool_arg(args, "includeRefuted").unwrap_or(false),
                 // 不传 limit 时用 `search.finalTopK`（默认 8）。以前写死 30，
                 // 那条「最终返回条数」旋钮同样是死键。
                 limit: number_arg(args, "limit").unwrap_or(settings.final_top_k),
@@ -596,6 +628,16 @@ fn dispatch(name: &str, args: &Value, agent: Option<&str>) -> Result<Value, Call
             }
             memory::update(&id, args).map_err(CallError::Failed)
         }
+        "memory_refute" => {
+            let id = text_arg(args, "id").ok_or_else(|| CallError::Failed("缺少 id".into()))?;
+            let reason = text_arg(args, "reason").unwrap_or_default();
+            let replacement = text_arg(args, "replacementId");
+            memory::refute_entry(&id, &reason, replacement.as_deref()).map_err(CallError::Failed)
+        }
+        "memory_unrefute" => {
+            let id = text_arg(args, "id").ok_or_else(|| CallError::Failed("缺少 id".into()))?;
+            memory::unrefute_entry(&id).map_err(CallError::Failed)
+        }
         "memory_recent" => Ok(memory::recent_for(
             text_arg(args, "project").as_deref(),
             text_arg(args, "agent").as_deref(),
@@ -638,10 +680,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spec_exposes_sixteen_tools() {
+    fn spec_exposes_eighteen_tools() {
         // 必须与 tool_services::CAPABILITY_COUNTS 里登记的一致，
-        // 否则界面上「N 个工具」与实际差一个
-        assert_eq!(spec().tools.len(), 16);
+        // 否则界面上「N 个工具」与实际差一个（新增 refute/unrefute 时那里已从 16 改成 18）
+        assert_eq!(spec().tools.len(), 18);
     }
 
     #[test]

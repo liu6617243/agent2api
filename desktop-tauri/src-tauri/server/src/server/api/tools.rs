@@ -356,7 +356,7 @@ pub async fn install_info(State(state): State<ServerState>, headers: HeaderMap, 
         // 端点仍然可达 —— 记忆接入页要拿这里的 `url` / `timeout_seconds` 拼片段。
         // 原来它掉进 `_ => vec!["image_analyze"]`，也就是把**视觉**的工具名当
         // 记忆的工具名回给调用方。直接从 spec 里取真实清单，避免再抄一份会漂移
-        // 的名单（`spec()` 里那 16 个才是唯一事实）。
+        // 的名单（`spec()` 里那 18 个才是唯一事实）。
         tool_services::MEMORY_SERVICE_ID => tool_services::memory_tool_names(),
         tool_services::VISION_SERVICE_ID => vec!["image_analyze".to_string()],
         _ => Vec::new(),
