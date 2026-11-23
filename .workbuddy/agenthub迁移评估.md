@@ -223,7 +223,7 @@ node scripts/migrate-agenthub.mjs --protect-profiles --apply
 
 ### 8.3 想让画像跟 AgentHub 一样怎么办
 
-搬不到一模一样 —— 那三个 md 是 AgentHub 自己提示词的产物。想要「接近」，只有两条路：
+搬不到一模一样 —— 那 4 个 md（persona / preferences / habits / tech）是 AgentHub 自己提示词的产物。想要「接近」，只有两条路：
 
 1. **迁完手动跑一次画像生成**，让 agent2api 用这批素材重画，再看 `设置 · 注入预览` 的
    「长期画像」段是否满意；不满意就把 `deep.batchSize` 调小（比如 20），让素材池只吃
@@ -233,3 +233,59 @@ node scripts/migrate-agenthub.mjs --protect-profiles --apply
    注意它们正文里带「证据 [n]：file_xxx, mem_xxx」这类内部 id，迁过去是纯文本噪声，
    不会自动变成 `evidence` 字段 —— 要干净就手抄一遍。
    这样它们进「相关经验」，**不进画像**，不会冒充「关于你的结论」，但内容仍能被检索到。
+
+## 9. 那两万多条为什么不算进「331 条」
+
+**它们是 l1，从来没被排除在记忆之外 —— 「331」是搬多少的口径，不是分类结论。**
+
+源库分层实测（`select layer, type, count(*) from mem group by 1,2`）：
+
+| 层 | 类型 | 条数 |
+|---|---|---|
+| l1 | daily | 25,821 |
+| l1 | note / lesson / troubleshooting / methodology / fact / debug / bugfix / 技术结论 / technical / preference / pattern / finding / config / conclusion | 36 |
+| l2 | knowledge | 194 |
+| l2 | decision | 130 |
+| l2 | insight | 7 |
+
+l1 合计 25,857，l2 合计 331。`--scope all` 就是把这 25,869 条全搬，
+`--scope l2` 只是搬蒸馏层。两边都把 l1 计入「普通记忆」总数，这一点没错。
+
+**不默认搬的理由是 l1 的角色，不是它的身份：**
+
+1. **形态**：daily 平均 537 字节，16,849 条不足 200 字节（一句话、一条命令、一次工具调用）。
+   标题层面 258 条都叫 `<conversation_history_summary>`、19 条 `## 结论`、15 条 `{`；
+   正文前 40 字有 215 条完全相同。agent2api 的列表和注入都拿 title 当检索键，这批条目
+   的 title 不携带信息。
+2. **体积**：正文 13.2MB，是 l2（143KB）的 96 倍。现在库里 l1 只有 188 条，搬完是 26,045 条。
+3. **蒸馏回流**：`extract` 每 30 分钟吃「最新 20 条 l1」（`auto.tasks.extract` +
+   `deep.extractThresholdCount`）。迁移把 `updated_at` 统一写成此刻，25,869 条全算新流水 →
+   以 48 轮/天算，闸门会一直放行约 **27 天**，每轮都在把流水压成 l2 候选，
+   把真正值钱的 331 条挤出「已有结论清单」（那份清单只保留 60 条）。
+   粗算 1,294 轮 × 约 8k token ≈ **1000 万 token**。
+4. **检索稀释**：`recallTopK 20 / finalTopK 8`。BM25 在 2.6 万条超短文本上 idf 塌陷，
+   常见词一命中就把 20 个召回位占满。
+5. **注入门槛**：普通 l1 要 3.3 分才进注入（路径命中 3.0 或两条独立线索 4.0 起算），
+   daily 基本进不去 —— 搬它主要是让**检索**变吵，不是让**注入**变好。
+6. **留存策略相反**：agent2api 自己的 `retain` 170 次尝试只落了 2 条，168 次因 `toolTurn`
+   被跳过（工具轮流水主动不记）。整批搬 25,821 条 daily 等于把它刻意不记的东西塞回来。
+7. **容器体积**：10-18 那天 1,467 条 / 711KB、10-14 那天 1,251 条 / 526KB，都压过
+   `storage.maxFileSizeKB`（默认 512KB）。现在 l1 容器对这条上限是豁免的（store.rs 有回归
+   测试钉着），但它本来就是「踩过坑才加豁免」的那个位置。
+
+**真想搬，给两个削峰旋钮（本次新增）：**
+
+```bash
+# 全搬（会触发上面第 3 条，记得先关 extract）
+node scripts/migrate-agenthub.mjs --scope all --apply
+
+# 只搬正文 ≥512 字的（daily 里信息密度最高的那批）
+node scripts/migrate-agenthub.mjs --scope all --min-size 512
+
+# 单日最多 100 条，避免把 10-18 做成 700KB 的巨型容器
+node scripts/migrate-agenthub.mjs --scope all --max-per-day 100
+```
+
+实测产量：`--min-size 500` → 1,261 条（4.9MB）；`--min-size 1024` → 611 条（4.5MB）；
+`--min-size 2048` → 360 条（4.1MB）。条数掉得很快而体积掉得很慢，说明长尾是少数巨型
+转写稿在占体积 —— 那批更适合当「笔记附件」，不适合当记忆条目。

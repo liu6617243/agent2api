@@ -24,6 +24,12 @@
 //   --scope typed  再加上有明确类型的 l1 笔记       （363 条）
 //   --scope all    全搬，含 25,821 条 daily        （26,188 条）
 //
+// 口径是「搬多少」，不是「哪些算记忆」：两万多条 daily **本来就是 l1**，在
+// AgentHub 里就是普通记忆（计入总数、走同一套检索）。不默认搬它们是因为
+// l1 在两个系统里都是素材层 —— 一条平均 537 字节、16,849 条不足 200 字节，
+// 258 条标题都叫 `<conversation_history_summary>`。想搬就 `--scope all`，
+// 想搬「长的那些」用 `--min-size`，想把某几天的巨型容器削平用 `--max-per-day`。
+//
 // ── 为什么必须能回滚 ────────────────────────────────────────────────
 // 写入是批量且不可逆的（进了库就参与检索与注入）。所以每写成功一条就把
 // 「源 id → 新 id」记进 `--manifest`（默认 `.workbuddy/tmp/agenthub-migrate-*.json`），
@@ -71,6 +77,13 @@ const APPLY = has('--apply')
 const LIMIT = Number(val('limit', '0'))
 const CONCURRENCY = Number(val('concurrency', '4'))
 const AGENT = val('agent', 'agenthub-migrate')
+// 正文长度门槛（字节）。`--scope all` 时库里有 16,849 条不足 200 字，全是
+// 「一句话 / 一条命令 / 一次工具调用」，搬过去只会把注入与检索位浪费掉。
+const MIN_SIZE = Number(val('min-size', '0')) || 0
+// 单日条数上限。agent2api 的 l1 是「一天一容器」，某天 1,467 条就 711KB，
+// 已经压过 `storage.maxFileSizeKB`（默认 512KB）那条线；想搬 all 又不想把某
+// 几天做成巨型容器时用它削平。
+const MAX_PER_DAY = Number(val('max-per-day', '0')) || 0
 // `--manifest` 既用来「这轮写到哪」，也用来 `--undo`「撤哪一轮」。
 // 不显式给的时候两边行为不同：写的是新建一个带时间戳的文件，撤的是取最新那个。
 const MANIFEST_GIVEN = val('manifest', '')
@@ -475,10 +488,32 @@ async function main() {
 
   const planned = []
   const skipped = []
+  const perDay = new Map()
+  // `--max-per-day` 是「每天只留 N 条」，留哪 N 条得有意义：先按 importance 降序、
+  // 再按时间降序，否则留下的是当天最早那一百次工具调用（默认顺序是 created asc）。
+  if (MAX_PER_DAY > 0) {
+    scopeRows.sort((a, b) => Number(b.importance || 0) - Number(a.importance || 0) || Number(b.created || 0) - Number(a.created || 0))
+  }
   for (const row of scopeRows) {
     const out = toWrite(row)
-    if (out.skip) skipped.push({ id: row.id, reason: out.skip })
-    else planned.push(out)
+    if (out.skip) {
+      skipped.push({ id: row.id, reason: out.skip })
+      continue
+    }
+    if (MIN_SIZE > 0 && out.payload.content.length < MIN_SIZE) {
+      skipped.push({ id: row.id, reason: `正文 ${out.payload.content.length} 字 < --min-size ${MIN_SIZE}` })
+      continue
+    }
+    if (MAX_PER_DAY > 0) {
+      const day = new Date(out.payload.createdAt || Date.now()).toISOString().slice(0, 10)
+      const seen = (perDay.get(day) || 0) + 1
+      perDay.set(day, seen)
+      if (seen > MAX_PER_DAY) {
+        skipped.push({ id: row.id, reason: `${day} 当天超过 --max-per-day ${MAX_PER_DAY}` })
+        continue
+      }
+    }
+    planned.push(out)
   }
   console.log(`可写入 ${planned.length} 条，源侧跳过 ${skipped.length} 条`)
 
