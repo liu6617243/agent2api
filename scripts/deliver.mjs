@@ -467,11 +467,26 @@ async function ensureRun(file, label, deadline) {
   return waitRun(file, label, deadline, base)
 }
 
-const MARK = (s) => {
-  if (!s) return 'TIMEOUT'
-  if (s === 'success') return 'OK  '
-  if (s === 'skipped') return 'SKIP'
-  return 'FAIL'
+// 打勾看的是 **settle 的判定**，不是 run.conclusion。
+//
+// ── 为什么不能直接读 run.conclusion（2026-11-24 撞到）──────────────
+// 跳过平台是靠「需要的 job 都完了 → 主动取消还在排队的那个」实现的（见
+// settle 里的 cancel 调用）。这一刀会让 run 级结论写成 `cancelled`，
+// 而 job 级判定（jobVerdict + ignore）依然是 `ok`。
+//
+// 于是 `MARK(run.conclusion)` 打出 `FAIL 服务端测试`，紧接着下一行却打印
+// 「闸门全绿，开始出包」—— 两行自相矛盾。流程是对的（走的是 `ok`），
+// 错的只是这一行显示。人看到 FAIL 会以为测试挂了，去翻一个并不存在的代码失败。
+//
+// 正确形状：判定为通过就只可能是 OK / SKIP，绝不显示 FAIL。
+//   ok    → run 全绿写 OK；结论是 cancelled/skipped 且靠跳过平台过关的写 SKIP
+//   !ok   → FAIL（真失败 / 超时 / 平台没跑起来）
+const MARK = (out) => {
+  if (!out?.ok) return out?.run ? 'FAIL' : 'TIMEOUT'
+  const conclusion = out.run?.conclusion
+  if (conclusion === 'success') return 'OK  '
+  // 这里只剩「job 全绿但 run 汇总不是 success」——被跳过的平台拖累了汇总。
+  return 'SKIP'
 }
 
 // ── 4. 判真假红 / 自动重跑 ──────────────────────────────────────────
@@ -605,7 +620,7 @@ async function main() {
     gates.map(async (g) => {
       const out = await settle(g.file, g.label, deadline)
       const tail = out.run ? `run ${out.run.id}` : '超时未出结果'
-      console.log(`${MARK(out.run?.conclusion)} ${g.label.padEnd(12)} ${tail}${out.note ? `  ← ${out.note}` : ''}`)
+      console.log(`${MARK(out)} ${g.label.padEnd(12)} ${tail}${out.note ? `  ← ${out.note}` : ''}`)
       return { ...g, ...out }
     }),
   )
@@ -633,7 +648,7 @@ async function main() {
 
   const built = await settle('build-windows.yml', 'Windows 安装包', Date.now() + TIMEOUT)
   const finalRun = built?.run
-  console.log(`${MARK(finalRun?.conclusion)} Windows 安装包 ${finalRun ? `run ${finalRun.id}` : '超时未出结果'}${built?.note ? `  ← ${built.note}` : ''}`)
+  console.log(`${MARK(built)} Windows 安装包 ${finalRun ? `run ${finalRun.id}` : '超时未出结果'}${built?.note ? `  ← ${built.note}` : ''}`)
 
   // `ok` 而不是 `conclusion === success`：被跳过的平台（默认 macOS）可能让整轮
   // 结论写成 cancelled，但需要的 job 全绿就等于通过（见 settle()）。
