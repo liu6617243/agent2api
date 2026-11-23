@@ -96,6 +96,26 @@ pub fn l2_dir_for(kind: &str) -> &'static str {
     }
 }
 
+/// 从相对路径反推层级（`.../l1/...` 或 `.../l2/...`）。
+///
+/// ── 为什么需要这条：路径是层级的事实来源 ──────────────────────
+/// `layout::memory_rel_path` 把层级写进路径（`[projects/<slug>|general]/l1| l2/...`），
+/// 而 `to_markdown` 刻意**不**写 `layer: l1`（l1 是缺省值，省一行 diff）。
+/// 两件事合起来的后果：显式声明 `layer: l1` 的 knowledge 存盘后字段缺失，
+/// 重新加载时只能「按类别猜」，猜成 l2 —— 同一条记忆于是分身两处：
+/// 磁盘与索引说 l1，内存条目说 l2（注入按 l2 给 2.0 的进门分，
+/// `status` 把它算进深层记忆）。
+///
+/// 迁移 AgentHub 的 l1 笔记时真机撞到 22 条，这条判据就是那次修出来的。
+/// 拿不到 `l1` / `l2` 段（手写文件放在 `notes/` 之类的位置）才回退到按类别推断。
+pub fn layer_of_path(relative: &str) -> Option<Layer> {
+    relative.split(['/', '\\']).find_map(|segment| match segment {
+        "l1" => Some(Layer::L1),
+        "l2" => Some(Layer::L2),
+        _ => None,
+    })
+}
+
 /// 去重状态。只用于展示与统计 —— 「是否被取代」看 `superseded_by`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -781,10 +801,22 @@ impl MemoryEntry {
             kind,
             // 没写 `layer` 时按类别推断：决策/知识/洞见/画像天然是沉淀层。
             // 这比一律当 l1 更准 —— 存量文件里的 `type: decision` 本就该进核心记忆。
+            //
+            // ── 但路径先说话 ────────────────────────────────────
+            // `to_markdown` 刻意不写 `layer: l1`（缺省值，省一行 diff），于是
+            // 「显式写成 l1 的 knowledge」存盘后字段缺失、只能靠类别猜 —— 猜成 l2。
+            // 结果同一个条目：索引行说 l1、内存条目说 l2，注入按 l2 给 2.0 的
+            // 进门分，`status` 把它算进深层记忆，而磁盘上它躺在 `/l1/` 目录里。
+            // 迁移 AgentHub 的 l1 笔记时真机撞到过 22 条。
             layer: match get("layer") {
                 Some(raw) => Layer::parse(&raw),
-                None if kind.prefers_l2() => Layer::L2,
-                None => Layer::L1,
+                None => layer_of_path(path).unwrap_or_else(|| {
+                    if kind.prefers_l2() {
+                        Layer::L2
+                    } else {
+                        Layer::L1
+                    }
+                }),
             },
             project: get("project").filter(|v| !v.is_empty()),
             agent: get("agent").filter(|v| !v.is_empty()),
@@ -1030,6 +1062,44 @@ mod tests {
         let back = MemoryEntry::from_markdown(&text, "fallback", &entry.path);
         assert_eq!(back.refuted_at, None);
         assert!(back.is_trusted());
+    }
+
+    /// 显式 l1 的 knowledge 必须能原样读回 l1。
+    ///
+    /// `to_markdown` 不写 `layer: l1`（缺省值），于是这条只能靠路径判 —— 早先按
+    /// 类别猜，knowledge 一律猜成 l2，落盘位置与内存层级分家。AgentHub 迁移时
+    /// 22 条 l1 笔记就是这么被算进「深层记忆」的。
+    #[test]
+    fn explicit_l1_knowledge_survives_reload() {
+        let mut entry = sample();
+        entry.kind = MemoryKind::Knowledge;
+        entry.layer = Layer::L1;
+        entry.path = "projects/agenthub/l1/agenthub-migrate/2026-10-04-x.md".into();
+        let text = entry.to_markdown();
+        assert!(!text.contains("layer:"), "l1 是缺省值，不该写进 frontmatter");
+        let back = MemoryEntry::from_markdown(&text, "fallback", &entry.path);
+        assert_eq!(back.layer, Layer::L1, "路径说是 l1，读回来不能变成 l2");
+    }
+
+    /// 路径里没有层级段（手写笔记放在任意目录）才回退到「按类别推断」。
+    #[test]
+    fn layer_falls_back_to_kind_without_path_hint() {
+        let mut entry = sample();
+        entry.kind = MemoryKind::Knowledge;
+        entry.layer = Layer::L2;
+        entry.path = "notes/2026/x.md".into();
+        let text = entry.to_markdown();
+        let back = MemoryEntry::from_markdown(&text, "fallback", &entry.path);
+        assert_eq!(back.layer, Layer::L2, "没有路径提示时 knowledge 仍按类别进 l2");
+    }
+
+    /// 路径判层要认得出两种分隔符，且在多层目录里取到 `l1` / `l2` 那一段。
+    #[test]
+    fn layer_of_path_reads_both_separators() {
+        assert_eq!(layer_of_path("general/l1/workbuddy/2026-11-16.md"), Some(Layer::L1));
+        assert_eq!(layer_of_path("projects/a--b/l2/knowledge/x.md"), Some(Layer::L2));
+        assert_eq!(layer_of_path(r"projects\a--b\l1\agent\x.md"), Some(Layer::L1));
+        assert_eq!(layer_of_path("notes/x.md"), None);
     }
 
     /// `origin_path` 只在回收站文件里出现，且必须能往返 —— 恢复靠它回原处。
