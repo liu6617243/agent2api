@@ -21,19 +21,23 @@
 // l2 的 knowledge / decision / insight（331 条）。
 //
 //   --scope l2     默认。非 daily 且 layer=l2      （331 条）
-//   --scope typed  再加上有明确类型的 l1 笔记       （367 条）
+//   --scope typed  再加上有明确类型的 l1 笔记       （363 条）
 //   --scope all    全搬，含 25,821 条 daily        （26,188 条）
 //
 // ── 为什么必须能回滚 ────────────────────────────────────────────────
 // 写入是批量且不可逆的（进了库就参与检索与注入）。所以每写成功一条就把
 // 「源 id → 新 id」记进 `--manifest`（默认 `.workbuddy/tmp/agenthub-migrate-*.json`），
-// 想撤销就按 manifest 里的新 id 逐条 `POST /api/memory/delete`。
+// 想撤销就 `--undo`：按台账里的新 id 逐条 `POST /api/memory/delete`。
+// 走的是**回收站**而不是物理删除 —— 撤错了还能 `POST /api/memory/restore` 捞回来。
 //
 // 用法：
 //   node scripts/migrate-agenthub.mjs                    # 干跑，只报数
-//   node scripts/migrate-agenthub.mjs --scope typed      # 干跑，367 条的口径
+//   node scripts/migrate-agenthub.mjs --scope typed      # 干跑，363 条的口径
 //   node scripts/migrate-agenthub.mjs --apply            # 真写
 //   node scripts/migrate-agenthub.mjs --apply --only=l2:knowledge   # 先试一类
+//   node scripts/migrate-agenthub.mjs --undo             # 干跑：按最近台账算能撤多少
+//   node scripts/migrate-agenthub.mjs --undo --apply     # 真撤（进回收站）
+//   node scripts/migrate-agenthub.mjs --undo --manifest=.workbuddy/tmp/xxx.json --apply
 // ─────────────────────────────────────────────────────────────────────
 
 import fs from 'node:fs'
@@ -67,10 +71,23 @@ const APPLY = has('--apply')
 const LIMIT = Number(val('limit', '0'))
 const CONCURRENCY = Number(val('concurrency', '4'))
 const AGENT = val('agent', 'agenthub-migrate')
-const MANIFEST = val(
-  'manifest',
+// `--manifest` 既用来「这轮写到哪」，也用来 `--undo`「撤哪一轮」。
+// 不显式给的时候两边行为不同：写的是新建一个带时间戳的文件，撤的是取最新那个。
+const MANIFEST_GIVEN = val('manifest', '')
+const MANIFEST =
+  MANIFEST_GIVEN ||
   path.join('.workbuddy', 'tmp', `agenthub-migrate-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')}.json`)
-)
+
+/// 找最近一轮的台账。文件名是 `YYYYMMDDHHMMSS` 前缀，字典序即时间序。
+function latestManifest() {
+  const dir = path.join('.workbuddy', 'tmp')
+  if (!fs.existsSync(dir)) return null
+  const files = fs
+    .readdirSync(dir)
+    .filter((name) => /^agenthub-migrate-.*\.json$/.test(name))
+    .sort()
+  return files.length ? path.join(dir, files[files.length - 1]) : null
+}
 
 // ── 凭据：先看环境变量，再看 workbuddy 的 mcp.json ──────────────────
 function token() {
@@ -389,8 +406,64 @@ async function protectProfiles(apply) {
   return ok
 }
 
+// ── 撤销：按台账把这一轮写进去的条目退回回收站 ────────────────────
+//
+// 为什么是回收站而不是物理删除：迁移的口径随时可能改（今天搬 331 条 l2，
+// 明天想改成 363 条 typed），撤错一轮的代价是「库里多了一批要手工清的东西」。
+// 回收站保留了 restore 的回头路，而删除本身已经把条目从检索与注入里摘掉了，
+// 目的已经达到。
+async function undo() {
+  const file = MANIFEST_GIVEN || latestManifest()
+  if (!file) throw new Error('找不到回滚台账：.workbuddy/tmp/agenthub-migrate-*.json 不存在')
+  if (!fs.existsSync(file)) throw new Error(`台账不存在：${file}`)
+
+  const ledger = JSON.parse(fs.readFileSync(file, 'utf8'))
+  const written = (ledger.written || []).filter((item) => item.id)
+  const noId = (ledger.written || []).length - written.length
+  console.log(`台账 ${file}`)
+  console.log(`  写入于 ${ledger.startedAt || '?'}，scope=${ledger.scope || '?'}，条目 ${written.length} 条${noId ? `（另有 ${noId} 条没拿到 id，跳过）` : ''}`)
+
+  if (!APPLY) {
+    console.log('\n前 5 条将退回回收站：')
+    for (const item of written.slice(0, 5)) {
+      console.log(' ──', item.layer, item.type, '|', item.title, `(${item.id})`)
+    }
+    console.log('\n干跑结束。真撤加 --apply（进回收站，可 /api/memory/restore 捞回）')
+    return
+  }
+
+  let ok = 0
+  let failed = 0
+  const errors = []
+  const queue = [...written]
+  const worker = async () => {
+    for (;;) {
+      const item = queue.shift()
+      if (!item) return
+      try {
+        await api('POST', '/api/memory/delete', { id: item.id })
+        ok++
+      } catch (error) {
+        failed++
+        if (errors.length < 5) errors.push(`${item.title} → ${String(error.message || error).slice(0, 160)}`)
+      }
+      if ((ok + failed) % 50 === 0) console.log(`  进度 ${ok + failed}/${written.length}（撤销 ${ok} / 失败 ${failed}）`)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.max(1, CONCURRENCY) }, worker))
+
+  console.log(`\n撤销完成：${ok} 条进回收站，失败 ${failed} 条`)
+  if (errors.length) {
+    console.log('失败样例：')
+    for (const line of errors) console.log('  ', line)
+  }
+  if (ok) console.log('要全部还原：对上面这些 id 逐条 POST /api/memory/restore')
+}
+
 // ── 主流程 ──────────────────────────────────────────────────────────
 async function main() {
+  if (has('--undo')) return undo()
+
   console.log(`源库 ${DB}`)
   console.log(`接口 ${API}   口径 ${ONLY ? 'only=' + ONLY : SCOPE}   ${APPLY ? '【真写】' : '【干跑】'}`)
 

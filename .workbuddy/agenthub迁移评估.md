@@ -122,7 +122,7 @@ node scripts/migrate-agenthub.mjs --scope typed --only l2:insight --limit 1 --ap
    knowledge 把 preference 挤出去了，把导入条目的 importance 整体下调 0.1（改
    `IMPORTANCE` 表）再重跑，或把它们 `pinned=false` 保持现状（默认就不进「必须遵守」段）。
 4. **想撤销**：台账在 `.workbuddy/tmp/agenthub-migrate-*.json`，每条都记了 `source → id`，
-   按 id 批量 `POST /api/memory/delete` 即可。
+   `node scripts/migrate-agenthub.mjs --undo --apply` 一条命令全退回回收站。
 
 ## 7. 命令速查
 
@@ -130,7 +130,7 @@ node scripts/migrate-agenthub.mjs --scope typed --only l2:insight --limit 1 --ap
 # 干跑，看数（默认 l2）
 node scripts/migrate-agenthub.mjs
 
-# 干跑，367 条口径
+# 干跑，363 条口径
 node scripts/migrate-agenthub.mjs --scope typed
 
 # 真写（推荐先按类试水）
@@ -139,7 +139,17 @@ node scripts/migrate-agenthub.mjs --apply
 
 # 只搬前 N 条
 node scripts/migrate-agenthub.mjs --apply --limit 20
+
+# 迁前锁住现有画像（防止下一轮画像重建把它们挤掉）
+node scripts/migrate-agenthub.mjs --protect-profiles --apply
+
+# 撤掉一轮（默认取最近一份台账，进回收站，可 restore）
+node scripts/migrate-agenthub.mjs --undo
+node scripts/migrate-agenthub.mjs --undo --apply
+node scripts/migrate-agenthub.mjs --undo --manifest .workbuddy/tmp/agenthub-migrate-2026....json --apply
 ```
+
+`--undo` 走的是 `POST /api/memory/delete`，即**进回收站**而不是物理删除：撤错了还能对同一批 id 逐条 `POST /api/memory/restore` 捞回来。往返已实测过一轮（写 1 条 → 活跃 3 条；`--undo --apply` → 活跃 1 条，2 条在回收站），台账见 `.workbuddy/tmp/_undo-roundtrip.json`。
 
 ## 8. 迁完之后「深层记忆」和「画像」跟 AgentHub 一样吗
 
