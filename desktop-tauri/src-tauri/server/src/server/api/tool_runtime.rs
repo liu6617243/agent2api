@@ -322,7 +322,7 @@ pub async fn mcp_vision(State(state): State<ServerState>, headers: HeaderMap, bo
     mcp_post(&state, headers, body, McpServerKind::Vision).await
 }
 
-/// POST /mcp/memory —— 记忆中枢（18 个工具）。
+/// POST /mcp/memory —— 记忆中枢（17 个工具）。
 ///
 /// 与另外三个 MCP 端点同一套骨架：鉴权由 `mcp_post` 内部做（`/mcp` 前缀不在
 /// `require_api_key` 的判定范围里，见 http.rs 的注释）。

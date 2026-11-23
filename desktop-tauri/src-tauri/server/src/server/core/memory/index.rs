@@ -1947,11 +1947,11 @@ mod tests {
         // 同任务同状态、明细不同 → 不合并（「跳过」的理由不同就是不同的事）
         assert!(!same_run("classify", "skipped", Some("没有未归类的记忆"), "classify", "skipped", Some("待确认已积压 12 条")));
         // 同状态同明细、任务不同 → 不合并。两个任务的跳过理由可能一字不差。
-        assert!(!same_run("classify", "skipped", Some("没有未归类的记忆"), "health", "skipped", Some("没有未归类的记忆")));
+        assert!(!same_run("classify", "skipped", Some("没有未归类的记忆"), "cleanup", "skipped", Some("没有未归类的记忆")));
         // 同任务同明细、状态不同 → 不合并（跳过变成功是转折，必须留痕）
         assert!(!same_run("extract", "skipped", Some("最近流水太少"), "extract", "done", Some("最近流水太少")));
         // 明细从 None 到 Some → 不合并
-        assert!(!same_run("health", "done", None, "health", "done", Some("陈旧 0 条")));
+        assert!(!same_run("cleanup", "done", None, "cleanup", "done", Some("清回收站 0 条")));
     }
 
     /// 列自愈：老库里缺的列必须能补上，否则升级后整页空白。

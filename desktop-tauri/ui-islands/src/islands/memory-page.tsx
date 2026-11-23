@@ -38,7 +38,7 @@ import { TabBoundary, notifyMemoryEnter, notifyMemoryRefresh } from './memory-sh
  *   settings  配置    —— 一百多个旋钮，schema 驱动
  *
  * ── 原来的第十个「索引」页去哪了 ────────────────────────────
- * 那一页原本放四样排障工具：重建索引、体检清单、检索调试、清理回收站。
+ * 那一页原本放四样排障工具：重建索引、体检清单（已删，见 memory/mod.rs）、检索调试、清理回收站。
  * 前两样在仪表盘「需要处理」里本来就有对等入口（可能过时 / 索引一致性），
  * 检索与回收站浏览页都有，剩下「重建索引」一个动作撑不起一整页 ——
  * 于是把它挪到仪表盘「索引一致性」那一行的按钮上，页签删掉。
@@ -356,7 +356,7 @@ function MemoryPage(): React.ReactElement {
     setTab(next)
     // 切到需要新鲜项目数据的页签时补一次（项目可能在别处被合并/归档）
     if (next === 'projects' || next === 'browse') void refreshProjects()
-    // 切回仪表盘：`Dashboard` 是条件渲染，重建时会自己重拉体检/同步/自动化，
+    // 切回仪表盘：`Dashboard` 是条件渲染，重建时会自己重拉状态/同步/自动化，
     // 但指标卡与顶栏读的是壳这一层的 `status` —— 它不会因为换页签而更新，
     // 于是「条数 / 待确认 / 今日新增」会停在离开时的数字。
     if (next === 'dashboard') void refreshStatus()
@@ -435,7 +435,7 @@ function MemoryPage(): React.ReactElement {
               // （配置 / 状态 / 项目），`notifyMemoryRefresh()` 让所有页签的
               // `useLoad` 都重拉 —— 包括那些豁免了「进页面重拉」的贵端点
               // （导入页要递归扫十二个来源）。
-              // 只调 loadShell 的话，用户点完会发现条数变了、体检和同步没变。
+              // 只调 loadShell 的话，用户点完会发现条数变了、索引和同步没变。
               void loadShell()
               notifyMemoryRefresh()
             }}

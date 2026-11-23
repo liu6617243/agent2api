@@ -107,7 +107,7 @@ pub mod maintenance;
 ///
 /// 与转发链路**无关**：记忆不参与拼请求体（早期那版"转发前注入"已删除，
 /// 理由见 `tool_services::memory_mcp` 的模块头 —— 网关不知道请求属于哪个
-/// 项目，替客户端塞必然跨项目串味）。对外只暴露 `/mcp/memory` 的 18 个工具，
+/// 项目，替客户端塞必然跨项目串味）。对外只暴露 `/mcp/memory` 的 17 个工具，
 /// 由客户端按需调用。
 pub mod memory;
 pub mod model_meta;

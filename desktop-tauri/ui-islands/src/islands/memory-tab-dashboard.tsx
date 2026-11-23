@@ -11,7 +11,7 @@ import { Empty, Panel, Section, StateBadge, num, timeText, useLoad } from './mem
  *   1. 有多少条？流水与沉淀各多少（l2 太少说明从没蒸馏过）；
  *   2. 今天有没有新东西进来？（数字不动 = 没人在用，或 Agent 没接上）
  *   3. 有没有积压要人裁决的？（待确认队列是这套系统唯一需要人工的地方）
- *   4. 同步与体检有没有异常？
+ *   4. 同步与索引有没有异常？
  *
  * ── 为什么没有「沉淀占比」这一格（2026-11-23）──────────────
  * 原来有一张 `l2 / trusted` 的百分比卡。它的问题不在算法（分子分母都已是可信
@@ -53,23 +53,23 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
   // 这一页三份数据都显式开启「重新进入就重拉」：状态页是全套里唯一需要「一眼看全
   // 现在」的一页，切回来还显示几分钟前的数字等于这一页白设。
   const auto = useLoad(() => m.loadAuto(), [], { refreshOnEnter: true })
-  const health = useLoad(() => m.loadHealth(20), [], { refreshOnEnter: true })
   const sync = useLoad(() => m.loadSync(), [], { refreshOnEnter: true })
   const [rebuilding, setRebuilding] = React.useState(false)
-  const [showStale, setShowStale] = React.useState(false)
   const [actionError, setActionError] = React.useState('')
 
   /**
    * 重建索引：原本在「索引」页的主按钮。那一页删掉之后它是唯一没有别处替代的
-   * 动作（体检清单、检索、回收站都各有归宿），所以挪到这里，并且只在
-   * 「索引漂移」时出现 —— 平时摆着一个「重建」按钮只会让人想去点它。
+   * 动作（检索、回收站都各有归宿），所以挪到这里，并且只在「索引漂移」时出现
+   * —— 平时摆着一个「重建」按钮只会让人想去点它。
+   *
+   * 重建完只需要 `onChanged()` 重拉 `status`：`drift` 现在读的就是
+   * `status.index.inSync`（早先读 `health`，那个端点已删）。
    */
   const rebuild = async () => {
     setRebuilding(true)
     setActionError('')
     try {
       await m.rebuildIndex()
-      health.reload()
       onChanged?.()
     } catch (caught) {
       setActionError(caught instanceof Error ? caught.message : String(caught))
@@ -107,8 +107,11 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
   const warnThreshold = status.review?.warnThreshold ?? 50
   const backlogged = pending >= warnThreshold
   const conflicts = sync.data?.conflicts ?? 0
-  const stale = health.data?.staleCount ?? 0
-  const drift = health.data ? !health.data.index.inSync : false
+  // 索引漂移只从 `status.index` 取。这里早先读的是 `health.data.index.inSync`
+  // —— 那个端点 2026-11-24 删了（它唯一的增量价值「过时记忆」从来没报出过东西），
+  // 而 `status()` 本来就报同一口径的 `index.inSync`（含同样处理「读不到给 null」
+  // 的语义），留下两份等于同一屏两个面板读同一份数、还可能取数时刻不同而打架。
+  const drift = status.index ? status.index.inSync === false : false
   // `today` / `yesterday` / `agents` 是本轮新加的字段。桌面端前端 bundle 与后端
   // 二进制不一定同批更新（旧后端 + 新界面会读到 undefined），缺字段时退成 0/0
   // 而不是让整页白屏 —— 这张卡坏了不该带走整个仪表盘。
@@ -264,16 +267,12 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
               ? { label: t('去裁决'), run: () => (onReview ? onReview() : onGo('browse')) }
               : undefined}
           />
-          <TodoRow
-            state={stale > 0 ? 'warn' : 'ok'}
-            title={t('可能过时的记忆')}
-            detail={stale
-              ? t('{n} 条记忆锚定的文件在写下之后被改过', { n: stale })
-              : t('没有发现')}
-            action={stale > 0
-              ? { label: showStale ? t('收起清单') : t('看清单'), run: () => setShowStale(value => !value) }
-              : undefined}
-          />
+          {/* 这一行早先是「可能过时的记忆」（`health.stale`）。删掉的原因不是
+              「不好看」，是那个信号从来没成立过：真机 73 条带 `files` 的条目、
+              482 个 files 项，`stat` 成功 0 次 —— `files` 存的是仓库相对路径，
+              检查用的是记忆根基准。按正确基准复跑，66 条能解析、66 条全报「过时」，
+              100% 误报。用户看到的永远是「没有发现」，等于一个恒绿的假指示灯。
+              取舍细节见 `memory/mod.rs` 里 `TASK_LABELS` 上方那段。 */}
           <TodoRow
             state={conflicts > 0 ? 'bad' : 'ok'}
             title={t('同步冲突')}
@@ -292,50 +291,7 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
           />
         </div>
 
-        {/* 过时清单就地展开在「需要处理」卡里。
-            原来它在「索引」页，那一页删掉之后清单无处可去 —— 但它正是这一行
-            「N 条可能过时」的证据，展开在原地比跳到另一页更短。 */}
-        {showStale && stale > 0 && health.data ? (
-          <div className='mm-stale-list'>
-            {health.data.stale.map(row => (
-              <div key={row.id} className='mm-stale'>
-                <div className='mm-stale-head'>
-                  <strong>{row.title}</strong>
-                  <Badge variant='secondary' shape='tag'>{row.type}</Badge>
-                  <Badge variant='outline' shape='tag'>{row.layer}</Badge>
-                  <span className='mm-muted'>{t('写下于 {when}', { when: row.updatedText })}</span>
-                  {/* ── 这里是「修复路径」──────────────────────────
-                      以前清单只给标题和文件名，看到了也没法动手 —— 用户的原话
-                      是「没给我修复路径」。处置动作本来就只有两个：读完文件后
-                      要么改这条记忆（确认仍成立就保存一次，`updated_at` 会跟进，
-                      提醒自然消失），要么把它删掉/标记失效。两条路都从「打开
-                      这条记忆」开始，所以这里必须能点进去。 */}
-                  {onOpenEntry ? (
-                    <Button
-                      type='button'
-                      size='sm'
-                      variant='link'
-                      onClick={() => onOpenEntry(row.id)}
-                    >
-                      {t('打开')}
-                    </Button>
-                  ) : null}
-                </div>
-                <div className='mm-stale-files'>
-                  {row.files.map(file => (
-                    <span key={file.file} className='mm-warn'>
-                      <code>{file.file}</code> {t('改于 {when}', { when: file.changedText })}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            ))}
-            <div className='mm-muted' style={{ marginTop: 6 }}>
-              {t('处理方式：点「打开」读完那条记忆锚定的文件 —— 结论仍成立就保存一次（提醒会消失），已经不成立就改掉或删除。这不是待确认队列，不需要裁决。')}
-            </div>
-          </div>
-        ) : null}
-      </Section>
+        </Section>
 
       <div className='mm-two-col'>
         <Section title={t('自动化')} hint={t('后台任务默认只开零 token 的那几个。')}>

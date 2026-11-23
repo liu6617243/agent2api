@@ -412,8 +412,6 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/memory/profile", get(api::memory::get_profile))
         .route("/api/memory/profile/build", post(api::memory::post_profile_build))
         .route("/api/memory/profile/pin", post(api::memory::post_profile_pin))
-        // 体检：锚定文件改过 / 队列积压 / 索引漂移
-        .route("/api/memory/health", get(api::memory::get_health))
         // 历史导入：来源清单 / 干跑预览 / 真导入。预览与导入是两个端点 ——
         // 「这个动作不写数据」应该是端点级承诺，不是请求体里的布尔开关。
         .route("/api/memory/import", get(api::memory::get_import))
@@ -1150,7 +1148,7 @@ pub fn gateway_router(state: ServerState) -> Router {
             "/mcp/vision",
             post(api::tool_runtime::mcp_vision).get(api::tool_runtime::mcp_unsupported),
         )
-        // 记忆中枢：18 个工具（记忆库是本机私有数据，鉴权与另外三个端点同口径，
+        // 记忆中枢：17 个工具（记忆库是本机私有数据，鉴权与另外三个端点同口径，
         // 由 handler 自己做 —— 见上方 `/mcp` 前缀的说明）。
         .route(
             "/mcp/memory",

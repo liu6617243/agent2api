@@ -738,26 +738,6 @@ export type SyncLogRow = {
   ok: boolean
 }
 
-/* ─── 体检（memory::health）────────────────────────────────── */
-
-export type HealthStale = {
-  id: string
-  title: string
-  type: string
-  layer: string
-  updatedAt: number
-  updatedText: string
-  files: { file: string; changedAt: number; changedText: string }[]
-}
-
-export type HealthView = {
-  stale: HealthStale[]
-  staleCount: number
-  review: { pending: number; warnThreshold: number; backlogged: boolean }
-  index: { count: number; inSync: boolean; fts: boolean }
-  note: string
-}
-
 /* ─── 导入（import::view / preview / run）──────────────────── */
 
 export type ImportSource = {
@@ -1098,10 +1078,6 @@ export function loadAgents(): Promise<AgentList> {
 
 export function loadAgentSnippet(): Promise<AgentSnippet> {
   return api('GET', '/api/memory/agents/snippet')
-}
-
-export function loadHealth(limit = 50): Promise<HealthView> {
-  return api('GET', `/api/memory/health${query({ limit })}`)
 }
 
 export function loadSync(): Promise<SyncStatus> {

@@ -37,7 +37,7 @@ pub(crate) mod image_config;
 pub(crate) mod image_jobs;
 mod image_mcp;
 mod mcp;
-/// 记忆中枢的 MCP 规格与工具分发（`/mcp/memory`，18 个工具）。
+/// 记忆中枢的 MCP 规格与工具分发（`/mcp/memory`，17 个工具）。
 /// 独立成文件：工具描述本身三百多行，塞进 `mcp.rs` 会把分发逻辑淹掉。
 mod memory_mcp;
 mod normalize;
@@ -85,7 +85,7 @@ pub const KEY_TOOL_SERVICES: &str = "toolServices";
 ///     屏幕上是**网络搜索**的供应商配置；
 ///   · 「安装」弹窗共用同一个组件，装的其实是记忆 MCP —— 但记忆接入页自己
 ///     就有逐卡「接入 / 测试 / 卸载」，两个入口改同一个配置文件；
-///   · 描述写「11 个工具」，而实际是 18 个（`memory_mcp::spec_tools`）。
+///   · 描述写「11 个工具」，而实际是 17 个（`memory_mcp::spec_tools`）。
 /// 记忆是**独立页面**（九个页签），不是这一页的一行表格项，所以从这里摘掉。
 ///
 /// ── 但「不列出来」≠「不存在」 ────────────────────────────────
@@ -143,12 +143,15 @@ pub const VISION_VERSION: &str = VISION_SERVICE_VERSION;
 pub const CAPABILITY_COUNTS: [(&str, u32); 3] = [
     (WEB_SEARCH_SERVICE_ID, 2),
     (VISION_SERVICE_ID, 1),
-    // 记忆中枢的 18 个工具：core / digest / search / get / timeline / write /
+    // 记忆中枢的 17 个工具：core / digest / search / get / timeline / write /
     // update / recent / projects / forget / status + review_list / review_resolve /
-    // health + profile / sync_status（见 tool_services::memory_mcp）。前 11 个是
-    // v1 就有的、名字与语义不变；中间 5 个是「对齐 AgentHub 全量能力」新增的；
+    // profile / sync_status（见 tool_services::memory_mcp）。前 11 个是
+    // v1 就有的、名字与语义不变；中间 4 个是「对齐 AgentHub 全量能力」新增的；
     // 最后 2 个是「这条错了」的纠错轴：refute / unrefute。
-    (MEMORY_SERVICE_ID, 18),
+    //
+    // 2026-11-24 从 18 降到 17：`health` 删了（真机 482 个 files 项 stat 成功 0 次，
+    // 修对基准后 66 条 100% 全报「过时」—— 零区分度）。理由见 memory/mod.rs。
+    (MEMORY_SERVICE_ID, 17),
 ];
 
 /// 工具执行超时（秒）：同一服务各协议共用；服务端强制上限，装 MCP 时写进客户端
@@ -194,12 +197,12 @@ pub fn service_protocols(service: &str) -> Vec<&'static str> {
         .collect()
 }
 
-/// 记忆中枢那 18 个工具的名字（`/api/tools/install-info?service=memory` 用）。
+/// 记忆中枢那 17 个工具的名字（`/api/tools/install-info?service=memory` 用）。
 ///
 /// ── 为什么不在这里手写一份名单 ──────────────────────────────
 /// `memory_mcp::spec_tools()` 才是工具清单的唯一事实 —— 它的描述、schema、
-/// 名字都在那里，`spec_exposes_eighteen_tools` 那条测试也钉在那儿。另抄一份
-/// 数组的结局是：加了第 19 个工具，界面上仍写着 18 个，而「差一个」这种错
+/// 名字都在那里，`spec_exposes_seventeen_tools` 那条测试也钉在那儿。另抄一份
+/// 数组的结局是：加了第 18 个工具，界面上仍写着 17 个，而「差一个」这种错
 /// 恰恰最难在页面上发现（数字看起来完全合理）。
 ///
 /// 返回值是 `Vec<String>` 而不是借用 spec 里那些 `&str`：`spec()` 每次调用都

@@ -21,7 +21,6 @@
 //! POST /api/memory/auto/run    立即执行一个任务（同步等结果）
 //! GET  /api/memory/auto/runs   任务执行审计（?limit=100）
 //! GET  /api/memory/agents      Agent 心跳（接入页的「最近活跃」）
-//! GET  /api/memory/health      体检（孤儿索引、断链、过期条目）
 //! GET  /api/memory/sync        WebDAV 同步状态（含设备、跳过名单、上次结果）
 //! POST /api/memory/sync/test   测连接（只读，不写任何文件）
 //! POST /api/memory/sync/run    立即同步一次（同步等待结果）
@@ -849,12 +848,6 @@ pub async fn post_project_merge(State(_state): State<ServerState>, body: Bytes) 
         Ok(Err(message)) => errors::management_error(400, message),
         Err(error) => errors::management_error(500, error.message),
     }
-}
-
-// ── 体检 ─────────────────────────────────────────────────────
-
-pub async fn get_health(State(_state): State<ServerState>, Query(params): Query<HashMap<String, String>>) -> Response {
-    ok_json(memory::health(number(&params, "limit").unwrap_or(50)))
 }
 
 // ── 导入 ─────────────────────────────────────────────────────

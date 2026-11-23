@@ -161,7 +161,7 @@ pub const PROFILE_PIN_TAG: &str = "pin";
 ///
 /// 条目数必须与 `schedule::TASKS` 一致 —— `status()` 是按 `TASKS` 遍历、
 /// 用这张表取名字的，少一条就会出现「有卡没名」或「有名没卡」。
-pub const TASK_LABELS: [(&str, &str); 12] = [
+pub const TASK_LABELS: [(&str, &str); 11] = [
     ("extract", "抽取结构化信息"),
     ("summarize", "生成摘要"),
     ("tag", "自动打标签"),
@@ -173,7 +173,6 @@ pub const TASK_LABELS: [(&str, &str); 12] = [
     ("ingest", "会话增量入库"),
     ("index-scan", "索引自愈扫描"),
     ("cleanup", "异常记忆清理"),
-    ("health", "记忆体检"),
 ];
 
 // ── 设置 ─────────────────────────────────────────────────────
@@ -3447,99 +3446,33 @@ pub fn digest_text(max_lines: usize) -> Value {
     json!({ "text": text, "lines": text.lines().count() })
 }
 
-// ── 体检：记忆可能过时 ───────────────────────────────────────
-
-/// 记忆体检：找出「写这条时锚定的文件后来改过」的条目，外加队列与索引的一致性。
-///
-/// ── 为什么用「文件 mtime > 记忆 updated_at」这个判据 ─────────
-/// 记忆里存的是**判断**（「这里要这么改，因为…」），而代码会继续变。当锚定文件
-/// 在记忆写下之后又被修改，「这条判断基于的代码已经变了」—— 它不是错的，而是
-/// **需要复核**。没有这个信号，模型会拿三个月前的判断去改刚重构过的文件。
-///
-/// 不做内容哈希比对：`files` 是用户手填的相对路径，路径在仓库里搬来搬去很常见，
-/// 而 mtime 检查的目标只是「提个醒」，误报的代价（多看一眼）远低于漏报。
-pub fn health(limit: usize) -> Value {
-    ensure_index_once();
-    let entries = store::snapshot();
-    let root = store::root();
-    let limit = limit.clamp(1, 200);
-    let mut stale: Vec<Value> = Vec::new();
-    for entry in entries.iter().filter(|entry| entry.is_trusted()) {
-        // 候选不参与体检：它带着从流水继承的 `files`（`schedule.rs` 里抽取时
-        // 抄了素材的文件锚点），于是每跑一轮就多几条「可能过时」——而这些条目
-        // 本身还没被确认，让人去复核一堆草稿等于制造噪音。升到 l2 后再进体检。
-        if is_auto_draft(entry) {
-            continue;
-        }
-        if entry.files.is_empty() {
-            continue;
-        }
-        let mut touched: Vec<Value> = Vec::new();
-        for file in &entry.files {
-            // 记忆库自己的容器不是「被引用的代码」：`general/l1/gateway/2026-11-22.md`
-            // 每写一条新记忆 mtime 就变，拿它当锚定文件会**永久**报「可能过时」。
-            // 真机 6 条全部是这个成因（l2 从 l1 派生时继承了来源容器路径）。
-            if store::internal_file(file) {
-                continue;
-            }
-            // `files` 是相对路径，但相对的是**记忆根**还是**项目目录**？
-            // 约定是相对记忆根（与 `path` 同口径），同时对「相对 cwd」的写法宽容：
-            // 两种都试，任一命中就算改动过。
-            let candidates = [root.join(file), root.join("projects").join(file)];
-            for path in candidates {
-                let Ok(meta) = std::fs::metadata(&path) else { continue };
-                let Ok(modified) = meta.modified() else { continue };
-                let Ok(age) = modified.duration_since(std::time::UNIX_EPOCH) else { continue };
-                let stamp = age.as_millis() as i64;
-                if stamp > entry.updated_at {
-                    touched.push(json!({
-                        "file": file,
-                        "changedAt": stamp,
-                        "changedText": search::relative_time(stamp, crate::server::logging::now_ms()),
-                    }));
-                    break;
-                }
-            }
-        }
-        if touched.is_empty() {
-            continue;
-        }
-        stale.push(json!({
-            "id": entry.id,
-            "title": entry.title,
-            "type": entry.kind.as_str(),
-            "layer": entry.layer.as_str(),
-            "updatedAt": entry.updated_at,
-            "updatedText": search::relative_time(entry.updated_at, crate::server::logging::now_ms()),
-            "files": touched,
-        }));
-        if stale.len() >= limit {
-            break;
-        }
-    }
-    let pending = index::global().review_count();
-    let warn = config::usize_of("dedup.pendingWarnThreshold");
-    // 只取一次 `count()`：每次都要抢那条全局连接，取两遍等于把等待时间翻倍
-    // （索引正在重建时它就是几十秒）。这一条走阻塞版是故意的 —— 健康检查问的
-    // 就是「索引现在能不能读」，读不到时宁可让这张卡片报错，也不要给个假数字。
-    let index_count = index::global().count();
-    json!({
-        "stale": stale,
-        "staleCount": stale.len(),
-        "review": { "pending": pending, "warnThreshold": warn, "backlogged": pending >= warn },
-        "index": {
-            "count": index_count,
-            // 与 `status()` 同一口径：索引留回收站/已取代的行，所以比的是总条数。
-            "inSync": index_count == entries.len(),
-            "fts": index::global().fts_enabled(),
-        },
-        "note": if stale.is_empty() {
-            "没有发现可能过时的记忆。"
-        } else {
-            "这些记忆锚定的文件在记忆写下之后被改过：结论可能仍成立，但值得复核。"
-        },
-    })
-}
+// ── 一致性自检：队列积压与索引（`status()` 的 `review` / `index`）────
+//
+// 这里早先有一份 `health()`：按「锚定文件 mtime > 记忆 updated_at」找「可能过时」
+// 的记忆，外加队列与索引的一致性。2026-11-24 整块删掉，理由记在这里，免得
+// 将来有人觉得「很简单的检查为什么不加回去」：
+//
+// ① **它一次都没报出过东西，而且结构上不可能报出。** 真机上 73 条带 `files`
+//    的条目、482 个 files 项，`stat` 成功 **0 次**：
+//    · 13 项命中 `internal_file` 被跳过（记忆库自身容器，正确）；
+//    · 469 项在 `root.join(file)` 与 `root.join("projects").join(file)` 两条基准下
+//      全 ENOENT —— 因为 `files` 存的是**仓库相对路径**（`scripts/deliver.mjs`），
+//      而两条基准都指向记忆根，差着整个仓库。
+//    · `registry_upsert` 的 `path` 字段本是修正基准的唯一来源，但真机
+//      `projects.json` 里 18 个项目 `path` 全是 `null` —— 于是没有任何一条能解析。
+//
+// ② **就算基准修对，判据本身也没有区分度。** 按真实仓库根复跑：66 条能解析，
+//    66 条全部报「过时」—— 命中率 100%。`files` 里最热的 `scripts/deliver.mjs`
+//    出现 67 次，而这文件几乎每次交付都改，等于把「所有锚过它的记忆」永久钉成
+//    可疑。误报 100% 的提醒不是提醒，是把清单变成噪音。
+//
+// ③ **真正有价值的两个指标已经在 `status()` 里了**，而且口径经过事故修正：
+//    `review.pending`（待确认队列）与 `index.inSync`（索引 vs 事实源）。
+//    `health()` 把它们又算了一遍，多一次 `review_count()` 与 `count()` 的全局
+//    连接等待 —— 同一屏两个面板读同一份数，还可能因为取数时刻不同而打架。
+//
+// 留下的是「体检」这个名字原本想解决的问题的正确位置：`files` 作为检索/注入的
+// 路由此继续存在（`inject::harvest_paths` 用它），只是不再假装能判断过时。
 
 #[cfg(test)]
 mod tests {

@@ -313,7 +313,6 @@ static SCHEMA: &[Knob] = &[
           \"profile\":{\"enabled\":false,\"weekly\":1,\"weeklyTime\":\"11:10\"},\
           \"index-scan\":{\"enabled\":true,\"intervalMin\":360},\
           \"cleanup\":{\"enabled\":true,\"daily\":\"11:20\"},\
-          \"health\":{\"enabled\":true,\"daily\":\"11:30\"},\
           \"ingest\":{\"enabled\":true,\"intervalMin\":30}}"),
 
     // ===== 去重 =====

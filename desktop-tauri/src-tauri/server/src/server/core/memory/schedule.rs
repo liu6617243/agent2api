@@ -1,13 +1,12 @@
 //! 记忆自动化调度器。
 //!
 //! ── 这里调度的是什么 ────────────────────────────────────────
-//! 十一件事，按「要不要花 token」分两档：
+//! 十件事，按「要不要花 token」分两档：
 //!
 //! 零 token（纯本地，默认开）：
 //!   · `index-scan` 增量重建索引 —— 索引是派生物，磁盘才是事实源；
 //!   · `classify`  项目归档建议 —— 只算 slug 相似度，不调模型；
-//!   · `cleanup`   回收站过期清理 + 队列过期；
-//!   · `health`    体检并记一条日志（不写记忆）。
+//!   · `cleanup`   回收站过期清理 + 队列过期。
 //!
 //! 花 token（默认全关，用户显式开才跑）：
 //!   · `extract` / `summarize` / `tag` / `distill` / `profile` / `supersede` /
@@ -22,6 +21,12 @@
 //!   · 桌面应用会睡眠/唤醒、会被关掉再打开，精确定时本来就会漂；
 //!   · 十一个独立定时器在调试时无法一眼看出「现在到底有几个在跑」；
 //!   · 扫描式天然幂等 —— 错过一次不会漏，只是晚一点。
+//!
+//! ── `health` 为什么被删（2026-11-24）──────────────────────────
+//! 它跑的「锚定文件 mtime > 记忆 updated_at」检查在真机上 `stat` 成功 **0 次**
+//! / 482 个 files 项：`files` 存的是**仓库相对路径**，检查用的是**记忆根**基准，
+//! 差着整个仓库。按正确基准复跑，66 条能解析、66 条全部报「过时」——100% 误报。
+//! 完整理由与取证数字见 `mod.rs` 里 `TASK_LABELS` 上方那段注释。
 //!
 //! ── 单写者 ──────────────────────────────────────────────────
 //! 所有落盘都发生在调度线程里（`std::thread`，不是 tokio 任务）。记忆的事实源
@@ -51,7 +56,7 @@ const TICK: Duration = Duration::from_secs(60);
 /// 动作有两个入口、两套开关、两份统计 —— 用户关掉卡片上的开关以为停了，
 /// 同步页点一下还是照跑。所以调度器只认这 11 个，`sync` 模块本身照旧
 /// 供同步页使用。
-pub const TASKS: [&str; 12] = [
+pub const TASKS: [&str; 11] = [
     "extract",
     "summarize",
     "tag",
@@ -63,7 +68,6 @@ pub const TASKS: [&str; 12] = [
     "ingest",
     "index-scan",
     "cleanup",
-    "health",
 ];
 
 /// 默认折叠时展示的执行记录行数。
@@ -100,7 +104,7 @@ fn default_interval(task: &str) -> i64 {
         "extract" => 120,
         // 按天跑的任务用 24h 表达；具体时刻由 `auto.tasks` 里的 `daily` 字段给，
         // 这里只是「两次之间至少隔多久」的兜底
-        "supersede" | "distill" | "cleanup" | "health" => 1_440,
+        "supersede" | "distill" | "cleanup" => 1_440,
         "consolidate" | "profile" => 10_080,
         _ => 30,
     }
@@ -120,7 +124,7 @@ fn task_enabled(task: &str) -> bool {
     //
     // `ingest` 在名单里：它不调模型（解析 + 写盘而已），而它的**存在意义**就是
     // 「不用人管」—— 默认关掉等于这个功能没发布。
-    matches!(task, "classify" | "ingest" | "index-scan" | "cleanup" | "health")
+    matches!(task, "classify" | "ingest" | "index-scan" | "cleanup")
 }
 
 /// 这个任务会不会调模型（即：开它会不会烧 token）。
@@ -131,8 +135,8 @@ fn task_enabled(task: &str) -> bool {
 /// 前端抄一份必然漂移 —— 漂移的后果是界面写着「零成本」而它在扣额度。
 ///
 /// 口径是**当前实现**：`extract` / `summarize` / `tag` / `distill` /
-/// `consolidate` / `profile` / `supersede` 会调 `llm`；其余五个纯本地
-/// （`classify` / `ingest` / `index-scan` / `cleanup` / `health`）。
+/// `consolidate` / `profile` / `supersede` 会调 `llm`；其余四个纯本地
+/// （`classify` / `ingest` / `index-scan` / `cleanup`）。
 /// `task_enabled` 的「没配就默认关」用的也是这条线，两边同一份事实。
 fn task_uses_model(task: &str) -> bool {
     matches!(
@@ -441,10 +445,12 @@ fn hydrate_last_run() {
 }
 
 fn stamp(task: &str, at: i64) {
-    if !TASKS.contains(&task) {
+    // `if let` 而不是 `contains` + `unwrap_or`：后者得给一个「不可能用到」的
+    // 兜底任务名，而那个名字会悄悄变成对某个具体任务（早先是 `health`）的
+    // 硬引用 —— 任务一删，兜底就成了指着一个不存在的键。
+    let Some(key) = TASKS.iter().find(|name| **name == task).copied() else {
         return;
-    }
-    let key = TASKS.iter().find(|name| **name == task).copied().unwrap_or("health");
+    };
     if let Ok(mut slot) = last_run().lock() {
         slot.insert(key, at);
     }
@@ -670,7 +676,6 @@ fn run_inner(task: &str, project: Option<&str>, manual: bool) -> Outcome {
         "ingest" => ingest(),
         "classify" => classify_pending(project),
         "cleanup" => cleanup(manual),
-        "health" => health_check(),
         "extract" => extract(project, manual),
         "summarize" => enrich::summarize(&[], task_batch("summarize")),
         "tag" => enrich::tag(&[], false, task_batch("tag")),
@@ -827,7 +832,6 @@ fn detail_of(task: &str, outcome: &Outcome) -> String {
                     }
                 }
                 "cleanup" => format!("清回收站 {} 条，失效入回收站 {} 条", n("trashPurged"), n("supersededTrashed")),
-                "health" => format!("陈旧 {} 条，待确认 {} 条", n("stale"), n("pending")),
                 // 将来加了任务但这里没跟上：不编措辞，把载荷压成一行即可，
                 // 至少能看出「它确实干了点什么」。
                 //
@@ -1186,20 +1190,6 @@ fn retire_entry(entry: &super::MemoryEntry, now: i64) -> bool {
     }
     let _ = index::global().upsert(&trashed_entry);
     true
-}
-
-/// 体检：只统计、不改数据。结果进日志与状态页。
-fn health_check() -> Outcome {
-    let report = super::health(50);
-    let stale = report.get("stale").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
-    let pending = report.get("pending").and_then(Value::as_u64).unwrap_or(0);
-    if stale > 0 {
-        crate::server::logging::log(
-            "[Memory]",
-            &format!("体检：{stale} 条记忆锚定的文件在写入后被改过，建议复核"),
-        );
-    }
-    Outcome::Done(json!({ "stale": stale, "pending": pending }))
 }
 
 /// 抽取：把最近的 l1 流水压成结论候选（`extract` 与 `distill` 的分工）。
@@ -1697,8 +1687,8 @@ pub fn status() -> Value {
                 "usesModel": task_uses_model(task),
                 // 一句「它在干什么」，进卡片副标题。文案与 `detail_of`
                 // 的分支同名同义，但这里是**静态说明**（还没跑时也要显示），
-                // 那边是**运行结果**（跑完才有）。空串 = 这个任务没有可说的
-                // （`health` 就是），前端画一个 `—`，不编一句废话。
+                // 那边是**运行结果**（跑完才有）。空串 = 这个任务没有可说的，
+                // 前端画一个 `—`，不编一句废话。
                 "summary": task_summary(task),
                 // 节奏（三选一：间隔 / 每天 / 每周）。界面那句「调度节奏：…」
                 // 直接用它，不自己从 `intervalMin` 反推 —— 反推会把
@@ -1786,7 +1776,6 @@ fn task_summary(task: &str) -> &'static str {
         "ingest" => "把客户端新产生的会话增量搬进记忆（零成本）",
         "index-scan" => "全库文件与索引一致性自检及修复（零成本）",
         "cleanup" => "清理回收站与异常无用记录（零成本）",
-        "health" => "",
         // `sync` 不在这里：WebDAV 同步已从自动化任务里摘出去，它有自己的
         // 页面（`GET /api/memory/sync` 一族）。留一句文案在这里只会让
         // 「为什么有说明却没有卡」变成下一个要解释的问题。
@@ -1962,8 +1951,13 @@ mod tests {
 
     #[test]
     fn last_run_stamp_round_trips() {
-        stamp("health", 123);
-        assert_eq!(last_of("health"), 123);
+        // 别用 `health` 当样例任务：它 2026-11-24 被删掉了，测试会跟着一起失效。
+        // 用仍在册的 `cleanup` —— 这条测的是 stamp/last_of 本身，与具体任务无关。
+        stamp("cleanup", 123);
+        assert_eq!(last_of("cleanup"), 123);
+        // 不在册的任务名必须被静默丢弃（否则会往 last_run 里塞野键）
+        stamp("not-a-task", 456);
+        assert_eq!(last_of("not-a-task"), 0);
     }
 
     #[test]
@@ -2054,17 +2048,11 @@ mod tests {
     #[test]
     fn every_task_has_a_summary_and_zero_cost_tasks_are_marked() {
         for task in TASKS {
-            // `health` 是唯一允许空说明的：它的名字（记忆体检）已经把「干什么」
-            // 说尽了，卡片上画一个 `—`，不要为凑满而编一句同义反复。
-            if task == "health" {
-                assert!(task_summary(task).is_empty(), "health 应当留空，由界面画 —");
-                continue;
-            }
             assert!(!task_summary(task).is_empty(), "{task} 没有说明文案");
         }
-        // 零 token 的五个必须标成零成本：界面据此写「零成本」，写错就等于
+        // 零 token 的四个必须标成零成本：界面据此写「零成本」，写错就等于
         // 让用户以为一个后台任务在烧钱。
-        for task in ["classify", "ingest", "index-scan", "cleanup", "health"] {
+        for task in ["classify", "ingest", "index-scan", "cleanup"] {
             assert!(!task_uses_model(task), "{task} 不该被标成调用模型");
         }
         for task in ["extract", "summarize", "tag", "distill", "consolidate", "profile", "supersede"] {
