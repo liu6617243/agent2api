@@ -2801,6 +2801,12 @@ pub(super) fn reinforce_entry_with(
 /// 草稿；走那条路的调用方（含 MCP `memory_update`）还可能顺手改正文、改项目，
 /// 一次调用做四件事。人工采纳的语义只有一个：**这条我认了**。单开一个函数，
 /// 前端就能给一个明确的按钮，审计日志也能说清是谁认的。
+///
+/// ── 为什么只认草稿 ────────────────────────────────────────
+/// 前端按 `isDraft` 决定要不要显示按钮，但接口本身不限来源的话，人写的 l1
+/// 流水也能被这条路径抬成 l2 —— 而「人写的 l1 是流水，不是待确认的结论」。
+/// 语义上「采纳」这个词只对草稿成立；想升人写的流水，走 `update` 的换层
+/// （那里有意留了这条路，因为它同时会过判重与 `manual:` 锚点）。
 pub fn promote_draft(id: &str) -> Result<Value, String> {
     let Some(before) = store::load_all().into_iter().find(|entry| entry.id == id) else {
         return Err(format!("找不到记忆 {id}"));
@@ -2811,6 +2817,12 @@ pub fn promote_draft(id: &str) -> Result<Value, String> {
     if before.layer == Layer::L2 {
         // 幂等：重复点不该报错，也不该再写一次盘
         return Ok(json!({ "id": id, "promoted": false, "layer": "l2" }));
+    }
+    if !is_auto_draft(&before) {
+        return Err(
+            "只有自动抽取的草稿能被「采纳」；人写的流水要提升层级请用编辑里的层级字段"
+                .into(),
+        );
     }
     let mut entry = before.clone();
     // 人工采纳本身算一次确认。锚点带 `manual:` 前缀，与流水 id 区分开 ——
