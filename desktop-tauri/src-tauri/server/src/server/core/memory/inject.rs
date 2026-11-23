@@ -2012,10 +2012,14 @@ pub fn preview(request_text: &str) -> Value {
                     // 这条候选花的是哪个钱包。三段各有各的预算，界面上必须能分开说
                     // 「被 `experienceTokens` 挤掉」还是「被 `profileTokens` 挤掉」——
                     // 混成一句「被预算挤掉」时，用户不知道该调哪一个旋钮。
-                    "section": if entry.kind == MemoryKind::Profile {
-                        "profile"
-                    } else if rule_candidate(entry) {
+                    //
+                    // 顺序要紧：先问 `rule_candidate`。被用户钉住的画像会进「必须遵守」
+                    // 段（`rule_candidate` 对它只认 `pinned`），那时它花的是
+                    // `rulesTokens`，标成 `profile` 会让人去调错旋钮。
+                    "section": if rule_candidate(entry) {
                         "rules"
+                    } else if entry.kind == MemoryKind::Profile {
+                        "profile"
                     } else {
                         "experience"
                     },
