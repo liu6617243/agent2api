@@ -44,6 +44,9 @@
 //   node scripts/migrate-agenthub.mjs --undo             # 干跑：按最近台账算能撤多少
 //   node scripts/migrate-agenthub.mjs --undo --apply     # 真撤（进回收站）
 //   node scripts/migrate-agenthub.mjs --undo --manifest=.workbuddy/tmp/xxx.json --apply
+//
+//   # 只给现有画像加锁（不搬条目）；不带 --protect-only 会顺带跑一遍默认 l2 口径
+//   node scripts/migrate-agenthub.mjs --protect-profiles --protect-only --apply
 // ─────────────────────────────────────────────────────────────────────
 
 import fs from 'node:fs'
@@ -480,7 +483,15 @@ async function main() {
   console.log(`源库 ${DB}`)
   console.log(`接口 ${API}   口径 ${ONLY ? 'only=' + ONLY : SCOPE}   ${APPLY ? '【真写】' : '【干跑】'}`)
 
-  if (has('--protect-profiles')) await protectProfiles(APPLY)
+  if (has('--protect-profiles')) {
+    await protectProfiles(APPLY)
+    // `--protect-only` 只加锁、不搬条目：`--protect-profiles --apply` 单独跑会顺带
+    // 执行默认的 l2 口径 —— 想「只锁画像」的人会被静默搬走 331 条，这个坑太深。
+    if (has('--protect-only')) {
+      console.log(APPLY ? '\n只加锁，未搬任何条目。' : '\n只加锁（干跑），未搬任何条目。')
+      return
+    }
+  }
 
   const rows = loadRows()
   const scopeRows = rows.filter(inScope)

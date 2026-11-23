@@ -140,7 +140,10 @@ node scripts/migrate-agenthub.mjs --apply
 # 只搬前 N 条
 node scripts/migrate-agenthub.mjs --apply --limit 20
 
-# 迁前锁住现有画像（防止下一轮画像重建把它们挤掉）
+# 只锁画像，不搬条目（--protect-only 必加：不加会顺带跑默认 l2 口径）
+node scripts/migrate-agenthub.mjs --protect-profiles --protect-only --apply
+
+# 锁画像 + 同一轮搬 l2（合起来用才省略 --protect-only）
 node scripts/migrate-agenthub.mjs --protect-profiles --apply
 
 # 撤掉一轮（默认取最近一份台账，进回收站，可 restore）
@@ -214,8 +217,8 @@ node scripts/migrate-agenthub.mjs --undo --manifest .workbuddy/tmp/agenthub-migr
 **对策（已内置）：**
 
 ```bash
-# 迁移前先把现有 16 条画像锁住（pinned + tags 加 pin，重建时跳过）
-node scripts/migrate-agenthub.mjs --protect-profiles --apply
+# 先把现有 16 条画像锁住（pinned + tags 加 pin，重建时跳过），不搬任何条目
+node scripts/migrate-agenthub.mjs --protect-profiles --protect-only --apply
 ```
 
 不锁也行，但要知道后果：迁完之后你的「画像」会从「agent2api 这几天自己的观察」
