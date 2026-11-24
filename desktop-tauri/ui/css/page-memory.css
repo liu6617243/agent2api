@@ -255,6 +255,12 @@
   gap: 10px;
   min-height: 0;
   flex: 1;
+  /* 窗口极矮时（窗口拖到 200px 高、或用户把系统缩放调到 150%）：
+     表头行 + 筛选行 + 等级 tab 的固有高度加起来就快占满整块了，剩下的
+     交给卡片收缩。没有这道兜底，`flex: 1 1 auto` 的卡片会被压到 2px ——
+     表头和所有行都在 DOM 里，但用户只能看到一条灰线，会以为列表空了。
+     改成整块滚动：卡片拿到 `min-height` 下限，超出部分在外层滚。 */
+  overflow: auto;
 }
 /* 视图切换行：新建按钮 + 四段分段控件（对齐 AgentHub 的 mem-head） */
 .mm-browse-head {
@@ -436,7 +442,9 @@
   border-radius: var(--r-md);
   background: var(--surface);
   overflow: hidden;
-  min-height: 0;
+  /* 160px ≈ 表头 + 六行。这是「能看出这是一张表」的最低限度；
+     更矮就该由外层 `.mm-browse` 滚动，而不是继续压这张卡。 */
+  min-height: 160px;
   flex: 1 1 auto;
   display: flex;
   flex-direction: column;
@@ -600,6 +608,10 @@
   gap: 10px;
   min-height: 0;
   flex: 1;
+  /* 窗口极矮时（比如把桌面窗口拖到 200px 高）两张卡都放不下：让这一块整体
+     滚动，而不是继续压卡片。没有它，flex 收缩会把下面的数据卡压成 0 高 ——
+     表格还在 DOM 里，但一行也看不见，用户以为回收站空了。 */
+  overflow: auto;
 }
 .mm-trash-card {
   border: 1px solid var(--border);
@@ -608,10 +620,21 @@
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  /* 配置卡（自动清理）**不参与收缩**，理由与 `.mm-section` 那条注释同一个坑：
+     父级 `.mm-trash` 是「吃掉剩余高度」的 flex 列，下面那张数据卡写着
+     `flex: 1 1 auto`，于是剩余高度全被它拿走。这里留默认的 `flex-shrink: 1`
+     + `overflow: hidden` 时，配置卡会被压到三十来像素 —— 标题行露出半截、
+     五个开关和保留期整片被裁掉，用户看到的是一条空白的圆角条。
+     真机就这么中过（2026-11-24 截图红框）：`.mm-trash-card` 实测高度 31px，
+     而它内容需要 62px。 */
+  flex: 0 0 auto;
 }
-/* 下面这张是数据卡：吃掉剩余高度，表体自己滚，卡片本身不滚。 */
+/* 下面这张是数据卡：吃掉剩余高度，表体自己滚，卡片本身不滚。
+   必须写在配置卡之后 —— 同特异性下靠顺序覆盖上面的 `flex: 0 0 auto`。
+   `min-height` 是下限：父级只剩几十像素时，没有它这张卡会被压成 2px
+   （表头都看不见，只剩一条细线），而有下限时外层 `.mm-trash` 改为整体滚动。 */
 .mm-trash-list {
-  min-height: 0;
+  min-height: 160px;
   flex: 1 1 auto;
 }
 .mm-trash-card-head {
