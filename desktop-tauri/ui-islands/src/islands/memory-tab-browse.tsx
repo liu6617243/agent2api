@@ -130,16 +130,17 @@ function Browse({
   /**
    * 批量裁决：勾中的待确认项 id。
    *
-   * ── 这个队列现在的定位 ────────────────────────────────────
-   * 高置信建议已经**不由人裁决**：后端 `auto_resolve` 按类型分档自动落地
-   * （归类要在目标项目已登记时才动、去重只在精确重复或分数够高时才合并、
-   * 事实失效永不自动），留 `resolution = auto-*` 痕迹，全部可逆。所以这一页
-   * 展示的是「判据认为需要你判断的那些」。
+   * ── 这个队列现在的定位：正常情况下应该是空的 ────────────────
+   * 每一类建议都由判据给出确定答案（合并 / 连边 / 作废），后端 `auto_resolve`
+   * 扫一遍就把队列清干净，留 `resolution = auto-*` 痕迹，全部可逆。归类要有路径
+   * 证据且目标项目已登记才动；去重要短边被覆盖掉才合并，否则只连边；事实失效要
+   * 旧条正文被新条解释掉才落地。
    *
-   * 那为什么还留「勾选 + 批量」而不是「全部批准」：留下的这几条恰恰是判据
-   * 没把握的那些（分数卡在 0.72~0.89 的近似项、指向不存在项目的归类），
-   * 它们之间**没有共性**，一次全批准仍然是把三个判断一次性交出去。
-   * 界面上有「自动处理高置信」按钮，让批量清空变成一件**有判据**的事。
+   * 那为什么还留着这一页：判据答不出来的是**结构性**的几种情况 —— 用户把某一类
+   * 的自动裁决关掉了（`review.autoConfirm*`），或者某次落地在磁盘上失败了。这两种
+   * 才该出现在这里，而它们之间没有共性，一次全批准仍然是把几个判断一次性交出去。
+   * 所以界面留「批准所选」而不是「全部批准」，另留一个「按判据全量裁决」按钮 ——
+   * 后者是**有判据**的一键清空，前者是人亲自表达。
    */
   const [picked, setPicked] = React.useState<Set<number>>(new Set())
   /** 批量执行进度；null = 没在跑。逐条串行，后端一次只认一个 id。 */
@@ -333,11 +334,12 @@ function Browse({
   /* ─── 批量裁决 ───────────────────────────────────────────── */
 
   /**
-   * 自动处理高置信：走后端 `auto_resolve`，够格的落盘、不够格的留在队列。
+   * 按判据全量裁决：走后端 `auto_resolve`，每一行都拿到终局 —— 落地 / 连边 /
+   * 作废，只有「用户关掉了这一类的自动裁决」才会留在队列里。
    *
-   * 与「批准所选」不是同一件事：这里不碰任何一条「判据说该留给人」的建议，
-   * 也不把「我勾了就表示我读过」这件事假装成判据。结果里 `kept` 就是剩下的
-   * 那些 —— 用户看到「处理了 45 条，剩下 17 条要你判断」才知道该干什么。
+   * 与「批准所选」不是同一件事：这里不碰任何一条「开关关着」的建议，也不把
+   * 「我勾了就表示我读过」这件事假装成判据。结果里 `kept` 就是剩下的那些，
+   * 意思是「这几类的开关是关着的」。
    */
   const runAutoResolve = async () => {
     if (batch) return
@@ -355,13 +357,13 @@ function Browse({
       // 后者真的动了记忆。两句话分开说，用户才敢继续用这个按钮。
       const retired = result.retired ?? 0
       if (result.applied > 0 || retired > 0) {
-        setNotice(t('自动处理了 {n} 条、作废 {r} 条永远轮不到自动裁决的建议，队列还剩 {left} 条需要你判断。', {
+        setNotice(t('自动处理了 {n} 条、作废 {r} 条判据认为不成立的建议，队列还剩 {left} 条（只剩关掉自动裁决的那几类）。', {
           n: result.applied,
           r: retired,
           left: result.kept,
         }))
       } else {
-        setNotice(t('这一轮没有够格自动处理的了，剩下的 {left} 条都要你判断。', { left: result.kept }))
+        setNotice(t('这一轮没有新东西可裁了，剩下的 {left} 条都在你关掉自动裁决的那几类里。', { left: result.kept }))
       }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
@@ -396,16 +398,25 @@ function Browse({
    *
    * 不中断：一条失败（比如目标记忆已被别人删掉）不该把剩下 20 条全卡住 ——
    * 失败的逐条记下来，跑完一起报。
+   *
+   * ── `approved: false` 不是失败 ──────────────────────────────
+   * 批准也可能返回 `approved: false` + `reason`：那表示判据说这条建议不成立
+   * （目标早被合走、旧条还有独有内容、分数连边都够不上）。它不是错误，但必须
+   * 说出来 —— 否则用户点了「批准 20 条」、队列少了 20 条、什么都没变，只会
+   * 以为这个按钮在骗人。
    */
   const runBatch = async (approve: boolean) => {
     const items = pickedItems
     if (items.length === 0 || batch) return
     setBatch({ done: 0, total: items.length })
     setError('')
+    setNotice('')
     const failed: string[] = []
+    let voided = 0
     for (const [index, item] of items.entries()) {
       try {
-        await m.resolveReview(item.id, approve)
+        const result = await m.resolveReview(item.id, approve)
+        if (approve && result.approved === false && result.reason) voided += 1
       } catch (caught) {
         failed.push(`${item.target}：${caught instanceof Error ? caught.message : String(caught)}`)
       }
@@ -417,8 +428,38 @@ function Browse({
     review.reload()
     list.reload()
     onChanged()
+    if (voided > 0) {
+      setNotice(t('{n} 条判据说这条建议不成立，没做任何改动（理由记在队列的已处理记录里）。', { n: voided }))
+    }
     if (failed.length > 0) {
       setError(t('{n} 条没成功：{detail}', { n: failed.length, detail: failed.slice(0, 3).join('；') }))
+    }
+  }
+
+  /**
+   * 逐条批准。判据说这条不成立时后端返回 `approved: false` + `reason`，
+   * 那不是失败 —— 但得说出来，否则用户点了「批准」看着队列少一条、
+   * 数据一点没变，只会以为按钮坏了（理由见 `runBatch`）。
+   */
+  const approveOne = async (id: number, target: string) => {
+    setBusy(`review-${id}`)
+    setError('')
+    setNotice('')
+    try {
+      const result = await m.resolveReview(id, true)
+      if (result.approved === false && result.reason) {
+        setNotice(t('「{target}」判据说这条建议不成立（{reason}），没做任何改动。', {
+          target,
+          reason: result.reason,
+        }))
+      }
+      list.reload()
+      review.reload()
+      onChanged()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy('')
     }
   }
 
@@ -805,7 +846,7 @@ function Browse({
         <div className='mm-review-page'>
           <Section
             title={t('待确认（{n}）', { n: review.data?.pending ?? 0 })}
-            hint={t('高置信建议会自动落地（可逆，留 auto 痕迹）；这里显示的是判据认为需要你判断的那些。批准才会改数据，拒绝只改队列状态 —— 任何裁决都能反悔。')}
+            hint={t('每一类建议都由判据自己给答案（合并 / 只连边 / 判为不成立），所以正常情况下这里是空的。留下的只可能是你关掉了某类自动裁决，或者落地时磁盘报错。批准会按同一套判据执行，拒绝只改队列状态 —— 任何裁决都能反悔。')}
             action={(
               <div className='mm-row' style={{ gap: 6 }}>
                 <Button type='button' size='sm' variant='ghost' onClick={() => review.reload()}>
@@ -818,7 +859,7 @@ function Browse({
                   disabled={busy === '__auto__'}
                   onClick={() => void runAutoResolve()}
                 >
-                  {busy === '__auto__' ? t('处理中…') : t('自动处理高置信')}
+                  {busy === '__auto__' ? t('处理中…') : t('按判据全量裁决')}
                 </Button>
                 <Button
                   type='button'
@@ -847,7 +888,7 @@ function Browse({
 
             {/* 批量条：勾 → 看清楚构成 → 一次确认。
                 不提供「全部批准」，只提供「批准所选」（理由见 `picked` 的注释）；
-                要清空队列走右上角「自动处理高置信」—— 那是按判据，不是按勾选。 */}
+                要按判据清空队列走右上角「按判据全量裁决」—— 那是按判据，不是按勾选。 */}
             {pickable > 0 ? (
               <div className='mm-review-batch'>
                 <Checkbox
@@ -902,7 +943,7 @@ function Browse({
                 <div>
                   <strong>{t('确认批准这 {n} 条？', { n: pickedItems.length })}</strong>
                   <div className='mm-muted' style={{ marginTop: 4 }}>
-                    {t('构成：{tally}。归类会移动记忆文件（目标项目不存在时会新建目录）；事实失效 / 去重会让旧条目从默认检索里消失；蒸馏会新落一条之后会被注入的结论。忽略只改队列状态，可以随时反悔。', { tally: pickedTally })}
+                    {t('构成：{tally}。批准 = 同意按判据处置，不是无条件执行：合并只在短边正文被另一条覆盖时才发生，覆盖不到只连一条「相关」边、两条都留，这条彻底不成立则什么都不动。忽略只改队列状态，可以随时反悔。', { tally: pickedTally })}
                   </div>
                 </div>
                 <div className='mm-review-batch-actions'>
@@ -935,7 +976,7 @@ function Browse({
                   </div>
                   <div className='mm-review-detail'>{reviewDetail(item, projectSlugs)}</div>
                   <div className='mm-review-actions'>
-                    <Button type='button' size='sm' onClick={() => void act(`review-${item.id}`, () => m.resolveReview(item.id, true))}>
+                    <Button type='button' size='sm' onClick={() => void approveOne(item.id, item.target)}>
                       {t('批准')}
                     </Button>
                     <Button type='button' size='sm' variant='ghost' onClick={() => void act(`review-${item.id}`, () => m.resolveReview(item.id, false))}>
@@ -1956,7 +1997,10 @@ function reviewDetail(item: m.ReviewItem, projectSlugs?: Set<string>): string {
       const who = keep === 'candidate'
         ? t('本条会被它取代')
         : t('{id} 会被本条取代', { id: candidate })
-      return t('与 {id} 相似度 {n}%：批准后 {who}（不删，演化链可倒回去）。{reason}', {
+      // 结果由覆盖率判，不由「谁点了批准」判 —— 所以这里说「按判据」，而不是
+      // 「批准后就一定取代」。真机上一半的配对是「相似但各有独有内容」，
+      // 那种只会连一条相关边、两条都留着。
+      return t('与 {id} 相似度 {n}%：批准会按同一套判据处置（短边被覆盖才 {who}；各有独有内容就只连一条相关边、两条都留；这条不成立则什么都不动）。{reason}', {
         id: candidate,
         n: Math.round(score * 100),
         who,
@@ -1968,16 +2012,16 @@ function reviewDetail(item: m.ReviewItem, projectSlugs?: Set<string>): string {
       if (!suggestion) return t('建议归类，但载荷里没有目标项目')
       const missing = projectSlugs ? !projectSlugs.has(suggestion) && suggestion !== '_global' : false
       return missing
-        ? t('建议归入项目 {slug} —— 这个项目现在不存在，批准会新建它。', { slug: suggestion })
-        : t('建议归入项目 {slug}。批准后记忆会被搬到那个项目目录。', { slug: suggestion })
+        ? t('建议归入项目 {slug} —— 这个项目现在不存在，判据不会自动往里搬。', { slug: suggestion })
+        : t('建议归入项目 {slug}。批准后记忆会被搬到那个项目目录（只在路径证据支持时自动）。', { slug: suggestion })
     }
     case 'supersede': {
       const oldId = pick('oldId') || pick('superseded')
       const reason = pick('reason')
       if (!oldId) return t('建议标记旧事实失效，但载荷里没有目标 id')
       return reason
-        ? t('新记忆让 {id} 不再成立：{reason} 批准后旧条目被标记为已取代。', { id: oldId, reason })
-        : t('新记忆让 {id} 不再成立。批准后旧条目被标记为已取代。', { id: oldId })
+        ? t('新记忆让 {id} 不再成立：{reason} 批准后按覆盖率处置 —— 旧条正文已被覆盖才标取代，覆盖不到只连一条相关边。', { id: oldId, reason })
+        : t('新记忆让 {id} 不再成立。批准后按覆盖率处置 —— 旧条正文已被覆盖才标取代，覆盖不到只连一条相关边。', { id: oldId })
     }
     case 'distill':
     case 'consolidate': {

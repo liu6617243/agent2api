@@ -1731,7 +1731,7 @@ fn write_inner(
     // 这里**一律入队**，不再看「要不要自动确认」的开关：早先 `review.autoConfirmClassify`
     // 开着时 `categorized_pending` 返回 false —— 建议既不进队列、也没被应用，
     // 记忆永远卡在 general，而界面上写着「已开启自动归类」。判据只留一份，
-    // 在 `auto_eligible` 里；入队只是留档，落地由 `auto_resolve_ids` 决定。
+    // 在 `decide` 里；入队只是留档，落地由 `auto_resolve_ids` 决定。
     let pending_classify = if categorized_pending(&classified) {
         index::global().enqueue(
             "classify",
@@ -1798,10 +1798,10 @@ fn write_inner(
     }
 
     // ── 归类建议：入队只是留档，够格的当场落地 ────────────────────
-    // 必须在 `save` 之后：`auto_eligible` 的 classify 分支要在快照里查得到
+    // 必须在 `save` 之后：`decide` 的 classify 分支要在快照里查得到
     // 这条目标记忆，而它在写盘之前根本不存在。
     if let Some(queued) = pending_classify {
-        if auto_resolve_ids(&[queued]) > 0 {
+        if auto_resolve_ids(&[queued]).applied > 0 {
             // 自动归入会搬文件、换 project。返回的 entry 必须是搬完之后的形态，
             // 否则调用方拿到 `project: null`，而记忆已经在 `projects/<slug>/` 里了
             // —— 同一个响应里两处说法打架，任何拿它做后续判断的调用方都会错。
@@ -1832,12 +1832,12 @@ fn write_inner(
         }
     }
 
-    // ── L2 近似去重：入队留档，落不落地由 `auto_eligible` 一处判 ──────
+    // ── L2 近似去重：入队留档，落不落地由 `decide` 一处判 ────────────
     //
     // 早先这里自带一段 `review.autoConfirmDedup && score >= autoMergeThreshold`
     // 的判定，与队列裁决各走一条路。两条路对「什么算够格」的口径只要有一点
     // 不同，就会出现「巡检明明 0.93 却没自动合并」这种谁也解释不清的场面。
-    // 现在：**一律入队**（留档 + 可审计），是否当场落地问 `auto_eligible`，
+    // 现在：**一律入队**（留档 + 可审计），是否当场落地问 `decide`，
     // 落地跑的是和人工批准同一个 `apply_verdict`。
     if config::bool_of("dedup.enabled") && config::bool_of("dedup.l2.enabled") && layer == Layer::L2 {
         if let Some((candidate, score)) = near_duplicate(&entry) {
@@ -1906,7 +1906,7 @@ fn write_inner(
 /// 早先这里还串了 `!config::bool_of("review.autoConfirmClassify")`，于是那个
 /// 开关开着时：建议不入队（`enqueue` 不执行），同时也没有任何地方去应用它 ——
 /// 记忆永远留在 general，而设置页写着「已开启自动归类」。开关是真的，动作是
-/// 不存在的。现在开关只作用于 [`auto_eligible`]，入队一律发生（留档）。
+/// 不存在的。现在开关只作用于 [`decide`]，入队一律发生（留档）。
 fn categorized_pending(classified: &Classified) -> bool {
     classified.origin == "suggest" && classified.suggestion.is_some()
 }
@@ -1988,8 +1988,8 @@ fn dedup_keeper(entry: &MemoryEntry, candidate_id: &str) -> DedupKeeper {
 ///   ② `apply_derived` 落蒸馏结论前（先看能不能改成强化既有结论）
 /// 早先这里各写了一套：① 用 `dice/wEdit/wTitle` 加权，② 用 `dice+edit` 的均值
 /// 且不读标题。两边同阈值（0.72）却不同算法，于是同一条结论可以「②判无关 →
-/// 新建」，紧接着「①判近似 → 入队」（`review.autoConfirmDedup` 开着时当场标
-/// superseded，把刚落地的那条埋掉）。症状是「明明合并过，怎么又出来两条」，
+/// 新建」，紧接着「①判近似 → 入队 → 当场合并」（`review.autoConfirmDedup` 开着，
+/// 覆盖率也过线时），把刚落地的那条埋掉）。症状是「明明合并过，怎么又出来两条」，
 /// 且两处日志分别看都自洽 —— 只有把两份算法并排放才能发现。
 ///
 /// 抽成一个纯函数之后，两处口径永远一致；想改判据只改这里。
@@ -2012,7 +2012,8 @@ fn pair_similarity(entry: &MemoryEntry, other: &MemoryEntry) -> f64 {
 ///
 /// 为什么不用向量：这里不想为了「找相似标题」引入 embedding 模型与一次额外
 /// 的模型调用；而沉淀结论的标题通常很短，词面相似度已经能抓住绝大多数重复。
-/// 阈值之上只产建议（`review_queue`），裁决由人做。
+/// 阈值之上只产建议（`review_queue`），裁决由 [`decide`] 按覆盖率做 —— 够了才
+/// 合并，各有独有内容就连边，这条不成立就作废。
 fn near_duplicate(entry: &MemoryEntry) -> Option<(String, f64)> {
     let threshold = config::number("dedup.l2.candidateThreshold");
     let mut best: Option<(String, f64)> = None;
@@ -2395,7 +2396,7 @@ pub fn update(id: &str, patch: &Value) -> Result<Value, String> {
             } else {
                 "new"
             };
-            index::global().enqueue(
+            let queued = index::global().enqueue(
                 "dedup",
                 &entry.id,
                 &json!({
@@ -2406,9 +2407,16 @@ pub fn update(id: &str, patch: &Value) -> Result<Value, String> {
                 }),
                 score,
             );
+            // 只入队不裁决 = 留一行等人点。判据对这条同样有答案（合并 / 连边 /
+            // 作废），所以当场问一次，和写入路径同一个 `decide`。人把一条半截
+            // 流水手升成 l2 是明确意图，但它和既有结论的关系不该变成下一件
+            // 「等你来点」的事。
+            if let Some(id) = queued {
+                auto_resolve_ids(&[id]);
+            }
             crate::server::logging::log(
                 "[Memory]",
-                &format!("手动升层 {} → l2，与 {candidate} 近似（{score:.2}），已入队待裁决", entry.id),
+                &format!("手动升层 {} → l2，与 {candidate} 近似（{score:.2}），已按判据裁决", entry.id),
             );
         }
     }
@@ -2619,9 +2627,12 @@ pub fn trash_list() -> Value {
 /// 活条目两两算 Dice + Levenshtein，库上千条就会卡住整个进程。
 ///
 /// ── 巡检产出的建议里，哪些会当场落地 ────────────────────────
-/// 全部先入队（留档），然后跑一次 [`auto_resolve`]：精确重复（score 1.0）无条件
-/// 合；近似项按 [`dedup_verdict`] 分三档 —— 短边被对方解释掉（覆盖率过线）就合，
-/// 够像但各有独有内容就只连边、两条都留，分数与覆盖都不够的才留在队列里等人。
+/// 全部先入队（留档），然后跑一次 [`auto_resolve`]：每一对都由 [`pair_outcome`]
+/// 给出终态 —— 短边被对方解释掉（覆盖率过线）就合，够像但各有独有内容就只连边、
+/// 两条都留，够不上连边门槛的才按「这条建议不成立」作废。
+///
+/// 队列不承担「等人拍板」的职责：判据从条目状态重算得出确定答案，把确定答案
+/// 留在队列里等于让「待确认 N 条」永远降不到 0（用户的实际用法是全选→确认）。
 ///
 /// 早先这里写的是「近似项要过 `autoMergeThreshold`（默认 0.9），0.72~0.89 那段
 /// 留给人」。真机上那段正好是全部 44 对 —— 队列清不完，而它们恰恰是最该合的。
@@ -2762,13 +2773,14 @@ pub fn dedup_scan() -> Value {
     }
 
     bump_revision();
-    // ── 巡检结束后把够格的当场处理掉 ────────────────────────────
+    // ── 巡检结束后把队列裁干净 ──────────────────────────────────
     // 不这么做的话，「巡检」这个动作只是把库里已有的重复从「看不见」变成
-    // 「队列里躺着」，用户点一次巡检得到的仍然是一个更长的队列。精确重复
-    // （score 1.0）在 `auto_eligible` 里无条件放行，所以至少这一大批是当场
-    // 消失的 —— 剩下真正需要人看的才是 0.72~0.89 的近似项。
+    // 「队列里躺着」，用户点一次巡检得到的仍然是一个更长的队列。`decide` 对每一
+    // 对都有答案（合并 / 连边 / 作废），所以这一轮之后队列里不该再留下本次巡检
+    // 产生的东西。
     let auto = auto_resolve(500);
     let applied = auto.get("applied").and_then(Value::as_u64).unwrap_or(0);
+    let retired = auto.get("retired").and_then(Value::as_u64).unwrap_or(0);
     crate::server::logging::log(
         "[Memory]",
         &format!("全库去重巡检：扫 {scanned} 条，精确重复 {exact}，近似 {near}"),
@@ -2780,6 +2792,7 @@ pub fn dedup_scan() -> Value {
         "near": near,
         "queued": queued,
         "autoApplied": applied,
+        "autoRetired": retired,
         "pending": index::global().review_count(),
     })
 }
@@ -2804,14 +2817,21 @@ pub fn review_list(status: Option<&str>, kind: Option<&str>, limit: usize) -> Va
     })
 }
 
-/// 裁决一条建议（人工入口）。`approve` 为真时按建议内容落盘：
+/// 裁决一条建议（人工入口）。`approve` 为真时**按判据**落盘 —— 不是「无视判据
+/// 执行」：
 ///
 /// * `classify` —— 把记忆搬进建议的项目
-/// * `dedup` —— 把信息量小的一条标成被取代（不删）
-/// * `supersede` —— 标记旧事实失效
-/// * `conflict` —— 保留当前版本，清掉冲突记录
+/// * `dedup` —— 覆盖率够就并正文后标取代，够像但各有独有内容就只连边，不够就作废
+/// * `supersede` —— 同上，方向由载荷固定
 ///
 /// 拒绝只改队列状态，不动数据。**永不物理删除**：任何裁决都可以反悔。
+///
+/// ── 为什么「批准」不等于「照做」──────────────────────────────
+/// 这条队列的正常状态是空的（判据对每一行都有结论，见 [`decide`]）。所以出现在
+/// 这里的一行，要么是某一类自动裁决被用户关掉了，要么是落地失败了 —— 两种情况下
+/// 把「批准」做成「无条件执行」都会重新打开批量埋记忆的口子：真机上的用法是
+/// 全选 → 确定，人不逐条看。批准的意思是「我同意按判据处置」，判据说这条建议
+/// 不成立（一端没了 / 覆盖不到）时就什么都不动，只留下那个理由。
 pub fn review_resolve(id: i64, approve: bool) -> Result<Value, String> {
     // 按 id 精确取：`review_list` 会截断到 500 条，队列积压时点「批准」会报
     // 「找不到待确认项」—— 而那条明明就在页面上。
@@ -2821,8 +2841,15 @@ pub fn review_resolve(id: i64, approve: bool) -> Result<Value, String> {
     if row.status != "pending" {
         return Ok(json!({ "id": id, "status": row.status, "already": true }));
     }
-    if approve {
-        apply_verdict(&row)?;
+    // ── 人点了「批准」，但判据说这条不成立 ─────────────────────
+    // 这种情况要如实记成「作废 + 理由」，而不是「approved + manual」。
+    // 后者会让审计链说谎：一条什么都没做的建议在库里显示「人工已批准」，
+    // 事后谁也查不出它其实是被判据否掉的。
+    let voided = if approve { apply_verdict(&row)? } else { None };
+    if let Some(reason) = voided {
+        index::global().review_resolve(&[id], "rejected", Some(reason));
+        bump_revision();
+        return Ok(json!({ "id": id, "approved": false, "type": row.kind, "reason": reason }));
     }
     index::global().review_resolve(
         &[id],
@@ -2833,10 +2860,52 @@ pub fn review_resolve(id: i64, approve: bool) -> Result<Value, String> {
     Ok(json!({ "id": id, "approved": approve, "type": row.kind }))
 }
 
-/// 把一条建议落盘。人工批准与自动批准共用这一份 —— 两条路各写一遍的话，
-/// 「自动合并的方向」与「人工批准的方向」迟早会漂开，而漂开的表现是
-/// 「我点了批准，结果要留的那条被埋了」。
-fn apply_verdict(row: &index::ReviewRow) -> Result<(), String> {
+/// 把一条建议落盘，**动作由传进来的结论决定**。
+///
+/// 这是「执行」那一半：[`decide`] / [`pair_outcome`] 负责判，这里只负责照做。
+/// 拆开的理由是判据只能有一处 —— 如果执行时再算一遍，两次计算之间快照可能已经
+/// 变了（一轮批扫里前一行刚合并掉这一行的一端），于是「判据说合并」和「执行时
+/// 说要作废」同时成立，而错的那次会静默生效。
+///
+/// 人工批准与自动批准共用这一份：两条路各写一遍的话，「自动合并的方向」与
+/// 「人工批准的方向」迟早会漂开，而漂开的表现是「我点了批准，结果要留的那条
+/// 被埋了」。
+///
+/// `outcome` 只对配对型（`dedup` / `supersede`）有意义：那两类的动作由裁决的
+/// 终态决定（并正文 / 只连边 / 什么都不做）。其余三类（归类搬家、蒸馏新增、
+/// 合并新增）不需要终态，传 `None`。参数做成 `Option` 而不是「随便传个 Merge
+/// 占位」，是因为后者会让读代码的人以为「归类也走合并那条路」。
+fn execute(row: &index::ReviewRow, outcome: Option<PairOutcome>) -> Result<(), String> {
+    if matches!(row.kind.as_str(), "dedup" | "supersede") {
+        let Some(outcome) = outcome else {
+            // 配对型却没给终态：调用方写错了，不是数据问题，直接报出来。
+            return Err(format!("配对型建议 {} 缺少裁决结果", row.kind));
+        };
+        return match outcome {
+            PairOutcome::Merge => {
+                if row.kind == "supersede" {
+                    let new_id = pair_this_id(row).unwrap_or_default();
+                    apply_supersede(new_id, pair_other_id(row))
+                } else {
+                    let candidate = pair_other_id(row).to_string();
+                    // 方向由载荷里的 `keep` 决定：`candidate` = 库里那条更全，
+                    // 把 `target`（新写的）并进去；`new` = 反过来。
+                    if row.payload.get("keep").and_then(Value::as_str) == Some("candidate") {
+                        apply_dedup(&candidate, &row.target)
+                    } else {
+                        apply_dedup(&row.target, &candidate)
+                    }
+                }
+            }
+            // 两条各有独有内容：连一条边，两份正文都留着。纯新增、可反悔。
+            PairOutcome::Relate => {
+                relate_pair(pair_this_id(row).unwrap_or_default(), pair_other_id(row))
+            }
+            // 判据说这条建议不成立（一端没了 / 已处理过 / 覆盖不到 / 分数不够）：
+            // 人点了「批准」也不该凭空执行一个会丢内容的动作。
+            PairOutcome::Retire(_) => Ok(()),
+        };
+    }
     match row.kind.as_str() {
         "classify" => {
             let slug = row
@@ -2844,116 +2913,93 @@ fn apply_verdict(row: &index::ReviewRow) -> Result<(), String> {
                 .get("suggestion")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if !slug.is_empty() {
-                apply_classification(&row.target, slug)?;
+            if slug.is_empty() {
+                return Ok(());
             }
+            apply_classification(&row.target, slug)
         }
-        "dedup" => {
-            let candidate = row
-                .payload
-                .get("candidate")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if !candidate.is_empty() {
-                // 方向由载荷里的 `keep` 决定：`candidate` = 库里那条更全，
-                // 把 `target`（新写的）并进去；其余（含老载荷没这个键）沿用
-                // 「新条取代候选」的旧语义。裁决错了会把一份完整结论埋掉，
-                // 所以这里不能靠猜。
-                //
-                // 生产端必须显式写 `keep`：`dedup_scan` 两轮入队原来都漏了这个
-                // 键，而它给的 `candidate` 恰恰是要保留的那条 —— 按旧语义处理
-                // 会把幸存者标成「已被取代」。
-                let keep_candidate = row
-                    .payload
-                    .get("keep")
-                    .and_then(Value::as_str)
-                    .map(|value| value == "candidate")
-                    .unwrap_or(false);
-                // ── 人工批准也要问覆盖率，不能一律合并 ────────────────────
-                // 用户真实的操作是「全选 → 确定」，所以 `apply_verdict` 这条路上
-                // 有多少人会逐条看，答案就是零。而它原来对 dedup 一律调
-                // `apply_dedup` —— 于是那 7 对「相似但各有独有内容」的配对被
-                // 手工批准批量埋掉，正是自动裁决特意没做的那件事。
-                //
-                // 这里和 `dedup_auto_verdict` 共用同一个判据：已经判成 `Relate`
-                // 的配对只连边（纯新增、可反悔），只有 `Merge` 才动正文。
-                // 判据不成立时（条目被删等）退回原来的无条件合并：人明确点了
-                // 「批准」，那是一个不该被阈值否掉的表态。
-                match dedup_auto_verdict(row) {
-                    Some(DedupVerdict::Relate) => {
-                        relate_pair(&row.target, candidate)?;
-                    }
-                    Some(DedupVerdict::Merge) => {
-                        if keep_candidate {
-                            apply_dedup(candidate, &row.target)?;
-                        } else {
-                            apply_dedup(&row.target, candidate)?;
-                        }
-                    }
-                    // `Keep` / `None`：判据不认识这一对（老载荷没 `keep`、条目被删过、
-                    // 分数不够连边），那就按用户点的意思合并。
-                    _ => {
-                        if keep_candidate {
-                            apply_dedup(candidate, &row.target)?;
-                        } else {
-                            apply_dedup(&row.target, candidate)?;
-                        }
-                    }
-                }
-            }
-        }
-        "supersede" => {
-            // 载荷里两个 id 都带：`oldId` 是被取代的那条，`newId` 是取代者。
-            // 早先这里只读一个叫 `superseded` 的键，而 `detect_supersede`
-            // 写的是 `oldId` —— 于是「批准失效」永远什么都没做却照样标记成功。
-            let old_id = row
-                .payload
-                .get("oldId")
-                .and_then(Value::as_str)
-                .or_else(|| row.payload.get("superseded").and_then(Value::as_str))
-                .unwrap_or_default();
-            let new_id = row
-                .payload
-                .get("newId")
-                .and_then(Value::as_str)
-                .unwrap_or(&row.target);
-            if !old_id.is_empty() {
-                apply_supersede(new_id, old_id)?;
-            }
-        }
-        "distill" | "consolidate" => apply_derived(&row.payload)?,
-        _ => {}
+        "distill" | "consolidate" => apply_derived(&row.payload),
+        _ => Ok(()),
     }
-    Ok(())
+}
+
+/// 人工批准：先问判据，再照做。返回 `Some(理由)` 表示**判据说这条不成立**，
+/// 调用方要把队列行记成「作废 + 理由」，而不是「人工已批准」。
+///
+/// ── 为什么人工批准也要过判据（2026-11-24）─────────────────────
+/// 用户真实的操作是「全选 → 确定」，所以这条路上有多少人会逐条看，答案就是零。
+/// 原来它对 dedup 一律合并、对 supersede 一律标失效 —— 于是那些「相似但各有
+/// 独有内容」的配对被人手批量埋掉，正是自动裁决特意避开的事。
+///
+/// 现在人点「批准」= 「我同意按判据处置」，而不是「无视判据直接执行」：判据说
+/// 该合并就合并，说只该连边就连边，说这条不成立就什么都不动、只留理由。
+/// 人想强行合并的场合仍然有 —— 逐条编辑正文，那才是亲手表达。
+fn apply_verdict(row: &index::ReviewRow) -> Result<Option<&'static str>, String> {
+    // 没有 `execute` 分支能落这类建议：批准它只会把队列行记成「人工已批准」，
+    // 而记忆一个字节都不会变。如实记成作废 + 理由，审计链才不撒谎。
+    if !is_managed_kind(&row.kind) {
+        return Ok(Some("auto-unknown-kind"));
+    }
+    let outcome = if matches!(row.kind.as_str(), "dedup" | "supersede") {
+        Some(pair_outcome(row, &store::snapshot()))
+    } else {
+        None
+    };
+    if let Some(PairOutcome::Retire(reason)) = outcome {
+        return Ok(Some(reason));
+    }
+    execute(row, outcome)?;
+    Ok(None)
+}
+
+/// 这个 kind 有明确的入队方与落地动作。
+///
+/// 不在这张表里的建议（老版本留下的、别的模块塞进来的）既没有开关管它、也没有
+/// `execute` 分支能落它 —— 无论自动还是人工都只会让它「看起来处理过，实际什么
+/// 都没发生」。所以它的终局只能是作废，理由写清楚，事后能查、能反向批准。
+///
+/// `conflict` 也不在这张表里，但它走的是自己那张 `sync_conflict` 表与独立的
+/// 冲突面板，本来就不该出现在 `review_queue`。
+fn is_managed_kind(kind: &str) -> bool {
+    matches!(kind, "classify" | "dedup" | "supersede" | "distill" | "consolidate")
 }
 
 // ── 自动裁决 ─────────────────────────────────────────────────
 
-/// 一条建议够不够格「不等人工点头、直接落地」。
+/// 一条建议现在该怎么办 —— 全仓唯一的裁决点。
+///
+/// ── 为什么把所有判据合成一个函数 ──────────────────────────────
+/// 原来这件事散在四处：`auto_eligible` 判「能不能自动落」、`retire_reason_of`
+/// 判「该不该作废」、`dedup_auto_verdict` / `supersede_auto_verdict` 各判各的
+/// 动作。四个函数读同一份数据、回答同一件事，只要有一处判据漂了，表现就是
+/// 「判据说能落的落不了、该清的清不掉」—— 真机上 2 条 supersede 挂了 7 小时、
+/// 44 对 dedup 一条都没自动，都是这么来的。
+///
+/// 现在一次裁决给出唯一答案，调用方只负责执行：全队列扫描、写入路径、人工
+/// 批准三条路都读这一份，不存在「两边判据不一致」这种状态。
 ///
 /// ── 为什么是「按类型分档」而不是一个总阈值 ────────────────────
 /// 四类建议的写操作后果不是一个量级：
 ///
-/// * `classify` 移动文件、`dedup` 标取代 —— 都**不改内容**，且都能倒着走回去
-///   （改回 project / 演化链），错了顶多是一条记忆放错抽屉；
-/// * `supersede` 让一条事实**变成假的** —— 这是唯一会让检索少一条真结论的类型，
-///   判错没有外部信号能纠正它。所以它永远不自动。
+/// * `classify` 移动文件、`dedup` / `supersede` 并正文后标取代 —— 都不删内容，
+///   且都能倒着走回去（改回 project / 演化链），错了顶多是一条记忆放错抽屉；
+/// * `supersede` 的落地动作就是 `dedup` 那个函数（见 [`apply_supersede`]），
+///   所以判据也共用覆盖率，见 [`pair_outcome`]；
 /// * `distill` / `consolidate` 只**新增** l2，靠内容哈希幂等，删掉即回原样，
 ///   默认就该落地（否则 l2 永远长不出来，见 `review.autoConfirmDistill`）。
 ///
 /// ── 为什么 classify 还要额外要求「slug 已登记」────────────────
 /// `classify` 的置信度来自 `name_similarity` 的词面比，它对「两个项目名只差一个
 /// 词」几乎没有分辨力（真机上 `agent2api` 与 `agent2api-main` 能到 0.9+）。
-/// 允许它在高置信下自动，前提是目标项目**已经在注册表里** —— 用户的意图已经
-/// 表过一次态；否则一次模糊命中就会凭空建出一个项目目录，把人越分越乱。
+/// 所以自动搬的判据不是分数，而是**证据类型**（路径 vs 提及）；此外目标项目必须
+/// **已经在注册表里且未归档** —— 用户的意图已经表过一次态。否则一次模糊命中就会
+/// 凭空建出一个项目目录，把人越分越乱。
 ///
-/// ── 为什么 dedup 的 0.72~0.89 不自动 ──────────────────────────
+/// ── 为什么 dedup 的 0.72~0.89 不靠分数一票否决 ────────────────
 /// 真机抽样里 0.72 那一对是「最小字节补丁」与「坚持最小字节改动」，同一件事的
-/// 两次表述里带着不同的具体字节值 —— 合并会丢掉其中一份。0.9 以上才是
-/// 「同一段结论被重写了一遍」。精确重复（同 hash，score 1.0）没有这种风险。
-///
-/// `projects` 由调用方给而不是在这里 `load_projects()`：批扫 500 行时每次都读
-/// 一遍 `projects.json` 就是 500 次磁盘读，而这个文件在一轮扫描里不会变。
+/// 两次表述里带着不同的具体字节值 —— 合并会丢掉其中一份。但「丢不丢」取决于
+/// **短边覆盖率**，不取决于相似分：同一个分数区间里同时住着「该合」与「绝不能
+/// 合」。所以分数只回答「值得比一比吗」，覆盖率回答「合了会不会丢东西」。
 ///
 /// ── 全局最低置信（已删除，别再往回加）────────────────────────
 /// 这里原来写着「classify / dedup 判错的代价大，所以除了各自阈值还要过一道全局
@@ -2965,15 +3011,36 @@ fn apply_verdict(row: &index::ReviewRow) -> Result<(), String> {
 ///   * classify —— 风险是「搬错抽屉」，尺子是**证据类型**（路径 vs 提及）；
 ///   * dedup —— 风险是「把一条真结论从检索里抹掉」，尺子是**短边覆盖率**；
 ///   * 分数只用于「够不够格进候选」与「连边会不会连出噪音」，不再兼任安全闸。
-fn auto_eligible(row: &index::ReviewRow, projects: &[store::Project]) -> bool {
+///
+/// ── 开关关着返回 `Hold`，不返回 `Retire` ────────────────────────
+/// 用户主动关掉某类自动裁决时，他要的是「这类别自己动」，不是「这类给我清空」。
+/// 所以开关关着 → 留在队列，等人。
+///
+/// `projects` 由调用方给而不是在这里 `load_projects()`：批扫 500 行时每次都读
+/// 一遍 `projects.json` 就是 500 次磁盘读，而这个文件在一轮扫描里不会变。
+fn decide(row: &index::ReviewRow, all: &[MemoryEntry], projects: &[store::Project]) -> Decision {
     if !config::bool_of("review.autoResolve") {
-        return false;
+        return Decision::Hold;
+    }
+    let enabled = match row.kind.as_str() {
+        "classify" => config::bool_of("review.autoConfirmClassify"),
+        "dedup" => config::bool_of("review.autoConfirmDedup"),
+        "supersede" => config::bool_of("review.autoConfirmSupersede"),
+        "distill" | "consolidate" => config::bool_of("review.autoConfirmDistill"),
+        // 没有开关、也没有落地动作能管它 —— 见 `is_managed_kind`。留着就是一条
+        // 永远清不掉的「待确认」，这正是「这台机器永远要我去点一下」的来源之一。
+        _ => return Decision::Retire("auto-unknown-kind"),
+    };
+    if !enabled {
+        return Decision::Hold;
     }
     match row.kind.as_str() {
+        "dedup" | "supersede" => match pair_outcome(row, all) {
+            PairOutcome::Merge => Decision::Merge,
+            PairOutcome::Relate => Decision::Relate,
+            PairOutcome::Retire(reason) => Decision::Retire(reason),
+        },
         "classify" => {
-            if !config::bool_of("review.autoConfirmClassify") {
-                return false;
-            }
             // ── 先把「凭什么这么判」查清楚，再谈阈值 ──────────────
             // 阈值原来是 0.95，理由「词面相似度分辨不了同名前缀」。真机数据说明
             // 问题不在阈值：6 条待归类全是「标签/标题提到 agenthub」，讲的是
@@ -2981,56 +3048,237 @@ fn auto_eligible(row: &index::ReviewRow, projects: &[store::Project]) -> bool {
             // 建议无论置信多高都不该自动 —— 分数是 `name_similarity` 给的，它只
             // 知道两个字符串有多像，不知道「像」和「属于」的区别。
             //
-            // 所以判据按证据类型分：只有 `files` 里的路径段命中才算证据。这时
-            // 阈值可以降到「够格进候选」的位置（0.72），因为路径证据本身极稀少 ——
-            // 真机 649 个活条目里带 `files` 的一小批，而路径段与已登记 slug **字面
-            // 相等**的 0 条（`files` 存的是 `src/server/...` 这类仓库内相对路径），
-            // 能走到这一步的已经不可能是噪音。反过来，`Mention` 级的一条也不自动，
-            // 阈值给多低都没用。
-            //
-            // ── 分数为什么不再当闸 ──────────────────────────────────
-            // `row.confidence` 是**入队那一刻**按名字相似度算的：巡检给的是标题/标签
-            // 的模糊分，写入侧给的是 `layout::classify` 的模糊分（真机 0.64~0.80）。
-            // 而 `classify_evidence_of` 判的是**证据类型**——cwd 落在这个项目的目录里，
-            // 就是确定的归属，哪怕当年算出来的名字分只有 0.65。拿一个与证据无关的
-            // 旧分数去否决一份硬证据，等于让「写记忆时工作目录在哪儿」这条最硬的
-            // 事实永远落不了地。
+            // 所以判据按证据类型分：只有路径证据（`files` / `cwd`）命中才算。
+            // `row.confidence` 是**入队那一刻**按名字相似度算的，拿一个与证据
+            // 无关的旧分数去否决一份硬证据，等于让「写记忆时工作目录在哪儿」
+            // 这条最硬的事实永远落不了地。
             let slug = row
                 .payload
                 .get("suggestion")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if slug.is_empty() {
-                return false;
+                return Decision::Retire("auto-stale-pair");
             }
-            let Some(target) = store::snapshot().iter().find(|entry| entry.id == row.target).cloned() else {
-                return false;
+            let Some(target) = all.iter().find(|entry| entry.id == row.target) else {
+                // 目标已被删 / 已被并。指向空气的建议永远无法被批准。
+                return Decision::Retire("auto-target-missing");
             };
-            if !target.is_trusted() || target.project.as_deref() == Some(slug) {
-                return false;
+            // 已经被归到别处了（另一次归类成功、或用户手动改过）：这条建议过期。
+            if target.project.as_deref() == Some(slug) {
+                return Decision::Retire("auto-already-classified");
             }
-            // 只有路径证据才可能自动：`Mention` 级（标签/标题提到项目名）代表
-            // 「这条在讲它」，不代表「这条属于它」。判据见 `ClassifyEvidenceOf`。
-            // `OtherProject` 也不行 —— 那条建议指向的目标是错的，搬了就是错搬。
-            if classify_evidence_of(&row.payload, &target, projects) != ClassifyEvidenceOf::OwnProject {
-                return false;
+            if !target.is_trusted() {
+                return Decision::Retire("auto-untrusted");
             }
-            // slug 必须已经在注册表里、且未归档 —— 用户的意图已经表过一次态。
-            // 归档项目的语义是「不再接新记忆」，把记忆往里搬是反向操作。
-            projects
-                .iter()
-                .any(|project| project.slug == slug && !project.archived)
+            match classify_evidence_of(&row.payload, target, projects) {
+                // 路径证据指向建议要去的项目，且项目已登记、未归档 —— 用户的意图
+                // 已经表过一次态；归档项目的语义是「不再接新记忆」，往里搬是反向操作。
+                ClassifyEvidenceOf::OwnProject
+                    if projects
+                        .iter()
+                        .any(|project| project.slug == slug && !project.archived) =>
+                {
+                    Decision::Apply
+                }
+                ClassifyEvidenceOf::OwnProject => Decision::Hold,
+                // 有路径证据，但它指向另一个项目：入队时按名字把目标猜错了。
+                // 留着等人点头只会在「全选确认」时被批量搬错。
+                ClassifyEvidenceOf::OtherProject(_) => Decision::Retire("auto-wrong-project"),
+                // 只有标签/标题提到项目名：那是「在讲它」，不是「属于它」。这种
+                // 建议**永远**不可能被自动裁决（真机 562 条记忆里带 `files` 的
+                // 只有 81 条，路径段命中已登记项目的 0 条），留着只会一直占着
+                // 「待确认」的位置冒充一件需要人决定的事。
+                ClassifyEvidenceOf::Mention => Decision::Retire("auto-mention-only"),
+            }
         }
-        "dedup" => {
-            if !config::bool_of("review.autoConfirmDedup") {
-                return false;
-            }
-            dedup_auto_verdict(row).is_some()
-        }
-        "distill" | "consolidate" => config::bool_of("review.autoConfirmDistill"),
-        // supersede 让事实变假；conflict 要留哪一侧必须看内容。都不自动。
-        _ => false,
+        // 蒸馏 / 合并结论只新增 l2，靠内容哈希幂等，删掉即回原样 —— 直接落。
+        "distill" | "consolidate" => Decision::Apply,
+        _ => Decision::Hold,
     }
+}
+
+/// 一次裁决的全部可能结果。`Hold` 是唯一会让建议继续占着「待确认」的一种。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// 按 `apply_verdict` 落盘（归类搬家 / 蒸馏新增 / 合并新增）
+    Apply,
+    /// 配对型：并正文 + 标取代
+    Merge,
+    /// 配对型：只连一条边，两条都留
+    Relate,
+    /// 不该继续挂在队列，附作废理由（仍可反向批准）
+    Retire(&'static str),
+    /// 开关关着，或判据说「还没到时候」—— 留给人
+    Hold,
+}
+
+/// 配对型建议（`dedup` / `supersede`）的终态。
+///
+/// ── 为什么没有「留给人」这一档 ────────────────────────────────
+/// 队列曾经是闸门：判据没把握的就挂在那儿等人点。真机上人的用法是「全选 →
+/// 确定」，所以「留给人」既没有换来安全（一段没有判据支撑的批量批准），又让
+/// 「待确认 N 条」永远降不到 0 —— 用户看到的是「这台机器永远要我去点一下」。
+///
+/// 一条建议只有三种命运，都能由判据自己回答：
+///   * `Merge`  —— 有内容要并，且并了不丢东西；
+///   * `Relate` —— 不该并，但确实相关：连一条边，两条正文都留着（纯新增、可反悔）；
+///   * `Retire` —— 这条建议已经不该存在（目标没了 / 早就处理过 / 够不上门槛），
+///                留一个具体理由作废，仍然可查、可反向批准。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairOutcome {
+    /// 有两份内容要并到一起
+    Merge,
+    /// 不动正文，只连一条边
+    Relate,
+    /// 不该继续挂在队列里，附作废理由
+    Retire(&'static str),
+}
+
+/// 一条配对型建议现在该怎么落。`all` 由调用方给（一轮扫描用同一份快照）。
+///
+/// 判据从**条目当前状态**重算，不读载荷里的分数当结论 —— `enqueue` 传的
+/// `confidence` 是入队那一刻的相似分，而条目可能已经被别的建议合走、被人改过。
+///
+/// ── `dedup` 与 `supersede` 共用这一个函数 ──────────────────────
+/// 两类建议的动作落到同一个函数（`apply_supersede` 直接调 `apply_dedup`），差别
+/// 只在「方向是否已知」：
+///   * `dedup` 的两个 id 地位对等，谁更全只有覆盖率知道，所以合并前必须由载荷的
+///     `keep` 指明方向；方向缺失时**仍可连边**（连边不动正文，不需要方向）；
+///   * `supersede` 方向由载荷固定（新的取代旧的），不需要 `keep`，判据只剩
+///     「旧的还有没有独有内容」。
+///
+/// ── 为什么「覆盖率不够」的去重建议是连边而不是留给人 ────────────
+/// 覆盖率低 = 两条各有独有内容 = 它们不是同一件事。这不是一个需要人拍板的
+/// 疑难，而是一个已经从数据里读出来的事实：正确动作是「两条都留、建立关联」，
+/// 也就是 `Relate`。留给人只会让人批一条「合并两个不同结论」的错操作。
+fn pair_outcome(row: &index::ReviewRow, all: &[MemoryEntry]) -> PairOutcome {
+    let Some(this) = pair_this_id(row) else {
+        return PairOutcome::Retire("auto-stale-pair");
+    };
+    let other = pair_other_id(row);
+    if other.is_empty() || other == this {
+        return PairOutcome::Retire("auto-stale-pair");
+    }
+    let (Some(this_end), Some(other_end)) = (live_end_of(all, this), live_end_of(all, other)) else {
+        // 有一端彻底没了（文件被删 / 链终点进回收站 / 被反驳 / 成环）：
+        // 这对比不出来，也合不了。指向空气的建议永远无法被批准。
+        return PairOutcome::Retire("auto-target-missing");
+    };
+    // 两端解到同一活条目 = 正文已经在一处了。真机那 2 条 supersede 就是这样：
+    // 数据早就落过地，队列行没人清，用户看到「还有 2 条等你批」，点批准却
+    // 什么都不变（`apply_dedup` 见两端相等直接返回）。
+    if this_end == other_end {
+        return PairOutcome::Retire("auto-already-resolved");
+    }
+    let (Some(this_entry), Some(other_entry)) = (
+        all.iter().find(|entry| entry.id == this_end),
+        all.iter().find(|entry| entry.id == other_end),
+    ) else {
+        return PairOutcome::Retire("auto-target-missing");
+    };
+
+    if row.kind == "supersede" {
+        // 被取代的那条必须是可信的活结论：拿一条已被反驳的旧条去「被取代」，
+        // 只是给一条错结论补一次葬礼，没有意义。
+        if !this_entry.is_trusted() || !other_entry.is_trusted() {
+            return PairOutcome::Retire("auto-untrusted");
+        }
+        // 方向固定：`this`（载荷里的 `newId`）取代 `other`（`oldId`），不需要猜。
+        // 唯一的判据是「旧条还有没有独有内容」——合并不删正文，旧条的内容会先
+        // 并进新条再退出检索，所以「覆盖不到」就是「旧条还有独有内容」。
+        return supersede_gate(
+            content_coverage(&other_entry.body, &this_entry.body),
+            this_entry.layer == other_entry.layer,
+            config::number("dedup.l2.mergeMinCoverage"),
+        );
+    }
+
+    // ── dedup ───────────────────────────────────────────────────
+    if !this_entry.is_trusted() || !other_entry.is_trusted() {
+        return PairOutcome::Retire("auto-untrusted");
+    }
+    let score = row.payload.get("score").and_then(Value::as_f64).unwrap_or(row.confidence);
+    // 方向必须明确才合并：载荷缺 `keep` 时 `apply_verdict` 会退回「新条取代
+    // 候选」的老语义，而巡检给的 `candidate` 恰恰是要留的那条 —— 那种合并会
+    // 把正主标成「已被取代」。但方向不明**不妨碍连边**。
+    let directed = row.payload.get("keep").and_then(Value::as_str).is_some();
+    dedup_gate(
+        score,
+        content_coverage(&this_entry.body, &other_entry.body),
+        this_entry.layer == other_entry.layer,
+        directed,
+        config::number("dedup.l2.mergeMinCoverage"),
+        config::number("dedup.l2.autoMergeThreshold"),
+        config::number("dedup.l2.relateMinScore"),
+    )
+}
+
+/// `supersede` 的判据本体（纯函数：三个入参，没有配置、没有磁盘）。
+///
+/// 拆出来是为了可测：判据挂在 `config::number()` 上时，单测只能验证「读到的
+/// 是不是默认值」，验不了「分档对不对」—— 而分档错了就是静默地丢内容。
+///
+/// ── 跨层为什么不合并 ──────────────────────────────────────────
+/// l1 是流水（带发生顺序、带当时的上下文），l2 是沉淀。把一条 l1 并进 l2 会
+/// 丢掉「什么时候知道的」这一层信息，而合并的结果是旧条退出检索 —— 丢掉的那
+/// 部分就再也读不到了。两条有关联这件事仍然成立，那正是 `Relate`。
+///
+/// ── 覆盖不到为什么不连边 ──────────────────────────────────────
+/// `supersede` 断言的是「旧的不再成立」。连边只会让两条都继续被当成事实，
+/// 而事实方向没法用一条边表达。所以覆盖不到时唯一安全的动作是什么都不动、
+/// 把这条无法成立的建议作废 —— 旧事实保持有效。
+fn supersede_gate(coverage: f64, same_layer: bool, min_coverage: f64) -> PairOutcome {
+    if !same_layer {
+        return PairOutcome::Relate;
+    }
+    if coverage >= min_coverage {
+        return PairOutcome::Merge;
+    }
+    PairOutcome::Retire("auto-not-covered")
+}
+
+/// `dedup` 的判据本体（纯函数）。三档的分工：
+///
+///   * `Retire` —— 连「值得比一比」都够不上（分数低于 `relate_min`）。连边是
+///     纯新增，但门槛低到「同项目任意两条」会把关联图撑成完全图，那等于没有
+///     关联：检索时每条都带出十条，人就不看了。
+///   * `Merge`  —— 有两份内容确实要并到一起，且并了不丢东西：方向明确
+///     （载荷有 `keep`）、同层、短边被长边解释掉（`coverage >= min_coverage`），
+///     且相似分过合并阈值。
+///   * `Relate` —— 其余全部：够像但各有独有内容、方向不明的老载荷、跨层。
+///     连一条边，两条正文都留 —— 纯新增，可反悔。
+///
+/// ── 为什么同 hash 绕过覆盖率 ──────────────────────────────────
+/// `score >= 0.999` 意味着两段字节相同，不存在「各有独有内容」；跨层也照合，
+/// 因为「层不同所以不是同一件事」在这句话面前不成立。
+///
+/// ── 为什么覆盖率够、分数不够也不能合 ──────────────────────────
+/// 典型来源是「两条短结论都引用了同一段长文本」：短边确实被长边含住，覆盖率
+/// 虚高，但两条在讲不同的事。合并它们等于把两个结论压成一条。
+fn dedup_gate(
+    score: f64,
+    coverage: f64,
+    same_layer: bool,
+    directed: bool,
+    min_coverage: f64,
+    merge_threshold: f64,
+    relate_min: f64,
+) -> PairOutcome {
+    if score < relate_min {
+        return PairOutcome::Retire("auto-below-threshold");
+    }
+    if directed && score >= 0.999 {
+        return PairOutcome::Merge;
+    }
+    if directed
+        && same_layer
+        && coverage >= min_coverage
+        && dedup_score_ok(score, merge_threshold)
+    {
+        return PairOutcome::Merge;
+    }
+    PairOutcome::Relate
 }
 
 /// 这条归类建议有没有「归属级」证据，以及证据指向谁。
@@ -3196,91 +3444,6 @@ fn segments_owner(segments: &[String], projects: &[store::Project]) -> Option<St
     owner
 }
 
-/// 一条 dedup 建议该自动落成什么。`None` = 不动它，留在队列里。
-///
-/// ── 为什么前置条件全塞在这里，而不是散在 `auto_eligible` 里 ──────
-/// 判「够不够格自动」与判「该落成什么」是同一件事：一条建议要是只能落成「合并」，
-/// 那覆盖率不够时它就该留在队列；要是能落成「连边」，覆盖率不够反而是正常路径。
-/// 分成两个函数各判一半，就会出现「`auto_eligible` 说够格、`auto_apply` 发现
-/// 该连边却按合并做」—— 而合并的代价是埋掉一条。
-///
-/// 返回 `Keep` 也不代表「这条建议没价值」，只代表「机器不知道该怎么办」。
-fn dedup_auto_verdict(row: &index::ReviewRow) -> Option<DedupVerdict> {
-    let candidate = row
-        .payload
-        .get("candidate")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if candidate.is_empty() || candidate == row.target {
-        return None;
-    }
-    // `keep` 缺失时 `apply_verdict` 会退回「新条取代候选」的老语义，而扫描产出的
-    // 建议里 `candidate` 才是要留的那条 —— 方向不明就不动。
-    let score = dedup_score_of(&row.payload, row.confidence)?;
-    // ── 两端各解到「现在还能当事实用的那一条」───────────────────────
-    // 不再要求两端都 `is_trusted()`：真机 44 对有 7 个 id 横跨两对以上，第一对
-    // 合完之后另两对必有一端已被取代，而它们的正文还没并进去（详见
-    // `live_end_of` 的注释）。要求两端都活着 = 串行合并只能落第一对。
-    let all = store::snapshot();
-    let target_end = live_end_of(&all, &row.target)?;
-    let survivor_end = live_end_of(&all, candidate)?;
-    // 两端解到同一条 = 这两份内容确实已经在一处了（或本来就是一个 id）。
-    // 这种配对没有可合并的东西，交给 `retire_reason_of` 作废，这里只回「不裁决」。
-    if target_end == survivor_end {
-        return None;
-    }
-    let Some(target) = all.iter().find(|entry| entry.id == target_end) else {
-        return None;
-    };
-    let Some(survivor) = all.iter().find(|entry| entry.id == survivor_end) else {
-        return None;
-    };
-    // 层不匹配只对**近似**配对成立：l1 流水里「同一个决定说过两遍」是时间线，
-    // 合了会丢掉发生顺序。但精确重复（同 hash，score 1.0）不受这条约束 ——
-    // 巡检第一轮专挑 l1 的 hash 组，一刀切会把那一整批挡在门外。
-    if score < 0.999 && target.layer != survivor.layer {
-        return None;
-    }
-    let pair_coverage = content_coverage(&target.body, &survivor.body);
-    let verdict = dedup_verdict(
-        score,
-        pair_coverage,
-        config::number("dedup.l2.mergeMinCoverage"),
-        config::number("dedup.l2.relateMinScore"),
-        config::number("dedup.l2.autoMergeThreshold"),
-    );
-    // ── 合并为什么不看 `review.autoResolveFloor` ─────────────────
-    // 两道门槛叠在同一件事上，高的那个会悄悄吃掉低的那个：`enqueue` 传的
-    // `confidence` 对 dedup 就是相似分本身，于是「floor 0.85」与「阈值 0.72」
-    // 同时生效时，真正起作用的是 0.85 —— 用户在界面上把自动合并阈值改到 0.72，
-    // 行为一点不变。真机 44 对的相似分全在 0.72~0.89，就是被这一层挡住的。
-    //
-    // 现在风险由覆盖率负责：短边被覆盖 0.5 以上，说明它没有独有内容，合并不丢
-    // 信息（`merge_body_into_survivor` 还会把剩下那部分追加成小节）。这才是
-    // 针对「合并会不会丢东西」的判据；一个置信度数字只是相似分的别名，它回答不了
-    // 这个问题。一道风险配一把尺子，别叠。
-    //
-    // 覆盖不够但确实像 → 连边，两条都留：连边是纯新增、可反悔，没有任何理由让它
-    // 等人点头（人不会来）。
-    match verdict {
-        DedupVerdict::Merge => Some(DedupVerdict::Merge),
-        DedupVerdict::Relate if score >= config::number("dedup.l2.relateMinScore") => Some(DedupVerdict::Relate),
-        _ => None,
-    }
-}
-
-/// 去重建议的分数，以及「方向是否明确」。`None` = 载荷里没有 `keep`（老载荷或
-/// 生产端漏写），方向不明 → 一律不自动。
-///
-/// 为什么把 `keep` 的存在性与分数绑在一个函数里：这两件事对裁决是**同一个
-/// 问题** ——「批准后会发生什么」必须毫无歧义地由载荷决定，缺任何一半都不该
-/// 让机器自己动手。分开判的话，将来加一个「分数够高就默认方向」的捷径很容易
-/// 被顺手写进来，而那条捷径的代价是把正主埋掉。
-fn dedup_score_of(payload: &Value, confidence: f64) -> Option<f64> {
-    payload.get("keep").and_then(Value::as_str)?;
-    Some(payload.get("score").and_then(Value::as_f64).unwrap_or(confidence))
-}
-
 /// 分数够不够格留在「值得比一比」的区间里。
 ///
 /// ── 这个阈值下调到 0.72 的理由 ───────────────────────────────
@@ -3291,73 +3454,20 @@ fn dedup_score_of(payload: &Value, confidence: f64) -> Option<f64> {
 /// （实测 0 条自动裁决），而后者依旧可能被相似分碰巧抬到 0.89 之上。
 ///
 /// 现在两把尺子分开：这个阈值只回答「值得比一比吗」，`mergeMinCoverage` 才回答
-/// 「合了会不会丢东西」。它的实际读取点在 [`dedup_verdict`] 的 `merge_threshold`
-/// 形参 —— 覆盖率够但分数不够的配对仍然不该合（引用了同一段长文本的两个不同
-/// 结论，覆盖率会虚高），这一道闸留在那里。
+/// 「合了会不会丢东西」。它的读取点在 [`pair_outcome`] 的合并分支 —— 覆盖率够但
+/// 分数不够的配对仍然不该合（引用了同一段长文本的两个不同结论，覆盖率会虚高），
+/// 这一道闸留在那里。
 fn dedup_score_ok(score: f64, merge_threshold: f64) -> bool {
     score >= 0.999 || score >= merge_threshold
 }
 
-/// 一对去重建议该怎么落：合并、只连线、还是留给人。
-///
-/// ── 为什么是三选一，而不是「够格 / 不够格」───────────────────
-/// 两类失败都试过：只标取代 = 把对方正文从检索里抹掉（整理越勤库越小）；
-/// 门槛拉高到只放极少数 = 44 对一条不动，队列永远清不完。真正的答案在中间：
-/// 相似但不重叠的配对**不该被当成重复**，它们只是「讲同一件事的两个侧面」——
-/// 对这类，正确动作是连一条边让检索互相带出来，两条都留着。这一步是纯新增，
-/// 不删任何东西，所以没有任何理由让它等人点头。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DedupVerdict {
-    /// 短边基本被长边覆盖：合（正文并进幸存者后标取代）
-    Merge,
-    /// 相似但各有独有内容：两条都留，连一条边
-    Relate,
-    /// 连相似分都不够 / 方向不明 / 条目已变：不动，留在队列里
-    Keep,
-}
-
-/// 判这一对该怎么落。`pair` 是短边覆盖率，`score` 是相似分。
-///
-/// ── 覆盖率是主闸，相似分只负责「别把无关的连成一片」─────────
-/// 两个判据的作用范围不同：
-///   * `mergeMinCoverage` 决定「合了会不会丢」。真机最不像的一对（「事故复盘
-///     清单化」vs「前端选型单文件离线 HTML」）覆盖率 0.44，最像的 0.93；
-///   * `relateMinScore` 决定「连边会不会连出噪音」。连边是纯新增、可反悔，
-///     所以门槛可以比合并低得多 —— 但也不能低到「同一个项目里的任意两条」
-///     （那正是把 `mem_link` 撑到 810 万行的那次事故）。
-///
-/// ── `merge_threshold` 在这里的作用（它不再是一票否决）──────────
-/// 覆盖率高但相似分低，说明「短边整段被长边含住」但两条在讲不同的事 ——
-/// 这种配对通常来自引用了同一段长文本的两个短结论。合并它们等于把两个
-/// 不同结论压成一条，所以仍然要求分数过线；反过来分数过线但覆盖率不够，
-/// 走 `Relate`（连边不丢东西）。两道闸各自只否掉自己能解释的那种情况。
-fn dedup_verdict(
-    score: f64,
-    pair_coverage: f64,
-    merge_coverage: f64,
-    relate_score: f64,
-    merge_threshold: f64,
-) -> DedupVerdict {
-    // 精确重复没有「各有独有内容」这一说，同 hash 就是同一段字节
-    if dedup_score_ok(score, 1.0) {
-        return DedupVerdict::Merge;
-    }
-    // 方向不明（`keep` 缺失）由调用方先挡掉，这里只管分数与覆盖
-    if pair_coverage >= merge_coverage && dedup_score_ok(score, merge_threshold) {
-        DedupVerdict::Merge
-    } else if score >= relate_score {
-        DedupVerdict::Relate
-    } else {
-        DedupVerdict::Keep
-    }
-}
 
 /// 自动裁决一条（已入队）建议。返回 `Some(留下的 id)` 表示**真的改了数据**，
 /// 调用方（写入路径）靠它决定是否要把响应里的 id 换成幸存者。
 ///
-/// 队列行无论如何都会被标成 `approved` + `resolution = auto-<kind>`：留档是
-/// 「这条为什么会变」的唯一线索，删掉它就等于让一次自动写操作无声无息 ——
-/// 事后要反悔时，人得先找得到它。
+/// 队列行无论结果如何都会被裁决掉（`approved` + `auto-*` 痕迹，或 `rejected` +
+/// 具体作废理由）：留档是「这条为什么会变」的唯一线索，删掉它就等于让一次自动
+/// 写操作无声无息 —— 事后要反悔时，人得先找得到它。
 fn auto_resolve_one(id: i64) -> Option<String> {
     // 按 id 精确取，不用 `review_list` 代取：后者按置信度排序并截断，积压到
     // 几百条时刚入队的低分建议排在 500 名之外，自动裁决会静默失效（见
@@ -3367,83 +3477,106 @@ fn auto_resolve_one(id: i64) -> Option<String> {
         return None;
     }
     let projects = store::load_projects();
-    if !auto_eligible(&row, &projects) {
-        return None;
-    }
-    auto_apply(&row).ok().flatten()
+    auto_apply(&row, &store::snapshot(), &projects).ok().flatten()
 }
 
 /// [`auto_resolve_one`] 的本体：`row` 由调用方给（批扫时已有一份 pending 快照，
-/// 不必按 id 再查一遍）。调用前必须已经过 [`auto_eligible`] —— 这里不再重复判。
+/// 不必按 id 再查一遍），`all` 是当轮快照。
 ///
-/// 返回 `Ok(Some(id))` 表示落盘成功且幸存者是 `id`（只有 dedup 有这种情况）；
-/// `Ok(None)` 表示落盘成功但「谁留下」不适用（classify / distill 只是改归属或
-/// 新增一条）；`Err` 表示没改成，队列行保持 pending。
-fn auto_apply(row: &index::ReviewRow) -> Result<Option<String>, String> {
-    // 去重这条要按判据分岔：合还是只连边，由覆盖率决定，不能一律合并。
-    if row.kind == "dedup" {
-        return match dedup_auto_verdict(row) {
-            Some(DedupVerdict::Merge) => {
-                // 返回给调用方（写入路径）的必须是**解链后的活条目**：载荷里的
-                // `candidate` 可能本身已经被别的建议合走了，`apply_dedup` 会把正文
-                // 并到链尽头，而调用方拿到旧 id 就会把一个「写了但搜不到」的 id
-                // 交给上游。这里与 `apply_dedup` 用同一把判据（`live_end_of`）。
-                let kept = row
-                    .payload
-                    .get("keep")
+/// 返回 `Ok(Some(id))` 表示落盘成功且幸存者是 `id`（只有 `keep = candidate` 的
+/// 合并有这种情况）；`Ok(None)` 表示「这一行已经有结论了」—— 包括真的落了盘、
+/// 以及按判据作废；`Err` 表示判据说「先别动」，队列行保持 pending。
+///
+/// ── 为什么作废也返回 `Ok` ────────────────────────────────────
+/// 对调用方（写入路径 / 巡检）来说，「这条建议已经有确定结论」是一件事，落盘
+/// 与作废只是两种结论。返回 `Err` 会让调用方以为「判据不成立、下次再试」，
+/// 而实际上它永远不会再成立 —— 那一行就会挂在队列里直到 30 天后过期。
+fn auto_apply(
+    row: &index::ReviewRow,
+    all: &[MemoryEntry],
+    projects: &[store::Project],
+) -> Result<Option<String>, String> {
+    match decide(row, all, projects) {
+        Decision::Retire(reason) => {
+            index::global().review_resolve(&[row.id], "rejected", Some(reason));
+            crate::server::logging::verbose(
+                "[Memory]",
+                &format!("队列建议自行作废 {} {}（{reason}）", row.kind, row.target),
+            );
+            Ok(None)
+        }
+        Decision::Hold => Err("这一条现在不该自动裁决".to_string()),
+        Decision::Merge => {
+            // 「谁活下来」要被解到**链尽头**再交给调用方：载荷里的 `candidate` 可能
+            // 本身已经被别的建议合走了，调用方拿到旧 id 就会把一个「写了但搜不到」
+            // 的 id 交给上游。
+            let survivor = if row.kind == "dedup" {
+                row.payload
+                    .get("candidate")
                     .and_then(Value::as_str)
-                    .map(str::to_string);
-                let survivor = match kept.as_deref() {
-                    Some("candidate") => row.payload.get("candidate").and_then(Value::as_str),
-                    // `keep = new`：幸存者是 `target` 那一侧（`dedup_keeper` 判「新条
-                    // 信息量更大」时这样写），同样要解链。
-                    _ => Some(row.target.as_str()),
-                }
-                .and_then(|id| live_end_of(&store::snapshot(), id));
-                apply_verdict(row)?;
-                index::global().review_resolve(&[row.id], "approved", Some("auto-dedup"));
+                    .filter(|_| row.payload.get("keep").and_then(Value::as_str) == Some("candidate"))
+                    .and_then(|id| live_end_of(all, id))
+            } else {
+                None
+            };
+            // 结论已经由 `decide` 给过了，这里只执行 —— 不再重算一遍判据：
+            // 重算会在两次计算之间读到新快照（一轮批扫里前一行刚合掉这一行的
+            // 一端），于是「判据说合并」变成「执行时判据说不行」，静默地什么都不做。
+            execute(row, Some(PairOutcome::Merge))?;
+            let note = format!("auto-{}", row.kind);
+            index::global().review_resolve(&[row.id], "approved", Some(note.as_str()));
+            // supersede 的日志要把「谁埋了谁」写出来：事后翻日志时，复合 target
+            // `新->旧` 读不出方向，得拆开看。
+            if row.kind == "supersede" {
+                crate::server::logging::log(
+                    "[Memory]",
+                    &format!(
+                        "自动判失效 {} → {}（旧条正文已被新条覆盖）",
+                        pair_this_id(row).unwrap_or("?"),
+                        pair_other_id(row),
+                    ),
+                );
+            } else {
                 crate::server::logging::log(
                     "[Memory]",
                     &format!(
                         "自动合并 {} → {}（置信 {:.2}）",
                         row.target,
-                        row.payload.get("candidate").and_then(Value::as_str).unwrap_or("?"),
+                        pair_other_id(row),
                         row.confidence
                     ),
                 );
-                // 只有 `keep = candidate` 时「谁活下来」才和写入路径相关：`keep = new`
-                // 意味着新写的那条本来就该被埋掉，调用方不需要换成别的 id。
-                Ok(if kept.as_deref() == Some("candidate") { survivor } else { None })
             }
-            Some(DedupVerdict::Relate) => {
-                relate_pair(&row.target, row.payload.get("candidate").and_then(Value::as_str).unwrap_or_default())?;
-                index::global().review_resolve(&[row.id], "approved", Some("auto-relate"));
-                crate::server::logging::log(
-                    "[Memory]",
-                    &format!("判为相关而非重复 {} ↔ {}（置信 {:.2}），两条都留", row.target, row.payload.get("candidate").and_then(Value::as_str).unwrap_or("?"), row.confidence),
-                );
-                Ok(None)
-            }
-            // 判据变了（条目被删 / 被人改过），这一行保持 pending 让人看
-            _ => Err("这一对已经不具备自动裁决的条件".to_string()),
-        };
+            Ok(survivor)
+        }
+        Decision::Relate => {
+            execute(row, Some(PairOutcome::Relate))?;
+            index::global().review_resolve(&[row.id], "approved", Some("auto-relate"));
+            crate::server::logging::log(
+                "[Memory]",
+                &format!(
+                    "判为相关而非重复 {} ↔ {}（置信 {:.2}），两条都留",
+                    pair_this_id(row).unwrap_or("?"),
+                    pair_other_id(row),
+                    row.confidence
+                ),
+            );
+            Ok(None)
+        }
+        // 归类 / 蒸馏 / 合并：动作由 `execute` 按 kind 分派，不需要配对终态。
+        Decision::Apply => {
+            execute(row, None)?;
+            let note = format!("auto-{}", row.kind);
+            index::global().review_resolve(&[row.id], "approved", Some(note.as_str()));
+            crate::server::logging::log(
+                "[Memory]",
+                &format!("自动裁决 {} {}（置信 {:.2}）", row.kind, row.target, row.confidence),
+            );
+            Ok(None)
+        }
     }
-    // 「谁活下来」只有 dedup 需要回答：`keep = candidate` 时幸存者是载荷里那条。
-    let survivor = row
-        .payload
-        .get("candidate")
-        .and_then(Value::as_str)
-        .filter(|_| row.payload.get("keep").and_then(Value::as_str) == Some("candidate"))
-        .map(str::to_string);
-    apply_verdict(row)?;
-    let note = format!("auto-{}", row.kind);
-    index::global().review_resolve(&[row.id], "approved", Some(note.as_str()));
-    crate::server::logging::log(
-        "[Memory]",
-        &format!("自动裁决 {} {}（置信 {:.2}）", row.kind, row.target, row.confidence),
-    );
-    Ok(survivor)
 }
+
 
 /// 把两条「相似但各有独有内容」的记忆连起来，两边都留。
 ///
@@ -3486,89 +3619,37 @@ fn relate_pair(left: &str, right: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 这条建议是不是「已经不可能落地、也不该等人点头」—— 是就给一个作废理由。
+/// 配对型建议的「本端」id。
 ///
-/// 两类来源：
+/// 两类建议把 id 存在不同位置，这不是历史遗留而是语义差别：
 ///
-/// 1. **去重**：这一对的一方已经被别的建议处理掉了（合并 / 删除）。同一批里
-///    「D 盘空间」那条同时出现在三对中，第一对合并完，另两对就永远不成立 ——
-///    `dedup_auto_verdict` 要求两边都 `is_trusted()`，返回 `None` 被当成
-///    「判据不成立」留在队列里，而那个状态是不可能自己恢复的。
-/// 2. **归类**：见下面 classify 分支的说明。
+/// * `dedup` —— `target` 就是条目 id（这条建议针对谁），另一端在载荷的
+///   `candidate`；
+/// * `supersede` —— `target` 是 `新id->旧id` 这个**复合串**（`enqueue` 用它
+///   保证同一对只入队一次），真 id 在载荷的 `newId` / `oldId` 里。
 ///
-/// ── 为什么是「作废」而不是「继续排队」──────────────────────────
-/// `auto_eligible` 的 classify 分支要求**路径证据**，而真机 562 个记忆文件里带
-/// `files` 的 81 条中，路径段命中已登记项目目录的是 **0 条**（`files` 里写的是
-/// `src/server/...` 这类相对路径，不含项目目录名）。也就是说：这类建议**永远**
-/// 不可能被自动裁决，只会一直躺在队列里，直到 30 天后被 `review_expire` 无声
-/// 作废。而用户的实际用法是「全选 → 确定」—— 留着它，等于让用户亲手把
-/// 「我们在讨论 agenthub」这批笔记搬进 `projects/agenthub/`。作废（`rejected` +
-/// 具体 resolution）比留着安全：它仍然可查、可反向批准（`review_resolve(id, true)`
-/// 照样能批），只是不再占着「待确认」的位置冒充一件需要人决定的事。
-///
-/// 判据从**条目当前状态**重算，不读载荷里那个 `evidence` 键：老队列根本没有
-/// 这个键，而它们恰恰是最需要拦住的一批。
-fn retire_reason_of(
-    row: &index::ReviewRow,
-    snapshot: &[MemoryEntry],
-    projects: &[store::Project],
-) -> Option<&'static str> {
-    if row.kind == "dedup" {
-        // ── 这一对已经没有可合并的内容了 ─────────────────────────────
-        // 真机上 44 条 dedup 里有多条指向同一条记忆（「D 盘空间」那条同时出现在
-        // 三对里）。第一对合并完成之后，另两对里有一端已经被标了 `superseded_by`
-        // —— 但它们**可能还有内容没并进去**（另一端是第三条记忆）。
-        //
-        // 所以判据不是「有没有一端失效」，而是「两端各解到哪条活条目」：
-        //   * 解到同一个 id → 两份内容已经在一处了，这条建议无事可做；
-        //   * 解出不同 id → 还有正文要合，交给 `dedup_auto_verdict` 处理；
-        //   * 有一端解不出来（文件没了 / 终点被删 / 终点被反驳）→ 没法合。
-        //
-        // 早先这里写的是「任一端 `superseded_by` 非空就作废」，那与
-        // `apply_dedup` 的链式合并直接冲突：链式合并存在的意义正是「一端已被取代、
-        // 但另一端还有内容」，而作废判据会把这种配对提前清掉，链式合并永远走不到。
-        let candidate = row.payload.get("candidate").and_then(Value::as_str).unwrap_or_default();
-        if candidate.is_empty() || candidate == row.target {
-            return Some("auto-stale-pair");
-        }
-        let target_end = live_end_of(snapshot, &row.target);
-        let candidate_end = live_end_of(snapshot, candidate);
-        // 这个 `return` 不能省：`if` 块没有 `else`，而且函数尾部还有 classify
-        // 分支要接着走 —— 少了它，match 的结果会被当成语句丢弃（E0308），
-        // dedup 分支于是永远返回 `None`，作废逻辑整体失效（真机表现为
-        // 「两端已解到同一条」的配对一直挂在队列里）。
-        return match (target_end, candidate_end) {
-            // 两端解到同一活条目：正文已经在它身上了（或两端本来就是同一条）。
-            (Some(left), Some(right)) if left == right => Some("auto-already-resolved"),
-            // 有一端彻底没了：这对比不出来，也合不了。
-            (None, _) | (_, None) => Some("auto-target-missing"),
-            // 两端都还活着、且不是同一条 —— 还有得合，别动它。
-            _ => None,
-        };
-    }
-    if row.kind != "classify" {
-        return None;
-    }
-    let Some(target) = snapshot.iter().find(|entry| entry.id == row.target) else {
-        // 目标已被删 / 已被并。指向空气的建议永远无法被批准，留着只是计数噪音。
-        return Some("auto-target-missing");
-    };
-    // 已经被归到别处了（另一次归类成功、或用户手动改过）：这条建议过期。
-    let slug = row.payload.get("suggestion").and_then(Value::as_str).unwrap_or_default();
-    if !slug.is_empty() && target.project.as_deref() == Some(slug) {
-        return Some("auto-already-classified");
-    }
-    match classify_evidence_of(&row.payload, target, projects) {
-        ClassifyEvidenceOf::OwnProject => None,
-        // 有路径证据，但它指向另一个项目：入队时按名字把目标猜错了。
-        // 留着等人点头只会在「全选确认」时被批量搬错，作废是对的，但原因
-        // 必须写清楚 —— 这不是「只是提及」，是目标判错。
-        ClassifyEvidenceOf::OtherProject(_) => Some("auto-wrong-project"),
-        ClassifyEvidenceOf::Mention => Some("auto-mention-only"),
+/// 混用后果不是报错而是**判据全错**：拿 `新->旧` 去 `live_end_of`，永远查不到
+/// 这个 id，于是每一条 supersede 都会被判成 `auto-target-missing` 当场作废 ——
+/// 包括那些真正还需要处理的。
+fn pair_this_id(row: &index::ReviewRow) -> Option<&str> {
+    match row.kind.as_str() {
+        "supersede" => row
+            .payload
+            .get("newId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .or(Some(row.target.as_str())),
+        _ => Some(row.target.as_str()),
     }
 }
 
-/// 扫一遍队列，把够格的自动裁决掉。
+/// 配对型建议的「另一端」id（`dedup` 是 `candidate`，`supersede` 是 `oldId`）。
+fn pair_other_id(row: &index::ReviewRow) -> &str {
+    let key = if row.kind == "supersede" { "oldId" } else { "candidate" };
+    row.payload.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// 扫一遍队列，把每一行都裁掉 —— 落地、连边，或者按判据作废。
 ///
 /// 供巡检末尾、调度器每轮 tick 与「立即处理」按钮调用。写入路径不走这里 ——
 /// 它只处理自己刚入队的那一条（见 `auto_resolve_one`），否则批量导入几千次写
@@ -3576,18 +3657,23 @@ fn retire_reason_of(
 ///
 /// `limit` 上限 500：积压是每天几百条的稳态，扫不完的部分下一轮继续；一次
 /// 处理太多会让自动任务的可观测时长失控。
+///
+/// ── 「扫一遍」的含义是「清空」，不是「挑几条处理」─────────────
+/// 判据（[`decide`]）对每一行都有答案，包括「这条建议不成立了」—— 那是作废，
+/// 也是答案。所以一次扫描之后队列里不该再有 pending：留下的一律是 `Hold`
+/// （用户把那一类的自动裁决关掉了）。真机上「待确认 53 条」的来源正是这里：
+/// 一次扫描只挑够格的落地，其余原样留着，而「其余」里绝大部分是不会自己变好的
+/// 僵尸行（目标被删、早就合并过、只有名字提及）。
 pub fn auto_resolve(limit: usize) -> Value {
     let rows = index::global().review_list(Some("pending"), None, limit.clamp(1, 500));
-    // `projects.json` 一轮扫一遍就够：`auto_eligible` 里每次读盘会在 500 行上
-    // 变成 500 次文件读，而这份注册表在一轮扫描里不会变。
+    // `projects.json` 一轮扫一遍就够：`decide` 里每次读盘会在 500 行上变成
+    // 500 次文件读，而这份注册表在一轮扫描里不会变。
     let projects = store::load_projects();
     // ── 快照要跟着写操作一起更新，不能一轮只取一次 ────────────────
-    // 这个循环**会改库**（`auto_apply` 合并正文并标取代）。拿循环开始前那张快照
-    // 判后面每一行，判的就是「这一行还成不成立」的过期答案：真机 44 对里有 8 个
-    // id 横跨两对以上，第一对合完之后，第三对的两端在**旧快照里**看着都还活着、
-    // 而且不是同一条 —— `retire_reason_of` 于是放它进去，`dedup_auto_verdict`
-    // （它读的是新快照）发现两端已经解到同一条、返回 `None`，这一行就被记成
-    // `kept`：内容明明已经并好了，界面上还显示「还剩 1 条需要你判断」。
+    // 这个循环**会改库**（合并正文并标取代）。拿循环开始前那张快照判后面每一行，
+    // 判的就是「这一行还成不成立」的过期答案：真机 44 对里有 8 个 id 横跨两对
+    // 以上，第一对合完之后，第三对的两端在**旧快照里**看着都还活着、而且不是同
+    // 一条 —— 判据会把它当成「还有得合」，而实际两端已经解到同一条。
     //
     // 刷新按「上一次是否真的写过」条件触发，不是每行一次：`snapshot()` 要先走
     // 一遍目录指纹（550 个 .md 的 stat），满队列 500 行就是 500 次白走。
@@ -3603,36 +3689,24 @@ pub fn auto_resolve(limit: usize) -> Value {
             snapshot = store::snapshot();
             stale = false;
         }
-        // 先排除「已经不可能落地、也不该等人点头」的那批（见 `retire_reason_of`）。
-        // 两个开关分别管各自类型：去重作废只看 `autoConfirmDedup`，归类作废
-        // 还要 `autoConfirmClassify` —— 把两者并成一个条件会让关掉归类的用户
-        // 连带失去「这对已经合并过了」这条清理。
-        if config::bool_of("review.autoResolve") {
-            let allowed = match row.kind.as_str() {
-                "dedup" => config::bool_of("review.autoConfirmDedup"),
-                "classify" => config::bool_of("review.autoConfirmClassify"),
-                _ => false,
-            };
-            if allowed {
-                if let Some(reason) = retire_reason_of(row, &snapshot, &projects) {
-                    retired.push((row.id, reason));
-                    continue;
-                }
-            }
-        }
-        if !auto_eligible(row, &projects) {
-            kept += 1;
-            continue;
-        }
         let entry = json!({ "id": row.id, "type": row.kind, "confidence": row.confidence, "target": row.target });
-        match auto_apply(row) {
-            Ok(_) => {
-                applied.push(entry);
-                // 真的动过数据（dedup 合并 / classify 搬家）→ 下一行必须看新快照。
-                stale = true;
+        match decide(row, &snapshot, &projects) {
+            Decision::Hold => kept += 1,
+            Decision::Retire(reason) => {
+                retired.push((row.id, reason));
+                // 作废只改队列行，不动记忆 —— 但下一行的判据仍可能因为它消失而
+                // 变化（同一对的两个 id 出现在两条建议里时，`enqueue` 只会留一条，
+                // 所以这里不必刷新快照）。
             }
-            // 落盘失败：行还是 pending，人在队列里点一次就能看到真实报错。
-            Err(_) => kept += 1,
+            _ => match auto_apply(row, &snapshot, &projects) {
+                Ok(_) => {
+                    applied.push(entry);
+                    // 真的动过数据（合并 / 搬家 / 新增）→ 下一行必须看新快照。
+                    stale = true;
+                }
+                // 落盘失败：行还是 pending，人在队列里点一次就能看到真实报错。
+                Err(_) => kept += 1,
+            },
         }
     }
     // 一条一条标记而不是走批量：批量的语义是「用户点了全部拒绝」，而这里每种
@@ -3642,11 +3716,8 @@ pub fn auto_resolve(limit: usize) -> Value {
     }
     if !applied.is_empty() || !retired.is_empty() {
         bump_revision();
-        // 作废有两条来源，日志里要能分开看：
-        //   * 归类「只有提及、没有路径」—— 永远不可能被自动裁决；
-        //   * 去重「两端已解到同一条」—— 内容已经在幸存者身上了。
-        // 合成一个「作废 N 条」会让人以为记忆被删：前者只改队列行，后者连记忆
-        // 都没碰过（正文早就并好了）。
+        // 作废有几种来源，日志里要能分开看：合成一个「作废 N 条」会让人以为
+        // 记忆被删 —— 而多数作废连记忆都没碰过，改的只是队列行。
         let mut by_reason: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         for (_, reason) in &retired {
             *by_reason.entry(reason).or_default() += 1;
@@ -3659,7 +3730,7 @@ pub fn auto_resolve(limit: usize) -> Value {
         crate::server::logging::log(
             "[Memory]",
             &format!(
-                "自动裁决 {} 条，作废 {} 条（{}），留在队列 {} 条",
+                "自动裁决 {} 条，作废 {} 条（{}），留待人工 {} 条",
                 applied.len(),
                 retired.len(),
                 if detail.is_empty() { "—" } else { detail.as_str() },
@@ -3677,76 +3748,88 @@ pub fn auto_resolve(limit: usize) -> Value {
     })
 }
 
-/// 对一批**刚入队**的建议做自动裁决，返回真的落地了几条。
+/// 对一批**刚入队**的建议做自动裁决。
 ///
 /// 与 [`auto_resolve`] 的分工：这个只处理调用方点名的 id（写入路径、巡检的
 /// 新建议），`auto_resolve` 扫全队列。分开是因为写入路径是热路径 —— 批量导入
 /// 几千次写，每次扫全队列会把 O(n) 摊成 O(n²)；而它只需要管自己刚产生的那条。
 ///
-/// ── 这里也要跑 [`retire_reason_of`] ──────────────────────────
-/// 否则「写入时就入队、但永远不可能自动」的归类建议会跳过所有自动路径，只在
-/// 下一次全队列扫描时才被作废 —— 中间这段时间它照样占着「待确认 N 条」，而
-/// 每次写入都在给这个数字加一。判据与全队列扫描共用同一个函数，两条路不会漂开。
-pub fn auto_resolve_ids(ids: &[i64]) -> usize {
-    if ids.is_empty() || !config::bool_of("review.autoResolve") {
-        return 0;
+/// ── 返回值换了含义（2026-11-24）────────────────────────────────
+/// 旧签名返回「落地了几条」，调用方拿它当「要不要刷新快照」的信号。现在判据对
+/// 每一行都有结论（落地 / 连边 / 作废），调用方关心的是「有没有动过数据」——
+/// 作废只改队列行、不需要刷新，落地与连边需要。所以返回 `Resolved`，把三件事
+/// 分开报：`落地的条数`、`连边的条数`、`作废的条数`。
+pub struct Resolved {
+    pub applied: usize,
+    pub related: usize,
+    pub retired: usize,
+}
+
+impl Resolved {
+    /// 有没有真的动过记忆（作废只改队列行，不算动过）。
+    pub fn touched(&self) -> bool {
+        self.applied > 0 || self.related > 0
     }
-    // 一次取齐：`auto_eligible` 的 classify 分支要查注册表，逐条读盘会在
-    // 「一次巡检 20 条新建议」上变成 20 次文件读。
+}
+
+pub fn auto_resolve_ids(ids: &[i64]) -> Resolved {
+    let mut out = Resolved { applied: 0, related: 0, retired: 0 };
+    if ids.is_empty() || !config::bool_of("review.autoResolve") {
+        return out;
+    }
+    // 一次取齐：`decide` 的 classify 分支要查注册表，逐条读盘会在「一次巡检
+    // 20 条新建议」上变成 20 次文件读。
     let projects = store::load_projects();
-    // 快照只在要判「作废」时才取：它是 55 MB 目录的指纹检查 + 可能的整盘读，
-    // 而这条路径是写入热路径（批量导入几千次写）。按开关判断，不按行判断 ——
-    // 一次调用里所有 id 都来自同一个入口，开关状态相同。
-    let retire_on = config::bool_of("review.autoConfirmClassify")
-        || config::bool_of("review.autoConfirmDedup");
-    let mut snapshot = if retire_on { Some(store::snapshot()) } else { None };
-    let mut applied = 0usize;
+    // 快照只在真有行要判时才需要 —— 它是目录指纹 + 可能的整盘读，而这条路径
+    // 是写入热路径。判据自己会决定要不要用，所以这里懒取。
+    let mut snapshot: Option<std::sync::Arc<Vec<MemoryEntry>>> = None;
     for id in ids {
         // 逐条按 id 取（`review_get`），不走 `review_list`：刚入队的建议在排序里
-        // 可能排到 500 名之外，见 `index::review_get` 的注释。这里是 O(1) 索引查询，
-        // 不是全表扫。
+        // 可能排到 500 名之外，见 `index::review_get` 的注释。这里是 O(1) 索引查询。
         let Some(row) = index::global().review_get(*id) else { continue };
         if row.status != "pending" {
             continue;
         }
-        let allowed = match row.kind.as_str() {
-            "dedup" => config::bool_of("review.autoConfirmDedup"),
-            "classify" => config::bool_of("review.autoConfirmClassify"),
-            _ => false,
-        };
-        if allowed {
-            if let Some(reason) = snapshot
-                .as_deref()
-                .and_then(|all| retire_reason_of(&row, all, &projects))
-            {
+        if snapshot.is_none() {
+            snapshot = Some(store::snapshot());
+        }
+        let view = snapshot.clone().unwrap_or_else(store::snapshot);
+        match decide(&row, &view, &projects) {
+            // 开关关着 / 判据说先别动：留在队列，等人。
+            Decision::Hold => {}
+            Decision::Retire(reason) => {
                 index::global().review_resolve(&[*id], "rejected", Some(reason));
-                continue;
+                out.retired += 1;
             }
-        }
-        if !auto_eligible(&row, &projects) {
-            continue;
-        }
-        if auto_apply(&row).is_ok() {
-            applied += 1;
-            // 与 `auto_resolve` 同一条理由：这一步可能刚合并掉另一对的一端，
-            // 后面几行的作废判据必须看新快照，否则同一批里会出现
-            // 「已经并好了，却因为旧快照判成还能合」→ 被判据拒绝 → 没人处理。
-            if retire_on {
-                snapshot = Some(store::snapshot());
+            Decision::Relate => {
+                if auto_apply(&row, &view, &projects).is_ok() {
+                    out.related += 1;
+                    // 下一行的判据必须看新快照：连边会改 `dedup_status`，
+                    // 而 `dedup_scan` 用「有边 + related」判「这一对判过」。
+                    snapshot = Some(store::snapshot());
+                }
+            }
+            Decision::Apply | Decision::Merge => {
+                if auto_apply(&row, &view, &projects).is_ok() {
+                    out.applied += 1;
+                    // 这一步可能刚合并掉另一对的一端，后面几行必须看新快照。
+                    snapshot = Some(store::snapshot());
+                }
             }
         }
     }
-    if applied > 0 {
+    if out.touched() {
         bump_revision();
     }
-    applied
+    out
 }
 
 /// 批量拒绝（「全部忽略」）。不批量**批准**：一批建议里几乎必然有一条是错的，
 /// 而错的那条会把记忆搬进错误项目，代价远高于逐条点多几下。
 ///
 /// 「逐条点」这件事对单条高频场合是负担，所以真正的答案是 [`auto_resolve`]：
-/// 够格的自动落地（留 `auto-*` 痕迹、可反悔），不够格的才在这里等人。
+/// 够格的自动落地（留 `auto-*` 痕迹、可反悔）。判据对每一行都有答案，所以
+/// 正常情况下不存在「不够格」这一档 —— 只剩「这一类开关被关掉了」。
 pub fn review_reject_all(kind: Option<&str>) -> Value {
     let changed = index::global().review_reject_all(kind);
     bump_revision();
@@ -4474,11 +4557,11 @@ fn apply_derived(payload: &Value) -> Result<(), String> {
     };
     // ── 同内容不写第二份 ───────────────────────────────────────
     //
-    // 蒸馏 / 合并现在默认**直接落地**（`review.autoConfirmDistill`），而队列里
-    // 那条仍然留着等审计。于是有两条路会走到这里：自动落地一次、用户之后在
-    // 待确认列表里又点一次「批准」。`write()` 的精确去重只管 l1（l2 允许两条
-    // 一字不差但语境不同），所以第二次会老老实实再写一条 —— 库里出现两条
-    // 一模一样的结论，注入时还会占两个名额。
+    // 蒸馏 / 合并的结论由判据落盘（`review.autoConfirmDistill` + 总闸），而
+    // 队列里那条仍然留着等审计。于是有两条路会走到这里：自动裁决落一次、
+    // 用户之后在待确认列表里又点一次「批准」。`write()` 的精确去重只管 l1
+    // （l2 允许两条一字不差但语境不同），所以第二次会老老实实再写一条 ——
+    // 库里出现两条一模一样的结论，注入时还会占两个名额。
     //
     // 这里按内容哈希挡一次：l2 里已有同内容的活条目就直接返回成功（幂等），
     // 不写、不报错。判据放在派生入口而不是 `write()` 里，是为了不动 l1/l2
@@ -4637,14 +4720,17 @@ fn should_absorb(existing: &MemoryEntry, candidate: &str) -> bool {
     model::information_score(&probe) > model::information_score(existing)
 }
 
-/// 把一条记忆标记为「被另一条取代」。
+/// 把一条记忆标记为「被另一条取代」——**已删除**，理由记在这里（2026-11-24）。
 ///
-/// 对外公开是给 `enrich::detect_supersede` 的自动应用路径用的（本地 LLM 判定
-/// + 两个开关都打开时）。与 `apply_supersede` 的区别只在可见性，逻辑同一份 ——
-/// 分两份实现迟早会出现「自动应用的历史链与人工批准的不一样」。
-pub fn mark_superseded(old_id: &str, new_id: &str) -> Result<(), String> {
-    apply_supersede(new_id, old_id)
-}
+/// 它原本是给 `enrich::detect_supersede` 的「当场自动应用」路径用的包装。那条
+/// 路已经删掉了：写入路径只入队，落地统一交给 `auto_resolve_ids` /
+/// `auto_resolve`，判据只有 [`decide`] 一处。
+///
+/// 这个包装本身在删掉调用点之后就成了死代码。它的注释当时写着「留着一个没人
+/// 调的 `pub fn` 比删掉更坏」—— 话是对的，那就该照做：留着它，下一个人会以为
+/// 「自动应用」还有第二条路，照着它再写一套判据，于是队列里那条判据和它又漂开
+/// 一次。要真标记失效，走 [`apply_supersede`]（它做的是「先并正文再标取代」，
+/// 与合并同一个动作）。
 
 // ── 三级披露的对外入口 ───────────────────────────────────────
 
@@ -5009,9 +5095,10 @@ mod tests {
 
     // ── 自动裁决的判据（纯函数部分）──────────────────────────────
     //
-    // `auto_eligible` 自己要读 `config::bool_of` 与真实记忆根，单测环境不保证
-    // 有；所以把「分档」拆成三个纯函数逐条钉住 —— 判据本身漏一条，自动裁决就
-    // 会去动它不该动的东西，而那种错误是静默的。
+    // `decide` 自己要读 `config::bool_of` 与真实记忆根，单测环境不保证有；
+    // 所以把「分档」拆成纯函数逐条钉住（`dedup_gate` / `supersede_gate` /
+    // `pair_this_id` / `live_end_of`）—— 判据本身漏一条，自动裁决就会去动它
+    // 不该动的东西，而那种错误是静默的。
 
     #[test]
     fn path_segments_only_match_near_exact_names() {
@@ -5245,50 +5332,186 @@ mod tests {
     }
 
     #[test]
-    fn dedup_verdict_merges_only_when_the_short_side_is_explained() {
-        // 三档各自的门槛。合并要同时过两道：覆盖度（0.2）与相似分（0.72）；
-        // 连边只看相似分（0.72）。
+    fn dedup_merges_only_when_the_short_side_is_explained() {
+        // 三档各自的门槛。合并要同时过三道：覆盖度（0.2）、相似分（0.72）、
+        // 方向明确（`directed`）；连边只看相似分。
         //
         // 为什么合并的覆盖率门槛能低到 0.2：覆盖率量的已经是**正文主体**（证据段
         // 剔除），而合并不删正文 —— 内容会被并入幸存者，退出检索的只是「另一条
         // 同样的结论」。真机 44 对在 0.2 处的分档是 42 合并 / 2 连边，那两条连边
         // 正是唯一真正无关的两对（覆盖 0.026 与 0.042）。
-        assert_eq!(dedup_verdict(0.723, 0.62, 0.2, 0.72, 0.72), DedupVerdict::Merge);
-        assert_eq!(dedup_verdict(0.892, 0.55, 0.2, 0.72, 0.72), DedupVerdict::Merge);
-        assert_eq!(dedup_verdict(0.72, 0.204, 0.2, 0.72, 0.72), DedupVerdict::Merge);
+        let gate = |score: f64, coverage: f64| dedup_gate(score, coverage, true, true, 0.2, 0.72, 0.72);
+        assert_eq!(gate(0.723, 0.62), PairOutcome::Merge);
+        assert_eq!(gate(0.892, 0.55), PairOutcome::Merge);
+        assert_eq!(gate(0.72, 0.204), PairOutcome::Merge);
         // 覆盖不够但确实像：连边，两条都留
-        assert_eq!(dedup_verdict(0.745, 0.042, 0.2, 0.72, 0.72), DedupVerdict::Relate);
-        // 连相似分都不够：别连，否则关联图会重新变成完全图
-        assert_eq!(dedup_verdict(0.60, 0.30, 0.2, 0.72, 0.72), DedupVerdict::Keep);
+        assert_eq!(gate(0.745, 0.042), PairOutcome::Relate);
+        // 连相似分都不够：作废（连边会让关联图重新变成完全图）
+        assert_eq!(gate(0.60, 0.30), PairOutcome::Retire("auto-below-threshold"));
         // 同 hash 无条件合 —— 那是同一段字节，不存在「各有独有内容」
-        assert_eq!(dedup_verdict(1.0, 0.0, 0.2, 0.72, 0.72), DedupVerdict::Merge);
+        assert_eq!(gate(1.0, 0.0), PairOutcome::Merge);
         // ── 覆盖率高但相似分低：降级成连边，不能合 ──────────────────
         // 典型来源是「两条短结论都引用了同一段长文本」：短边确实被长边含住，
         // 覆盖率虚高，但两条在讲不同的事。合并它们等于把两个结论压成一条。
-        assert_eq!(dedup_verdict(0.66, 0.95, 0.2, 0.72, 0.72), DedupVerdict::Keep);
-        assert_eq!(dedup_verdict(0.66, 0.95, 0.2, 0.60, 0.72), DedupVerdict::Relate);
+        assert_eq!(
+            dedup_gate(0.66, 0.95, true, true, 0.2, 0.72, 0.72),
+            PairOutcome::Retire("auto-below-threshold"),
+            "连边门槛也要过：0.66 < relateMinScore"
+        );
+        assert_eq!(
+            dedup_gate(0.66, 0.95, true, true, 0.2, 0.72, 0.60),
+            PairOutcome::Relate,
+            "连边门槛降到 0.60 就能连边了，但合并门槛 0.72 仍然过不了"
+        );
+    }
+
+    /// 跨层与方向不明这两条闸：都不许合并，但都还能连边。
+    ///
+    /// `directed = false` 是那些老载荷（没有 `keep`）—— 判据不能猜方向，
+    /// 猜错就是把该留的那条标成「已被取代」，而它正是巡检认为「更全」的候选。
+    #[test]
+    fn dedup_never_merges_across_layers_or_without_direction() {
+        assert_eq!(
+            dedup_gate(0.95, 0.9, false, true, 0.2, 0.72, 0.72),
+            PairOutcome::Relate,
+            "跨层不合并：l1 并入 l2 会丢掉发生顺序"
+        );
+        assert_eq!(
+            dedup_gate(0.95, 0.9, true, false, 0.2, 0.72, 0.72),
+            PairOutcome::Relate,
+            "方向不明不合并：猜错方向会把正主埋掉"
+        );
+        // 唯独同 hash 例外：两段字节相同，方向猜错也还是同一段字
+        assert_eq!(
+            dedup_gate(1.0, 0.0, false, true, 0.2, 0.72, 0.72),
+            PairOutcome::Merge,
+            "同 hash 跨层也合"
+        );
+    }
+
+    /// `supersede` 的三态：方向固定，判据只剩「旧条还有没有独有内容」。
+    #[test]
+    fn supersede_gate_merges_only_when_the_old_body_is_explained() {
+        assert_eq!(supersede_gate(0.30, true, 0.2), PairOutcome::Merge);
+        assert_eq!(supersede_gate(0.199, true, 0.2), PairOutcome::Retire("auto-not-covered"));
+        assert_eq!(
+            supersede_gate(0.95, false, 0.2),
+            PairOutcome::Relate,
+            "跨层有关联，但不能合并"
+        );
+        assert_eq!(
+            supersede_gate(0.0, false, 0.2),
+            PairOutcome::Relate,
+            "跨层优先：连边不涉及正文，覆盖不到也不该被作废"
+        );
+    }
+
+    /// 配对型建议的两端 id 取法：`dedup` 的 `target` 就是 id，`supersede` 的
+    /// `target` 是 `新->旧` 复合串。
+    ///
+    /// 这条判据错了不报错，只会让 supersede 全被当成 `auto-target-missing`：
+    /// 拿复合串去 `live_end_of` 永远查不到，于是每一条都被当场作废 ——
+    /// 包括真正还需要处理的那批。
+    #[test]
+    fn supersede_ids_come_from_the_payload_not_the_target() {
+        let row = index::ReviewRow {
+            id: 1,
+            kind: "supersede".to_string(),
+            target: "new-id->old-id".to_string(),
+            payload: json!({ "newId": "new-id", "oldId": "old-id" }),
+            confidence: 0.9,
+            status: "pending".to_string(),
+            created_at: 0,
+            resolved_at: None,
+            resolution: None,
+        };
+        assert_eq!(pair_this_id(&row), Some("new-id"));
+        assert_eq!(pair_other_id(&row), "old-id");
+
+        let row = index::ReviewRow {
+            kind: "dedup".to_string(),
+            target: "target-id".to_string(),
+            payload: json!({ "candidate": "candidate-id", "score": 0.8, "keep": "candidate" }),
+            ..row
+        };
+        assert_eq!(pair_this_id(&row), Some("target-id"));
+        assert_eq!(pair_other_id(&row), "candidate-id");
+    }
+
+    /// 老载荷没有 `newId` 时要退回 `target`，不能直接判 None 让整条建议消失。
+    #[test]
+    fn supersede_falls_back_to_target_when_payload_is_old() {
+        let row = index::ReviewRow {
+            id: 2,
+            kind: "supersede".to_string(),
+            target: "legacy-target".to_string(),
+            payload: json!({ "oldId": "old-id" }),
+            confidence: 0.9,
+            status: "pending".to_string(),
+            created_at: 0,
+            resolved_at: None,
+            resolution: None,
+        };
+        assert_eq!(pair_this_id(&row), Some("legacy-target"));
+    }
+
+    /// supersede 的自动判据：旧条正文有没有被新条解释掉。
+    ///
+    /// 用真机两条 supersede 的实际正文当样本，另外补一条「新条只讲了一半」的反例
+    /// —— 那种情况旧条还有独有内容，判失效就是丢东西。
+    #[test]
+    fn supersede_merges_only_when_the_old_body_is_explained() {
+        let old = "网关改写 body（注入系统提示词）后仍把客户端旧 content-length 发给上游，\
+                   上游按旧长度截断请求体，导致 JSON 断裂。改为由插件按实际 body 重算长度并重写 host。";
+        let new = "网关改写 body 后，由插件按新 body 重新生成 content-length 并覆写 host，\
+                   禁止沿用客户端原值。透传旧长度使上游按错误长度读取请求体，读到一半即停、JSON 断裂。";
+        let coverage = content_coverage(old, new);
+        assert!(
+            coverage >= 0.20,
+            "同一件事的两次表述覆盖率过低（{coverage:.3}），判失效会被永久挡住"
+        );
+
+        // 新条只覆盖了「要重写 host」这一个点，旧条还有大量独有内容 —— 不该判失效。
+        let partial = "插件要重写 host。";
+        assert!(
+            content_coverage(old, partial) < 0.20,
+            "只讲了一个点的短句不该过闸"
+        );
+
+        // 完全无关的两条：覆盖率必须远低于门槛，否则 supersede 会把不相干的结论埋掉。
+        let unrelated = "赛车轮胎温度窗口在八十到一百一十度之间，超出就滑。";
+        assert!(content_coverage(old, unrelated) < 0.20);
     }
 
     #[test]
-    fn dedup_without_keep_is_never_auto() {
-        // 方向没写清楚的建议一律不自动：老载荷没有 `keep`，`apply_verdict` 会按
+    fn dedup_without_keep_is_never_merged_but_can_still_relate() {
+        // 方向没写清楚的建议一律不合并：老载荷没有 `keep`，`apply_verdict` 会按
         // 「新条取代候选」处理，而巡检给的 `candidate` 恰恰是该留的那条 ——
         // 自动合并一条方向不明的建议，等于把正主标成「已被取代」。
-        let payload = json!({ "candidate": "old", "score": 1.0 });
-        assert!(dedup_score_of(&payload, 1.0).is_none());
-
-        let payload = json!({ "candidate": "old", "score": 0.72, "keep": "candidate" });
-        assert_eq!(dedup_score_of(&payload, 0.72), Some(0.72));
-
-        // 没有 score 时退回队列行的 confidence（`enqueue` 传的就是它）。
-        let payload = json!({ "keep": "candidate" });
-        assert_eq!(dedup_score_of(&payload, 0.91), Some(0.91));
+        //
+        // 但「方向不明」不等于「这条建议没用」：两条确实相关这件事仍然成立，
+        // 连边是纯新增、不需要方向，所以它落在 `Relate` 而不是留队列。
+        assert_eq!(
+            dedup_gate(1.0, 0.0, true, false, 0.2, 0.72, 0.72),
+            PairOutcome::Relate,
+            "同 hash 但不带方向：连边（两条内容一样，连边也无害）"
+        );
+        assert_eq!(
+            dedup_gate(0.72, 0.62, true, false, 0.2, 0.72, 0.72),
+            PairOutcome::Relate,
+            "覆盖率够但不带方向：只能连边"
+        );
+        // 带上方向就恢复成能合
+        assert_eq!(
+            dedup_gate(0.72, 0.62, true, true, 0.2, 0.72, 0.72),
+            PairOutcome::Merge
+        );
     }
 
     #[test]
     fn dedup_auto_merge_lets_exact_duplicates_through() {
         // 同一段话导两遍（score 1.0）没有信息损失，阈值再高也该放行。
-        // 近似项现在由 `dedup_verdict` 的两把尺子决定（见上一个用例），
+        // 近似项现在由 `dedup_gate` 的两把尺子决定（见上一个用例），
         // 这里的阈值只回答「值得比一比吗」。
         assert!(dedup_score_ok(1.0, 1.0));
         assert!(dedup_score_ok(0.932, 0.9));
@@ -5379,7 +5602,7 @@ mod tests {
 
     #[test]
     fn one_ended_pair_is_still_mergeable_and_same_end_is_not() {
-        // ── 这条钉住 retire 判据与链式合并的一致性 ──────────────────
+        // ── 这条钉住 `pair_outcome` 与链式合并的一致性 ──────────────
         // 早先 `retire_reason_of` 写的是「任一端 `superseded_by` 非空就作废」，
         // 而 `dedup_auto_verdict` 要求「两端都 is_trusted()」。两边叠加的结果：
         //   * 真机 44 对里 7 个 id 横跨多对，第一对合完之后，另两对既进不了
@@ -5391,9 +5614,9 @@ mod tests {
             superseded("B", "A"),
             MemoryEntry::draft("C", "C", MemoryKind::Knowledge, "C 的正文"),
         ];
-        // A↔C：两端解出不同 id → 还能合（对应 dedup_auto_verdict 该给 Merge/Relate）
+        // A↔C：两端解出不同 id → 还能合（`pair_outcome` 会继续看覆盖率）
         assert_ne!(live_end_of(&all, "A"), live_end_of(&all, "C"));
-        // B↔A：两端解到同一条 → 无事可做（对应 retire_reason_of 该给已解决）
+        // B↔A：两端解到同一条 → 无事可做（`pair_outcome` 给 auto-already-resolved）
         assert_eq!(live_end_of(&all, "B"), live_end_of(&all, "A"));
     }
 }

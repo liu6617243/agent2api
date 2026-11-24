@@ -10,7 +10,7 @@ import { Empty, Panel, Section, StateBadge, num, timeText, useLoad } from './mem
  * ── 这一页要回答的四个问题 ──────────────────────────────────
  *   1. 有多少条？流水与沉淀各多少（l2 太少说明从没蒸馏过）；
  *   2. 今天有没有新东西进来？（数字不动 = 没人在用，或 Agent 没接上）
- *   3. 有没有积压要人裁决的？（待确认队列是这套系统唯一需要人工的地方）
+ *   3. 有没有积压的？队列里剩的是不是「你关掉的那几类」？
  *   4. 同步与索引有没有异常？
  *
  * ── 为什么没有「沉淀占比」这一格（2026-11-23）──────────────
@@ -23,8 +23,10 @@ import { Empty, Panel, Section, StateBadge, num, timeText, useLoad } from './mem
  * 需要那个百分比 —— 两个绝对数字并排比比例更直接，也不会被派生品带偏。
  *
  * ── 为什么把「待确认」放这么显眼 ────────────────────────────
- * 记忆的自动化默认全关，唯一会「卡住」的就是待确认队列：AI 提了建议没人批，
- * 队列会一直涨，而用户完全不知道。所以它必须在第一屏。
+ * 队列正常情况应该是空的：每一类建议都有判据，`auto_resolve` 扫一遍就清干净。
+ * 所以这个数字一旦不是 0，含义就变了 —— 它不是「有活要干」，而是「有一类的
+ * 自动裁决被关掉了，或者落地在磁盘上失败了」。这两种都需要人看一眼，而且用户
+ * 完全不会主动去查。所以它必须在第一屏。
  *
  * ── 为什么没有「最近 7 天热力图」───────────────────────────
  * 后端目前没有按天聚合的接口（`llm_call` / `recall_log` 有原始行但没有日聚合）。
@@ -176,7 +178,7 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
           <MetricLabel>{t('待确认')}</MetricLabel>
           <MetricValue className={pending ? 'mm-warn-text' : undefined}>{num(pending)}</MetricValue>
           <div className='mm-metric-sub'>
-            {pending ? t('需要你点头才会落盘') : t('队列是空的')}
+            {pending ? t('判据没能自己收尾（多为某类自动裁决被关）') : t('判据已把该做的都做完')}
           </div>
         </MetricCard>
         <MetricCard>
@@ -266,11 +268,11 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
             label={t('待确认')}
             title={t('待确认队列')}
             detail={pending
-              ? t('{n} 条建议等待裁决（去重 / 归类 / 失效判定）· 在「浏览 → 待确认」逐条批准或忽略{crowded}', {
+              ? t('{n} 条还挂着（去重 / 归类 / 失效判定）—— 每类都有判据，正常应该清空，剩下的多半是某类自动裁决被关掉或落地失败 · 在「浏览 → 待确认」看{crowded}', {
                   n: pending,
                   crowded: backlogged ? t(' · 已超过提醒阈值 {n}', { n: warnThreshold }) : '',
                 })
-              : t('没有积压')}
+              : t('队列是空的（判据把该做的都做完了）')}
             action={pending
               ? { label: t('去裁决'), run: () => (onReview ? onReview() : onGo('browse')) }
               : undefined}
@@ -396,7 +398,7 @@ function TodoRow({
   action,
 }: {
   state: 'ok' | 'warn' | 'bad' | 'idle'
-  /** 徽标文案（默认「待处理」）。待确认那行用「待确认」——它要人点头，不是要人修。 */
+  /** 徽标文案（默认「待处理」）。待确认那行用「待确认」——那里的数字不为 0 本身就是异常。 */
   label?: string
   title: string
   detail: string

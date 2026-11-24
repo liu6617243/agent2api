@@ -126,8 +126,11 @@ function unwiredBlocks(text) {
   return out
 }
 
+// Rust 的字符串续行：`"...第一段\` + 换行 + 缩进 + `第二段..."`。
+// 编译器会把反斜杠+换行+行首空白整个吃掉，所以这里也要先吃掉，
+// 否则 JSON.parse 撞上真换行就判「取不到 desc」—— 那是脚本的错，不是代码的错。
 function unquote(raw) {
-  const trimmed = raw.trim()
+  const trimmed = raw.trim().replace(/\\\r?\n[ \t]*/g, '')
   if (!trimmed.startsWith('"') || !trimmed.endsWith('"')) return null
   try {
     return JSON.parse(trimmed)

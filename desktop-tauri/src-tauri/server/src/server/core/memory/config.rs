@@ -284,8 +284,16 @@ static SCHEMA: &[Knob] = &[
     // ===== 双时间轴 =====
     knob("timeline.enabled", Kind::Bool, Tier::Advanced, "双时间轴", "启用双时间轴", "true"),
     knob("timeline.autoDetect", Kind::Bool, Tier::Advanced, "双时间轴", "蒸馏时自动识别取代", "true"),
-    knob_d("timeline.requireConfirm", Kind::Bool, Tier::Advanced, "双时间轴", "失效判定需人工确认",
-        "关掉后仅高置信建议自动应用", "true"),
+    // ── 这个旋钮已经没有读取点了（2026-11-24）────────────────────
+    // 它原来是 `detect_supersede` 的「要不要当场自动应用」开关。那条捷径已经删掉
+    // （改由队列统一裁决，判据是覆盖率而不是置信度），于是这里没有任何代码读它。
+    //
+    // 留着会变成第二个「改了没反应」的旋钮 —— 用户关掉它，期望是「失效建议
+    // 自动生效」，实际什么都不变，因为现在唯一决定那件事的是
+    // `review.autoConfirmSupersede` + 覆盖率。所以标成 unwired 并说清楚去哪改。
+    unwired(knob_d("timeline.requireConfirm", Kind::Bool, Tier::Advanced, "双时间轴", "失效判定需人工确认",
+        "本仓未接入：失效建议的落地现在统一由「待确认 → 自动确认事实失效」决定\
+         （判据是旧条正文是否已被新条覆盖）。这个键改了不会有任何行为影响", "true")),
 
     // ===== 自动化 =====
     knob("auto.enabled", Kind::Bool, Tier::Basic, "自动化", "自动化总开关", "true"),
@@ -365,8 +373,14 @@ static SCHEMA: &[Knob] = &[
         "本仓未接入 L4：没有让模型做 ADD/UPDATE/DELETE/NONE 判定的流水；近似重复只产待确认建议", "false")),
     unwired(range(knob_d("dedup.l4.minCandidateScore", Kind::Number, Tier::Advanced, "去重", "L4 触发最低候选分",
         "本仓未接入 L4：没有候选分门槛这一环（L2 的门槛是 dedup.l2.candidateThreshold）", "0.62"), 0.0, 1.0)),
-    range(knob_d("dedup.l4.autoUpdateThreshold", Kind::Number, Tier::Advanced, "去重", "L4 UPDATE 自动执行置信",
-        "「事实失效」自动应用的最低置信度（失效判定任务用这个门槛，不是 L4 判重）", "0.8"), 0.0, 1.0),
+    // ── 失效判定也不再读这个数了（2026-11-24）────────────────────
+    // 它原来喂 `detect_supersede` 的「置信度过线就当场落地」那条捷径。那条捷径
+    // 已删（改由队列的 `pair_outcome` 用正文覆盖率裁决），于是这里没有任何读取
+    // 点。留着它就是下一个「改了没反应」的旋钮 —— 标 unwired 并说清楚现在由
+    // 什么决定，比让用户猜好。
+    unwired(range(knob_d("dedup.l4.autoUpdateThreshold", Kind::Number, Tier::Advanced, "去重", "L4 UPDATE 自动执行置信",
+        "本仓未接入：失效建议的落地改由「待确认 → 自动确认事实失效」按正文覆盖率决定，\
+         不再看模型给的置信度（置信度只说明模型有多确信，说明不了合并会不会丢内容）", "0.8"), 0.0, 1.0)),
     unwired(range(knob_d("dedup.l4.batchSize", Kind::Number, Tier::Internal, "去重", "L4 单批条数",
         "本仓未接入 L4：没有分批判重；单批条数由 auto.tasks 里各任务的 batchSize 决定", "20"), 1.0, 50.0)),
     range(knob_d("dedup.pendingWarnThreshold", Kind::Number, Tier::Advanced, "去重", "队列积压告警阈值",
@@ -381,11 +395,16 @@ static SCHEMA: &[Knob] = &[
     // 建议**推迟**了一个月，然后丢掉。而四类建议的写操作全部可逆（搬文件、
     // 标取代、新增 l2，没有任何一类物理删除），可逆的东西不该当闸门。
     //
-    // 所以改成「按类型分档 + 高置信自动落地」：明显该做的当场做掉，留
-    // `resolution = auto-*` 痕迹；剩下的才进队列。判据见 `auto_eligible`。
-    knob_d("review.autoResolve", Kind::Bool, Tier::Basic, "待确认", "高置信建议自动落地",
-        "开：够格的建议当场落盘并记 `auto-*` 痕迹（全部可逆）；关：一律只入队等人点头。\
-         关掉后队列会重新积压 —— 归类和去重都不会自己发生", "true"),
+    // 所以改成「按类型分档 + 判据自己给结论」：每一类建议的命运（落地 / 连边 /
+    // 作废）都由判据回答，留 `resolution = auto-*` 痕迹；只有开关关着的那一类
+    // 才会留在队列。判据见 `decide`。
+    //
+    // 这个键是**总闸**：关掉它，连蒸馏与合并也不会自己落地（它们虽然各自有
+    // `review.autoConfirmDistill`，但落地入口统一走 `auto_resolve_ids`，先问总闸）。
+    knob_d("review.autoResolve", Kind::Bool, Tier::Basic, "待确认", "按判据自动裁决建议",
+        "开：每类建议由自己的判据当场收尾（落地 / 连边 / 作废），并记 `auto-*` 痕迹\
+         （全部可逆）；关：一律只入队等人点头。关掉后队列会重新积压 —— 归类、去重、\
+         失效、蒸馏都不会自己发生", "true"),
     // ── 这里原本有一个 `review.autoResolveFloor`（默认 0.85），已删除 ──
     //
     // 它是一道「全局最低置信」，挂在归类与去重两条判据之上。删掉的理由不是它
@@ -410,8 +429,10 @@ static SCHEMA: &[Knob] = &[
     // 会出现和 `autoResolveFloor` 一样的局面 —— 用户把阈值从 0.72 调到 0.5，
     // 行为一点不变，因为真正决定那件事的是「这条建议有没有路径证据」。
     knob_d("review.autoConfirmSupersede", Kind::Bool, Tier::Advanced, "待确认", "自动确认事实失效",
-        "只作用于失效**判定流水本身**（`detect_supersede`，还要 `timeline.requireConfirm` 也关着）。\
-         队列里的 supersede 建议永远不自动裁决：它会让一条真结论变成假的", "false"),
+        "开：失效建议在**旧条正文已被新条覆盖**（覆盖率 >= dedup.l2.mergeMinCoverage）时自动落地，\
+         动作与去重同一个函数（先并正文、再标 superseded_by，演化链仍可倒着走回去）；\
+         覆盖不到且同层时这条建议作废（旧条还有独有内容，不该被判失效，旧事实保持有效）；\
+         跨层的只连一条「相关」边、两条都留 —— 跨层合并会丢掉发生顺序", "true"),
     knob_d("review.autoConfirmClassify", Kind::Bool, Tier::Advanced, "待确认", "自动确认项目归类",
         "开：归类建议在**有路径证据**（`files` 的目录段与项目 slug 字面相等，或该路径落在\
          项目登记的 `path` 里）且目标项目已登记、未归档时自动归入。\
@@ -422,22 +443,28 @@ static SCHEMA: &[Knob] = &[
     knob_d("review.autoConfirmDedup", Kind::Bool, Tier::Advanced, "待确认", "自动确认去重采纳",
         "开：精确重复（同 hash）无条件合并；近似项按覆盖率分三档 —— 短边被对方解释掉\
          （>= mergeMinCoverage）就合并，够像但各有独有内容（>= relateMinScore）只连边、\
-         两条都留，其余留在队列。合并只标取代、不物理删除，被取代方正文会先并进幸存者", "true"),
-    // ── 蒸馏结论默认直接落地（与上面三条相反，故意的）──────────
+         两条都留，分数连连边门槛都不够的按「这条建议不成立」作废（不留在队列）。\
+         合并只标取代、不物理删除，被取代方正文会先并进幸存者", "true"),
+    // ── 蒸馏 / 合并结论：判据固定给「落地」（与上面三条的差别在判据，不在优先级）
     //
-    // 上面三条默认关，因为它们改的是**已有记忆**（搬项目、标失效、合并重复），
-    // 判错的代价是破坏原有数据。蒸馏不一样：它只**新增**一条 l2，来源写在
-    // `supersedes` / `evidence` 里，删掉就回到原样 —— 而且 `deep.evidenceRequired`
-    // 已经挡掉了「说不出出处」的结论。
+    // 上面三条的判据是「改已有记忆会不会破坏它」，所以各有尺子（路径证据 /
+    // 覆盖率 / 分数区间），够不上的作废或连边。蒸馏与合并只**新增**一条 l2，
+    // 来源写在 `supersedes` / `evidence` / `sources` 里，删掉就回到原样，没有
+    // 「破坏原数据」这种风险可判 —— 所以它们的判据不是阈值，而是「这类动作
+    // 该不该自动」这一个布尔。
     //
     // 默认开是为了补一个实测出来的死结：导入 2341 条之后，「深度记忆」还是 9 条。
     // 原因不是蒸馏没跑，而是蒸馏的产物全部停在待确认队列里等人点头，而人不会
     // 每天去点几百下。于是 l2 永远长不出来，而请求级注入最值钱的那一段
     // （沉淀结论 + 踩坑/决策）—— 注入看着「开了」，实际没东西可注。
     // 队列留着当审计，但不再当闸门。
-    knob_d("review.autoConfirmDistill", Kind::Bool, Tier::Basic, "待确认", "蒸馏结论直接落地",
-        "开：蒸馏产出的结论直接写成 l2（仍进队列留档，可随时删）；关：只入队等人工点头。\
-         关掉后 l2 几乎不会自己长出来，请求级注入也就没东西可注", "true"),
+    //
+    // 这个开关只管「这类要不要自动」；`review.autoResolve` 是总闸，关掉它连
+    // 蒸馏也不会自己落地。
+    knob_d("review.autoConfirmDistill", Kind::Bool, Tier::Basic, "待确认", "蒸馏结论自动落地",
+        "开：蒸馏与合并产出的结论按判据直接写成 l2（仍进队列留档，可随时删）；\
+         关：只入队等人工点头。关掉后 l2 几乎不会自己长出来，请求级注入也就没东西可注。\
+         受 `review.autoResolve` 总闸约束：总闸关着时这个开关不起作用", "true"),
 
     // ===== 清理（危险动作，默认全关）=====
     knob_d("cleanup.autoDeleteSuperseded", Kind::Bool, Tier::Advanced, "清理", "自动清理失效记忆",

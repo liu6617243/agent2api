@@ -293,9 +293,9 @@ pub async fn post_review(State(_state): State<ServerState>, body: Bytes) -> Resp
         let kind = payload.get("type").and_then(Value::as_str);
         return ok_json(memory::review_reject_all(kind));
     }
-    // 批量自动裁决（「自动处理高置信」）：跑的是和后台 tick 同一条 `auto_resolve`，
-    // 不是「全批准」。够格的落盘、不够格的留在队列 —— 所以按钮能把队列清到
-    // 「只剩需要你判断的」，而不是「一条不剩」。
+    // 批量裁决队列（「按判据全量裁决」）：跑的是和后台 tick 同一条 `auto_resolve`，
+    // 不是「全批准」。每一行都由判据给出终局（落地 / 连边 / 作废），所以跑完队列
+    // 里剩下的只可能是「这一类自动裁决被关掉了」。
     if payload.get("autoResolve").and_then(Value::as_bool).unwrap_or(false) {
         let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(200).clamp(1, 500) as usize;
         return ok_json(memory::auto_resolve(limit));

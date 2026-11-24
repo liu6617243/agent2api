@@ -676,13 +676,16 @@ fn tick() {
     //
     // 每轮 tick（60 秒）都扫是故意的：旧建议是用户在队列里翻到的，不是
     // 等下一轮巡检才出现。`TICK` 的间隔远大于一次 500 行的 `review_list`。
+    //
+    // 这里只在「真动过数据」时补一行日志：`auto_resolve` 自己已经记过一条完整的
+    // （含作废理由分布），再记一条会把日志刷成两遍同一件事。
     let swept = super::auto_resolve(200);
     let applied = swept.get("applied").and_then(Value::as_u64).unwrap_or(0);
     if applied > 0 {
         crate::server::logging::log(
             "[Memory]",
             &format!(
-                "队列自动裁决 {applied} 条（扫 {}，仍待人工 {}）",
+                "队列自动裁决落地 {applied} 条（扫 {} 条，仍有 {} 条留在队列 —— 那是自动裁决被关掉的那几类）",
                 swept.get("scanned").and_then(Value::as_u64).unwrap_or(0),
                 swept.get("kept").and_then(Value::as_u64).unwrap_or(0),
             ),
@@ -898,10 +901,20 @@ fn detail_of(task: &str, outcome: &Outcome) -> String {
                 "tag" => format!("打标 {} 条", n("tagged")),
                 "distill" => {
                     let (queued, applied, reinforced) = (n("queued"), n("applied"), n("reinforced"));
-                    format!(
-                        "读 {} 条素材，新建 {queued} 条（落地 {applied} 条），强化 {reinforced} 条",
-                        n("material")
-                    )
+                    let kept = n("keptForReview");
+                    // 落地数 < 产出数只有两种情况：判据关了这类自动裁决，或落地
+                    // 失败。后者要能一眼看见，所以这种轮次单独写一句。
+                    if kept > 0 {
+                        format!(
+                            "读 {} 条素材，新建 {queued} 条（落地 {applied} 条，留待确认 {kept} 条），强化 {reinforced} 条",
+                            n("material")
+                        )
+                    } else {
+                        format!(
+                            "读 {} 条素材，新建 {queued} 条（落地 {applied} 条），强化 {reinforced} 条",
+                            n("material")
+                        )
+                    }
                 }
                 // 归类巡检报两个数：扫了多少条没项目的、其中新提了几条建议。
                 // 只报「扫描 0 条」读起来像它没干活；只报建议数又在全部 skipped
@@ -909,7 +922,15 @@ fn detail_of(task: &str, outcome: &Outcome) -> String {
                 // 与「扫都没扫」的区别。
                 "classify" => format!("扫描 {} 条未归类，新增 {} 条建议", n("unclassified"), n("suggested")),
                 "supersede" => format!("检查 {} 条，产出 {} 条失效建议", n("checked"), n("suggestions")),
-                "consolidate" => format!("检查 {} 条，产出 {} 条合并建议", n("checked"), n("queued")),
+                "consolidate" => {
+                    let (checked, queued, applied) = (n("checked"), n("queued"), n("applied"));
+                    let kept = n("keptForReview");
+                    if kept > 0 {
+                        format!("检查 {checked} 条，产出 {queued} 条合并建议（落地 {applied} 条，留待确认 {kept} 条）")
+                    } else {
+                        format!("检查 {checked} 条，产出 {queued} 条合并建议（落地 {applied} 条）")
+                    }
+                }
                 // 「保留 N 条置顶」只在真的有钉子时出现：大多数轮次没有用户钉的
                 // 结论，恒显示「保留 0 条」会让审计行看起来像是漏了什么。
                 "profile" => {
@@ -1051,9 +1072,9 @@ fn classify_pending(project: Option<&str>) -> Outcome {
     }
     // ── 入队后立刻问一次「够不够格自动归」────────────────────────
     // 这条路以前只入队，于是每小时把同一批建议重新确认一遍、队列只增不减
-    // （真机 17 条 classify 躺了好几天没人点）。判据在 `auto_eligible`，这里
-    // 不另写一份 —— 两处独立维护必然漂开，「巡检说该自动处理的，队列里却一直
-    // 留着」就是这么来的。
+    // （真机 17 条 classify 躺了好几天没人点）。判据在 `decide`，这里不另写
+    // 一份 —— 两处独立维护必然漂开，「巡检说该自动处理的，队列里却一直留着」
+    // 就是这么来的。
     //
     // 批末统一扫一次，不是每条扫一次：`auto_resolve_ids` 每次要读一遍 pending
     // 快照，放进循环就是每轮 20 次 `review_list`。
@@ -1061,7 +1082,10 @@ fn classify_pending(project: Option<&str>) -> Outcome {
     Outcome::Done(json!({
         "unclassified": unclassified.len(),
         "suggested": suggested,
-        "autoApplied": auto,
+        "autoApplied": auto.applied,
+        // 作废条数也要报：归类建议里的「只有提及」一类会被当场作废（判据永远不会
+        // 让它们落地），只报 `autoApplied` 会让「这一轮什么都没干」变成一个错觉。
+        "autoRetired": auto.retired,
     }))
 }
 
@@ -1119,10 +1143,10 @@ fn best_project_match(
     // 只认路径里出现的项目目录名，不比文件名：`lib.rs` / `index.ts` 到处都是，
     // 拿它当线索等于给每条记忆都发一张「像某个项目」的通行证。
     //
-    // 这一级的判据与 `mod.rs::segments_hit` 是**同一个**（`name_is_same_project`），
+    // 这一级的判据与 `mod.rs::segments_owner` 是**同一个**（`name_is_same_project`），
     // 不在这里另算一遍相似度：两处各用一套阈值就会出现「巡检按 0.72 入队、
-    // 自动裁决按字面否掉」，于是建议一条也落不了地，还都被 `retire_reason_of`
-    // 判成「不是路径证据」作废 —— 白跑一趟，队列里连解释都留不下。
+    // 自动裁决按字面否掉」，于是建议一条也落不了地，还都被 `decide` 判成
+    // 「不是路径证据」作废 —— 白跑一趟，队列里连解释都留不下。
     let mut path_hits: Vec<String> = Vec::new();
     for file in &entry.files {
         for segment in file.split(['/', '\\']) {
@@ -1850,6 +1874,8 @@ fn consolidate(project: Option<&str>, manual: bool) -> Outcome {
     };
     let groups = parsed.get("groups").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut queued = 0usize;
+    // 本轮入队的建议 id：落地交给队列统一裁决（见本函数末尾）。
+    let mut queued_ids: Vec<i64> = Vec::new();
     for group in groups.iter().take(5) {
         let body = group.get("body").and_then(Value::as_str).unwrap_or("").trim();
         let sources: Vec<String> = group
@@ -1876,34 +1902,32 @@ fn consolidate(project: Option<&str>, manual: bool) -> Outcome {
             &payload,
             group.get("confidence").and_then(Value::as_f64).unwrap_or(0.7),
         );
-        // 与蒸馏同一条理由（见 `enrich::distill`）：合并只**新增**一条 l2，
-        // 被合并的原条目进回收站、可恢复，所以默认直接落地。
+        // ── 落地交给队列统一裁决（2026-11-24）─────────────────────
+        // 这里原本是「`review.autoConfirmDistill` 打开就当场 `apply_derived`」，
+        // 与 `enrich::distill` 同一条漏水路：只认自己的布尔，不认
+        // `review.autoResolve` 总闸，于是总闸关掉之后合并仍然自己入库。
         //
-        // 但合并比蒸馏多一道闸：来源少于两条的组已经在上面被跳过了，这里再要求
-        // `review.autoConfirmDistill` 打开 —— 合并会动到已有 l2（把原件移进
-        // 回收站），比「纯新增」重一档，用同一个开关是为了不让用户去理解两个
-        // 名字不同的开关其实是一件事。
-        if config::bool_of("review.autoConfirmDistill") {
-            match super::apply_derived(&payload) {
-                Ok(()) => {
-                    if let Some(id) = queued_id {
-                        index::global().review_resolve(&[id], "approved", Some("auto-consolidate"));
-                    }
-                }
-                Err(error) => {
-                    crate::server::logging::verbose(
-                        "[Memory]",
-                        &format!("合并结论自动落地失败（已留在待确认队列）：{error}"),
-                    );
-                }
-            }
+        // 现在只入队，落地由 `auto_resolve_ids` 走 `decide`：合并与蒸馏同属
+        // 「只新增 l2」那一档，判据固定给 `Apply`，多出来的只是总闸这一道。
+        // 来源少于两条的组已经在上面跳过，所以这里不需要再补一道内容闸。
+        if let Some(id) = queued_id {
+            queued_ids.push(id);
         }
         queued += 1;
     }
+    // 判据自己记 `auto-consolidate` 痕迹；返回值只报「模型分出几组」。
+    let applied = super::auto_resolve_ids(&queued_ids).applied;
     if queued == 0 {
         return Outcome::Skipped("模型认为没有可合并的组".into());
     }
-    Outcome::Done(json!({ "queued": queued, "checked": batch.len(), "model": reply.model }))
+    Outcome::Done(json!({
+        "queued": queued,
+        "applied": applied,
+        // 落地失败 / 总闸拦下：产出了组但没进库，要能从审计里看见。
+        "keptForReview": queued.saturating_sub(applied),
+        "checked": batch.len(),
+        "model": reply.model,
+    }))
 }
 
 /// 调度器状态（自动化页面顶部）。

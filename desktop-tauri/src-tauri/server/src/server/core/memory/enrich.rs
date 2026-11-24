@@ -10,11 +10,12 @@
 //!   · 模型不可用（没配 Key / 预算用完）→ 返回 [`Outcome::Skipped`]，什么都不写；
 //!   · 模型给的 JSON 解析不了 → 同样跳过。**绝不用正则从自由文本里抠结论** ——
 //!     抠错一条会被当成事实长期留在记忆里，比没生成糟得多；
-//!   · 自动应用与否由 `review.autoConfirm*` 决定。改**已有**记忆的那几条
-//!     （归类 / 失效 / 去重）默认全关，只入待确认队列；只**新增** l2 的
-//!     蒸馏 / 合并默认直接落地（`review.autoConfirmDistill`，默认开）——
-//!     因为队列留档 + 内容哈希幂等，落地是可撤销的，而「只入队」的实测结果
-//!     是 l2 永远长不出来。
+//!   · 自动应用与否由队列统一裁决（`review.autoResolve` 总闸 + 各 `review.autoConfirm*`）。
+//!     改**已有**记忆的那几条（归类 / 失效 / 去重）由覆盖率与路径证据分档，
+//!     只**新增** l2 的蒸馏 / 合并判据固定给「落地」—— 因为队列留档 + 内容
+//!     哈希幂等，落地是可撤销的，而「只入队」的实测结果是 l2 永远长不出来。
+//!   · 这里只入队，不自己落地：写入路径的落地一律走 `auto_resolve_ids`，
+//!     判据只有一处（`decide`）。自己落地就会多出一个不认总闸的旁路。
 //!
 //! ── 为什么不覆盖原文 ────────────────────────────────────────
 //! 摘要写进「新增的一条 `l2 / insight`」，原文一个字都不动。记忆是历史陈述，
@@ -94,12 +95,15 @@ A different angle or an extra detail is not obsolescence. Output strict JSON, no
 /// `project` 为空表示「所有项目的流水一起看」——不推荐，但允许（第一次使用时
 /// 用户往往还没分类）。
 ///
-/// ── 产物默认直接落地，但仍然进队列留档 ──────────────────────
+/// ── 产物固定判「落地」，但仍进队列留档 ──────────────────────
 /// 早先这里只入队等人工点头。实测结果是死结：导入 2341 条之后深度记忆还是 9 条，
 /// 而人不会每天点几百下「批准」—— l2 长不出来，请求级注入最值钱的那一段
-/// （沉淀结论 + 踩坑/决策）就永远没东西可注。所以改成「先落地 + 队列留档」
-/// （`review.autoConfirmDistill`，默认开）：批准时 `apply_derived` 靠内容哈希
-/// 幂等，不会写成两条。
+/// （沉淀结论 + 踩坑/决策）就永远没东西可注。所以判据对这类建议**固定给
+/// 「落地」**（`review.autoConfirmDistill` 开着时），落地靠内容哈希幂等，
+/// 不会写成两条。
+/// 但「落地」这一步不在这里做：这里只入队，末尾调 `auto_resolve_ids`。原因是
+/// 自己落地等于多开一条不认 `review.autoResolve` 总闸的旁路 —— 用户关掉自动
+/// 裁决后蒸馏仍会自己写库，那不是开关，是漏水。
 /// 现在还会先比对已有结论：能强化（追加证据锚点）的不再新建，确实没有才 new ——
 /// 重复从生成端就被拦住，否则每跑一轮 distill 都净增几条同义 l2。
 pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
@@ -218,7 +222,8 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
     };
     let items = parsed.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut queued = 0usize;
-    let mut applied_count = 0usize;
+    // 本轮入队的建议 id：落地交给队列统一裁决，见循环末尾的 `auto_resolve_ids`。
+    let mut queued_ids: Vec<i64> = Vec::new();
     let mut reinforced = 0usize;
     // 强化锚点：这批素材的指纹，不是模型写的 `note`。
     //
@@ -306,49 +311,33 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
             "model": reply.model,
         });
         let queued_id = index::global().enqueue("distill", &target, &payload, importance);
-        // ── 默认直接落地（`review.autoConfirmDistill`）────────────
+        // ── 落地交给队列统一裁决（2026-11-24）─────────────────────
         //
-        // 为什么蒸馏和「归类 / 失效 / 去重」三条自动确认的默认值相反：那三条改的
-        // 是**已有**记忆，判错就破坏原数据；蒸馏只**新增**一条 l2，来源写在
-        // `supersedes` / `evidence` 里，删掉就回到原样。
+        // 这里原本是「`review.autoConfirmDistill` 打开就当场 `apply_derived`」。
+        // 那条路与队列里的自动裁决（`decide`）是两把开关：它只认自己那个布尔，
+        // 不认 `review.autoResolve` 总闸。于是用户把「自动裁决」整个关掉，蒸馏
+        // 仍然自己往库里写 —— 关不掉的东西不是开关，是漏水的龙头。
         //
-        // 而默认「只入队」的实测结果是死结：导入 2341 条之后深度记忆还是 9 条 ——
-        // 蒸馏产物全躺在待确认队列里等人点头，人不会每天点几百下。l2 长不出来，
-        // 请求级注入最值钱的那一段（沉淀结论 + 踩坑/决策）就永远没东西可注。
-        //
-        // 队列**照样留着**（`enqueue` 已写入），所以这是「先落地 + 可审计」，
-        // 不是「不留痕」。批准后 `apply_derived` 会再跑一遍，靠 `supersedes`
-        // 与内容哈希去重，不会写成两条。
-        let mut applied = false;
-        if config::bool_of("review.autoConfirmDistill") {
-            match super::apply_derived(&payload) {
-                Ok(()) => {
-                    applied = true;
-                    if let Some(id) = queued_id {
-                        index::global().review_resolve(&[id], "approved", Some("auto-distill"));
-                    }
-                }
-                Err(error) => {
-                    // 落地失败不算整体失败：队列里那条还在，人还能点头。
-                    // 这里只记日志，不把已经成功的其它条目一起丢掉。
-                    crate::server::logging::verbose(
-                        "[Memory]",
-                        &format!("蒸馏结论自动落地失败（已留在待确认队列）：{error}"),
-                    );
-                }
-            }
-        }
-        if applied {
-            applied_count += 1;
+        // 现在这里只入队，落地交给 `auto_resolve_ids`：它读的是同一个 `decide`，
+        // 蒸馏 / 合并那一档固定判 `Apply`（只新增 l2、靠内容哈希幂等、删掉即回
+        // 原样），所以行为不变，只是多了「总闸关着就不动」这一条。
+        if let Some(id) = queued_id {
+            queued_ids.push(id);
         }
         queued += 1;
     }
+    // 判据自己决定落不落地、记什么痕迹（`auto-distill`），返回值只报「产出了
+    // 几条结论」；这里不等结果，与 `detect_supersede` 同一处理。
+    let resolved = super::auto_resolve_ids(&queued_ids);
+    let applied_count = resolved.applied;
     if queued == 0 && reinforced == 0 {
         return Outcome::Skipped("模型既没给出新结论，也没确认任何已有结论".into());
     }
     Outcome::Done(json!({
         "queued": queued,
         "applied": applied_count,
+        // 落地失败或被总闸拦下的条数：产出了结论但没进库，审计时要能看见。
+        "keptForReview": queued.saturating_sub(applied_count),
         "reinforced": reinforced,
         "material": source.len(),
         "model": reply.model,
@@ -491,9 +480,16 @@ pub fn summarize(ids: &[String], limit: usize) -> Outcome {
 
 /// 事实失效判定：拿一条新记忆去比同主题的旧记忆，产 `supersede` 建议。
 ///
-/// 默认只入队（`timeline.requireConfirm` = true）。关掉确认时才在
-/// `review.autoConfirmSupersede` 也开着的情况下自动应用 —— 两个开关同时开，
-/// 是因为这一步会**让旧事实失效**，误判的代价很高。
+/// ── 这里只产建议，落不落地不归它管（2026-11-24）─────────────────
+/// 早先这里有一条「两个开关都开 + 置信度过线就当场调 `mark_superseded`」的
+/// 捷径，结果是同一对建议有两套判据：这条看置信度，队列那条看覆盖率。两套
+/// 判据漂开的表现是「它明明已经生效了，队列里还挂着一条等我批」。
+///
+/// 现在统一走队列：`enqueue` 之后交给 `auto_resolve_ids`，由
+/// [`super::decide`] / [`super::pair_outcome`] 唯一裁决。判据是「旧条正文还有
+/// 没有独有内容」（覆盖率），不是模型给的那个置信度数字 —— 置信度回答的是
+/// 「模型有多确信」，覆盖率回答的是「合了会不会丢东西」，后者才是这把尺子该
+/// 量的东西。
 pub fn detect_supersede(new_id: &str) -> Outcome {
     if !config::bool_of("timeline.enabled") || !config::bool_of("timeline.autoDetect") {
         return Outcome::Skipped("双时间轴自动识别已关闭".into());
@@ -547,8 +543,11 @@ pub fn detect_supersede(new_id: &str) -> Outcome {
     let Some(parsed) = llm::parse_json(&reply.text) else {
         return Outcome::Failed("失效判定结果不是合法 JSON，已丢弃".into());
     };
-    let threshold = config::number("dedup.l4.autoUpdateThreshold").clamp(0.0, 1.0);
     let mut queued = 0usize;
+    // 入队返回的行 id 攒起来，末尾一次性交给自动裁决：逐条调
+    // `auto_resolve_one` 每条都要读一遍 pending 快照，这批最多 6 条，
+    // 合并成一次调用即可（`auto_resolve_ids` 内部也只取一次）。
+    let mut queued_ids: Vec<i64> = Vec::new();
     for item in parsed.get("supersedes").and_then(Value::as_array).into_iter().flatten() {
         let Some(old_id) = item.get("id").and_then(Value::as_str) else { continue };
         if !candidates.iter().any(|other| other.id == old_id) {
@@ -556,7 +555,7 @@ pub fn detect_supersede(new_id: &str) -> Outcome {
         }
         let confidence = item.get("confidence").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 1.0);
         let reason = item.get("reason").and_then(Value::as_str).unwrap_or("").to_string();
-        index::global().enqueue(
+        if let Some(id) = index::global().enqueue(
             "supersede",
             &format!("{new_id}->{old_id}"),
             &json!({
@@ -567,18 +566,24 @@ pub fn detect_supersede(new_id: &str) -> Outcome {
                 "model": reply.model,
             }),
             confidence,
-        );
-        // 两个开关同时开且置信度够高才自动应用
-        let auto = !config::bool_of("timeline.requireConfirm")
-            && config::bool_of("review.autoConfirmSupersede")
-            && confidence >= threshold;
-        if auto {
-            if let Err(error) = super::mark_superseded(old_id, new_id) {
-                crate::server::logging::log("[Memory]", &format!("⚠️ 自动标记失效失败：{error}"));
-            }
+        ) {
+            queued_ids.push(id);
         }
+        // ── 自动落地改由队列统一裁决（2026-11-24）───────────────────
+        // 这里原本是「两个开关同时开 + 置信度过线就当场调 `mark_superseded`」。
+        // 那条路与队列里的自动裁决（`decide`）各有一套判据，而两套判据迟早会
+        // 漂开：这条只看置信度，队列那条要看覆盖率。于是同一对建议「写入时按
+        // 置信度落地了」和「巡检时按覆盖率留在队列里」可以同时成立，表现为
+        // 「它明明已经生效了，队列里还挂着一条等我批」。
+        //
+        // 现在统一：这里只入队，落地交给 `auto_resolve_ids`（写入路径）与
+        // `auto_resolve`（巡检/每轮 tick）。判据只有一处，就是 `decide` —— 它
+        // 看的是「旧条还有没有独有内容」，而不是模型给的那个置信度数字。
         queued += 1;
     }
+    // 落不落地由判据决定，这里不等结果：`auto_resolve_ids` 自己记日志、
+    // 自己标 `auto-supersede` 痕迹。返回值只报「判出了几条建议」。
+    super::auto_resolve_ids(&queued_ids);
     if queued == 0 {
         return Outcome::Skipped("模型认为没有旧结论被取代".into());
     }

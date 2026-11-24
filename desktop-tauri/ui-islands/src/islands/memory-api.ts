@@ -1248,7 +1248,28 @@ export function rebuildIndex(): Promise<{ rebuilt: number; status: MemoryStatus 
   return api('POST', '/api/memory/rebuild')
 }
 
-export function resolveReview(id: number, approve: boolean): Promise<{ ok: boolean }> {
+/**
+ * 裁决一条建议。
+ *
+ * `approve = false` 只改队列状态，不动任何记忆。
+ *
+ * `approve = true` **不代表「无条件执行」**：后端会按同一套判据走一遍，判据说
+ * 该合并就合并、说只该连边就连边、说这条不成立就什么都不动。最后一种会返回
+ * `approved: false` + `reason`（作废理由），而不是把它记成「人工已批准」——
+ * 否则审计链上会出现一条「人批准了但实际上什么都没发生」的记录。
+ */
+export type ResolveReviewResult = {
+  id: number
+  approved: boolean
+  type: string
+  /** 只在 `approved: false` 且 `reason` 存在时出现：判据说这条建议不成立的原因 */
+  reason?: string
+  /** 这条已经被人处理过了（重复点击） */
+  already?: boolean
+  status?: string
+}
+
+export function resolveReview(id: number, approve: boolean): Promise<ResolveReviewResult> {
   return api('POST', '/api/memory/review', { id, approve })
 }
 
@@ -1257,21 +1278,23 @@ export function rejectAllReview(): Promise<{ rejected: number }> {
 }
 
 /**
- * 批量自动裁决：够格的建议当场落盘，不够格的**留在队列**。
+ * 按判据全量裁决队列：每一行都拿到终局（落地 / 连边 / 作废）。
  *
- * 与 `rejectAllReview` 的区别是「批准 vs 忽略」，与「全部批准」的区别是
- * 「按判据」vs「按勾选」：这里不碰任何一条本来会进人工队列的建议。后端跑的
- * 就是后台 tick 用的同一条 `memory::auto_resolve`。
+ * 与 `rejectAllReview` 的区别是「按判据处置」vs「一律忽略」；与「批准所选」的
+ * 区别是「按判据」vs「按勾选」。后端跑的就是后台 tick 用的同一条
+ * `memory::auto_resolve`。
+ *
+ * `kept` 不是「需要人判断的」——判据对每一行都有答案。它只会在两种情况下非零：
+ * 某一类的自动裁决被用户关掉了（`review.autoConfirm*`），或者落地时磁盘报错。
  */
 export type AutoResolveResult = {
   scanned: number
   applied: number
   appliedItems: { id: number; type: string; confidence: number; target: string }[]
   /**
-   * 被判作废（`rejected`）的条数。目前只有一种来源：归类建议**没有路径证据**
-   * ——「标签/标题里提到某个项目」不等于「这些活是给那个项目干的」，这类建议
-   * 永远不该自动搬（真机 641 条活记忆里带 `files` 的是 0 条），也不该占着
-   * 「待确认」的位置等人点头。作废只改队列行，不动任何记忆，仍可反向批准。
+   * 被判作废（`rejected`）的条数，附具体理由（`auto-mention-only` /
+   * `auto-already-resolved` / `auto-not-covered` …）。作废只改队列行，不动任何
+   * 记忆，仍可反向批准。
    */
   retired: number
   kept: number
