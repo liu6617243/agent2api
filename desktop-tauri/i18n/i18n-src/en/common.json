@@ -976,5 +976,10 @@
   "导入进行中：{done} / {total} 条（切到别的页签也不会中断，回来再看这里）": "Importing: {done} of {total} items (switching tabs will not interrupt it — come back here to check)",
   "导入进行中（正在扫描来源，切到别的页签也不会中断）": "Importing (scanning sources — switching tabs will not interrupt it)",
   "导入失败": "Import failed",
-  "这一屏只读文件，一个字都没写。这份结果是 {time} 扫的，30 分钟内有效（切页签回来还在）；要重扫就再点一次「导入全部来源」。": "This screen only reads files — nothing has been written. This rundown was scanned at {time} and stays valid for 30 minutes (switching tabs keeps it); click \"Import all sources\" again to rescan."
+  "这一屏只读文件，一个字都没写。这份结果是 {time} 扫的，30 分钟内有效（切页签回来还在）；要重扫就再点一次「导入全部来源」。": "This screen only reads files — nothing has been written. This rundown was scanned at {time} and stays valid for 30 minutes (switching tabs keeps it); click \"Import all sources\" again to rescan.",
+  "这几项都不会自己消失，也不会阻塞 Agent —— 但放着会越来越难查。": "These do not resolve themselves and do not block the agent, but they get harder to trace the longer they sit.",
+  "{n} 条还挂着（去重 / 归类 / 失效判定）—— 每类都有判据，正常应该清空，剩下的多半是某类自动裁决被关掉或落地失败 · 在「浏览 → 待确认」看{crowded}": "{n} still queued (dedupe / classify / supersede) — every kind has a rule, so this should normally be empty. Whatever is left usually means one kind of auto-resolve is turned off, or applying it to disk failed · see Browse → Pending{crowded}",
+  "自动裁决没收尾的失效 / 归类 / 查重建议": "Supersede / classify / dedupe suggestions that auto-resolve did not finish",
+  "条待确认": "pending",
+  "去待确认清单": "Open pending list"
 }

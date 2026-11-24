@@ -22,11 +22,19 @@ import { Empty, Panel, Section, StateBadge, num, timeText, useLoad } from './mem
  * 现在后端把画像从 `l1` / `l2` 里摘出来单列（`status.profile`），仪表盘也就不再
  * 需要那个百分比 —— 两个绝对数字并排比比例更直接，也不会被派生品带偏。
  *
- * ── 为什么把「待确认」放这么显眼 ────────────────────────────
+ * ── 为什么「待确认」既不在指标格里、也不在恒常清单里 ──────────
  * 队列正常情况应该是空的：每一类建议都有判据，`auto_resolve` 扫一遍就清干净。
  * 所以这个数字一旦不是 0，含义就变了 —— 它不是「有活要干」，而是「有一类的
- * 自动裁决被关掉了，或者落地在磁盘上失败了」。这两种都需要人看一眼，而且用户
- * 完全不会主动去查。所以它必须在第一屏。
+ * 自动裁决被关掉了，或者落地在磁盘上失败了」。这两种都需要人看一眼。
+ *
+ * 但「需要人看一眼」不等于「必须占一个常驻格子」。真机上它连续几天都是 0，
+ * 副行写着「判据已把该做的都做完」—— 于是每天打开这一页，先读到的是三处
+ * 同义重复（指标格的 0、清单里的「待确认 正常」、顶栏不出现的徽标），而
+ * 真正会变的信号（同步冲突、索引漂移）被夹在中间。
+ *
+ * 现在的做法：队列为空时它**不出现**；不为 0 时「需要处理」自动展开，
+ * 那一行带「去裁决」直通「浏览 → 待确认」，顶栏同时亮出「N 条待确认」徽标。
+ * 告警只在它真的响的时候出现。
  *
  * ── 为什么没有「最近 7 天热力图」───────────────────────────
  * 后端目前没有按天聚合的接口（`llm_call` / `recall_log` 有原始行但没有日聚合）。
@@ -180,13 +188,6 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
           ) : null}
         </MetricCard>
         <MetricCard>
-          <MetricLabel>{t('待确认')}</MetricLabel>
-          <MetricValue className={pending ? 'mm-warn-text' : undefined}>{num(pending)}</MetricValue>
-          <div className='mm-metric-sub'>
-            {pending ? t('判据没能自己收尾（多为某类自动裁决被关）') : t('判据已把该做的都做完')}
-          </div>
-        </MetricCard>
-        <MetricCard>
           <MetricLabel>{t('已连通 Agent')}</MetricLabel>
           <MetricValue>{agentCalled}/{agentInjected}</MetricValue>
           <div className='mm-metric-sub'>{t('真实调用过 / 已配置')}</div>
@@ -257,56 +258,62 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
         </MetricCard>
       </MetricGrid>
 
-      <Section
-        title={t('需要处理')}
-        hint={t('这四类问题都不会自己消失，也不会阻塞 Agent —— 但放着会越来越难查。')}
-      >
-        {actionError ? <div className='mm-error'>{actionError}</div> : null}
-        <div className='mm-todo-list'>
-          <TodoRow
-            /* 只要队列里有东西等人点头，这一行就不该是「正常」。
-               以前判据是 `pending >= warnThreshold`（真机阈值 50），41 条积压
-               照样亮绿「正常」，detail 却写着「41 条建议等待裁决」—— 同一行里
-               自相矛盾，用户当然会问「有 41 条你说正常？」。
-               阈值现在只用来区分「有积压」和「积压严重」，不再决定要不要提醒。 */
-            state={pending ? 'warn' : 'ok'}
-            label={t('待确认')}
-            title={t('待确认队列')}
-            detail={pending
-              ? t('{n} 条还挂着（去重 / 归类 / 失效判定）—— 每类都有判据，正常应该清空，剩下的多半是某类自动裁决被关掉或落地失败 · 在「浏览 → 待确认」看{crowded}', {
+      {/* 整块只在真有东西要处理时才出现。
+          自动裁决 + 自动去重 + 自动失效判据上线之后，「待确认」常年是 0，
+          同步冲突与索引漂移也极少发生 —— 于是原来那三行常驻清单在大多数时候
+          只是一块写着「全部正常」的绿区，占掉首屏近三分之一的高度。
+          一个永远亮绿灯的告警面板不是信息，是噪音：它让真正变红的那一天
+          混在用户已经习惯忽略的绿色里。
+
+          现在这块的行为和告警一致 —— 没内容就整块不渲染。三种情况各自带着
+          「去裁决 / 去裁决 / 重建索引」出现，出现即意味着「这里点得动」。 */}
+      {/* 重建失败的错误必须渲染在这块**外面**：这块在「一切正常」时整块消失，
+          而「重建失败」这个信息恰好可能出现在漂移已被消掉的那一次刷新之后 ——
+          放在里面就等于把错误藏进一个不再渲染的容器里。 */}
+      {actionError ? <div className='mm-error'>{actionError}</div> : null}
+      {(pending || conflicts > 0 || drift) ? (
+        <Section
+          title={t('需要处理')}
+          hint={t('这几项都不会自己消失，也不会阻塞 Agent —— 但放着会越来越难查。')}
+        >
+          <div className='mm-todo-list'>
+            {pending ? (
+              <TodoRow
+                state='warn'
+                label={t('待确认')}
+                title={t('待确认队列')}
+                detail={t('{n} 条还挂着（去重 / 归类 / 失效判定）—— 每类都有判据，正常应该清空，剩下的多半是某类自动裁决被关掉或落地失败 · 在「浏览 → 待确认」看{crowded}', {
                   n: pending,
                   crowded: backlogged ? t(' · 已超过提醒阈值 {n}', { n: warnThreshold }) : '',
-                })
-              : t('队列是空的（判据把该做的都做完了）')}
-            action={pending
-              ? { label: t('去裁决'), run: () => (onReview ? onReview() : onGo('browse')) }
-              : undefined}
-          />
-          {/* 这一行早先是「可能过时的记忆」（`health.stale`）。删掉的原因不是
-              「不好看」，是那个信号从来没成立过：真机 73 条带 `files` 的条目、
-              482 个 files 项，`stat` 成功 0 次 —— `files` 存的是仓库相对路径，
-              检查用的是记忆根基准。按正确基准复跑，66 条能解析、66 条全报「过时」，
-              100% 误报。用户看到的永远是「没有发现」，等于一个恒绿的假指示灯。
-              取舍细节见 `memory/mod.rs` 里 `TASK_LABELS` 上方那段。 */}
-          <TodoRow
-            state={conflicts > 0 ? 'bad' : 'ok'}
-            title={t('同步冲突')}
-            detail={conflicts ? t('{n} 个文件两边都改过，需要选一边', { n: conflicts }) : t('没有冲突')}
-            action={conflicts > 0 ? { label: t('去裁决'), run: () => onGo('sync') } : undefined}
-          />
-          <TodoRow
-            state={drift ? 'warn' : 'ok'}
-            title={t('索引一致性')}
-            detail={drift
-              ? t('索引条数与事实源不一致（可重建，不影响数据）')
-              : t('索引与事实源一致')}
-            action={drift
-              ? { label: rebuilding ? t('重建中…') : t('重建索引'), run: () => void rebuild() }
-              : undefined}
-          />
-        </div>
-
+                })}
+                action={{ label: t('去裁决'), run: () => (onReview ? onReview() : onGo('browse')) }}
+              />
+            ) : null}
+            {/* 这一行早先是「可能过时的记忆」（`health.stale`）。删掉的原因不是
+                「不好看」，是那个信号从来没成立过：真机 73 条带 `files` 的条目、
+                482 个 files 项，`stat` 成功 0 次 —— `files` 存的是仓库相对路径，
+                检查用的是记忆根基准。按正确基准复跑，66 条能解析、66 条全报「过时」，
+                100% 误报。用户看到的永远是「没有发现」，等于一个恒绿的假指示灯。
+                取舍细节见 `memory/mod.rs` 里 `TASK_LABELS` 上方那段。 */}
+            {conflicts > 0 ? (
+              <TodoRow
+                state='bad'
+                title={t('同步冲突')}
+                detail={t('{n} 个文件两边都改过，需要选一边', { n: conflicts })}
+                action={{ label: t('去裁决'), run: () => onGo('sync') }}
+              />
+            ) : null}
+            {drift ? (
+              <TodoRow
+                state='warn'
+                title={t('索引一致性')}
+                detail={t('索引条数与事实源不一致（可重建，不影响数据）')}
+                action={{ label: rebuilding ? t('重建中…') : t('重建索引'), run: () => void rebuild() }}
+              />
+            ) : null}
+          </div>
         </Section>
+      ) : null}
 
       <div className='mm-two-col'>
         <Section title={t('自动化')} hint={t('后台任务默认只开零 token 的那几个。')}>
@@ -395,6 +402,17 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
   )
 }
 
+/**
+ * 「需要处理」里的一行。
+ *
+ * ── 为什么 `state` 只有 warn / bad，`action` 又是必填 ─────────
+ * 这张清单只在**真有事**的时候渲染（见上面那段的条件），所以这里不存在
+ * 「一切正常」的第三种状态：正常时整块不出现，根本走不到这一行。
+ * 同理，能出现在这里的一行一定点得动 —— 把 `action` 从可选改成必填，
+ * 等于在类型上钉死「凡是有人看见的告警，都必须给出下一步去哪儿」。
+ * 原来那三行之所以变成噪音，正是因为它们在 ok 状态下既没有 action、
+ * 也不解释任何数字。
+ */
 function TodoRow({
   state,
   label,
@@ -402,29 +420,25 @@ function TodoRow({
   detail,
   action,
 }: {
-  state: 'ok' | 'warn' | 'bad' | 'idle'
+  state: 'warn' | 'bad'
   /** 徽标文案（默认「待处理」）。待确认那行用「待确认」——那里的数字不为 0 本身就是异常。 */
   label?: string
   title: string
   detail: string
-  action?: { label: string; run: () => void }
+  action: { label: string; run: () => void }
 }): React.ReactElement {
-  const variant = state === 'ok' ? 'success' : state === 'warn' ? 'warning' : state === 'bad' ? 'destructive' : 'outline'
+  const variant = state === 'warn' ? 'warning' : 'destructive'
   return (
     <div className='mm-todo'>
       <span className={`mm-todo-dot mm-todo-${state}`} aria-hidden='true' />
       <div className='mm-todo-body'>
         <div className='mm-todo-title'>
           {title}
-          <Badge variant={variant} shape='tag'>
-            {state === 'ok' ? t('正常') : (label ?? t('待处理'))}
-          </Badge>
+          <Badge variant={variant} shape='tag'>{label ?? t('待处理')}</Badge>
         </div>
         <div className='mm-todo-detail'>{detail}</div>
       </div>
-      {action ? (
-        <Button type='button' size='sm' variant='ghost' onClick={action.run}>{action.label}</Button>
-      ) : null}
+      <Button type='button' size='sm' variant='ghost' onClick={action.run}>{action.label}</Button>
     </div>
   )
 }

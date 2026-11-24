@@ -186,7 +186,8 @@
   color: var(--text-3);
   white-space: nowrap;
 }
-.mm-warn-text { color: var(--warn); }
+/* 这里曾有 `.mm-warn-text`（给「待确认」那一格的数字上 warn 色）。那一格已删：
+   一个恒为 0 的指标不需要「异常」色。没有任何地方再引用这个类。 */
 
 .mm-todo-list { display: flex; flex-direction: column; gap: 2px; }
 .mm-todo {

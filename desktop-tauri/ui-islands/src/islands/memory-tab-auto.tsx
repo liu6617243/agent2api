@@ -145,8 +145,15 @@ function exportRuns(rows: m.TaskRun[], labelOf: (task: string) => string): void 
  *
  * 超预算行为（`auto.overBudgetAction`）不在这张卡上：它属于「配置」，
  * 一年改一次，摆在日常页面上只会把这张卡的两个数字挤散。
+ *
+ * ── 为什么 pending 为 0 时整张卡不渲染（2026-11-24）──────────
+ * 判据自动裁决上线之后，这个数字常年是 0。那张卡于是变成「0 项待办 +
+ * 一个通往空收件箱的按钮」—— 页面最顶部的位置，摆着一个恒为 0 的待办。
+ * 它和仪表盘那块「需要处理」是同一个病：常驻的绿灯不是信息。
+ * 现在它只在真有积压时出现，出现即意味着「这里确实有活」。
  */
-function VerdictCard({ pending, onGo }: { pending: number; onGo: () => void }): React.ReactElement {
+function VerdictCard({ pending, onGo }: { pending: number; onGo: () => void }): React.ReactElement | null {
+  if (!pending) return null
   return (
     <div className='mm-verdict'>
       <div className='mm-verdict-head'>
@@ -161,17 +168,20 @@ function VerdictCard({ pending, onGo }: { pending: number; onGo: () => void }): 
         </span>
         <div className='mm-verdict-title'>
           <div className='mm-verdict-name'>{t('待确认裁决建议')}</div>
-          <div className='mm-verdict-sub'>{t('需人工判定的失效 / 归类 / 查重建议')}</div>
+          {/* 副行不再说「需人工判定」：判据会自己收尾，积压意味着某一类自动裁决
+              被人关掉了、或者落地在磁盘上失败了。这句话要指向原因，而不是指向
+              「你来判」—— 用户在这里点进去也只该看「为什么它没自己处理」。 */}
+          <div className='mm-verdict-sub'>{t('自动裁决没收尾的失效 / 归类 / 查重建议')}</div>
         </div>
       </div>
 
       <div className='mm-verdict-body'>
         <span className='mm-verdict-count'>
           <strong>{num(pending)}</strong>
-          <span>{t('项待办')}</span>
+          <span>{t('条待确认')}</span>
         </span>
         <Button type='button' size='sm' variant='outline' onClick={onGo}>
-          {t('进入裁决收件箱')}
+          {t('去待确认清单')}
           <span aria-hidden className='mm-verdict-arrow'>→</span>
         </Button>
       </div>
@@ -596,7 +606,7 @@ function TaskCard({
   )
 }
 
-function Auto({ onGo }: { onGo: (tab: 'browse') => void }): React.ReactElement {
+function Auto({ onGo, onReview }: { onGo: (tab: 'browse') => void; onReview?: () => void }): React.ReactElement {
   const { data: loaded, loading, error, reload } = useLoad(() => m.loadAuto(), [])
   /**
    * 「手上这份状态」。
@@ -731,7 +741,7 @@ function Auto({ onGo }: { onGo: (tab: 'browse') => void }): React.ReactElement {
       {/* 调度器状态 + 预算进度已按截图并入裁决卡；这里不再重复一遍「已开启 /
           线程在跑 / 上次 tick」—— 那三项在仪表盘有，两处都摆在页面最上面
           只会让真正要动手的事（裁决积压）被挤到第二眼。 */}
-      <VerdictCard pending={data.pendingReview} onGo={() => onGo('browse')} />
+      <VerdictCard pending={data.pendingReview} onGo={() => (onReview ? onReview() : onGo('browse'))} />
 
       {data.privacyPaused ? (
         <div className='mm-scan-note'>{t('隐私暂停：全部自动化任务停跑。去「配置 → 自动化」解除。')}</div>

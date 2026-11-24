@@ -502,7 +502,7 @@ function MemoryPage(): React.ReactElement {
           {tab === 'agents' ? <TabBoundary name='接入'><Agents /></TabBoundary> : null}
           {tab === 'auto' ? (
             <TabBoundary name='自动化'>
-              <Auto onGo={next => switchTab(next as Tab)} />
+              <Auto onGo={next => switchTab(next as Tab)} onReview={openReview} />
             </TabBoundary>
           ) : null}
           {tab === 'import' ? <TabBoundary name='导入'><Import /></TabBoundary> : null}
