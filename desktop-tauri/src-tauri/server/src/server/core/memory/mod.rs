@@ -2095,10 +2095,36 @@ fn coverage_ratio(left: &str, right: &str) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
-    // 谁短算谁：被取代的通常是较短的那条，它的内容必须能被对方解释掉
+    // 谁短算谁：无方向的「这两条是不是在讲同一件事」。
     let (short, long) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
     let hit = short.iter().filter(|token| long.contains(*token)).count();
     hit as f64 / short.len() as f64
+}
+
+/// 有向覆盖率：`subject` 的内容有多少比例被 `explainer` 讲到。
+///
+/// ── 为什么「谁短算谁」在有方向的判据上是错的（2026-11-24）──────────
+/// `coverage_ratio` 取短边做分母，它回答的是「这两条是不是在讲同一件事」——
+/// 那是个无方向的问题，取短边是对的。
+///
+/// 但 `supersede` 问的是有方向的问题：**旧条的内容有没有被新条解释掉**。
+/// 新条写一句「插件要重写 host。」（5 个 token），旧条有 45 个 token 讲完整
+/// 因果链 —— 取短边算出来 0.600（过闸 → 判失效 → 旧条正文被并进这条短句后
+/// 退出检索，因果链就此消失）；取旧条做分母算出来 0.067（不过闸 → 旧事实保持
+/// 有效，正确）。
+///
+/// 一句话结论：`supersede` 的风险是「短的新结论埋掉长的旧结论」，所以分母必须
+/// 是**被取代的那条**，不能是「两条里较短的那条」。
+///
+/// `dedup` 仍然用对称的那个：两条地位对等，谁更全只有覆盖率知道。
+fn coverage_of(subject: &str, explainer: &str) -> f64 {
+    let a = token_set(subject);
+    let b = token_set(explainer);
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let hit = a.iter().filter(|token| b.contains(*token)).count();
+    hit as f64 / a.len() as f64
 }
 
 /// 覆盖率只算**正文主体**，不算「证据：」那一段。
@@ -2118,6 +2144,14 @@ fn coverage_ratio(left: &str, right: &str) -> f64 {
 /// 其余同事实的两次表述集中在 0.20~0.81。这才是一把能用的尺子。
 fn content_coverage(left: &str, right: &str) -> f64 {
     coverage_ratio(split_evidence(left).0, split_evidence(right).0)
+}
+
+/// 有向版 `content_coverage`：`subject` 的正文有多少被 `explainer` 讲到。
+///
+/// 用于 `supersede`（「旧条被新条解释掉多少」）。见 [`coverage_of`] 里那段
+/// 「为什么短边当分母是错的」。
+fn content_coverage_of(subject: &str, explainer: &str) -> f64 {
+    coverage_of(split_evidence(subject).0, split_evidence(explainer).0)
 }
 
 /// 文本 → token 集合（去重后）。ASCII 整词 + CJK 二元组。
@@ -3184,11 +3218,14 @@ fn pair_outcome(row: &index::ReviewRow, all: &[MemoryEntry]) -> PairOutcome {
         if !this_entry.is_trusted() || !other_entry.is_trusted() {
             return PairOutcome::Retire("auto-untrusted");
         }
-        // 方向固定：`this`（载荷里的 `newId`）取代 `other`（`oldId`），不需要猜。
-        // 唯一的判据是「旧条还有没有独有内容」——合并不删正文，旧条的内容会先
-        // 并进新条再退出检索，所以「覆盖不到」就是「旧条还有独有内容」。
+        // 判据是「旧条还有没有独有内容」：合并不删正文，旧条的内容会先并进新条
+        // 再退出检索，所以「覆盖不到」就是「旧条还有独有内容」。
+        //
+        // 这里必须用**有向**覆盖率（分母是旧条）：对称版取两边较短的那条当分母，
+        // 于是「新条只有一句话」时短边是新条、覆盖率虚高成 0.6 —— 一条只说
+        // 「插件要重写 host」的短句就能把一份完整因果链判成失效并埋掉。
         return supersede_gate(
-            content_coverage(&other_entry.body, &this_entry.body),
+            content_coverage_of(&other_entry.body, &this_entry.body),
             this_entry.layer == other_entry.layer,
             config::number("dedup.l2.mergeMinCoverage"),
         );
@@ -5459,27 +5496,51 @@ mod tests {
     ///
     /// 用真机两条 supersede 的实际正文当样本，另外补一条「新条只讲了一半」的反例
     /// —— 那种情况旧条还有独有内容，判失效就是丢东西。
+    ///
+    /// ── 这条测试曾经红过，红的正是判据本身（2026-11-24 第三次 CI）────────
+    /// 当时判据调的是对称版 `content_coverage`，它取**两边较短的那条**当分母。
+    /// 反例 `partial` 只有 5 个 token，于是短边成了它、旧条覆盖它 3 个 ——
+    /// 算出来 0.600「过闸」，与「旧条还有 41 个 token 的独有内容」这个事实无关。
+    /// 症状是「一条短句就把完整因果链判成失效并埋掉」，而且不报错、只在事后翻
+    /// 演化链时才发现。现在判据用有向版 `content_coverage_of(old, new)`：
+    /// 同一个反例算出来 0.067。
+    ///
+    /// 保留对称版那一行断言（`sym 0.600`）是故意的：它把这个坑钉在原地，
+    /// 谁把判据改回对称版，这里就会立刻指着说明为什么不行。
     #[test]
-    fn supersede_merges_only_when_the_old_body_is_explained() {
+    fn supersede_coverage_is_directional_on_real_bodies() {
         let old = "网关改写 body（注入系统提示词）后仍把客户端旧 content-length 发给上游，\
                    上游按旧长度截断请求体，导致 JSON 断裂。改为由插件按实际 body 重算长度并重写 host。";
         let new = "网关改写 body 后，由插件按新 body 重新生成 content-length 并覆写 host，\
                    禁止沿用客户端原值。透传旧长度使上游按错误长度读取请求体，读到一半即停、JSON 断裂。";
-        let coverage = content_coverage(old, new);
+        // 有向：旧条被新条解释掉多少（分母是旧条）。
+        let coverage = content_coverage_of(old, new);
         assert!(
             coverage >= 0.20,
             "同一件事的两次表述覆盖率过低（{coverage:.3}），判失效会被永久挡住"
         );
 
-        // 新条只覆盖了「要重写 host」这一个点，旧条还有大量独有内容 —— 不该判失效。
+        // ── 反例：新条只讲了「要重写 host」这一个点 ────────────────
         let partial = "插件要重写 host。";
+        let partial_directed = content_coverage_of(old, partial);
         assert!(
-            content_coverage(old, partial) < 0.20,
-            "只讲了一个点的短句不该过闸"
+            partial_directed < 0.20,
+            "只讲了一个点的短句不该过闸（有向覆盖率 {partial_directed:.3}）"
+        );
+        // 对称版会算出 0.6 —— 这正是当初误判的来源，写在这里防回退。
+        let partial_symmetric = content_coverage(old, partial);
+        assert!(
+            partial_symmetric > 0.5,
+            "对称版本就该虚高（{partial_symmetric:.3}），它是无方向问题的尺子"
+        );
+        assert!(
+            partial_directed < partial_symmetric,
+            "有向覆盖率必须严格低于对称版：短的新条不该抬高它"
         );
 
-        // 完全无关的两条：覆盖率必须远低于门槛，否则 supersede 会把不相干的结论埋掉。
+        // 完全无关的两条：两种算法都必须远低于门槛。
         let unrelated = "赛车轮胎温度窗口在八十到一百一十度之间，超出就滑。";
+        assert!(content_coverage_of(old, unrelated) < 0.20);
         assert!(content_coverage(old, unrelated) < 0.20);
     }
 
@@ -5618,5 +5679,54 @@ mod tests {
         assert_ne!(live_end_of(&all, "A"), live_end_of(&all, "C"));
         // B↔A：两端解到同一条 → 无事可做（`pair_outcome` 给 auto-already-resolved）
         assert_eq!(live_end_of(&all, "B"), live_end_of(&all, "A"));
+    }
+
+    /// `pair_outcome` 对 supersede 必须用**旧条**当覆盖率分母。
+    ///
+    /// 这是 `supersede_merges_only_when_the_old_body_is_explained` 的端到端版本：
+    /// 那条测纯函数 `content_coverage_of`，这条测「判据在真实行上取的是哪个方向」。
+    /// 只测纯函数挡不住「函数写对了但 `pair_outcome` 调错顺序」—— 而那个错法的
+    /// 后果是短的新条把长的旧条埋掉，且没有任何报错。
+    #[test]
+    fn supersede_pairs_use_the_old_body_as_the_denominator() {
+        let long_old = "网关改写 body 后仍把客户端旧 content-length 发给上游，\
+                        上游按旧长度截断请求体，导致 JSON 断裂。改为由插件按实际 body \
+                        重算长度并重写 host，同时要处理分块传输的边界情况。";
+        let short_new = "插件要重写 host。";
+        let all = vec![
+            MemoryEntry::draft("new", "new", MemoryKind::Knowledge, short_new),
+            MemoryEntry::draft("old", "old", MemoryKind::Knowledge, long_old),
+        ];
+        let row = index::ReviewRow {
+            id: 1,
+            kind: "supersede".to_string(),
+            // 真机上 target 就是 `新->旧` 这个复合串。
+            target: "new->old".to_string(),
+            payload: json!({ "newId": "new", "oldId": "old" }),
+            confidence: 0.9,
+            status: "pending".to_string(),
+            created_at: 0,
+            resolved_at: None,
+            resolution: None,
+        };
+        assert_eq!(
+            pair_outcome(&row, &all),
+            PairOutcome::Retire("auto-not-covered"),
+            "短的新条不该把长的旧条判失效 —— 旧条还有大量独有内容"
+        );
+
+        // 反过来：新条确实把旧条讲全了 → 该合并。
+        let full_new = "网关改写 body 后仍把客户端旧 content-length 发给上游，\
+                        上游按旧长度截断请求体，导致 JSON 断裂。改为由插件按实际 body \
+                        重算长度并重写 host。";
+        let all = vec![
+            MemoryEntry::draft("new", "new", MemoryKind::Knowledge, full_new),
+            MemoryEntry::draft("old", "old", MemoryKind::Knowledge, long_old),
+        ];
+        assert_eq!(
+            pair_outcome(&row, &all),
+            PairOutcome::Merge,
+            "旧条的内容已被新条讲全，该判失效"
+        );
     }
 }
