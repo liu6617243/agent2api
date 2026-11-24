@@ -612,22 +612,55 @@ function scanDuplicateFns(files) {
       }
       return found
     }
-    const seen = new Map()
+    // ── 作用域栈（2026-11-24）────────────────────────────────
+    // 原来这闸门只认**顶层** fn（正则锚在行首、不允许缩进），于是同一个
+    // `mod tests` 里两个同名辅助函数（`fn project` 之类）看不见 —— 那是
+    // E0428，CI 上以编译失败收场，白跑一轮。
+    //
+    // 但也不能退化成「按缩进分组」：Rust 的条目名按**花括号作用域**划分，
+    // 所以
+    //   · 同一个 mod 里的两个同名 fn      → 重名（E0428）
+    //   · 两个兄弟 mod 里的同名 fn        → 合法
+    //   · 两个不同 fn 体内的同名嵌套 fn  → 合法
+    //   · 两个不同 impl 里的同名方法      → 合法（同名同类型才是 E0592）
+    // 「每开一个 `{` 压一层、闭一个 `{` 弹一层」正好对上这套语义：
+    // 函数名登记在**声明行开始时**所处的层，也就是它所属的那个作用域。
+    //
+    // 字符串与注释在 maskCode 里已被抹成空白，剩下的大括号都是代码里的；
+    // 字符字面量（`'{'`）也在 mask 里被吃掉，所以计数不会失衡。
+    const scopes = [new Map()]
+    let depth = 0
     for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i]
       const hit =
-        /^(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z_]\w*)/.exec(
-          lines[i],
+        /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z_]\w*)/.exec(
+          line,
         )
-      if (!hit) continue
-      const first = seen.get(hit[1])
-      if (first === undefined) {
-        seen.set(hit[1], i + 1)
-        continue
+      if (hit) {
+        const scope = scopes[depth]
+        const first = scope.get(hit[1])
+        if (first === undefined) {
+          scope.set(hit[1], i + 1)
+        } else {
+          const here = cfgsAbove(i)
+          const there = cfgsAbove(first - 1)
+          if (!(here.length && there.length)) {
+            problems.push({ file, line: i + 1, name: hit[1], first })
+          }
+        }
       }
-      const here = cfgsAbove(i)
-      const there = cfgsAbove(first - 1)
-      if (here.length && there.length) continue
-      problems.push({ file, line: i + 1, name: hit[1], first })
+      // 本行的大括号收支：开一个压一层，闭一个弹一层。
+      for (const ch of line) {
+        if (ch === '{') {
+          scopes.push(new Map())
+          depth += 1
+        } else if (ch === '}') {
+          if (scopes.length > 1) {
+            scopes.pop()
+            depth -= 1
+          }
+        }
+      }
     }
   }
   return problems

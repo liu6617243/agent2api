@@ -597,6 +597,20 @@ function InjectPreview(): React.ReactElement {
               {result.probes.map(item => ` ${item}`).join(' · ')}
             </div>
           ) : null}
+          {/* 真正进了请求正文的那几条（后端 `injectedIds`）。
+              候选表回答「有哪些够格」，这一行回答「这次真的带了哪几条」——
+              两者的差额就是被预算挤掉的部分。留痕（热度与检索台账）只记
+              这一段，「必须遵守」是每轮常驻规则，不算「这次用上了哪条」。 */}
+          {result.injectedIds ? (
+            <div className='mm-cfg-card-note'>
+              {result.injectedIds.length === 0
+                ? t('这次只带了「必须遵守」那一段 —— 没有命中具体经验与画像。')
+                : t('真正写进请求的记忆：{n} 条（{ids}）', {
+                    n: result.injectedIds.length,
+                    ids: result.injectedIds.join(' · '),
+                  })}
+            </div>
+          ) : null}
           {/* 中文线索单独一行：它不在 `probes` 里（那边只认 ASCII 整串），
               但中文提问靠它才能命中 —— 不显示出来，用户会以为「抽出 0 个线索」
               等于「没找」。 */}

@@ -187,6 +187,7 @@ pub async fn responses_endpoint(
             crate::server::core::memory::inject::inject_native(
                 &mut raw,
                 crate::server::core::protocol::native::WireProtocol::Responses,
+                Some(source.client.as_str()),
             )
         }) {
             logging::verbose(
@@ -453,6 +454,7 @@ pub async fn messages_endpoint(
             crate::server::core::memory::inject::inject_native(
                 &mut raw,
                 crate::server::core::protocol::native::WireProtocol::Anthropic,
+                Some(source.client.as_str()),
             )
         }) {
             logging::verbose(

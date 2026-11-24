@@ -8,10 +8,17 @@
 //!
 //! ── 哪些表是「派生的」，哪些不是 ─────────────────────────────
 //! `entries` / `entries_fts` 是派生的（事实源是 `.md`）。
-//! `review_queue` / `recall_log` / `llm_call` / `agent_beat` / `sync_state`
-//! 里那几张**不是**：待确认队列的裁决状态、调用台账、同步游标，删了就是丢数据。
-//! 它们跟索引同库只是为了「一个文件搞定记忆模块的全部机读状态」；`rebuild`
-//! 只清派生表，其余原样保留。
+//! `review_queue` / `recall_log` / `llm_call` / `agent_beat` / `sync_state` /
+//! `heat` 里那几张**不是**：待确认队列的裁决状态、调用台账、同步游标、使用
+//! 热度，删了就是丢数据。它们跟索引同库只是为了「一个文件搞定记忆模块的全部
+//! 机读状态」；`rebuild` 只清派生表，其余原样保留。
+//!
+//! `heat` 为什么必须单开一张表（而不是只写在 `entries` 里）：`rebuild` 是
+//! 「删光 entries 再按 `.md` 重写」，而热度不写 `.md`（见 [`MemoryIndex::hit`]），
+//! 于是每次重建都把「哪条被读过 30 次」抹成 0。这不是理论问题：注入与检索
+//! 都会打热度，而索引重建是常规操作 —— 结果就是 `search.weightHeat` 这一项
+//! 永远等于「最近一次重建之后被读过的次数」。`heat` 表重建后按 id 回填，
+//! 热度才真的是累计值。
 //!
 //! ── FTS5 是「有就用、没有就退化」──────────────────────────────
 //! `rusqlite` 的 `bundled` 构建通常带 FTS5，但这属于「依赖的编译选项」而不是
@@ -222,6 +229,28 @@ fn is_write_tool(tool: &str) -> bool {
     )
 }
 
+/// 按 `auto.logKeepCount` 把 `recall_log` 滚到上限之内。
+///
+/// 抽成独立函数是因为有两个写入点：[`MemoryIndex::log_recall`]（MCP 检索）
+/// 与 [`MemoryIndex::trace_inject`]（请求级注入）。两处各写一遍删除语句，迟早
+/// 出现「一处改了上限、另一处没改」—— 而症状是「注入写了一堆台账把检索记录
+/// 挤出窗口」，从现象完全看不出是上限口径不一致。
+///
+/// ── 为什么不用 `id NOT IN (SELECT id ... LIMIT n)`（2026-11-24）──
+/// 那个写法要把整张表读一遍、再逐行判断「在不在那 n 行里」。注入接入之后
+/// 台账变成**每请求一行**，这个写法就是每请求一次全表扫。
+///
+/// `id <= (SELECT id ... LIMIT 1 OFFSET n)` 沿主键索引走 n+1 行就停：
+/// 它取到第 n+1 新的一行，把比它老的全删掉，留下的正好是最新的 n 行。
+/// 不足 n 行时子查询返回 `NULL`，什么都不删 —— 语义与原来一致。
+fn prune_recall_log(conn: &Connection) {
+    let keep = super::config::usize_of("auto.logKeepCount").max(20) as i64;
+    let _ = conn.execute(
+        "DELETE FROM recall_log WHERE id <= (SELECT id FROM recall_log ORDER BY id DESC LIMIT 1 OFFSET ?1)",
+        params![keep],
+    );
+}
+
 /// 本地自然日零点的毫秒时间戳。
 ///
 /// ── 为什么不能用 `now - now % 86400000` ─────────────────────
@@ -304,7 +333,7 @@ impl MemoryIndex {
              CREATE TABLE IF NOT EXISTS recall_log (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                at INTEGER NOT NULL,
-               tool TEXT NOT NULL,            -- search / get / core / digest / recent
+               tool TEXT NOT NULL,            -- search / get / core / digest / recent / inject
                query TEXT,
                hits INTEGER DEFAULT 0,
                tokens INTEGER DEFAULT 0,
@@ -312,6 +341,17 @@ impl MemoryIndex {
                project TEXT
              );
              CREATE INDEX IF NOT EXISTS recall_at ON recall_log(at DESC);
+
+             -- 使用热度：**不是**派生表，rebuild 不清它。
+             --
+             -- 只记「被读过几次 / 最后一次什么时候」，不记内容 —— 它是使用痕迹，
+             -- 不是记忆。放在单独一张表里的唯一理由：`entries` 每次重建都会整表
+             -- 重写，而热度不写 `.md`，混在里面就必然被抹成 0（详见文件头）。
+             CREATE TABLE IF NOT EXISTS heat (
+               id TEXT PRIMARY KEY,
+               hits INTEGER NOT NULL DEFAULT 0,
+               last_hit_at INTEGER
+             );
 
              CREATE TABLE IF NOT EXISTS llm_call (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -505,8 +545,16 @@ impl MemoryIndex {
 
     /// 全量重建派生表：清表 → 按事实源逐条写入。
     ///
-    /// 只清 `entries` / `entries_fts`：待确认队列、调用台账、同步游标不是派生
-    /// 数据，重建索引不该把它们一起抹掉。
+    /// 只清 `entries` / `entries_fts`：待确认队列、调用台账、同步游标、使用
+    /// 热度不是派生数据，重建索引不该把它们一起抹掉。
+    ///
+    /// ── 为什么写完要把 `heat` join 回去（2026-11-24）─────────────
+    /// `access_count` / `last_hit_at` 在 `entries` 里，但它的真源是 `heat`
+    /// （见 [`Self::hit`] 的说明：热度不写 `.md`，而重建是「清空再按 `.md`
+    /// 重写」）。不回填的话，重建一次全库热度归零 —— 那正是修这个问题的原因。
+    ///
+    /// 回填在**同一个事务里**：重建中途失败时不能出现「行写好了但热度没跟上」
+    /// 的半成品；一起回滚，读到的就是重建前的完整状态。
     pub fn rebuild(&self, entries: &[MemoryEntry]) -> Result<usize, String> {
         let Ok(mut conn) = self.conn.lock() else {
             return Err("索引锁不可用".into());
@@ -521,6 +569,21 @@ impl MemoryIndex {
             write_row(&tx, entry, self.fts).map_err(|error| error.to_string())?;
             count += 1;
         }
+        // 热度回填：`heat` 是「不是派生」的那一侧，重建只读它、不动它。
+        //
+        // `MAX(...)` 而不是直接覆盖：老版本曾经把热度写进 `.md`（`access_count`
+        // 是 `MemoryEntry` 的字段），那些行里的数字可能比 `heat` 还大。取两者
+        // 较大的一个，升级不会被「回填」成更小的数 —— 热度只能涨，不该因为
+        // 换了个存法而倒退。
+        //
+        // 失败不致命：最坏结果是这一轮热度退化为 `.md` 里记的值，而不是整次
+        // 重建失败（索引是派生数据，可用性优先）。
+        let _ = tx.execute(
+            "UPDATE entries SET
+               access_count = MAX(COALESCE(access_count, 0), COALESCE((SELECT hits FROM heat WHERE heat.id = entries.id), 0)),
+               last_hit_at  = COALESCE((SELECT last_hit_at FROM heat WHERE heat.id = entries.id), last_hit_at)",
+            [],
+        );
         tx.commit().map_err(|error| error.to_string())?;
         // 重建是唯一「先整表清空、再整表写满」的操作，也是空闲页的主要来源。
         // 写完顺手压一遍：判据在 `compact_connection` 里，正常情况下它什么都不做。
@@ -540,6 +603,13 @@ impl MemoryIndex {
         tx.commit().map_err(|error| error.to_string())
     }
 
+    /// 从索引里彻底移除一条（**真删除**，不是进回收站）。
+    ///
+    /// ── 为什么连 `heat` 一起删 ──────────────────────────────────
+    /// `heat` 是「不随 rebuild 清空」的表（见 [`Self::hit`]），所以它的行不会
+    /// 自己消失 —— 删了条目却留着热度的直接后果是「同 id 重写一条新记忆，
+    /// 它一出生就带着 30 次阅读量」。两处调用方（`purge` 与清理任务的「文件
+    /// 不存在」）都是「这条真的没了」，一起删才对。
     pub fn drop_one(&self, id: &str) {
         let Ok(conn) = self.conn.lock() else { return };
         let _ = conn.execute("DELETE FROM entries WHERE id = ?1", params![id]);
@@ -550,6 +620,7 @@ impl MemoryIndex {
             "DELETE FROM mem_link WHERE from_id = ?1 OR to_id = ?1",
             params![id],
         );
+        let _ = conn.execute("DELETE FROM heat WHERE id = ?1", params![id]);
     }
 
     /// 库里现有条目数（状态自检用）
@@ -850,11 +921,28 @@ impl MemoryIndex {
 
     // ── 使用热度 ─────────────────────────────────────────────
 
-    /// 记一次命中：累加 `entries.access_count` / `last_hit_at`。
+    /// 记一次命中：累加 `heat.hits` / 刷新 `heat.last_hit_at`。
     ///
-    /// 只写索引不写 `.md`：热度是「使用痕迹」，不是记忆内容。写进事实源会让
-    /// 每次检索都产生一次磁盘写 + 一次 git diff，而它的价值远不够那个代价。
-    /// 索引重建时热度归零 —— 这是个有意的取舍，`search.weightHeat` 默认 0.1。
+    /// ── 为什么热度写 `heat` 表而不写 `entries`（2026-11-24）───────
+    /// 原来这里 `UPDATE entries SET access_count = ...`。这看着很自然 —— 热度
+    /// 就是条目的一个字段。但它和 [`Self::rebuild`] 直接冲突：`rebuild` 是
+    /// 「`DELETE FROM entries` 再按 `.md` 逐条重写」，而热度**故意**不写
+    /// `.md`（写进去等于每次检索都产生一次磁盘写 + 一次 git diff）。于是
+    /// 「重建索引」这个常规操作会把全库热度抹成 0。
+    ///
+    /// 这不是理论问题。真机数据：`access_count > 0` 的条目 **0 条**，
+    /// 而同期 `search` / `get` 调用几十次 —— 每次重建都归零，而重建是排障第
+    /// 一步。`search.weightHeat`（默认 0.1）这一项于是恒等于「最近一次重建之后
+    /// 被读过的次数」，等于没有这一项。
+    ///
+    /// 单开一张 `heat` 表，让「条目内容」与「使用痕迹」各有各的生命周期：
+    /// `entries` 跟着 `.md` 走（可整表重建），`heat` 跟着索引库走（只在回收站
+    /// 清空时按 id 删）。`rebuild()` 结尾把两份数据 join 回去，热度就真的是
+    /// 累计值。
+    ///
+    /// ── 为什么不是 `INSERT OR REPLACE` ─────────────────────────
+    /// 同一次请求里两条 id 可能重复（`scored` 与画像段各算一遍），用
+    /// `hits = hits + 1` 才是「读了几次」；`REPLACE` 会把重复写成 1。
     pub fn hit(&self, ids: &[String]) {
         if ids.is_empty() {
             return;
@@ -863,6 +951,15 @@ impl MemoryIndex {
         let now = crate::server::logging::now_ms();
         let _ = conn.execute_batch("BEGIN");
         for id in ids {
+            // `ON CONFLICT` 而不是 `INSERT OR REPLACE`：后者会先 DELETE 再 INSERT，
+            // `hits` 归 1，而且多一次写放大。
+            let _ = conn.execute(
+                "INSERT INTO heat (id, hits, last_hit_at) VALUES (?1, 1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET hits = hits + 1, last_hit_at = ?2",
+                params![id, now],
+            );
+            // `entries` 是派生的一侧：`search` 直接读它，同步写一份就不必为了
+            // 一个字段去 join。真源仍是 `heat`（重建时会从它回填）。
             let _ = conn.execute(
                 "UPDATE entries SET access_count = access_count + 1, last_hit_at = ?2 WHERE id = ?1",
                 params![id, now],
@@ -871,7 +968,62 @@ impl MemoryIndex {
         let _ = conn.execute_batch("COMMIT");
     }
 
+    /// 记一次注入的使用痕迹：热度 + 检索台账，**一次加锁、失败就放弃**。
+    ///
+    /// ── 为什么单独一个方法，而不是调 `hit()` + `log_recall()` ─────
+    /// 两件事要落在同一个临界区里：只写了热度没写台账，`recall_log` 里仍然
+    /// 看不到注入；只写了台账没记热度，`weightHeat` 那一项仍然是死的。
+    ///
+    /// ── 为什么用 `try_lock` 而不是 `lock`（关键）───────────────
+    /// 这条路径挂在**每一条转发请求**前面。全局只有一条索引连接，
+    /// [`Self::rebuild`] 会独占它几十秒（3 GB 的 `index.db` 实测过）。用
+    /// `lock()` 的话，重建期间所有转发请求都排在这把锁后面 —— 那正是
+    /// 「记忆中枢整页打不开、一直等到 60 秒超时」那个事故的形状。
+    ///
+    /// 丢一行使用痕迹的代价，和卡住一次用户请求的代价，不是一个量级。所以
+    /// 索引忙就放弃这一条，返回 `false` 让调用方记一笔「这次没留痕」——
+    /// 不静默吞掉，否则「注入 137 次 / 台账只有 3 行」又变成新的无解问题。
+    pub fn trace_inject(
+        &self,
+        ids: &[String],
+        query: &str,
+        tokens: usize,
+        agent: Option<&str>,
+        project: Option<&str>,
+    ) -> bool {
+        let Ok(conn) = self.conn.try_lock() else {
+            return false;
+        };
+        let now = crate::server::logging::now_ms();
+        let _ = conn.execute_batch("BEGIN");
+        for id in ids {
+            let _ = conn.execute(
+                "INSERT INTO heat (id, hits, last_hit_at) VALUES (?1, 1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET hits = hits + 1, last_hit_at = ?2",
+                params![id, now],
+            );
+            let _ = conn.execute(
+                "UPDATE entries SET access_count = access_count + 1, last_hit_at = ?2 WHERE id = ?1",
+                params![id, now],
+            );
+        }
+        let _ = conn.execute(
+            "INSERT INTO recall_log (at, tool, query, hits, tokens, agent, project)
+             VALUES (?1,'inject',?2,?3,?4,?5,?6)",
+            params![now, query, ids.len() as i64, tokens as i64, agent, project],
+        );
+        // 裁剪放在同一个事务里：注入每请求一行，不裁剪的话台账会一直涨；
+        // 放在事务外就是两次写、两次提交 —— 这条路径挂在每个转发请求前面。
+        prune_recall_log(&conn);
+        let _ = conn.execute_batch("COMMIT");
+        true
+    }
+
     /// 记一次检索调用（`recall_log`）。按条数上限滚动删除，不无限增长。
+    ///
+    /// `tool` 的取值到目前为止是 `search` / `get` / `core` / `digest` / `recent`
+    /// / `inject`。最后那个是 2026-11-24 加的：请求级注入是全套机制里唯一
+    /// **自动**读记忆的入口，不记它等于「记忆被用了」这条链上少一半证据。
     pub fn log_recall(&self, tool: &str, query: &str, hits: usize, tokens: usize, agent: Option<&str>, project: Option<&str>) {
         let Ok(conn) = self.conn.lock() else { return };
         let now = crate::server::logging::now_ms();
@@ -880,11 +1032,7 @@ impl MemoryIndex {
              VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![now, tool, query, hits as i64, tokens as i64, agent, project],
         );
-        let keep = super::config::usize_of("auto.logKeepCount").max(20) as i64;
-        let _ = conn.execute(
-            "DELETE FROM recall_log WHERE id NOT IN (SELECT id FROM recall_log ORDER BY id DESC LIMIT ?1)",
-            params![keep],
-        );
+        prune_recall_log(&conn);
     }
 
     /// 记一次内部 LLM 调用（`llm_call`）。
@@ -1263,6 +1411,50 @@ impl MemoryIndex {
         Some(count as usize)
     }
 
+    /// 某类建议的 pending 条数。
+    ///
+    /// ── 为什么必须能分类计数（2026-11-24）────────────────────────
+    /// 归类巡检原来用 [`review_count`]（**全部** pending）和
+    /// `dedup.pendingWarnThreshold` 比，本意是"队列积压成这样，先别再加新建议了"。
+    /// 但队列是所有建议共用的一张表：真机 52 条 pending 里 44 条是 dedup、
+    /// 6 条 classify、2 条 supersede —— 归类巡检每轮都看到"积压 52 条"，
+    /// 于是永久跳过，而那些 dedup 积压跟它一点关系都没有。
+    ///
+    /// **一种建议的积压让另一种任务的巡检停止**，这是判据用错了对象。所以积压
+    /// 闸必须按 kind 看：`classify` 只该被 `classify` 自己的积压拦住。
+    pub fn review_count_of(&self, kind: &str) -> usize {
+        let Ok(conn) = self.conn.lock() else { return 0 };
+        conn.query_row(
+            "SELECT COUNT(*) FROM review_queue WHERE status = 'pending' AND kind = ?1",
+            params![kind],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count as usize)
+        .unwrap_or(0)
+    }
+
+    /// 按 kind 统计全部 pending（排障与界面用）。
+    ///
+    /// 一次 `GROUP BY` 拿到全部，比每个任务各查一遍便宜 —— 调用方通常想同时
+    /// 知道"我这类的积压"和"别处有没有堵着"。
+    pub fn review_count_by_kind(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut out = std::collections::BTreeMap::new();
+        let Ok(conn) = self.conn.lock() else { return out };
+        let Ok(mut statement) = conn.prepare(
+            "SELECT kind, COUNT(*) FROM review_queue WHERE status = 'pending' GROUP BY kind",
+        ) else {
+            return out;
+        };
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        });
+        let Ok(rows) = rows else { return out };
+        for row in rows.flatten() {
+            out.insert(row.0, row.1.max(0) as usize);
+        }
+        out
+    }
+
     /// 裁决：`approved` / `rejected` / `expired`。返回受影响行数。
     pub fn review_resolve(&self, ids: &[i64], status: &str, resolution: Option<&str>) -> usize {
         if ids.is_empty() {
@@ -1614,7 +1806,7 @@ impl MemoryIndex {
     /// 全部表与行数（状态页 / 自检）。
     ///
     /// ── `mem_link` 为什么走 `dbstat` 估算 ───────────────────────
-    /// 其余九张表都是「条目量级」（几千行），`COUNT(*)` 是毫秒级。`mem_link`
+    /// 其余各表都是「条目量级」（几千行），`COUNT(*)` 是毫秒级。`mem_link`
     /// 不一样：老版本按「任意共同标签」建边，一度涨到 810 万行，`COUNT(*)` 要
     /// 扫几百毫秒。虽然新口径已经把边数压回条目量的几倍，但**老库在第一次
     /// 重建之前仍然是几百万行** —— 而这一栏是排障时看的，不该让排障本身变成
@@ -1630,6 +1822,7 @@ impl MemoryIndex {
             "entries",
             "review_queue",
             "recall_log",
+            "heat",
             "llm_call",
             "agent_beat",
             "mem_link",
@@ -2105,6 +2298,23 @@ mod tests {
                pinned INTEGER, starred INTEGER, created_at INTEGER, updated_at INTEGER,
                superseded_by TEXT, deleted_at INTEGER, body TEXT, path TEXT
              );
+             -- `hit` / `trace_inject` 要写这两张，`rebuild` 的回填要读 `heat`。
+             -- DDL 与 `open()` 同源：缺了任何一张，测试里的热度路径都走不到。
+             CREATE TABLE heat (
+               id TEXT PRIMARY KEY,
+               hits INTEGER NOT NULL DEFAULT 0,
+               last_hit_at INTEGER
+             );
+             CREATE TABLE recall_log (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               at INTEGER NOT NULL,
+               tool TEXT NOT NULL,
+               query TEXT,
+               hits INTEGER DEFAULT 0,
+               tokens INTEGER DEFAULT 0,
+               agent TEXT,
+               project TEXT
+             );
              CREATE TABLE llm_call (
                at INTEGER NOT NULL,
                prompt_tokens INTEGER DEFAULT 0,
@@ -2117,6 +2327,124 @@ mod tests {
             conn: Mutex::new(conn),
             fts: false,
         }
+    }
+
+    /// 热度是**累计值**，不能被一次索引重建抹掉。
+    ///
+    /// 事故形状：`hit()` 原来只 `UPDATE entries`，而 `rebuild()` 是「清空
+    /// `entries` 再按 `.md` 重写」—— 热度不写 `.md`，于是每次重建都归零。
+    /// 真机上 `access_count > 0` 的条目 0 条，而同期 `search` / `get` 有几十次
+    /// 调用：`search.weightHeat` 那一项恒等于「最近一次重建之后被读过的次数」。
+    ///
+    /// 修法：热度落在 `heat` 表（非派生，重建不动），重建结尾从它回填。
+    #[test]
+    fn heat_survives_a_rebuild() {
+        use crate::server::core::memory::model::MemoryKind;
+        let index = scratch_index();
+        let entry = MemoryEntry::draft("m1", "被读过很多次的结论", MemoryKind::Knowledge, "正文");
+        index.rebuild(std::slice::from_ref(&entry)).unwrap();
+
+        index.hit(&["m1".to_string()]);
+        index.hit(&["m1".to_string()]);
+        // 重复 id 记两次就是两次：「读了几次」不能因为一次请求里出现两遍而打折
+        index.hit(&["m1".to_string(), "m1".to_string()]);
+        let before = index.rows(false);
+        let before_hits = before.iter().find(|row| row.id == "m1").map(|row| row.access_count).unwrap_or(0);
+        assert_eq!(before_hits, 4, "四次命中必须累加成 4");
+
+        // 重建（= 用户点「重建索引」，也是排障第一步）之后热度必须还在
+        index.rebuild(std::slice::from_ref(&entry)).unwrap();
+        let after = index.rows(false);
+        let after_hits = after.iter().find(|row| row.id == "m1").map(|row| row.access_count).unwrap_or(0);
+        assert_eq!(after_hits, before_hits, "重建不能把热度清零");
+    }
+
+    /// 真删除要连热度一起删：否则同 id 重写一条新记忆，它一出生就带着旧阅读量。
+    #[test]
+    fn dropping_an_entry_also_drops_its_heat() {
+        use crate::server::core::memory::model::MemoryKind;
+        let index = scratch_index();
+        let entry = MemoryEntry::draft("m1", "会被彻底删掉", MemoryKind::Knowledge, "正文");
+        index.rebuild(std::slice::from_ref(&entry)).unwrap();
+        index.hit(&["m1".to_string()]);
+        index.drop_one("m1");
+        {
+            let conn = index.conn.lock().unwrap();
+            let left: i64 = conn
+                .query_row("SELECT COUNT(*) FROM heat WHERE id = 'm1'", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(left, 0, "彻底删掉的条目不该留着热度");
+        }
+        // 同 id 重写：新条目必须是干净的 0
+        index.rebuild(std::slice::from_ref(&entry)).unwrap();
+        let rows = index.rows(false);
+        assert_eq!(rows[0].access_count, 0);
+    }
+
+    /// 注入也要留痕：一行 `recall_log` + 每条命中的热度。
+    ///
+    /// 这条是「记忆被用了」链路的闭环证据 —— 没有它，注入成功多少次都只能看
+    /// 那三个原子计数器，而计数器不告诉你「用了哪几条」。
+    #[test]
+    fn trace_inject_records_both_heat_and_recall_log() {
+        use crate::server::core::memory::model::MemoryKind;
+        let index = scratch_index();
+        let entry = MemoryEntry::draft("m1", "这次真被注入的结论", MemoryKind::Knowledge, "正文");
+        index.rebuild(std::slice::from_ref(&entry)).unwrap();
+
+        let traced = index.trace_inject(&["m1".to_string()], "改一下 chat.rs", 412, Some("claude-code"), None);
+        assert!(traced, "索引空闲时必须写得进去");
+
+        {
+            let conn = index.conn.lock().unwrap();
+            let (tool, hits, tokens, agent): (String, i64, i64, Option<String>) = conn
+                .query_row(
+                    "SELECT tool, hits, tokens, agent FROM recall_log ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(tool, "inject");
+            assert_eq!(hits, 1);
+            assert_eq!(tokens, 412);
+            // 归因丢了的话「哪个客户端在读记忆」这个问题又变得无法回答
+            assert_eq!(agent.as_deref(), Some("claude-code"));
+        }
+        let rows = index.rows(false);
+        assert_eq!(rows[0].access_count, 1, "注入命中的条目要加热度");
+    }
+
+    /// 台账必须真的封顶 —— 注入接入后台账是**每请求一行**。
+    ///
+    /// 不封顶的后果不是「库变大」这么轻：`recall_log` 是「记忆被用了」这件事
+    /// 的唯一台账，它被撑爆之后，界面上的近期调用记录会被几十天前的注入刷掉，
+    /// 于是「最近用了哪些记忆」这个问题又变成无解。
+    ///
+    /// 断言不写死上限：上限来自 `auto.logKeepCount`（默认 200），本机配置
+    /// 可能改过。只断言「不超过上限」与「最新那一条还在」。
+    #[test]
+    fn recall_log_stays_capped_and_keeps_the_newest_row() {
+        let index = scratch_index();
+        for i in 0..120 {
+            index.log_recall("search", &format!("q{i}"), 1, 10, None, None);
+        }
+        let keep = crate::server::core::memory::config::usize_of("auto.logKeepCount").max(20);
+        let conn = index.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM recall_log", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            count as usize <= keep,
+            "台账不能超过上限：{count} > {keep}"
+        );
+        let newest: String = conn
+            .query_row(
+                "SELECT query FROM recall_log ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(newest, "q119", "最新的那条不能被剪掉");
     }
 
     /// 「今日消耗」的窗口跟着**本地自然日**走，不是 UTC 24 小时窗口。

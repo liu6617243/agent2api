@@ -369,7 +369,9 @@ static SCHEMA: &[Knob] = &[
         "「事实失效」自动应用的最低置信度（失效判定任务用这个门槛，不是 L4 判重）", "0.8"), 0.0, 1.0),
     unwired(range(knob_d("dedup.l4.batchSize", Kind::Number, Tier::Internal, "去重", "L4 单批条数",
         "本仓未接入 L4：没有分批判重；单批条数由 auto.tasks 里各任务的 batchSize 决定", "20"), 1.0, 50.0)),
-    range(knob("dedup.pendingWarnThreshold", Kind::Number, Tier::Advanced, "去重", "队列积压告警阈值", "50"), 1.0, 999.0),
+    range(knob_d("dedup.pendingWarnThreshold", Kind::Number, Tier::Advanced, "去重", "队列积压告警阈值",
+        "待确认队列超过这个数时界面提示积压；归类巡检也用它，但只数归类自己那一类的 pending（别处的积压不该让归类停摆）",
+        "50"), 1.0, 999.0),
 
     // ===== 待确认队列的自动裁决 =====
     //

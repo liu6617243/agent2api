@@ -468,6 +468,92 @@ fn last_of(task: &str) -> i64 {
 static RUNNING: AtomicBool = AtomicBool::new(false);
 /// 上一轮开始时间（状态页展示「刚刚检查过」）。
 static LAST_TICK: AtomicI64 = AtomicI64::new(0);
+/// 自动轮次上一轮挑中的合并项目（slug）。只用于轮转，不做任何持久化 ——
+/// 重启之后从"条数最多"重新开始也没问题：它不会漏掉项目，只是顺序不同。
+static LAST_CONSOLIDATE: Mutex<Option<String>> = Mutex::new(None);
+
+/// 自动轮次该合并哪个项目。
+///
+/// ── 判据 ────────────────────────────────────────────────────
+/// 1. 只考虑**够合并**的项目（l2 ≥ 4 条，与 `consolidate` 里的门槛同一个数）；
+/// 2. 排除归档项目与 `_global`：归档的项目按定义不再接受整理，
+///    `_global` 是"没归属"的垃圾桶而不是一个真项目；
+/// 3. 按条数降序 —— 合并的收益与条数正相关；
+/// 4. 上一轮选过的那个排到最后，避免同一个项目连续两轮占着机会。
+///
+/// ── 为什么门槛常量要在这里再写一遍 ────────────────────────────
+/// 不共用会不一致（这里放过 3 条的项目，进去又被 `Skipped`，任务每轮空转）；
+/// 但要共用就得把它提成模块常量，而那会让 `consolidate` 里的门槛散在两处。
+/// 4 这个数字是「合并至少需要几个来源」的语义（合并要 ≥2 条来源，而一次要
+/// 找出重复组，池子太小必然找不到），写两遍并互相注释比抽常量更不容易错。
+const CONSOLIDATE_MIN_ITEMS: usize = 4;
+
+fn pick_consolidate_project() -> Option<String> {
+    let entries = store::load_all();
+    let projects = store::load_projects();
+    let last = LAST_CONSOLIDATE.lock().ok().and_then(|slot| slot.clone());
+    let picked = rank_consolidate_projects(&entries, &projects, last.as_deref())?;
+    if let Ok(mut slot) = LAST_CONSOLIDATE.lock() {
+        *slot = Some(picked.clone());
+    }
+    Some(picked)
+}
+
+/// [`pick_consolidate_project`] 的纯判据部分（不碰全局状态，可单测）。
+///
+/// 抽出来是为了能测：这条判据判错的两种后果都不报错 —— 挑到一个不够 4 条的
+/// 项目（任务每轮空转、日志全是「只有 3 条，不够合并」），或者挑到归档项目
+/// （合出来的结论挂在用户已经收起来的项目下）。两种都只能靠读代码发现。
+fn rank_consolidate_projects(
+    entries: &[super::model::MemoryEntry],
+    projects: &[store::Project],
+    last: Option<&str>,
+) -> Option<String> {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for entry in entries {
+        // 与 `consolidate` 的池子口径逐条对齐：可信、l2、非画像。
+        // 少一条判据就会挑出一个"看起来有素材、进去发现不够"的项目。
+        if !entry.is_trusted() || entry.layer != super::Layer::L2 {
+            continue;
+        }
+        if entry.kind == super::MemoryKind::Profile {
+            continue;
+        }
+        let Some(slug) = entry.project.as_deref().map(store::slugify) else { continue };
+        if slug == store::GLOBAL_SLUG {
+            continue;
+        }
+        *counts.entry(slug).or_insert(0) += 1;
+    }
+    // 只留下真实登记过的项目：`projects.json` 里没有的 slug 多半是历史残留
+    //（项目被删、条目还在）。给它们合并会生成一条挂在不存在的项目上的结论。
+    //
+    // 归一化口径必须与 `consolidate` 里那条 `project_matches` 一致（两边都先
+    // `slugify` 再比）。这里直接拿 `project.slug` 原样比，一旦有人手改过
+    // `projects.json`（大写、空格），条目的 slug 会被归一而项目名不会 ——
+    // 两边永远对不上，项目于是永远排不上队，而现象只是「合并任务空转」。
+    let known_slugs: std::collections::HashSet<String> = projects
+        .iter()
+        .filter(|project| !project.archived && project.slug != store::GLOBAL_SLUG)
+        .map(|project| store::slugify(&project.slug))
+        .collect();
+    let known: std::collections::HashSet<&str> =
+        known_slugs.iter().map(|slug| slug.as_str()).collect();
+
+    let mut ranked: Vec<(String, usize)> = counts
+        .into_iter()
+        .filter(|(slug, count)| *count >= CONSOLIDATE_MIN_ITEMS && known.contains(slug.as_str()))
+        .collect();
+    ranked.sort_by(|left, right| {
+        // 上一轮选中的沉底，其余按条数降序；条数相同按 slug 定序（保证稳定）
+        let pinned = |slug: &str| last == Some(slug);
+        pinned(&left.0)
+            .cmp(&pinned(&right.0))
+            .then(right.1.cmp(&left.1))
+            .then(left.0.cmp(&right.0))
+    });
+    ranked.first().map(|(slug, _)| slug.clone())
+}
 
 /// 手动执行请求（管理 API 的「立即执行」）。
 ///
@@ -899,9 +985,18 @@ fn classify_pending(project: Option<&str>) -> Outcome {
     // 带范围调用时两个过滤器互斥，结果恒为空，永远报「没有未归类的记忆」。
     // 参数留着只为与其它任务同形。
     let _ = project;
-    let pending = index::global().review_count();
+    // ── 积压闸只看自己这一类（2026-11-24）────────────────────────
+    // 原来用 `review_count()`（全部 pending）比阈值，本意是"队列堵成这样先别
+    // 再加新建议"。但队列是所有建议共用的一张表：真机 52 条 pending 里 44 条
+    // 是 dedup、6 条 classify、2 条 supersede —— 归类巡检每轮看到"积压 52 条"
+    // 就永久跳过，而那些 dedup 跟它毫无关系。一种建议的积压把另一种任务的巡检
+    // 饿死，这是判据用错了对象。
+    //
+    // 改成只数 `classify` 自己：它的积压闸回答的是"我这类的待确认是不是多到
+    // 该先停下"，别处堵着不影响我继续把线索收进队列。
+    let pending = index::global().review_count_of("classify");
     if pending >= config::usize_of("dedup.pendingWarnThreshold").max(10) {
-        return Outcome::Skipped(format!("待确认已积压 {pending} 条，先处理队列再说"));
+        return Outcome::Skipped(format!("归类建议已积压 {pending} 条，先处理队列再说"));
     }
     let entries = store::load_all();
     let unclassified: Vec<_> = entries
@@ -1677,10 +1772,34 @@ fn supersede_recent(project: Option<&str>) -> Outcome {
 ///
 /// 与 distill 的区别：distill 是「l1 → l2」，consolidate 是「l2 → 更短的 l2」。
 /// 它产出的是**建议**，因为合并会删掉原条目（进回收站），这是不可逆的语义变化。
+///
+/// ── 自动轮次为什么也要能跑（2026-11-24）──────────────────────
+/// 原来这里第一行就是 `let Some(slug) = project else { Skipped }`，而自动
+/// `tick()` 调的是 `run_once(task, None, false)` —— 于是**自动轮次必然跳过**。
+/// 真机 `task_run` 里 `consolidate` 一条记录都没有，而卡片上写着「全库记忆查重：
+/// 自动合并雷同」，这是文案在对用户撒谎。
+///
+/// 修法有两个方向，选了「自动轮次自己挑项目」：
+///   · 让它一次处理全库 —— 会把两个项目的结论搓成一条（合并要生成新正文，
+///     跨项目合并等于把 A 的架构和 B 的架构缝在一起），不能干；
+///   · 自动轮次遍历项目、一次一个 —— 与本函数「一次只合并一个项目」的语义
+///     一致，只是把"挑哪个"从用户手里接过来。
+///
+/// 挑法：**l2 条数最多的那个**（下次轮到第二多，轮转记录在 `LAST_CONSOLIDATE`）。
+/// 为什么不是"按 updated_at 最新"：合并的收益与条数正相关 —— 只有 4 条的项目
+/// 合不出一条有意义的新结论，而 106 条的项目里必然有重复主题。轮转是为了不让
+/// 小项目永远排不上队。
 fn consolidate(project: Option<&str>, manual: bool) -> Outcome {
-    let Some(slug) = project else {
-        return Outcome::Skipped("合并需要指定项目（一次只合并一个项目，避免跨项目串味）".into());
+    let slug = match project {
+        Some(slug) => slug.to_string(),
+        None => match pick_consolidate_project() {
+            Some(slug) => slug,
+            None => {
+                return Outcome::Skipped("没有哪个项目的 l2 够多，暂时不用合并".into());
+            }
+        },
     };
+    let slug = slug.as_str();
     let mut items: Vec<super::model::MemoryEntry> = store::load_all()
         .into_iter()
         // 被反驳的结论不进合并池：合并会删掉原条目，等于把错误洗成一条新结论。
@@ -1867,6 +1986,11 @@ pub fn status() -> Value {
         // 与状态页 `review.pending` 同一个计数（`review_queue` 里 pending 的行），
         // 这里再给一次是因为自动化页不该为了一个数字去拉整个 status。
         "pendingReview": index::global().review_count(),
+        // 待裁决的**分类**积压。总数回答「队列堵没堵」，分类回答「堵在哪」——
+        // 真机 52 条 pending 里 44 条是 dedup、6 条 classify、2 条 supersede：
+        // 只看总数会以为「归类任务不工作」，其实它只被自己那一类的积压拦过。
+        // 现在归类巡检的积压闸也只看自己这一类（见 `classify_pending`）。
+        "pendingReviewByKind": index::global().review_count_by_kind(),
         // 最近几次执行（「任务执行记录」那张表）。**预览只取 10 条** ——
         // 与目标界面同口径：这张表是「刚才发生了什么」的速览，不是全量列表。
         // 早先取 30 条，结果页面被一张表撑到两三屏，下面「待确认裁决」之类
@@ -2079,6 +2203,125 @@ mod tests {
         for task in TASKS {
             assert!(default_interval(task) > 0, "{task} 没有默认间隔");
         }
+    }
+
+    // ── 自动 consolidate 的选题（2026-11-24）────────────────────
+
+    // `project(slug, archived)` 这个构造助手本模块下面已经有一份（后面那条
+    // `path_evidence_beats_name_similarity` 用的就是它），这里不再重复定义 ——
+    // 同名同作用域的两个函数是编译错误（E0428）。
+    // `scripts/precheck-rust.mjs` 的「重复函数」闸门现在按花括号作用域判重，
+    // 能抓到这种同模块内的重名（2026-11-24 补上：它原来只认顶层 fn）。
+
+    fn l2(id: &str, project: Option<&str>) -> super::super::model::MemoryEntry {
+        let mut entry = super::super::model::MemoryEntry::draft(
+            id,
+            format!("结论 {id}"),
+            super::super::model::MemoryKind::Knowledge,
+            "正文",
+        );
+        entry.layer = super::super::model::Layer::L2;
+        entry.project = project.map(str::to_string);
+        entry
+    }
+
+    #[test]
+    fn auto_consolidate_picks_the_fullest_project() {
+        // 自动轮次原来是「必然跳过」（`project = None` 直接被拒），修法是让它
+        // 自己挑。挑错了不会报错，只会每轮合错项目或空转，所以判据要单测。
+        let entries = vec![
+            l2("a1", Some("big")),
+            l2("a2", Some("big")),
+            l2("a3", Some("big")),
+            l2("a4", Some("big")),
+            l2("b1", Some("small")),
+            l2("b2", Some("small")),
+        ];
+        let projects = vec![project("big", false), project("small", false)];
+        assert_eq!(
+            rank_consolidate_projects(&entries, &projects, None).as_deref(),
+            Some("big")
+        );
+    }
+
+    #[test]
+    fn auto_consolidate_skips_projects_that_cannot_merge() {
+        // 3 条的池子进去必然被 `consolidate` 判「不够合并」—— 挑它等于每轮
+        // 白跑一次并往 `task_run` 里刷一行「只有 3 条」。
+        let entries = vec![
+            l2("a1", Some("tiny")),
+            l2("a2", Some("tiny")),
+            l2("a3", Some("tiny")),
+        ];
+        let projects = vec![project("tiny", false)];
+        assert_eq!(rank_consolidate_projects(&entries, &projects, None), None);
+    }
+
+    #[test]
+    fn auto_consolidate_ignores_archived_and_unregistered() {
+        // 归档项目「不再接受整理」；未登记的 slug 是历史残留（项目被删、条目
+        // 还在），给它合并会造一条挂在不存在的项目下的结论。
+        let entries = vec![
+            l2("a1", Some("gone")),
+            l2("a2", Some("gone")),
+            l2("a3", Some("gone")),
+            l2("a4", Some("gone")),
+            l2("b1", Some("archived")),
+            l2("b2", Some("archived")),
+            l2("b3", Some("archived")),
+            l2("b4", Some("archived")),
+        ];
+        let projects = vec![project("archived", true)];
+        assert_eq!(rank_consolidate_projects(&entries, &projects, None), None);
+    }
+
+    #[test]
+    fn auto_consolidate_rotates_away_from_the_last_pick() {
+        // 不轮转的话，条数最多的那个项目会永久占住每一轮，小项目永远排不上队。
+        let mut entries = Vec::new();
+        for index in 0..5 {
+            entries.push(l2(&format!("a{index}"), Some("big")));
+        }
+        for index in 0..4 {
+            entries.push(l2(&format!("b{index}"), Some("second")));
+        }
+        let projects = vec![project("big", false), project("second", false)];
+        assert_eq!(
+            rank_consolidate_projects(&entries, &projects, Some("big")).as_deref(),
+            Some("second"),
+            "上一轮挑中的必须沉底"
+        );
+        // 只有它一个够格时，沉底也得挑它 —— 否则任务永远跳过
+        assert_eq!(
+            rank_consolidate_projects(&entries[..5], &projects, Some("big")).as_deref(),
+            Some("big")
+        );
+    }
+
+    #[test]
+    fn auto_consolidate_counts_only_the_pool_it_will_merge() {
+        // 与 `consolidate` 的池子同口径：l1 / 画像 / `_global` 都不算。
+        // 少一条判据就会挑出一个「看起来有素材、进去发现不够」的项目。
+        let mut l1 = l2("l1a", Some("mixed"));
+        l1.layer = super::super::model::Layer::L1;
+        let mut profile = super::super::model::MemoryEntry::draft(
+            "p1",
+            "画像",
+            super::super::model::MemoryKind::Profile,
+            "正文",
+        );
+        profile.layer = super::super::model::Layer::L2;
+        profile.project = Some("mixed".into());
+        let entries = vec![
+            l1,
+            profile,
+            l2("g1", Some(super::super::store::GLOBAL_SLUG)),
+            l2("g2", Some(super::super::store::GLOBAL_SLUG)),
+            l2("m1", Some("mixed")),
+            l2("m2", Some("mixed")),
+        ];
+        let projects = vec![project("mixed", false)];
+        assert_eq!(rank_consolidate_projects(&entries, &projects, None), None);
     }
 
     #[test]

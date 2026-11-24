@@ -68,7 +68,30 @@ use super::model::{
 };
 use super::store;
 
-/// 注入块的起止标记。
+/// 一次注入的完整产物：插进去的文本 + 它引用了哪几条记忆。
+///
+/// ── 为什么要带 `ids`（2026-11-24）─────────────────────────────
+/// 原来 `compose` 只回一个 `String`。于是注入是**单向**的：把记忆塞进请求，
+/// 但从不记「我塞了哪几条」。真机后果是使用侧完全没有反馈回路 ——
+/// `recall_log` 里只有 `search` / `get`，`access_count > 0` 的条目 **0 条**，
+/// 「注入到底有没有让某些记忆被反复用到」这件事无法回答，`search.weightHeat`
+/// 那一项等于装饰。
+///
+/// 带出 id 之后，注入成功时就能做两件事：写一行检索台账（证明「记忆真的被
+/// 送进去了」）、给这几条记一次热度（让「反复被注入的」在检索里排得更前）。
+#[derive(Debug, Clone)]
+struct Composed {
+    block: String,
+    /// 本次真正进了注入块的条目 id。
+    ///
+    /// 只收「相关经验」与「长期画像」两段，**不收「必须遵守」段**：那一段是
+    /// 每轮无条件送进去的常驻规则（pinned / preference），给它记热度等于给
+    /// 「被钉住」这件事再刷一遍分 —— 热度会被几十条固定条目永久占满，
+    /// 而「这次任务真用上了哪条经验」这个信号就没了。
+    ids: Vec<String>,
+}
+
+/// 注入块的起始标记。
 ///
 /// 用 HTML 注释风格而不是纯文本：万一用户把注入内容贴回聊天里，它也不会被
 /// 当成正常内容渲染出来。同时它也是幂等判据（见模块头）。
@@ -1150,7 +1173,7 @@ pub fn is_internal_origin(user_agent: &str) -> bool {
     user_agent.to_ascii_lowercase().starts_with("agent2api-")
 }
 
-/// 注入次数、尝试次数与累计 token。
+/// 注入次数、尝试次数、累计 token、留痕失败次数。
 ///
 /// ── 为什么需要这三个计数器 ──────────────────────────────────
 /// 「注入到底有没有发生」是这套机制唯一说不清的地方：用户看到的是模型行为，
@@ -1166,12 +1189,20 @@ pub fn is_internal_origin(user_agent: &str) -> bool {
 /// 两种在界面上长得一模一样，而处理方式完全相反。所以再记一个 `attempts`：
 /// `attempts > 0 && count == 0` 才是「没命中」，`attempts == 0` 才是「没跑」。
 ///
-/// 用原子计数而不是往 `recall_log` 写一行：注入挂在每一条转发请求前面，
-/// 一次 SQLite 写入（还要抢索引连接锁）在这个位置太贵。计数够用，细节看
-/// 注入预览。
+/// ── 为什么计数**不能**代替使用痕迹（2026-11-24）───────────────
+/// 这里最早只有原子计数，理由是「注入挂在每一条转发请求前面，一次 SQLite 写入
+/// 太贵」。代价是使用侧完全没有反馈回路：`recall_log` 里永远只有 `search` /
+/// `get`，`access_count > 0` 的条目 0 条 —— 「注入让哪些记忆被反复读到」这个
+/// 问题无法回答。
+///
+/// 现在注入成功会调 [`super::index::MemoryIndex::trace_inject`]，用 `try_lock` +
+/// 单事务写一次（索引忙就放弃，绝不排队）。`untraced` 记的就是「注入成功了但
+/// 没写成台账」的次数：`count - traced` 与它必须对得上，否则「台账比注入次数
+/// 少」又变成一个只能靠猜的现象。
 static INJECT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static INJECT_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static INJECT_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INJECT_UNTRACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn note_attempt() {
     INJECT_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1183,12 +1214,41 @@ fn note_injected(tokens: usize) {
     INJECT_TOKENS.fetch_add(tokens as u64, Ordering::Relaxed);
 }
 
+/// 把「这次注入用了哪几条记忆」落到索引库里（热度 + 检索台账）。
+///
+/// 失败（索引被重建独占）只让计数 +1，不影响注入本身 —— 见
+/// [`super::index::MemoryIndex::trace_inject`] 里对 `try_lock` 的说明。
+///
+/// `composed.ids` 可能为空（只注入了「必须遵守」那一段）：那种情况下仍然写
+/// 台账，只是不记热度 —— 一行 `tool=inject / hits=0` 也是「注入真的发生了」
+/// 的证据，而它恰好是最常见的形状（用户钉了规则但这次请求没命中具体经验）。
+///
+/// ── `project` 为什么传 `None`（2026-11-24）────────────────────
+/// 网关不知道这次请求属于哪个项目 —— 那正是它「只认字符串级命中、不猜项目」
+/// 的原因（见模块头）。而一次注入可能同时命中两个项目的记忆（「这次用了两个
+/// 项目的记忆」不是一个可归因的值）。硬记第一个会误导，所以留空：台账这一行
+/// 的价值是「哪些记忆被用了」，项目归属交给条目本身。
+fn note_traced(composed: &Composed, query: &str, tokens: usize, agent: Option<&str>) {
+    // ── 台账里的 `query` 必须截断（2026-11-24）───────────────────
+    // 注入拿到的可能是**整段对话**（几 KB 到几十 KB），原样写进 `recall_log`
+    // 会把「调用台账」变成「对话存档」—— 台账每请求一行，写满一次对话就把
+    // 整个上限吃掉了，检索记录被挤出去。
+    //
+    // 台账要回答的是「当时在聊什么」，一句开头就够；要看全文，聊天记录本身
+    // 还在，那里才是它的正确落点。
+    let short = truncate_chars(query, 240);
+    if !super::index::global().trace_inject(&composed.ids, &short, tokens, agent, None) {
+        INJECT_UNTRACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// 本次启动以来的注入统计（仪表盘用）。
 pub fn stats() -> Value {
     use std::sync::atomic::Ordering;
     let count = INJECT_COUNT.load(Ordering::Relaxed);
     let tokens = INJECT_TOKENS.load(Ordering::Relaxed);
     let attempts = INJECT_ATTEMPTS.load(Ordering::Relaxed);
+    let untraced = INJECT_UNTRACED.load(Ordering::Relaxed);
     serde_json::json!({
         "count": count,
         "tokens": tokens,
@@ -1198,13 +1258,23 @@ pub fn stats() -> Value {
         // 走过注入逻辑的请求数。`attempts - count` = 没命中的次数
         "attempts": attempts,
         "missed": attempts.saturating_sub(count),
+        // 写进 `recall_log` 的次数与放弃次数：`traced + untraced` 恒等于 `count`。
+        // 分开报是为了让「台账比注入少」这件事能被一眼解释（索引正忙），
+        // 而不是又去怀疑注入坏了。
+        "traced": count.saturating_sub(untraced),
+        "untraced": untraced,
     })
 }
 
 /// 给一段请求文本产出注入块。没有任何相关内容时返回 `None`。
 ///
 /// 纯函数（除了读快照），可以直接单测。
-pub fn compose(request_text: &str) -> Option<String> {
+///
+/// ── 为什么回 [`Composed`] 而不是 `String` ──────────────────────
+/// 调用方（`inject_chat` / `inject_native`）除了要文本，还要知道「这条块引用
+/// 了哪几条记忆」才能写使用痕迹。把它拆成两个函数（再扫一遍全库拿 id）等于
+/// 把同一份打分算两次，而这段代码挂在每条转发请求前面。
+fn compose(request_text: &str) -> Option<Composed> {
     let settings = settings();
     if !settings.enabled || settings.max_tokens == 0 {
         return None;
@@ -1229,9 +1299,9 @@ pub fn compose(request_text: &str) -> Option<String> {
     if let Some(hit) = cache_get(key) {
         return hit;
     }
-    let block = build(&settings, &probes, cjk.as_ref());
-    cache_put(key, block.as_deref());
-    block
+    let composed = build(&settings, &probes, cjk.as_ref());
+    cache_put(key, composed.as_ref());
+    composed
 }
 
 /// 注入结果缓存。
@@ -1253,8 +1323,14 @@ const CACHE_TTL: Duration = Duration::from_secs(60);
 /// 最多记这么多条。一轮对话里线索组合也就十几种，64 足够且不会无限涨。
 const CACHE_MAX: usize = 64;
 
-fn cache() -> &'static Mutex<Vec<(u64, Instant, Option<Arc<String>>)>> {
-    static CACHE: OnceLock<Mutex<Vec<(u64, Instant, Option<Arc<String>>)>>> = OnceLock::new();
+/// 缓存里存的一份注入结果：文本 + 引用到的 id。
+///
+/// `Arc<str>` 存文本是为了让「命中缓存」只做一次引用计数加一，不必把整块
+/// （几百到几千字节）复制一遍 —— 这条路径在每条转发请求前面。
+type Cached = Option<(Arc<str>, Arc<[String]>)>;
+
+fn cache() -> &'static Mutex<Vec<(u64, Instant, Cached)>> {
+    static CACHE: OnceLock<Mutex<Vec<(u64, Instant, Cached)>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
@@ -1290,29 +1366,62 @@ fn cache_key(settings: &Settings, probes: &[String], cjk: Option<&CjkClues>) -> 
     hash
 }
 
-fn cache_get(key: u64) -> Option<Option<String>> {
+/// 从缓存取一份结果。
+///
+/// 返回 `Some(None)` = 「这个键算过了，结论是没东西可注」，`None` = 没这个键。
+/// 这个三态是原先就有的语义，`Cached` 只是把「有结果」那一支从纯文本换成
+/// 「文本 + id」，判据本身没变。
+fn cache_get(key: u64) -> Option<Option<Composed>> {
     let mut guard = cache().lock().ok()?;
     let now = Instant::now();
     guard.retain(|(_, stamp, _)| now.duration_since(*stamp) < CACHE_TTL);
     guard
         .iter()
         .find(|(stored, _, _)| *stored == key)
-        .map(|(_, _, value)| value.as_deref().map(|text| text.to_string()))
+        .map(|(_, _, value)| {
+            value.as_ref().map(|(block, ids)| Composed {
+                block: block.to_string(),
+                ids: ids.to_vec(),
+            })
+        })
 }
 
-fn cache_put(key: u64, value: Option<&str>) {
+fn cache_put(key: u64, value: Option<&Composed>) {
     let Ok(mut guard) = cache().lock() else { return };
     if guard.len() >= CACHE_MAX {
         // 简单淘汰：丢掉最早的那条。不用 LRU —— 缓存的是「同一批线索」，
         // 命中率对淘汰策略不敏感。
         guard.remove(0);
     }
-    guard.push((key, Instant::now(), value.map(|text| Arc::new(text.to_string()))));
+    let stored: Cached = value.map(|composed| {
+        (
+            Arc::from(composed.block.as_str()),
+            Arc::from(composed.ids.clone().into_boxed_slice()),
+        )
+    });
+    guard.push((key, Instant::now(), stored));
 }
 
-fn build(settings: &Settings, probes: &[String], cjk: Option<&CjkClues>) -> Option<String> {
+fn build(settings: &Settings, probes: &[String], cjk: Option<&CjkClues>) -> Option<Composed> {
     let entries = store::snapshot();
+    build_from(settings, probes, cjk, entries.as_slice())
+}
 
+/// [`build`] 的纯函数版本：条目由调用方给。
+///
+/// ── 为什么拆出这一层（2026-11-24）────────────────────────────
+/// 「哪些条目被记了热度」这条判据错了**不会报错** —— 只是热度榜慢慢长歪：
+/// 该记的不记（用过的记忆排不上去），不该记的记（被钉住的规则把热度信号占满）。
+/// 而它原来只能靠真机跑几轮、再去翻索引库才能看出来。
+///
+/// 拆开之后这条判据能直接单测：给一份人造条目，断言进块的是哪几条。
+/// 快照仍由 [`build`] 负责读 —— 读盘是它的事，判据不是。
+fn build_from(
+    settings: &Settings,
+    probes: &[String],
+    cjk: Option<&CjkClues>,
+    entries: &[MemoryEntry],
+) -> Option<Composed> {
     // ── 第一段：必须遵守 ────────────────────────────────────────
     let mut rules: Vec<&MemoryEntry> = entries.iter().filter(|entry| rule_candidate(entry)).collect();
     rules.sort_by(|left, right| {
@@ -1393,6 +1502,8 @@ fn build(settings: &Settings, probes: &[String], cjk: Option<&CjkClues>) -> Opti
     let mut experience_text = String::new();
     let mut experience_used = 0usize;
     let mut picked = 0usize;
+    // 本次真正进了注入块的条目 id（只收经验段与画像段，见 [`Composed::ids`]）。
+    let mut hit_ids: Vec<String> = Vec::new();
     // 已经渲染过的正文（去重第二道闸）：同一条结论可能以两条 l1 碎片存在，
     // 分组键挡不住（两条的摘要尾部措辞略有差异），但渲染出来的行完全一样。
     let mut seen_lines: Vec<String> = Vec::new();
@@ -1432,6 +1543,7 @@ fn build(settings: &Settings, probes: &[String], cjk: Option<&CjkClues>) -> Opti
         experience_text.push('\n');
         experience_used += cost;
         picked += 1;
+        hit_ids.push(entry.id.clone());
         seen_groups.push(group);
         seen_lines.push(rendered);
     }
@@ -1504,6 +1616,7 @@ fn build(settings: &Settings, probes: &[String], cjk: Option<&CjkClues>) -> Opti
         profile_text.push('\n');
         profile_used += cost;
         profile_picked += 1;
+        hit_ids.push(entry.id.clone());
         profile_groups.push(group);
         profile_lines.push(rendered);
     }
@@ -1517,7 +1630,10 @@ fn build(settings: &Settings, probes: &[String], cjk: Option<&CjkClues>) -> Opti
     if body.trim().is_empty() {
         return None;
     }
-    Some(format!("{MARKER}\n{}\n{body}{MARKER_END}", header().trim_end()))
+    Some(Composed {
+        block: format!("{MARKER}\n{}\n{body}{MARKER_END}", header().trim_end()),
+        ids: hit_ids,
+    })
 }
 
 /// 注入块的开头说明。
@@ -1839,18 +1955,30 @@ fn insert_chat(body: &mut Value, block: &str) -> bool {
 /// 「注入有没有发生」和「注入了多少」是两个问题。只回 bool 时，日志里那行
 /// 「已附加记忆块」既不能证明它带了内容（可能是空块），也不能解释「这次请求
 /// 怎么贵了 600 token」。把数字带回去，日志一行就说清了。
-pub fn inject_chat(body: &mut Value) -> Option<usize> {
+///
+/// ── 为什么不回命中的 id ────────────────────────────────────
+/// 使用痕迹（热度 + 台账）在函数内部就写掉了：调用方是转发主链路，它不关心
+/// 「用了哪几条」，把 id 带出去只会让每个调用点都多一次 `Option<Vec<_>>` 的
+/// 解包，而漏解包就等于漏留痕。唯一需要 id 的地方是仪表盘/预览，那走
+/// [`preview`]。
+///
+/// ── `agent` 为什么必须由调用方传 ────────────────────────────
+/// 这里拿不到请求头（只拿到请求体），而 `recall_log.agent` 是「哪个客户端在读
+/// 记忆」的唯一归因字段。写死 `None` 的话，注入这一路的台账在接入页上全部
+/// 归不到任何客户端 —— 与 `mod.rs::core_text_for` 那次修的是同一个问题。
+pub fn inject_chat(body: &mut Value, agent: Option<&str>) -> Option<usize> {
     note_attempt();
     if already_chat(body) {
         return None;
     }
     let text = chat_request_text(body);
-    let block = compose(&text)?;
-    if !insert_chat(body, &block) {
+    let composed = compose(&text)?;
+    if !insert_chat(body, &composed.block) {
         return None;
     }
-    let tokens = estimate_tokens(&block);
+    let tokens = estimate_tokens(&composed.block);
     note_injected(tokens);
+    note_traced(&composed, &text, tokens, agent);
     Some(tokens)
 }
 
@@ -1861,12 +1989,16 @@ pub fn inject_chat(body: &mut Value) -> Option<usize> {
 /// 发送的是 `native.routed(projection)` —— 它只从 Chat 投影里取 `model`，其余
 /// 字段全部来自原生体。所以只在 `chat_body` 上注入，原生转发那一支收不到。
 /// 两处都注，靠 [`MARKER`] 保证只生效一次。
-pub fn inject_native(body: &mut Value, protocol: crate::server::core::protocol::native::WireProtocol) -> Option<usize> {
+pub fn inject_native(
+    body: &mut Value,
+    protocol: crate::server::core::protocol::native::WireProtocol,
+    agent: Option<&str>,
+) -> Option<usize> {
     use crate::server::core::protocol::native::WireProtocol;
     let key = match protocol {
         WireProtocol::Anthropic => "system",
         WireProtocol::Responses => "instructions",
-        WireProtocol::Chat => return inject_chat(body),
+        WireProtocol::Chat => return inject_chat(body, agent),
     };
     note_attempt();
     if already_native(body, key, protocol) {
@@ -1886,12 +2018,13 @@ pub fn inject_native(body: &mut Value, protocol: crate::server::core::protocol::
             serialized
         }
     };
-    let block = compose(&tail)?;
-    if !append_native(body, protocol, key, &block) {
+    let composed = compose(&tail)?;
+    if !append_native(body, protocol, key, &composed.block) {
         return None;
     }
-    let tokens = estimate_tokens(&block);
+    let tokens = estimate_tokens(&composed.block);
     note_injected(tokens);
+    note_traced(&composed, &tail, tokens, agent);
     Some(tokens)
 }
 
@@ -1945,7 +2078,7 @@ pub fn preview(request_text: &str) -> Value {
     // 注入块与候选命中**必须**用同一份请求文本。以前这里塞的是一句占位中文
     // （「未提供请求文本，仅展示『必须遵守』」），而 `probes` 用的是真文本 ——
     // 两边口径不一致。现在中文线索也参与匹配，占位句不能再来冒充请求。
-    let block = compose(request_text);
+    let composed = compose(request_text);
     // 命中的那几条单独扫一遍：`build` 只回拼好的文本，拿不到「差多少分」。
     // 这条接口是用户手点的，多扫一遍全库是几十毫秒，可以接受。
     let probes = probes(request_text);
@@ -2052,8 +2185,12 @@ pub fn preview(request_text: &str) -> Value {
         // 中文检索为 0 条时先看这个数，别再去猜。
         "cjkGrams": cjk.len(),
         "hits": hits,
-        "text": block,
-        "tokens": block.as_deref().map(estimate_tokens).unwrap_or(0),
+        // 这次注入块里真正进了哪几条（经验段 + 画像段）。与 `hits` 不是一回事：
+        // `hits` 是「过线的候选 + 差多少分」，`injectedIds` 是「最终真的写进
+        // 请求的那几条」。两者差得远时说明预算在卡人 —— 那正是用户要调的旋钮。
+        "injectedIds": composed.as_ref().map(|item| item.ids.clone()).unwrap_or_default(),
+        "text": composed.as_ref().map(|item| item.block.clone()),
+        "tokens": composed.as_ref().map(|item| estimate_tokens(&item.block)).unwrap_or(0),
     })
 }
 
@@ -2072,6 +2209,92 @@ mod tests {
         assert!(!is_internal_origin("claude-cli/2.0.1 (external, cli)"));
         assert!(!is_internal_origin("codex_cli_rs/0.51.0"));
         assert!(!is_internal_origin(""));
+    }
+
+    // ── 注入要留下「用了哪几条」的证据（2026-11-24）──────────────
+
+    #[test]
+    fn stats_expose_traced_and_untraced_as_a_partition() {
+        // `traced + untraced` 必须恒等于 `count`：只要这三个数对不上，用户在
+        // 仪表盘上就会看到「注入 137 次 / 台账只有 3 行」这种无法解释的差额，
+        // 而真实原因只是「索引当时正在重建，写台账被跳过了」。
+        let snapshot = stats();
+        let count = snapshot["count"].as_u64().unwrap();
+        let traced = snapshot["traced"].as_u64().unwrap();
+        let untraced = snapshot["untraced"].as_u64().unwrap();
+        assert_eq!(traced + untraced, count, "留痕与放弃必须覆盖每一次注入");
+        assert!(untraced <= count, "放弃次数不可能多于注入次数");
+    }
+
+    #[test]
+    fn injected_ids_cover_experience_and_profile_but_not_pinned_rules() {
+        // 「热度只给这次真正用到的记忆」是 `Composed::ids` 的全部意义。
+        // 这条判据错了不报错，只是热度榜慢慢长歪：该记的不记（用过的记忆排不
+        // 上去），不该记的记（被钉住的规则把热度信号占满，检索里"最常用的"
+        // 全是那几条常驻规则）。
+        //
+        // 三条各占一段，断言三件事：
+        //   · 命中线索的经验条目 → 记热度；
+        //   · 命中线索的画像条目 → 记热度；
+        //   · 被钉住、每轮常驻的「必须遵守」→ 不记热度。
+        let mut rule = MemoryEntry::draft(
+            "rule-1",
+            "改文件前先读文件",
+            MemoryKind::Preference,
+            "改文件前先读文件，别凭记忆改",
+        );
+        rule.pinned = true;
+
+        let mut experience = MemoryEntry::draft(
+            "exp-1",
+            "widget 首屏要等 hydrate",
+            MemoryKind::Pitfall,
+            "widget 首屏渲染必须在 hydrate 之后，否则会白屏",
+        );
+        experience.layer = Layer::L2;
+
+        let mut profile = MemoryEntry::draft(
+            "prof-1",
+            "动手前先跑自检",
+            MemoryKind::Profile,
+            "习惯在动手之前先跑一遍 widget 自检，确认了再改",
+        );
+        profile.layer = Layer::L2;
+
+        let settings = Settings {
+            enabled: true,
+            max_tokens: 2000,
+            rules_tokens: 800,
+            experience_tokens: 800,
+            profile_tokens: 600,
+            max_items: 6,
+            // 关掉路径匹配：不走 `derived_paths()`，这条测试不碰磁盘。
+            path_match: false,
+        };
+        let entries = vec![rule, experience, profile];
+        let composed = build_from(
+            &settings,
+            &["widget".to_string()],
+            None,
+            entries.as_slice(),
+        )
+        .expect("命中了就该有注入块");
+
+        assert!(
+            composed.ids.contains(&"exp-1".to_string()),
+            "进「相关经验」的条目必须记热度，实际：{:?}",
+            composed.ids
+        );
+        assert!(
+            composed.ids.contains(&"prof-1".to_string()),
+            "进「长期画像」的条目必须记热度，实际：{:?}",
+            composed.ids
+        );
+        assert!(
+            !composed.ids.contains(&"rule-1".to_string()),
+            "「必须遵守」是每轮常驻规则，记热度会把热度信号占满，实际：{:?}",
+            composed.ids
+        );
     }
 
     // ── 真机事故回归（attempts=109 / count=0）────────────────────

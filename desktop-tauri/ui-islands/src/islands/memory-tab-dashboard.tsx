@@ -214,9 +214,17 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
                    attempts 一路涨、count 恒为 0，根因是判重逻辑把会话里的
                    MARKER 字面量当成「已注入」直接跳过。修完之后这种形态会
                    重新变成真实的「没命中」，所以数字本身没有特别标注。 */
-                : t('平均 {n} token / 次 · 未命中 {m} 次', {
+                : t('平均 {n} token / 次 · 未命中 {m} 次{trace}', {
                     n: num(status.inject?.avgTokens ?? 0),
                     m: num(status.inject?.missed ?? 0),
+                    /* 「已留痕」= 注入顺手写下的检索台账行数。
+                       没有它只能证明「注入发生过」，证明不了「哪几条记忆被
+                       用了」—— 注入是自动读记忆的入口，不留痕的话使用侧
+                       整条链就没有闭环证据。旧后端没有这个字段，那时显示
+                       一个假的 0 反而会误导，所以整段省略。 */
+                    trace: status.inject?.traced === undefined
+                      ? ''
+                      : t(' · 已留痕 {t} 次', { t: num(status.inject.traced) }),
                   })}
           </div>
         </MetricCard>

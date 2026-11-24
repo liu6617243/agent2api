@@ -214,6 +214,17 @@ export type MemoryStatus = {
     attempts?: number
     /** 走了注入但没命中任何记忆的次数 */
     missed?: number
+    /**
+     * 写进检索台账（`recall_log`）的次数 —— 「记忆真的被读进请求、并且留下了
+     * 痕迹」的次数。
+     *
+     * 有了它，「注入 137 次」才有下半句：这些注入里到底有几次能被事后追查。
+     * `traced + untraced` 恒等于 `count`；`untraced` 非零时说明索引当时正忙
+     * （重建索引会独占连接），那几次注入仍然发生，只是没记账。
+     */
+    traced?: number
+    /** 注入成功但没能记账的次数（索引忙，放弃留痕，绝不阻塞请求） */
+    untraced?: number
   }
   /**
    * 请求后留存的「写回来没有」证据：本次启动以来写回 l1 的轮数、跳过的轮数。
@@ -445,6 +456,14 @@ export type AutoStatus = {
   overBudgetAction: string
   /** 待裁决建议条数（`review_queue` 里 pending 的行）。 */
   pendingReview: number
+  /**
+   * 待裁决建议的**分类**积压（kind → 条数）。
+   *
+   * 总数回答「队列堵没堵」，分类回答「堵在哪」—— 真机 52 条 pending 里
+   * 44 条是 dedup、6 条 classify、2 条 supersede。只看总数会以为「归类任务
+   * 不工作」，其实它只被自己那一类的积压拦过。
+   */
+  pendingReviewByKind?: Record<string, number>
   labels: { task: string; label: string }[]
   tasks: AutoTask[]
   /** 最近 10 条执行记录（预览；展开走 loadAutoRuns）。 */
@@ -1032,6 +1051,16 @@ export type InjectPreview = {
   /** 拼出来的注入块；`null` = 这次不会注入（没有命中） */
   text: string | null
   tokens: number
+  /**
+   * 这次注入块里**真正进了正文**的条目 id（经验段 + 画像段）。
+   *
+   * 与 `hits` 不是一回事：`hits` 是「过线的候选 + 差多少分」，`injectedIds`
+   * 是「最终真的写进请求的那几条」。两者差得远时说明预算在卡人 —— 那正是
+   * 用户要调的旋钮。
+   *
+   * 「必须遵守」那一段不在里面：它是每轮常驻规则，不算「这次用上了哪条」。
+   */
+  injectedIds?: string[]
 }
 
 export function loadProjects(): Promise<{ items: MemoryProject[]; general: MemoryGeneral }> {

@@ -198,9 +198,15 @@ pub async fn chat_completions(
         turn_source = pipeline::TurnSource::of(&payload);
 
         // 返回注入的 token 数（`None` = 没注入）：日志里带上数字，才能一眼看出
-        // 「注入了」和「注入了个空块」的区别，也解释了这次请求贵了多少
+        // 「注入了」和「注入了个空块」的区别，也解释了这次请求贵了多少。
+        //
+        // 第二个参数是客户端身份（`request_source.client`）：注入会写一行
+        // `recall_log`，没有它那一行就归不到任何客户端。
         if let Some(tokens) = crate::server::core::blocking::in_place(|| {
-            crate::server::core::memory::inject::inject_chat(&mut payload)
+            crate::server::core::memory::inject::inject_chat(
+                &mut payload,
+                Some(request_source.client.as_str()),
+            )
         }) {
             logging::verbose(
                 "[Memory]",
