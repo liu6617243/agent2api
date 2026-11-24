@@ -565,6 +565,126 @@ function blankComments(src) {
   return out.join('')
 }
 
+/// 同名函数重复定义（同一文件、模块顶层）。
+///
+/// ── 为什么需要这道闸 ────────────────────────────────────────
+/// 2026-11-24：`memory/mod.rs` 里 `auto_apply` 被整段写了两遍，两份内容逐字
+/// 相同。rustc 报 E0428（the name is defined multiple times），同样在第一个
+/// job 就炸。成因是一次编辑把整块函数连同文档注释一起贴了两遍 —— 这种失误
+/// 肉眼看 diff 时极难发现（两份一模一样，`git diff` 里只是多了一段）。
+///
+/// 只看**列 0** 的 `fn`：`impl` 块与内联 `mod` 里的函数有缩进，同名的 `new` /
+/// `default` 在不同 `impl` 里完全合法，不能报。`#[cfg(test)]` 里的测试函数
+/// 同样有缩进，天然被排除。
+///
+/// ── 平台分支要放过 ──────────────────────────────────────────
+/// 上面这条规则一跑，`backend.rs` / `login.rs` 立刻报出三对「重名」，全都是
+/// `#[cfg(windows)]` 与 `#[cfg(not(windows))]` 成对的实现（同一函数两份，
+/// 各自只在一个平台上参与编译）。这是合法写法，rustc 不会报 E0428。
+///
+/// 所以判据是「**两边都**带 `#[cfg(...)]` 才放过」：
+///   * 两边都有 cfg → 条件互斥的平台/特性分支，放过；
+///   * 只有一边有 cfg → 仍是真错误，另一个配置下就是重名；
+///   * 两边都没有 cfg → 真错误（这次 `auto_apply` 的形态）。
+function scanDuplicateFns(files) {
+  const problems = []
+  for (const file of files) {
+    const mask = maskCode(readFileSync(file, 'utf8'))
+    const lines = mask.split('\n')
+    // 某个顶层函数声明上方紧邻的属性集合（`#[cfg(...)]` 之类）。
+    // 文档注释在 mask 里已被抹成空白，所以「往前跳过空白行」不会跳过属性。
+    const cfgsAbove = (at) => {
+      const found = []
+      let k = at - 1
+      let guard = 0
+      while (k >= 0 && guard < 60) {
+        const text = lines[k].trim()
+        if (text === '') {
+          k -= 1
+          guard += 1
+          continue
+        }
+        const attr = /^#\[[^\]]*\]/.exec(text)
+        if (!attr) break
+        if (/^#\[cfg(?:_attr)?\s*\(/.test(attr[0])) found.push(attr[0])
+        k -= 1
+        guard += 1
+      }
+      return found
+    }
+    const seen = new Map()
+    for (let i = 0; i < lines.length; i += 1) {
+      const hit =
+        /^(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z_]\w*)/.exec(
+          lines[i],
+        )
+      if (!hit) continue
+      const first = seen.get(hit[1])
+      if (first === undefined) {
+        seen.set(hit[1], i + 1)
+        continue
+      }
+      const here = cfgsAbove(i)
+      const there = cfgsAbove(first - 1)
+      if (here.length && there.length) continue
+      problems.push({ file, line: i + 1, name: hit[1], first })
+    }
+  }
+  return problems
+}
+
+/// 括号平衡：`(` `[` `{` 三种是否成对闭合。
+///
+/// ── 为什么必须补这道闸 ──────────────────────────────────────
+/// 2026-11-24：`config.rs` 的 SCHEMA 里多打了一个 `)`（`"false")),` 应为
+/// `"false"),`）。这行改动只是加了一对括号里的一个字符，而上面三道检查
+/// ——结构体字段、mod 路径、字节串——全都不看括号，于是 `npm run precheck`
+/// 一路绿，只有 CI 的 rustc 会在第一个 job 就炸：
+///
+///   error: unexpected closing delimiter: `)`
+///
+/// 本机没有 cargo，CI 是唯一编译权威。一个字符的失误换来一整轮 4 个 job ×
+/// 十几分钟的反馈延迟，而这恰好是纯文本就能查出来的东西。所以在这里补上。
+///
+/// 判据是 `maskCode()` 之后的文本（注释/字符串/字符字面量都已被抹成空格），
+/// 所以中文字符串里的全角括号、注释里的 `//` 都不会干扰计数。
+function scanDelimiters(files) {
+  const pairs = { ')': '(', ']': '[', '}': '{' }
+  const problems = []
+  for (const file of files) {
+    const src = readFileSync(file, 'utf8')
+    const mask = maskCode(src)
+    const stack = []
+    for (let i = 0; i < mask.length; i += 1) {
+      const c = mask[i]
+      if (c === '(' || c === '[' || c === '{') {
+        stack.push({ ch: c, at: i })
+        continue
+      }
+      if (c !== ')' && c !== ']' && c !== '}') continue
+      const top = stack.pop()
+      const line = mask.slice(0, i).split('\n').length
+      if (!top) {
+        problems.push({ file, line, detail: `多出一个 \`${c}\`，此时没有任何未闭合的左括号` })
+        continue
+      }
+      if (top.ch !== pairs[c]) {
+        const openLine = mask.slice(0, top.at).split('\n').length
+        problems.push({
+          file,
+          line,
+          detail: `\`${c}\` 与第 ${openLine} 行的 \`${top.ch}\` 不配对`,
+        })
+      }
+    }
+    for (const left of stack) {
+      const line = mask.slice(0, left.at).split('\n').length
+      problems.push({ file, line, detail: `\`${left.ch}\` 一直没有闭合` })
+    }
+  }
+  return problems
+}
+
 function scanModPaths(files) {
   const { declared, parentOf } = buildModuleTree(files)
   const problems = []
@@ -618,11 +738,19 @@ const types = scanDefinitions(files)
 const problems = scanLiterals(files, types)
 const pathProblems = scanModPaths(files)
 const byteProblems = scanByteStrings(files)
+const delimiterProblems = scanDelimiters(files)
+const dupProblems = scanDuplicateFns(files)
 const rel = file => path.relative(root, file).split(path.sep).join('/')
 
-if (!problems.length && !pathProblems.length && !byteProblems.length) {
+if (
+  !problems.length &&
+  !pathProblems.length &&
+  !byteProblems.length &&
+  !delimiterProblems.length &&
+  !dupProblems.length
+) {
   console.log(
-    `precheck:rust OK — ${files.length} 个文件 / ${types.size} 个类型定义，结构体字面量字段与 mod 路径都没问题。`,
+    `precheck:rust OK — ${files.length} 个文件 / ${types.size} 个类型定义，结构体字面量字段、mod 路径、括号平衡、重复函数都没问题。`,
   )
   process.exit(0)
 }
@@ -646,6 +774,29 @@ for (const item of pathProblems) {
   )
   console.error(
     `    内联 mod 里的 super:: 指回文件模块本身，碰不到兄弟模块；改成 \`super::super::${item.target}::\` 或 \`crate::...::${item.target}::\` 全路径`,
+  )
+}
+
+for (const item of dupProblems) {
+  console.error(
+    `✗ ${rel(item.file)}:${item.line} — 函数 \`${item.name}\` 重复定义（首次在第 ${item.first} 行）`,
+  )
+}
+if (dupProblems.length) {
+  console.error(`\nprecheck:rust 失败：${dupProblems.length} 处同文件重名函数。`)
+  console.error(
+    '这会在 CI 里以 E0428（the name is defined multiple times）编译失败。' +
+      '多半是整段函数被贴了两次 —— 删掉多余的那一份。',
+  )
+}
+for (const item of delimiterProblems) {
+  console.error(`✗ ${rel(item.file)}:${item.line} — ${item.detail}`)
+}
+if (delimiterProblems.length) {
+  console.error(`\nprecheck:rust 失败：${delimiterProblems.length} 处括号不配对。`)
+  console.error(
+    '这会在 CI 里以「unexpected closing delimiter / mismatched closing delimiter」编译失败，' +
+      '而且是 rustc 看到的第一类错误 —— 先把它修了，后面的真错误才轮得到显示。',
   )
 }
 

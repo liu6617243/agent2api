@@ -374,7 +374,7 @@ static SCHEMA: &[Knob] = &[
          蒸馏与合并（只新增一条 l2、幂等可删）不看这个下限，否则 l2 永远长不出来", "0.85"), 0.0, 1.0),
     knob_d("review.autoConfirmSupersede", Kind::Bool, Tier::Advanced, "待确认", "自动确认事实失效",
         "只作用于失效**判定流水本身**（`detect_supersede`，还要 `timeline.requireConfirm` 也关着）。\
-         队列里的 supersede 建议永远不自动裁决：它会让一条真结论变成假的", "false")),
+         队列里的 supersede 建议永远不自动裁决：它会让一条真结论变成假的", "false"),
     knob_d("review.autoConfirmClassify", Kind::Bool, Tier::Advanced, "待确认", "自动确认项目归类",
         "开：归类建议在置信度达到 autoConfirmClassifyThreshold **且目标项目已登记**时自动归入。\
          要求「已登记」是因为 slug 相似度分辨不了同名前缀的项目（agent2api / agent2api-main）",

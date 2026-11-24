@@ -2930,30 +2930,6 @@ fn auto_apply(row: &index::ReviewRow) -> Result<Option<String>, String> {
     Ok(survivor)
 }
 
-/// [`auto_resolve_one`] 的本体：`row` 由调用方给（批扫时已有一份 pending 快照，
-/// 不必按 id 再查一遍）。调用前必须已经过 [`auto_eligible`] —— 这里不再重复判。
-///
-/// 返回 `Ok(Some(id))` 表示落盘成功且幸存者是 `id`（只有 dedup 有这种情况）；
-/// `Ok(None)` 表示落盘成功但「谁留下」不适用（classify / distill 只是改归属或
-/// 新增一条）；`Err` 表示没改成，队列行保持 pending。
-fn auto_apply(row: &index::ReviewRow) -> Result<Option<String>, String> {
-    // 「谁活下来」只有 dedup 需要回答：`keep = candidate` 时幸存者是载荷里那条。
-    let survivor = row
-        .payload
-        .get("candidate")
-        .and_then(Value::as_str)
-        .filter(|_| row.payload.get("keep").and_then(Value::as_str) == Some("candidate"))
-        .map(str::to_string);
-    apply_verdict(row)?;
-    let note = format!("auto-{}", row.kind);
-    index::global().review_resolve(&[row.id], "approved", Some(note.as_str()));
-    crate::server::logging::log(
-        "[Memory]",
-        &format!("自动裁决 {} {}（置信 {:.2}）", row.kind, row.target, row.confidence),
-    );
-    Ok(survivor)
-}
-
 /// 扫一遍队列，把够格的自动裁决掉。
 ///
 /// 供巡检末尾、调度器每轮 tick 与「立即处理」按钮调用。写入路径不走这里 ——
