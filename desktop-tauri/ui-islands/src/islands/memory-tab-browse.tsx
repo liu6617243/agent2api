@@ -124,19 +124,22 @@ function Browse({
    */
   const [editing, setEditing] = React.useState<string | null>(null)
   const [error, setError] = React.useState('')
+  /** 上一轮操作的结果提示（自动裁决剩了几条要人判断）。空串 = 不显示。 */
+  const [notice, setNotice] = React.useState('')
   const [busy, setBusy] = React.useState('')
   /**
    * 批量裁决：勾中的待确认项 id。
    *
-   * ── 为什么是「勾选 + 批量」而不是「全部批准」────────────────
-   * 批准是写操作，四类建议没有一类是纯记录：
-   * - 归类会把记忆文件搬进 `projects/<slug>/`，slug 不存在就**新建目录**；
-   * - 去重 / 事实失效会把一条记忆标记为「被取代」，默认检索从此看不到它；
-   * - 蒸馏 / 合并会新落一条 l2 结论，之后每个请求都会注入它。
+   * ── 这个队列现在的定位 ────────────────────────────────────
+   * 高置信建议已经**不由人裁决**：后端 `auto_resolve` 按类型分档自动落地
+   * （归类要在目标项目已登记时才动、去重只在精确重复或分数够高时才合并、
+   * 事实失效永不自动），留 `resolution = auto-*` 痕迹，全部可逆。所以这一页
+   * 展示的是「判据认为需要你判断的那些」。
    *
-   * 全部批准 = 把「哪条会被搬错、哪条会被埋掉、哪条错知识会长期在线」这三个
-   * 判断一次性交出去。后端也因此只提供批量拒绝（`rejectAll`），没有批量批准。
-   * 所以这里的批量是「你逐条勾出来的那几条」，一次点确认，但每一条都是你选的。
+   * 那为什么还留「勾选 + 批量」而不是「全部批准」：留下的这几条恰恰是判据
+   * 没把握的那些（分数卡在 0.72~0.89 的近似项、指向不存在项目的归类），
+   * 它们之间**没有共性**，一次全批准仍然是把三个判断一次性交出去。
+   * 界面上有「自动处理高置信」按钮，让批量清空变成一件**有判据**的事。
    */
   const [picked, setPicked] = React.useState<Set<number>>(new Set())
   /** 批量执行进度；null = 没在跑。逐条串行，后端一次只认一个 id。 */
@@ -328,6 +331,37 @@ function Browse({
   }
 
   /* ─── 批量裁决 ───────────────────────────────────────────── */
+
+  /**
+   * 自动处理高置信：走后端 `auto_resolve`，够格的落盘、不够格的留在队列。
+   *
+   * 与「批准所选」不是同一件事：这里不碰任何一条「判据说该留给人」的建议，
+   * 也不把「我勾了就表示我读过」这件事假装成判据。结果里 `kept` 就是剩下的
+   * 那些 —— 用户看到「处理了 45 条，剩下 17 条要你判断」才知道该干什么。
+   */
+  const runAutoResolve = async () => {
+    if (batch) return
+    setBusy('__auto__')
+    setError('')
+    try {
+      const result = await m.autoResolveReview(200)
+      review.reload()
+      list.reload()
+      onChanged()
+      if (result.applied > 0) {
+        setNotice(t('自动处理了 {n} 条，队列还剩 {left} 条需要你判断。', {
+          n: result.applied,
+          left: result.kept,
+        }))
+      } else {
+        setNotice(t('这一轮没有够格自动处理的了，剩下的 {left} 条都要你判断。', { left: result.kept }))
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy('')
+    }
+  }
 
   /** 勾选 / 取消一条待确认项。 */
   const togglePicked = (id: number, next: boolean) => {
@@ -764,11 +798,20 @@ function Browse({
         <div className='mm-review-page'>
           <Section
             title={t('待确认（{n}）', { n: review.data?.pending ?? 0 })}
-            hint={t('AI 的建议不会自动落盘。批准才会改数据，拒绝只改队列状态 —— 任何裁决都能反悔。')}
+            hint={t('高置信建议会自动落地（可逆，留 auto 痕迹）；这里显示的是判据认为需要你判断的那些。批准才会改数据，拒绝只改队列状态 —— 任何裁决都能反悔。')}
             action={(
               <div className='mm-row' style={{ gap: 6 }}>
                 <Button type='button' size='sm' variant='ghost' onClick={() => review.reload()}>
                   {t('刷新')}
+                </Button>
+                <Button
+                  type='button'
+                  size='sm'
+                  variant='ghost'
+                  disabled={busy === '__auto__'}
+                  onClick={() => void runAutoResolve()}
+                >
+                  {busy === '__auto__' ? t('处理中…') : t('自动处理高置信')}
                 </Button>
                 <Button
                   type='button'
@@ -781,6 +824,9 @@ function Browse({
               </div>
             )}
           >
+            {notice ? (
+              <div className='mm-muted' style={{ marginBottom: 8 }}>{notice}</div>
+            ) : null}
             {review.loading && !review.data ? <Panel loading error=''>{null}</Panel> : null}
             {review.error ? <Panel loading={false} error={review.error} onRetry={review.reload}>{null}</Panel> : null}
             {/* 队列构成先摆出来：41 条里是「22 条归类 + 10 条失效 + 8 条蒸馏 + 1 条重复」
@@ -793,7 +839,8 @@ function Browse({
             ) : null}
 
             {/* 批量条：勾 → 看清楚构成 → 一次确认。
-                不提供「全部批准」，只提供「批准所选」—— 理由见上面 `picked` 的注释。 */}
+                不提供「全部批准」，只提供「批准所选」（理由见 `picked` 的注释）；
+                要清空队列走右上角「自动处理高置信」—— 那是按判据，不是按勾选。 */}
             {pickable > 0 ? (
               <div className='mm-review-batch'>
                 <Checkbox
@@ -1893,9 +1940,21 @@ function reviewDetail(item: m.ReviewItem, projectSlugs?: Set<string>): string {
     case 'dedup': {
       const candidate = pick('candidate')
       const reason = pick('reason')
-      return candidate
-        ? t('与 {id} 高度相似，批准后本条会被它取代。{reason}', { id: candidate, reason: reason ? `（${reason}）` : '' })
-        : t('疑似重复，但载荷里没有候选 id')
+      const score = typeof payload.score === 'number' ? payload.score : item.confidence
+      const keep = pick('keep')
+      if (!candidate) return t('疑似重复，但载荷里没有候选 id')
+      // 「谁被取代」必须按 `keep` 说，不能默认「本条被取代」：巡检产出的建议
+      // 里 `keep=candidate` 才是主流（candidate 是要留的那条），而写入路径
+      // 在信息量偏向新条时写 `keep=new`，此时被取代的是 candidate。
+      const who = keep === 'candidate'
+        ? t('本条会被它取代')
+        : t('{id} 会被本条取代', { id: candidate })
+      return t('与 {id} 相似度 {n}%：批准后 {who}（不删，演化链可倒回去）。{reason}', {
+        id: candidate,
+        n: Math.round(score * 100),
+        who,
+        reason: reason ? `（${reason}）` : '',
+      })
     }
     case 'classify': {
       const suggestion = pick('suggestion')

@@ -1190,6 +1190,38 @@ impl MemoryIndex {
         mapped.map(|rows| rows.flatten().collect()).unwrap_or_default()
     }
 
+    /// 按 id 精确取一条（含已裁决的）。
+    ///
+    /// ── 为什么不能用 `review_list` 代取 ──────────────────────────
+    /// `review_list` 按 `confidence DESC` 排序并截断：队列积压到几百条时，一条刚
+    /// 入队的低分建议（比如 0.64 的归类）会排在 500 名之后，于是「入队后立刻问
+    /// 一次能不能自动裁决」永远查不到自己那一行 —— 自动裁决在那批建议上静默失效，
+    /// 而失效的表现只是「队列没清」，看起来像判据太严，不像 bug。
+    pub fn review_get(&self, id: i64) -> Option<ReviewRow> {
+        let Ok(conn) = self.conn.lock() else { return None };
+        conn.query_row(
+            "SELECT id, kind, target, payload, confidence, status, created_at, resolved_at, resolution
+               FROM review_queue WHERE id = ?1",
+            params![id],
+            |row| {
+                let payload: String = row.get(3)?;
+                Ok(ReviewRow {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    target: row.get(2)?,
+                    payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+                    confidence: row.get::<_, f64>(4).unwrap_or(0.0),
+                    status: row.get(5)?,
+                    created_at: row.get(6)?,
+                    resolved_at: row.get(7)?,
+                    resolution: row.get(8)?,
+                })
+            },
+        )
+        .ok()
+    }
+
+    /// pending 条数。索引正忙（`try_lock` 失败）时给 0，不排队。
     pub fn review_count(&self) -> usize {
         self.try_review_count().unwrap_or(0)
     }

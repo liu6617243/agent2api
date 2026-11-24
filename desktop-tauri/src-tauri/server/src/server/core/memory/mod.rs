@@ -1406,6 +1406,10 @@ pub fn status_with(with_tables: bool) -> Value {
             // （徽章不出现），页面不会因为这一格挂住。
             "pending": index::global().try_review_count(),
             "warnThreshold": config::usize_of("dedup.pendingWarnThreshold"),
+            // 高置信建议会不会自己落地。界面上「待确认 N 条」的措辞要按它变：
+            // 自动裁决开着时，这个 N 是「需要你判断的」，关着时是「没人处理的」。
+            "autoResolve": config::bool_of("review.autoResolve"),
+            "floor": config::number("review.autoResolveFloor"),
         },
         // 「索引一致」比的是**索引行数 vs 事实源总条数**，不是 vs live。
         // 索引要留着回收站与已取代的行（浏览页的回收站视图就读这些行），
@@ -1720,7 +1724,12 @@ fn write_inner(
     let id = make_id(&content, created_at);
     // 归类建议要用**最终 id** 作 target：早先这里又调了一次 `make_id`，
     // 拿到的 id 与真正落盘的那条不是同一个，于是「批准归类」永远找不到目标
-    if categorized_pending(&classified) {
+    //
+    // 这里**一律入队**，不再看「要不要自动确认」的开关：早先 `review.autoConfirmClassify`
+    // 开着时 `categorized_pending` 返回 false —— 建议既不进队列、也没被应用，
+    // 记忆永远卡在 general，而界面上写着「已开启自动归类」。判据只留一份，
+    // 在 `auto_eligible` 里；入队只是留档，落地由 `auto_resolve_ids` 决定。
+    let pending_classify = if categorized_pending(&classified) {
         index::global().enqueue(
             "classify",
             &id,
@@ -1730,8 +1739,10 @@ fn write_inner(
                 "cwd": input.cwd,
             }),
             classified.confidence,
-        );
-    }
+        )
+    } else {
+        None
+    };
     let title = input
         .title
         .map(|value| value.trim().to_string())
@@ -1783,6 +1794,20 @@ fn write_inner(
         set.insert(entry.hash.clone());
     }
 
+    // ── 归类建议：入队只是留档，够格的当场落地 ────────────────────
+    // 必须在 `save` 之后：`auto_eligible` 的 classify 分支要在快照里查得到
+    // 这条目标记忆，而它在写盘之前根本不存在。
+    if let Some(queued) = pending_classify {
+        if auto_resolve_ids(&[queued]) > 0 {
+            // 自动归入会搬文件、换 project。返回的 entry 必须是搬完之后的形态，
+            // 否则调用方拿到 `project: null`，而记忆已经在 `projects/<slug>/` 里了
+            // —— 同一个响应里两处说法打架，任何拿它做后续判断的调用方都会错。
+            if let Some(fresh) = store::snapshot().iter().find(|item| item.id == entry.id).cloned() {
+                entry = fresh;
+            }
+        }
+    }
+
     // ── 被取代的旧记忆：标 superseded_by（不删 —— 演化链要能倒着走回去）──
     let mut marked = 0usize;
     if !entry.supersedes.is_empty() {
@@ -1804,67 +1829,48 @@ fn write_inner(
         }
     }
 
-    // ── L2 近似去重：只产建议，不动数据。归类错了比不归类更糟，同理，
-    //    判重判错了会 silently 合并两条不同的结论。`review.autoConfirmDedup`
-    //    是唯一的例外，且它**只标取代、不物理删除**（旧条目仍可恢复）──
+    // ── L2 近似去重：入队留档，落不落地由 `auto_eligible` 一处判 ──────
+    //
+    // 早先这里自带一段 `review.autoConfirmDedup && score >= autoMergeThreshold`
+    // 的判定，与队列裁决各走一条路。两条路对「什么算够格」的口径只要有一点
+    // 不同，就会出现「巡检明明 0.93 却没自动合并」这种谁也解释不清的场面。
+    // 现在：**一律入队**（留档 + 可审计），是否当场落地问 `auto_eligible`，
+    // 落地跑的是和人工批准同一个 `apply_verdict`。
     if config::bool_of("dedup.enabled") && config::bool_of("dedup.l2.enabled") && layer == Layer::L2 {
         if let Some((candidate, score)) = near_duplicate(&entry) {
             // 谁留下不由「谁更新」决定，由信息量决定 —— 见 `information_score`。
             // 原来的规则是「新的必赢」，真实场面是隔天的「同上，已修复」把一份
             // 带根因带路径的完整结论顶进回收站，越整理越空。
             let keep = dedup_keeper(&entry, &candidate);
-            let mut merged_into: Option<String> = None;
-            if config::bool_of("review.autoConfirmDedup")
-                && score >= config::number("dedup.l2.autoMergeThreshold")
-            {
-                let result = if keep == DedupKeeper::New {
-                    apply_dedup(&entry.id, &candidate)
-                } else {
-                    // 反向：旧的那条更全，把**本次新写的**标成被它取代。
-                    // 仍然不删新条目 —— 演化链要能倒着走回去。
-                    apply_dedup(&candidate, &entry.id)
-                };
-                match result {
-                    Ok(()) => {
-                        if keep == DedupKeeper::Candidate {
-                            merged_into = Some(candidate.clone());
-                        }
-                    }
-                    Err(error) => {
-                        crate::server::logging::log("[Memory]", &format!("⚠️ 自动采纳去重失败：{error}"));
-                    }
-                }
-            } else {
-                index::global().enqueue(
-                    "dedup",
-                    &entry.id,
-                    &json!({
-                        "candidate": candidate,
-                        "score": score,
-                        // 队列里要能看出「批准后会留哪一条」。只写 candidate 的
-                        // 话，人工裁决时无法判断这次批准是把新条并进去还是反过来。
-                        "keep": if keep == DedupKeeper::New { "new" } else { "candidate" },
-                    }),
-                    score,
-                );
-            }
-            if let Some(into) = merged_into {
+            let queued = index::global().enqueue(
+                "dedup",
+                &entry.id,
+                &json!({
+                    "candidate": candidate,
+                    "score": score,
+                    // 队列里要能看出「批准后会留哪一条」。只写 candidate 的
+                    // 话，人工裁决时无法判断这次批准是把新条并进去还是反过来。
+                    "keep": if keep == DedupKeeper::New { "new" } else { "candidate" },
+                }),
+                score,
+            );
+            // 只处理**刚入队的这一条**，不顺手扫全队列：批量导入是几千次写，
+            // 每次都扫队列会把 O(n) 摊成 O(n²)。返回 `Some(id)` 只在这一条真的
+            // 被并进既有条目时才给 —— 那正是调用方需要换掉响应 id 的唯一情形。
+            if let Some(merged_into) = queued.and_then(auto_resolve_one) {
                 // 这一轮写进去的条目当场就被判成旧结论的旁支。返回既有条目的 id，
                 // 否则调用方拿到的是一个「写了但搜不到」的 id（它已被 superseded
                 // 过滤掉），会以为记忆丢了。
-                //
-                // 只在**真的执行了**反向合并时才提前返回：`autoConfirmDedup` 关着
-                // 的时候上面只入队、什么都不改，此时新条目是活的，必须照常返回。
                 crate::server::logging::log(
                     "[Memory]",
-                    &format!("写入并入 {into}（旧条目信息量更大，本次内容标为被取代）"),
+                    &format!("写入并入 {merged_into}（旧条目信息量更大，本次内容标为被取代）"),
                 );
                 return Ok(json!({
-                    "id": into,
+                    "id": merged_into,
                     "entry": Value::Null,
                     "duplicate": true,
                     "superseded": 0,
-                    "mergedInto": into,
+                    "mergedInto": merged_into,
                 }));
             }
         }
@@ -1888,9 +1894,18 @@ fn write_inner(
     }))
 }
 
-/// 模糊归类的建议要不要进队列。`suggest` 才进 —— 其余结论都是确定的。
+/// 模糊归类的建议要不要进队列。
+///
+/// 只看「这条建议有没有内容可批」，不看「要不要自动确认」：`suggest` 才进 ——
+/// 其余 origin 都是确定结论（显式指名 / git 身份 / 已允许自动建项目）。
+///
+/// ── 为什么把开关从这里拿掉 ──────────────────────────────────
+/// 早先这里还串了 `!config::bool_of("review.autoConfirmClassify")`，于是那个
+/// 开关开着时：建议不入队（`enqueue` 不执行），同时也没有任何地方去应用它 ——
+/// 记忆永远留在 general，而设置页写着「已开启自动归类」。开关是真的，动作是
+/// 不存在的。现在开关只作用于 [`auto_eligible`]，入队一律发生（留档）。
 fn categorized_pending(classified: &Classified) -> bool {
-    classified.origin == "suggest" && classified.suggestion.is_some() && !config::bool_of("review.autoConfirmClassify")
+    classified.origin == "suggest" && classified.suggestion.is_some()
 }
 
 /// 标题兜底：第一段非空、非标题行；全篇都是标题时退回第一个标题。
@@ -2478,15 +2493,16 @@ pub fn trash_list() -> Value {
 /// 中间可能关过去重、也可能换过归一化强度 —— 所以「当时没判成重复」的那些
 /// 会一直留在库里，越导越多。这个巡检就是补那一步。
 ///
-/// ── 为什么只产建议不自动合并 ────────────────────────────────
-/// 判重判错的代价是**静默丢掉一条不同的结论**，而且用户不会知道。所以这里只
-/// 往 `review_queue` 塞 `dedup` 建议，由人在浏览页逐条点头。`dedup.l2.autoMergeThreshold`
-/// 这条自动通道仍然保留给写入路径 —— 那里两边都是「刚写下来的」，语境更近。
-///
 /// ── 为什么先按 hash 分组再进近似判定 ────────────────────────
 /// 精确重复（同一段话导了两遍）占绝大多数，且 O(n) 就能抓干净。先分组把这一
 /// 大批一次性解决掉，剩下的才进 O(n²) 的词面比较 —— 否则每次巡检都要对所有
 /// 活条目两两算 Dice + Levenshtein，库上千条就会卡住整个进程。
+///
+/// ── 巡检产出的建议里，哪些会当场落地 ────────────────────────
+/// 全部先入队（留档），然后跑一次 [`auto_resolve`]：精确重复（score 1.0）在
+/// `auto_eligible` 里无条件放行，所以「同一段话导了两遍」这一大批会在巡检
+/// 结束时就消失；近似项要过 `dedup.l2.autoMergeThreshold`（默认 0.9），
+/// 0.72~0.89 那一段仍然留在队列里等人 —— 它们的分歧在信息量，不在措辞。
 pub fn dedup_scan() -> Value {
     if !config::bool_of("dedup.enabled") {
         return json!({
@@ -2604,6 +2620,13 @@ pub fn dedup_scan() -> Value {
     }
 
     bump_revision();
+    // ── 巡检结束后把够格的当场处理掉 ────────────────────────────
+    // 不这么做的话，「巡检」这个动作只是把库里已有的重复从「看不见」变成
+    // 「队列里躺着」，用户点一次巡检得到的仍然是一个更长的队列。精确重复
+    // （score 1.0）在 `auto_eligible` 里无条件放行，所以至少这一大批是当场
+    // 消失的 —— 剩下真正需要人看的才是 0.72~0.89 的近似项。
+    let auto = auto_resolve(500);
+    let applied = auto.get("applied").and_then(Value::as_u64).unwrap_or(0);
     crate::server::logging::log(
         "[Memory]",
         &format!("全库去重巡检：扫 {scanned} 条，精确重复 {exact}，近似 {near}"),
@@ -2614,6 +2637,7 @@ pub fn dedup_scan() -> Value {
         "exact": exact,
         "near": near,
         "queued": queued,
+        "autoApplied": applied,
         "pending": index::global().review_count(),
     })
 }
@@ -2638,93 +2662,379 @@ pub fn review_list(status: Option<&str>, kind: Option<&str>, limit: usize) -> Va
     })
 }
 
-/// 裁决一条建议。`approve` 为真时按建议内容落盘：
+/// 裁决一条建议（人工入口）。`approve` 为真时按建议内容落盘：
 ///
 /// * `classify` —— 把记忆搬进建议的项目
-/// * `dedup` —— 把新条目取代旧条目（旧条目进回收站，可恢复）
+/// * `dedup` —— 把信息量小的一条标成被取代（不删）
 /// * `supersede` —— 标记旧事实失效
 /// * `conflict` —— 保留当前版本，清掉冲突记录
 ///
 /// 拒绝只改队列状态，不动数据。**永不物理删除**：任何裁决都可以反悔。
 pub fn review_resolve(id: i64, approve: bool) -> Result<Value, String> {
-    let rows = index::global().review_list(None, None, 500);
-    let row = rows
-        .into_iter()
-        .find(|row| row.id == id)
+    // 按 id 精确取：`review_list` 会截断到 500 条，队列积压时点「批准」会报
+    // 「找不到待确认项」—— 而那条明明就在页面上。
+    let row = index::global()
+        .review_get(id)
         .ok_or_else(|| format!("找不到待确认项 {id}"))?;
     if row.status != "pending" {
         return Ok(json!({ "id": id, "status": row.status, "already": true }));
     }
     if approve {
-        match row.kind.as_str() {
-            "classify" => {
-                let slug = row
-                    .payload
-                    .get("suggestion")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if !slug.is_empty() {
-                    apply_classification(&row.target, slug)?;
-                }
-            }
-            "dedup" => {
-                let candidate = row
-                    .payload
-                    .get("candidate")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if !candidate.is_empty() {
-                    // 方向由载荷里的 `keep` 决定：`candidate` = 库里那条更全，
-                    // 把 `target`（新写的）并进去；其余（含老载荷没这个键）沿用
-                    // 「新条取代候选」的旧语义。裁决错了会把一份完整结论埋掉，
-                    // 所以这里不能靠猜。
-                    //
-                    // 生产端必须显式写 `keep`：`dedup_scan` 两轮入队原来都漏了这个
-                    // 键，而它给的 `candidate` 恰恰是要保留的那条 —— 按旧语义处理
-                    // 会把幸存者标成「已被取代」。
-                    let keep_candidate = row
-                        .payload
-                        .get("keep")
-                        .and_then(Value::as_str)
-                        .map(|value| value == "candidate")
-                        .unwrap_or(false);
-                    if keep_candidate {
-                        apply_dedup(candidate, &row.target)?;
-                    } else {
-                        apply_dedup(&row.target, candidate)?;
-                    }
-                }
-            }
-            "supersede" => {
-                // 载荷里两个 id 都带：`oldId` 是被取代的那条，`newId` 是取代者。
-                // 早先这里只读一个叫 `superseded` 的键，而 `detect_supersede`
-                // 写的是 `oldId` —— 于是「批准失效」永远什么都没做却照样标记成功。
-                let old_id = row
-                    .payload
-                    .get("oldId")
-                    .and_then(Value::as_str)
-                    .or_else(|| row.payload.get("superseded").and_then(Value::as_str))
-                    .unwrap_or_default();
-                let new_id = row
-                    .payload
-                    .get("newId")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&row.target);
-                if !old_id.is_empty() {
-                    apply_supersede(new_id, old_id)?;
-                }
-            }
-            "distill" | "consolidate" => apply_derived(&row.payload)?,
-            _ => {}
-        }
+        apply_verdict(&row)?;
     }
-    index::global().review_resolve(&[id], if approve { "approved" } else { "rejected" }, Some(if approve { "manual" } else { "manual-reject" }));
+    index::global().review_resolve(
+        &[id],
+        if approve { "approved" } else { "rejected" },
+        Some(if approve { "manual" } else { "manual-reject" }),
+    );
     bump_revision();
     Ok(json!({ "id": id, "approved": approve, "type": row.kind }))
 }
 
-/// 批量拒绝（「全部忽略」）。不批量批准：一批建议里几乎必然有一条是错的，
+/// 把一条建议落盘。人工批准与自动批准共用这一份 —— 两条路各写一遍的话，
+/// 「自动合并的方向」与「人工批准的方向」迟早会漂开，而漂开的表现是
+/// 「我点了批准，结果要留的那条被埋了」。
+fn apply_verdict(row: &index::ReviewRow) -> Result<(), String> {
+    match row.kind.as_str() {
+        "classify" => {
+            let slug = row
+                .payload
+                .get("suggestion")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !slug.is_empty() {
+                apply_classification(&row.target, slug)?;
+            }
+        }
+        "dedup" => {
+            let candidate = row
+                .payload
+                .get("candidate")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !candidate.is_empty() {
+                // 方向由载荷里的 `keep` 决定：`candidate` = 库里那条更全，
+                // 把 `target`（新写的）并进去；其余（含老载荷没这个键）沿用
+                // 「新条取代候选」的旧语义。裁决错了会把一份完整结论埋掉，
+                // 所以这里不能靠猜。
+                //
+                // 生产端必须显式写 `keep`：`dedup_scan` 两轮入队原来都漏了这个
+                // 键，而它给的 `candidate` 恰恰是要保留的那条 —— 按旧语义处理
+                // 会把幸存者标成「已被取代」。
+                let keep_candidate = row
+                    .payload
+                    .get("keep")
+                    .and_then(Value::as_str)
+                    .map(|value| value == "candidate")
+                    .unwrap_or(false);
+                if keep_candidate {
+                    apply_dedup(candidate, &row.target)?;
+                } else {
+                    apply_dedup(&row.target, candidate)?;
+                }
+            }
+        }
+        "supersede" => {
+            // 载荷里两个 id 都带：`oldId` 是被取代的那条，`newId` 是取代者。
+            // 早先这里只读一个叫 `superseded` 的键，而 `detect_supersede`
+            // 写的是 `oldId` —— 于是「批准失效」永远什么都没做却照样标记成功。
+            let old_id = row
+                .payload
+                .get("oldId")
+                .and_then(Value::as_str)
+                .or_else(|| row.payload.get("superseded").and_then(Value::as_str))
+                .unwrap_or_default();
+            let new_id = row
+                .payload
+                .get("newId")
+                .and_then(Value::as_str)
+                .unwrap_or(&row.target);
+            if !old_id.is_empty() {
+                apply_supersede(new_id, old_id)?;
+            }
+        }
+        "distill" | "consolidate" => apply_derived(&row.payload)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+// ── 自动裁决 ─────────────────────────────────────────────────
+
+/// 一条建议够不够格「不等人工点头、直接落地」。
+///
+/// ── 为什么是「按类型分档」而不是一个总阈值 ────────────────────
+/// 四类建议的写操作后果不是一个量级：
+///
+/// * `classify` 移动文件、`dedup` 标取代 —— 都**不改内容**，且都能倒着走回去
+///   （改回 project / 演化链），错了顶多是一条记忆放错抽屉；
+/// * `supersede` 让一条事实**变成假的** —— 这是唯一会让检索少一条真结论的类型，
+///   判错没有外部信号能纠正它。所以它永远不自动。
+/// * `distill` / `consolidate` 只**新增** l2，靠内容哈希幂等，删掉即回原样，
+///   默认就该落地（否则 l2 永远长不出来，见 `review.autoConfirmDistill`）。
+///
+/// ── 为什么 classify 还要额外要求「slug 已登记」────────────────
+/// `classify` 的置信度来自 `name_similarity` 的词面比，它对「两个项目名只差一个
+/// 词」几乎没有分辨力（真机上 `agent2api` 与 `agent2api-main` 能到 0.9+）。
+/// 允许它在高置信下自动，前提是目标项目**已经在注册表里** —— 用户的意图已经
+/// 表过一次态；否则一次模糊命中就会凭空建出一个项目目录，把人越分越乱。
+///
+/// ── 为什么 dedup 的 0.72~0.89 不自动 ──────────────────────────
+/// 真机抽样里 0.72 那一对是「最小字节补丁」与「坚持最小字节改动」，同一件事的
+/// 两次表述里带着不同的具体字节值 —— 合并会丢掉其中一份。0.9 以上才是
+/// 「同一段结论被重写了一遍」。精确重复（同 hash，score 1.0）没有这种风险。
+///
+/// `projects` 由调用方给而不是在这里 `load_projects()`：批扫 500 行时每次都读
+/// 一遍 `projects.json` 就是 500 次磁盘读，而这个文件在一轮扫描里不会变。
+///
+/// ── 全局门槛 `review.autoResolveFloor` 只作用于改已有记忆的两类 ──
+/// classify / dedup 判错的代价是「一条记忆放错抽屉 / 一条结论被埋」，所以除了
+/// 各自类型的阈值，还要过一道全局下限。distill / consolidate 不设下限：它们的
+/// confidence 是模型给的 `importance`（真机上大量在 0.5~0.8），而这两类只**新增**
+/// 一条 l2、靠内容哈希幂等 —— 门槛压在这上面就是 `review.autoConfirmDistill`
+/// 那段注释写过的死结：导入 2341 条后 l2 还是 9 条。
+fn auto_eligible(row: &index::ReviewRow, projects: &[store::Project]) -> bool {
+    if !config::bool_of("review.autoResolve") {
+        return false;
+    }
+    match row.kind.as_str() {
+        "classify" => {
+            if !config::bool_of("review.autoConfirmClassify") {
+                return false;
+            }
+            if row.confidence < config::number("review.autoResolveFloor") {
+                return false;
+            }
+            let slug = row
+                .payload
+                .get("suggestion")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if slug.is_empty() || !classify_score_ok(row.confidence, config::number("review.autoConfirmClassifyThreshold")) {
+                return false;
+            }
+            // 目标条目必须还在、还没被别的裁决动过（已删 / 已被取代 / 已归到
+            // 同一个项目：再批一次只会白搬一遍文件）。
+            let Some(target) = store::snapshot().iter().find(|entry| entry.id == row.target).cloned() else {
+                return false;
+            };
+            if !target.is_trusted() || target.project.as_deref() == Some(slug) {
+                return false;
+            }
+            // slug 必须已经在注册表里 —— 用户的意图已经表过一次态。
+            projects.iter().any(|project| project.slug == slug)
+        }
+        "dedup" => {
+            if !config::bool_of("review.autoConfirmDedup") {
+                return false;
+            }
+            if row.confidence < config::number("review.autoResolveFloor") {
+                return false;
+            }
+            let candidate = row
+                .payload
+                .get("candidate")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if candidate.is_empty() {
+                return false;
+            }
+            // `keep` 缺失时 `apply_verdict` 会退回「新条取代候选」的老语义，
+            // 而扫描产出的建议里 `candidate` 才是要留的那条 —— 方向不明就不动。
+            let Some(score) = dedup_score_of(&row.payload, row.confidence) else {
+                return false;
+            };
+            if !dedup_score_ok(score, config::number("dedup.l2.autoMergeThreshold")) {
+                return false;
+            }
+            // 两条都还活着、都是 l2 —— 已经被人判错或已删的不再自动动它。
+            let all = store::snapshot();
+            let live = |id: &str| {
+                all.iter()
+                    .any(|entry| entry.id == id && entry.is_trusted() && entry.layer == Layer::L2)
+            };
+            live(&row.target) && live(candidate)
+        }
+        "distill" | "consolidate" => config::bool_of("review.autoConfirmDistill"),
+        // supersede 让事实变假；conflict 要留哪一侧必须看内容。都不自动。
+        _ => false,
+    }
+}
+
+/// 归类建议的置信度够不够格自动搬。`threshold` 由配置给，这里只做比较 ——
+/// 纯函数才能单测，而配置读取会让测试依赖测试机上的 `config.json`。
+fn classify_score_ok(confidence: f64, threshold: f64) -> bool {
+    confidence >= threshold
+}
+
+/// 去重建议的分数，以及「方向是否明确」。`None` = 载荷里没有 `keep`（老载荷或
+/// 生产端漏写），方向不明 → 一律不自动。
+///
+/// 为什么把 `keep` 的存在性与分数绑在一个函数里：这两件事对裁决是**同一个
+/// 问题** ——「批准后会发生什么」必须毫无歧义地由载荷决定，缺任何一半都不该
+/// 让机器自己动手。分开判的话，将来加一个「分数够高就默认方向」的捷径很容易
+/// 被顺手写进来，而那条捷径的代价是把正主埋掉。
+fn dedup_score_of(payload: &Value, confidence: f64) -> Option<f64> {
+    payload.get("keep").and_then(Value::as_str)?;
+    Some(payload.get("score").and_then(Value::as_f64).unwrap_or(confidence))
+}
+
+/// 分数够不够格自动合并。精确重复（同 hash 导了两遍）没有信息损失，无条件放行；
+/// 近似项要过 `dedup.l2.autoMergeThreshold`（默认 0.9）。
+fn dedup_score_ok(score: f64, merge_threshold: f64) -> bool {
+    score >= 0.999 || score >= merge_threshold
+}
+
+/// 自动裁决一条（已入队）建议。返回 `Some(留下的 id)` 表示**真的改了数据**，
+/// 调用方（写入路径）靠它决定是否要把响应里的 id 换成幸存者。
+///
+/// 队列行无论如何都会被标成 `approved` + `resolution = auto-<kind>`：留档是
+/// 「这条为什么会变」的唯一线索，删掉它就等于让一次自动写操作无声无息 ——
+/// 事后要反悔时，人得先找得到它。
+fn auto_resolve_one(id: i64) -> Option<String> {
+    // 按 id 精确取，不用 `review_list` 代取：后者按置信度排序并截断，积压到
+    // 几百条时刚入队的低分建议排在 500 名之外，自动裁决会静默失效（见
+    // `index::review_get` 的注释）。
+    let row = index::global().review_get(id)?;
+    if row.status != "pending" {
+        return None;
+    }
+    let projects = store::load_projects();
+    if !auto_eligible(&row, &projects) {
+        return None;
+    }
+    auto_apply(&row).ok().flatten()
+}
+
+/// [`auto_resolve_one`] 的本体：`row` 由调用方给（批扫时已有一份 pending 快照，
+/// 不必按 id 再查一遍）。调用前必须已经过 [`auto_eligible`] —— 这里不再重复判。
+///
+/// 返回 `Ok(Some(id))` 表示落盘成功且幸存者是 `id`（只有 dedup 有这种情况）；
+/// `Ok(None)` 表示落盘成功但「谁留下」不适用（classify / distill 只是改归属或
+/// 新增一条）；`Err` 表示没改成，队列行保持 pending。
+fn auto_apply(row: &index::ReviewRow) -> Result<Option<String>, String> {
+    // 「谁活下来」只有 dedup 需要回答：`keep = candidate` 时幸存者是载荷里那条。
+    let survivor = row
+        .payload
+        .get("candidate")
+        .and_then(Value::as_str)
+        .filter(|_| row.payload.get("keep").and_then(Value::as_str) == Some("candidate"))
+        .map(str::to_string);
+    apply_verdict(row)?;
+    let note = format!("auto-{}", row.kind);
+    index::global().review_resolve(&[row.id], "approved", Some(note.as_str()));
+    crate::server::logging::log(
+        "[Memory]",
+        &format!("自动裁决 {} {}（置信 {:.2}）", row.kind, row.target, row.confidence),
+    );
+    Ok(survivor)
+}
+
+/// [`auto_resolve_one`] 的本体：`row` 由调用方给（批扫时已有一份 pending 快照，
+/// 不必按 id 再查一遍）。调用前必须已经过 [`auto_eligible`] —— 这里不再重复判。
+///
+/// 返回 `Ok(Some(id))` 表示落盘成功且幸存者是 `id`（只有 dedup 有这种情况）；
+/// `Ok(None)` 表示落盘成功但「谁留下」不适用（classify / distill 只是改归属或
+/// 新增一条）；`Err` 表示没改成，队列行保持 pending。
+fn auto_apply(row: &index::ReviewRow) -> Result<Option<String>, String> {
+    // 「谁活下来」只有 dedup 需要回答：`keep = candidate` 时幸存者是载荷里那条。
+    let survivor = row
+        .payload
+        .get("candidate")
+        .and_then(Value::as_str)
+        .filter(|_| row.payload.get("keep").and_then(Value::as_str) == Some("candidate"))
+        .map(str::to_string);
+    apply_verdict(row)?;
+    let note = format!("auto-{}", row.kind);
+    index::global().review_resolve(&[row.id], "approved", Some(note.as_str()));
+    crate::server::logging::log(
+        "[Memory]",
+        &format!("自动裁决 {} {}（置信 {:.2}）", row.kind, row.target, row.confidence),
+    );
+    Ok(survivor)
+}
+
+/// 扫一遍队列，把够格的自动裁决掉。
+///
+/// 供巡检末尾、调度器每轮 tick 与「立即处理」按钮调用。写入路径不走这里 ——
+/// 它只处理自己刚入队的那一条（见 `auto_resolve_one`），否则批量导入几千次写
+/// 就会变成几千次全队列扫描。
+///
+/// `limit` 上限 500：积压是每天几百条的稳态，扫不完的部分下一轮继续；一次
+/// 处理太多会让自动任务的可观测时长失控。
+pub fn auto_resolve(limit: usize) -> Value {
+    let rows = index::global().review_list(Some("pending"), None, limit.clamp(1, 500));
+    // `projects.json` 一轮扫一遍就够：`auto_eligible` 里每次读盘会在 500 行上
+    // 变成 500 次文件读，而这份注册表在一轮扫描里不会变。
+    let projects = store::load_projects();
+    let mut scanned = 0usize;
+    let mut applied: Vec<Value> = Vec::new();
+    let mut kept = 0usize;
+    for row in &rows {
+        scanned += 1;
+        if !auto_eligible(row, &projects) {
+            kept += 1;
+            continue;
+        }
+        let entry = json!({ "id": row.id, "type": row.kind, "confidence": row.confidence, "target": row.target });
+        match auto_apply(row) {
+            Ok(_) => applied.push(entry),
+            // 落盘失败：行还是 pending，人在队列里点一次就能看到真实报错。
+            Err(_) => kept += 1,
+        }
+    }
+    if !applied.is_empty() {
+        bump_revision();
+        crate::server::logging::log(
+            "[Memory]",
+            &format!("自动裁决 {} 条，留在队列 {} 条", applied.len(), kept),
+        );
+    }
+    json!({
+        "scanned": scanned,
+        "applied": applied.len(),
+        "appliedItems": applied,
+        "kept": kept,
+        "pending": index::global().review_count(),
+    })
+}
+
+/// 对一批**刚入队**的建议做自动裁决，返回真的落地了几条。
+///
+/// 与 [`auto_resolve`] 的分工：这个只处理调用方点名的 id（写入路径、巡检的
+/// 新建议），`auto_resolve` 扫全队列。分开是因为写入路径是热路径 —— 批量导入
+/// 几千次写，每次扫全队列会把 O(n) 摊成 O(n²)；而它只需要管自己刚产生的那条。
+pub fn auto_resolve_ids(ids: &[i64]) -> usize {
+    if ids.is_empty() || !config::bool_of("review.autoResolve") {
+        return 0;
+    }
+    // 一次取齐：`auto_eligible` 的 classify 分支要查注册表，逐条读盘会在
+    // 「一次巡检 20 条新建议」上变成 20 次文件读。
+    let projects = store::load_projects();
+    let mut applied = 0usize;
+    for id in ids {
+        // 逐条按 id 取（`review_get`），不走 `review_list`：刚入队的建议在排序里
+        // 可能排到 500 名之外，见 `index::review_get` 的注释。这里是 O(1) 索引查询，
+        // 不是全表扫。
+        let Some(row) = index::global().review_get(*id) else { continue };
+        if row.status != "pending" || !auto_eligible(&row, &projects) {
+            continue;
+        }
+        if auto_apply(&row).is_ok() {
+            applied += 1;
+        }
+    }
+    if applied > 0 {
+        bump_revision();
+    }
+    applied
+}
+
+/// 批量拒绝（「全部忽略」）。不批量**批准**：一批建议里几乎必然有一条是错的，
 /// 而错的那条会把记忆搬进错误项目，代价远高于逐条点多几下。
+///
+/// 「逐条点」这件事对单条高频场合是负担，所以真正的答案是 [`auto_resolve`]：
+/// 够格的自动落地（留 `auto-*` 痕迹、可反悔），不够格的才在这里等人。
 pub fn review_reject_all(kind: Option<&str>) -> Value {
     let changed = index::global().review_reject_all(kind);
     bump_revision();
@@ -3770,5 +4080,49 @@ mod tests {
         assert_eq!((live, candidates, refuted_n), (4, 2, 2));
         assert_eq!(live - candidates - refuted_n, 0, "相减会少算一条：交集被扣两次");
         assert_ne!(live - candidates - refuted_n, trusted, "所以分母不能由前端算");
+    }
+
+    // ── 自动裁决的判据（纯函数部分）──────────────────────────────
+    //
+    // `auto_eligible` 自己要读 `config::bool_of` 与真实记忆根，单测环境不保证
+    // 有；所以把「分档」拆成三个纯函数逐条钉住 —— 判据本身漏一条，自动裁决就
+    // 会去动它不该动的东西，而那种错误是静默的。
+
+    #[test]
+    fn classify_needs_the_high_threshold_not_the_fuzzy_one() {
+        // 模糊归类的门槛是 0.62，自动搬家的门槛是 0.95：这两个数字差得远是
+        // 故意的 —— 前者决定「值得问一句」，后者决定「不问了，直接搬」。
+        assert!(!classify_score_ok(0.64, 0.95), "0.64 只够进队列，不够自动搬");
+        assert!(!classify_score_ok(0.94, 0.95));
+        assert!(classify_score_ok(0.95, 0.95));
+        assert!(classify_score_ok(1.0, 0.95));
+    }
+
+    #[test]
+    fn dedup_without_keep_is_never_auto() {
+        // 方向没写清楚的建议一律不自动：老载荷没有 `keep`，`apply_verdict` 会按
+        // 「新条取代候选」处理，而巡检给的 `candidate` 恰恰是该留的那条 ——
+        // 自动合并一条方向不明的建议，等于把正主标成「已被取代」。
+        let payload = json!({ "candidate": "old", "score": 1.0 });
+        assert!(dedup_score_of(&payload, 1.0).is_none());
+
+        let payload = json!({ "candidate": "old", "score": 0.72, "keep": "candidate" });
+        assert_eq!(dedup_score_of(&payload, 0.72), Some(0.72));
+
+        // 没有 score 时退回队列行的 confidence（`enqueue` 传的就是它）。
+        let payload = json!({ "keep": "candidate" });
+        assert_eq!(dedup_score_of(&payload, 0.91), Some(0.91));
+    }
+
+    #[test]
+    fn dedup_auto_merge_lets_exact_duplicates_through() {
+        // 同一段话导两遍（score 1.0）没有信息损失，阈值再高也该放行；而
+        // 0.723 那种「同一件事的两次表述」不自动 —— 真机上它带着不同的字节值，
+        // 合并会丢掉其中一份。
+        assert!(dedup_score_ok(1.0, 1.0));
+        assert!(dedup_score_ok(0.932, 0.9));
+        assert!(dedup_score_ok(0.9, 0.9));
+        assert!(!dedup_score_ok(0.892, 0.9));
+        assert!(!dedup_score_ok(0.723, 0.9));
     }
 }

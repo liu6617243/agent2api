@@ -14,7 +14,7 @@
 //! GET  /api/memory/projects    项目列表（含 l1/l2 计数与注册表字段）
 //! GET  /api/memory/status      自检（含表行数、队列积压、设备 id）
 //! GET  /api/memory/review      待确认队列（?status=pending&type=dedup）
-//! POST /api/memory/review      裁决（{id, approve} 或 {rejectAll: true}）
+//! POST /api/memory/review      裁决（{id, approve} / {rejectAll: true} / {autoResolve: true}）
 //! GET  /api/memory/calls       内部 LLM 调用台账（?limit=100）
 //! GET  /api/memory/auto        自动化：调度器状态 + 11 个任务的节奏与累计统计
 //! POST /api/memory/auto/task   改一个任务的开关 / 节奏（返回刷新后的整份状态）
@@ -292,6 +292,13 @@ pub async fn post_review(State(_state): State<ServerState>, body: Bytes) -> Resp
     if payload.get("rejectAll").and_then(Value::as_bool).unwrap_or(false) {
         let kind = payload.get("type").and_then(Value::as_str);
         return ok_json(memory::review_reject_all(kind));
+    }
+    // 批量自动裁决（「自动处理高置信」）：跑的是和后台 tick 同一条 `auto_resolve`，
+    // 不是「全批准」。够格的落盘、不够格的留在队列 —— 所以按钮能把队列清到
+    // 「只剩需要你判断的」，而不是「一条不剩」。
+    if payload.get("autoResolve").and_then(Value::as_bool).unwrap_or(false) {
+        let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(200).clamp(1, 500) as usize;
+        return ok_json(memory::auto_resolve(limit));
     }
     let Some(id) = payload.get("id").and_then(Value::as_i64) else {
         return errors::management_error(400, "缺少 id");

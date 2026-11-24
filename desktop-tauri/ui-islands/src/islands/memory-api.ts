@@ -193,7 +193,7 @@ export type MemoryStatus = {
    */
   agents: { called: number; injected: number }
   projects: number
-  review: { pending: number | null; warnThreshold: number }
+  review: { pending: number | null; warnThreshold: number; autoResolve?: boolean; floor?: number }
   /**
    * `count` / `inSync` 可能是 `null`：索引被重建或打开时压缩独占着那条全局
    * 连接，后端**不会排队**（否则整页会卡到网关 60 秒超时），而是给 `null`。
@@ -1225,6 +1225,25 @@ export function resolveReview(id: number, approve: boolean): Promise<{ ok: boole
 
 export function rejectAllReview(): Promise<{ rejected: number }> {
   return api('POST', '/api/memory/review', { rejectAll: true })
+}
+
+/**
+ * 批量自动裁决：够格的建议当场落盘，不够格的**留在队列**。
+ *
+ * 与 `rejectAllReview` 的区别是「批准 vs 忽略」，与「全部批准」的区别是
+ * 「按判据」vs「按勾选」：这里不碰任何一条本来会进人工队列的建议。后端跑的
+ * 就是后台 tick 用的同一条 `memory::auto_resolve`。
+ */
+export type AutoResolveResult = {
+  scanned: number
+  applied: number
+  appliedItems: { id: number; type: string; confidence: number; target: string }[]
+  kept: number
+  pending: number
+}
+
+export function autoResolveReview(limit = 200): Promise<AutoResolveResult> {
+  return api('POST', '/api/memory/review', { autoResolve: true, limit })
 }
 
 export function runAutoTask(task: string, project?: string): Promise<{ task: string; outcome: Outcome }> {

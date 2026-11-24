@@ -356,13 +356,34 @@ static SCHEMA: &[Knob] = &[
         "本仓未接入 L4：没有分批判重；单批条数由 auto.tasks 里各任务的 batchSize 决定", "20"), 1.0, 50.0)),
     range(knob("dedup.pendingWarnThreshold", Kind::Number, Tier::Advanced, "去重", "队列积压告警阈值", "50"), 1.0, 999.0),
 
-    // ===== 待确认队列的自动确认（默认全关）=====
+    // ===== 待确认队列的自动裁决 =====
+    //
+    // ── 为什么默认开 ────────────────────────────────────────────
+    // 队列曾经是「闸门」：建议进来，人不点就一直躺着，30 天后被 `review_expire`
+    // 无声作废。真机上的用法是「全选 → 确定」——闸门没筛掉任何东西，只把每一条
+    // 建议**推迟**了一个月，然后丢掉。而四类建议的写操作全部可逆（搬文件、
+    // 标取代、新增 l2，没有任何一类物理删除），可逆的东西不该当闸门。
+    //
+    // 所以改成「按类型分档 + 高置信自动落地」：明显该做的当场做掉，留
+    // `resolution = auto-*` 痕迹；剩下的才进队列。判据见 `auto_eligible`。
+    knob_d("review.autoResolve", Kind::Bool, Tier::Basic, "待确认", "高置信建议自动落地",
+        "开：够格的建议当场落盘并记 `auto-*` 痕迹（全部可逆）；关：一律只入队等人点头。\
+         关掉后队列会重新积压 —— 归类和去重都不会自己发生", "true"),
+    range(knob_d("review.autoResolveFloor", Kind::Number, Tier::Advanced, "待确认", "自动裁决最低置信",
+        "低于这个分数的归类 / 去重建议一律留给人。只作用于「改已有记忆」的两类 —— \
+         蒸馏与合并（只新增一条 l2、幂等可删）不看这个下限，否则 l2 永远长不出来", "0.85"), 0.0, 1.0),
     knob_d("review.autoConfirmSupersede", Kind::Bool, Tier::Advanced, "待确认", "自动确认事实失效",
-        "建议产生后立即按推荐标记旧事实失效，不再等人工点头", "false"),
+        "只作用于失效**判定流水本身**（`detect_supersede`，还要 `timeline.requireConfirm` 也关着）。\
+         队列里的 supersede 建议永远不自动裁决：它会让一条真结论变成假的", "false")),
     knob_d("review.autoConfirmClassify", Kind::Bool, Tier::Advanced, "待确认", "自动确认项目归类",
-        "归类建议产生后立即按推荐归入对应项目", "false"),
+        "开：归类建议在置信度达到 autoConfirmClassifyThreshold **且目标项目已登记**时自动归入。\
+         要求「已登记」是因为 slug 相似度分辨不了同名前缀的项目（agent2api / agent2api-main）",
+        "true"),
+    range(knob_d("review.autoConfirmClassifyThreshold", Kind::Number, Tier::Advanced, "待确认",
+        "归类自动确认阈值", "低于它仍然进队列。词面相似度的 0.98 也未必对，所以门槛给得很高", "0.95"), 0.3, 1.0),
     knob_d("review.autoConfirmDedup", Kind::Bool, Tier::Advanced, "待确认", "自动确认去重采纳",
-        "去重建议产生后立即按推荐采纳新记忆；永不物理删除", "false"),
+        "开：精确重复（同 hash）与分数达到 dedup.l2.autoMergeThreshold 的近似项自动合并；\
+         只标取代、不物理删除，旧条目仍可恢复", "true"),
     // ── 蒸馏结论默认直接落地（与上面三条相反，故意的）──────────
     //
     // 上面三条默认关，因为它们改的是**已有记忆**（搬项目、标失效、合并重复），

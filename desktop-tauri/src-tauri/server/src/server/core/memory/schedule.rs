@@ -582,6 +582,26 @@ fn tick() {
     }
     // 队列过期与回收站清理跟着 cleanup 一起做，但即使 cleanup 关着也要清队列：
     // 一条 pending 建议躺了 30 天还在，只会让「待确认 128 条」永远降不下来
+    // ── 队列收尾：先自动裁决够格的，再让超期的归档 ─────────────────
+    //
+    // 顺序不能反：超期归档（`review_expire`）会把 pending 直接标成 expired ——
+    // 一条 0.99 的精确重复如果恰好在第 31 天被人想起来，它已经「过期」了，
+    // 而它原本可以被自动处理掉。先扫一遍能自动的，剩下的才谈过期。
+    //
+    // 每轮 tick（60 秒）都扫是故意的：旧建议是用户在队列里翻到的，不是
+    // 等下一轮巡检才出现。`TICK` 的间隔远大于一次 500 行的 `review_list`。
+    let swept = super::auto_resolve(200);
+    let applied = swept.get("applied").and_then(Value::as_u64).unwrap_or(0);
+    if applied > 0 {
+        crate::server::logging::log(
+            "[Memory]",
+            &format!(
+                "队列自动裁决 {applied} 条（扫 {}，仍待人工 {}）",
+                swept.get("scanned").and_then(Value::as_u64).unwrap_or(0),
+                swept.get("kept").and_then(Value::as_u64).unwrap_or(0),
+            ),
+        );
+    }
     let expired = index::global().review_expire(30);
     if expired > 0 {
         crate::server::logging::log("[Memory]", &format!("过期待确认建议已归档 {expired} 条"));
@@ -907,6 +927,7 @@ fn classify_pending(project: Option<&str>) -> Outcome {
         .map(|row| row.target)
         .collect();
     let mut suggested = 0usize;
+    let mut queued_ids: Vec<i64> = Vec::new();
     for entry in unclassified.iter().copied() {
         if known.contains(&entry.id) {
             continue;
@@ -914,15 +935,30 @@ fn classify_pending(project: Option<&str>) -> Outcome {
         let Some((slug, confidence)) = best_project_match(entry, &projects, threshold) else {
             continue;
         };
-        let _ = index::global().enqueue(
+        if let Some(id) = index::global().enqueue(
             "classify",
             &entry.id,
             &json!({ "suggestion": slug, "confidence": confidence, "foundBy": "scan" }),
             confidence,
-        );
+        ) {
+            queued_ids.push(id);
+        }
         suggested += 1;
     }
-    Outcome::Done(json!({ "unclassified": unclassified.len(), "suggested": suggested }))
+    // ── 入队后立刻问一次「够不够格自动归」────────────────────────
+    // 这条路以前只入队，于是每小时把同一批建议重新确认一遍、队列只增不减
+    // （真机 17 条 classify 躺了好几天没人点）。判据在 `auto_eligible`，这里
+    // 不另写一份 —— 两处独立维护必然漂开，「巡检说该自动处理的，队列里却一直
+    // 留着」就是这么来的。
+    //
+    // 批末统一扫一次，不是每条扫一次：`auto_resolve_ids` 每次要读一遍 pending
+    // 快照，放进循环就是每轮 20 次 `review_list`。
+    let auto = super::auto_resolve_ids(&queued_ids);
+    Outcome::Done(json!({
+        "unclassified": unclassified.len(),
+        "suggested": suggested,
+        "autoApplied": auto,
+    }))
 }
 
 /// 一条未归类记忆最像哪个已登记项目。

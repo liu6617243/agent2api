@@ -37,7 +37,8 @@ Call memory_core once at the start of a session to load the long-term picture; \
 call memory_search when the user refers to earlier work or an earlier decision, and memory_get to read an entry in full. \
 After finishing a task or making a decision, call memory_write with the reasoning, the trade-offs and the pitfalls — not the volatile code details. Prefer type=decision/knowledge/pitfall so the entry lands in l2; use type=daily only for raw session notes. \
 Use `supersedes` to retire an entry that is no longer true, `validTo` to state that a fact only holds until a date, and `files` to anchor entries to relative file paths so stale-memory warnings can fire. \
-Never approve review items yourself: memory_review_list shows suggestions (dedup, project classification, stale facts) and memory_review_resolve needs the user's explicit go-ahead. \
+Review items (`memory_review_list`) are suggestions the user has not decided on: high-confidence ones are applied automatically, the rest are kept for the user. \
+Do not resolve review items on the user's behalf with memory_review_resolve unless the user explicitly asks — the queue exists for the cases no rule could settle. \
 The code on disk is the only current truth: memory is history, intent and warnings, never a snapshot of the present. \
 Read the actual files before editing them, and never revert working code back to an older memory.";
 
@@ -246,7 +247,7 @@ fn spec_tools() -> Vec<Value> {
         json!({
             "name": "memory_review_list",
             "title": "待确认建议",
-            "description": "List pending suggestions the store wants a human decision on: duplicate candidates, project classification guesses, facts that look superseded. Read-only; nothing has been applied yet.",
+            "description": "List suggestions that are still waiting for a human decision: duplicate candidates, project classification guesses, facts that look superseded. High-confidence ones are applied automatically (recorded as `auto-*`), so what stays here is the cases no rule could settle. Read-only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -261,7 +262,7 @@ fn spec_tools() -> Vec<Value> {
         json!({
             "name": "memory_review_resolve",
             "title": "裁决建议",
-            "description": "Approve or reject one pending suggestion. Requires the user's explicit consent — do not call this on your own initiative. Approving a dedup marks the older entry superseded (recoverable from trash); approving a classify moves the entry to the suggested project.",
+            "description": "Approve or reject one suggestion by hand — for the cases the automatic rules could not settle. Do not call this on your own initiative; ask the user first. Approving a dedup marks one entry superseded (nothing is deleted, the evolution chain can be walked back); approving a classify moves the entry to the suggested project.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
