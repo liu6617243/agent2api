@@ -718,9 +718,26 @@ mod tests {
 
     #[test]
     fn instructions_forbid_self_approving_reviews() {
-        // 模型不该自己批准「这条记忆作废」
+        // 模型不该自己批准「这条记忆作废」。
+        //
+        // ── 断言为什么换过说法（2026-11-24）───────────────
+        // 原文案是「Never approve review items yourself」，写这句话的时候队列
+        // 里所有建议都要人点头，模型代批等于绕过唯一的闸门。现在队列改成按
+        // 类型自动裁决：够格的在写入时就被规则落掉了（记 `auto-*` 痕迹），
+        // 留在队列里的恰恰是「规则判不了」的那部分 —— 更需要人看，而不是更不需要。
+        //
+        // 所以约束本身没变，只是理由从「那是唯一的闸门」变成「那是规则的漏网项」。
+        // 断言盯住这条约束的**行为**（不许代批 + 点名 must mention 用户明确要求），
+        // 而不是某一句具体措辞，改文案时不会误报。
         let text = spec().instructions.to_lowercase();
-        assert!(text.contains("never approve review items yourself"));
+        assert!(
+            text.contains("do not resolve review items on the user's behalf"),
+            "instructions 必须明确禁止模型代替用户裁决队列：{text}"
+        );
+        assert!(
+            text.contains("unless the user explicitly asks"),
+            "禁止代批必须留「用户明确要求」这一个例外：{text}"
+        );
     }
 
     #[test]
