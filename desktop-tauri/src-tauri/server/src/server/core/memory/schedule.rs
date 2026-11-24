@@ -932,13 +932,22 @@ fn classify_pending(project: Option<&str>) -> Outcome {
         if known.contains(&entry.id) {
             continue;
         }
-        let Some((slug, confidence)) = best_project_match(entry, &projects, threshold) else {
+        let Some((slug, confidence, evidence)) = best_project_match(entry, &projects, threshold) else {
             continue;
         };
+        // ── 只有路径证据才入队 ──────────────────────────────────
+        // 标签/标题命中（`Mention`）不进队列，理由见 `ClassifyEvidence`：真机上
+        // 这批全是「在讨论某个项目」，归进去就是把别人的架构笔记记成自己的活。
+        // 不入队不等于丢掉线索：`suggested` 照样计数，日志里能看出「这轮有多少
+        // 条提到了某个项目」，只是不产出需要人点头的条目。
+        if evidence == ClassifyEvidence::Mention {
+            suggested += 1;
+            continue;
+        }
         if let Some(id) = index::global().enqueue(
             "classify",
             &entry.id,
-            &json!({ "suggestion": slug, "confidence": confidence, "foundBy": "scan" }),
+            &json!({ "suggestion": slug, "confidence": confidence, "foundBy": "scan", "evidence": evidence.as_str() }),
             confidence,
         ) {
             queued_ids.push(id);
@@ -961,33 +970,85 @@ fn classify_pending(project: Option<&str>) -> Outcome {
     }))
 }
 
-/// 一条未归类记忆最像哪个已登记项目。
+/// 归类线索的强度。决定「能不能自动搬」，也决定「值不值得进队列」。
+///
+/// ── 为什么必须分等级，而不是一个分数 ──────────────────────────
+/// 真机实测把这件事钉死了：562 个记忆文件里带 `files` 的有 81 条，而路径段命中
+/// 已登记项目目录的是 **0 条** —— `files` 存的是 `src/server/...` 这类仓库内相对
+/// 路径，从来不含项目目录名。于是巡检只剩标签和标题可用。而 279 条未归类条目里，
+/// 靠标签/标题能凑出 13 条「像某项目」的建议 —— 逐条看下去全是这种：
+///
+///   `agenthub几万条对比` / `AgentHub画像设计` / `AgentHub记忆分层` / `AgentHub`
+///   标题「画像不是深层记忆：它是 l2 的下游产物，不进 mem 表」
+///
+/// 讲的全是**这个项目是怎么设计的**，也就是「我们在讨论 agenthub」，而不是
+/// 「这些是我们给 agenthub 干的活」。把它们归档进 `projects/agenthub/`，等于
+/// 把「读别人的代码写的心得」记进「给别人干的活」。
+///
+/// 区别不在分数高低，在**证据类型**：路径是「这条记忆落在这个仓库的哪个文件」——
+/// 唯一能证明归属的东西；标题/标签里的词只说明「这条在讲什么」。前者能自动，
+/// 后者只能当一句提示，而且提示量大了就是纯噪音。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClassifyEvidence {
+    /// `files` 里的路径段命中项目目录：可自动归档
+    Path,
+    /// 只有标签 / 标题提到项目名：只说明在讲它，不该自动也不该入队
+    Mention,
+}
+
+impl ClassifyEvidence {
+    fn as_str(self) -> &'static str {
+        match self {
+            ClassifyEvidence::Path => "path",
+            ClassifyEvidence::Mention => "mention",
+        }
+    }
+}
+
+/// 一条未归类记忆最像哪个已登记项目，以及凭什么。
 ///
 /// 取「最像的那一项线索」而不是全部平均：一条记忆挂十个文件时，只有路径里
 /// 带项目名的那一个是有证据的，其余都是背景噪音 —— 平均会把证据摊薄到阈值
 /// 以下，于是明明有线索也发不出建议。
+///
+/// ── 路径优先，且路径一旦命中就不再退回标签 ──────────────────
+/// 两级证据不是「加权平均」而是「有高等级就不用低等级」：路径命中是事实，
+/// 标签命中是措辞。两者混在一起打分的话，一个写得很长的复合标签会靠字符串
+/// 包含关系压过一条真实的路径证据。
 fn best_project_match(
     entry: &super::model::MemoryEntry,
     projects: &[store::Project],
     threshold: f64,
-) -> Option<(String, f64)> {
-    let mut hints: Vec<String> = Vec::new();
+) -> Option<(String, f64, ClassifyEvidence)> {
+    // ── 第一级：`files` 的路径段 ────────────────────────────────
+    // 只认路径里出现的项目目录名，不比文件名：`lib.rs` / `index.ts` 到处都是，
+    // 拿它当线索等于给每条记忆都发一张「像某个项目」的通行证。
+    let mut path_hits: Vec<String> = Vec::new();
     for file in &entry.files {
-        let path = std::path::Path::new(file);
-        if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
-            hints.push(stem.to_string());
-        }
-        // 目录段也要：项目身份通常写在目录上（`agent2api/src/...`），
-        // 文件名本身（`lib.rs`、`index.ts`）几乎没有辨识度。
-        for part in path.components() {
+        for part in std::path::Path::new(file).components() {
             if let std::path::Component::Normal(segment) = part {
-                hints.push(segment.to_string_lossy().to_string());
+                path_hits.push(segment.to_string_lossy().to_string());
             }
         }
     }
-    hints.extend(entry.tags.iter().cloned());
+    if let Some((slug, score)) = best_of(&path_hits, projects, threshold) {
+        return Some((slug, score, ClassifyEvidence::Path));
+    }
+
+    // ── 第二级：标签与标题 ──────────────────────────────────────
+    // 这一级只在「有路径但不命中」时才跑到。它的用途是把建议摆到人眼前，
+    // 不是替人做决定 —— 见 `ClassifyEvidence` 的说明。
+    let mut hints: Vec<String> = entry.tags.clone();
     if !entry.title.is_empty() {
         hints.push(entry.title.clone());
+    }
+    best_of(&hints, projects, threshold).map(|(slug, score)| (slug, score, ClassifyEvidence::Mention))
+}
+
+/// 在一组线索里找最像的项目。`threshold` 以下是「都不像」。
+fn best_of(hints: &[String], projects: &[store::Project], threshold: f64) -> Option<(String, f64)> {
+    if hints.is_empty() {
+        return None;
     }
     let mut best: Option<(String, f64)> = None;
     for project in projects {

@@ -339,8 +339,23 @@ static SCHEMA: &[Knob] = &[
     knob_d("dedup.l2.preferRicher", Kind::Bool, Tier::Advanced, "去重", "留信息量更大的那条",
         "开：两条近似重复时，正文更长 / 标签更全 / 带代码与证据的那条留下，另一条标为被取代。\
          关：退回「新条取代旧条」—— 隔天补一句「同上」就可能把完整结论埋掉", "true"),
-    range(knob("dedup.l2.autoMergeThreshold", Kind::Number, Tier::Advanced, "去重", "L2 自动合并阈值", "0.9"), 0.5, 1.0),
+    range(knob_d("dedup.l2.autoMergeThreshold", Kind::Number, Tier::Advanced, "去重", "L2 自动合并阈值",
+        "近似项进入自动合并判定的最低相似分。**0.72 而不是 0.9** —— 它只回答「值得比一比吗」；\
+         「合了会不会丢东西」由旁边的 mergeMinCoverage 判。相似分只看措辞像不像，分不清\
+         「同一件事写了两遍」和「两件相关的事」。真机 44 对的相似分全在 0.72~0.89，\
+         阈值 0.9 时一条都没触发；降到 0.72 后交由覆盖率筛掉真正会丢信息的那些", "0.72"), 0.5, 1.0),
+    range(knob_d("dedup.l2.mergeMinCoverage", Kind::Number, Tier::Advanced, "去重", "自动合并最低覆盖率",
+        "短边正文被长边覆盖的 token 比例下限。**这是自动合并的安全闸**，但它量的是「正文主体」——\
+         「证据：」那段被剔除。理由：同一批流水压出来的记忆证据列表几乎逐字相同，算进去等于用\
+         「它们出处相同」冒充「它们说的是同一件事」；真机实测每对因此虚高 0.03~0.34，\
+         连「事故复盘清单化」vs「前端选型」这种无关配对都被抬到 0.378。剔除后 44 对的分布\
+         出现断层（0.042 → 0.204 → 0.304），0.20 落在最宽断层里。低于它仍会进队列，\
+         但自动路径会给它连一条「相关」边、两条都留 —— 连边不动正文，可反悔", "0.20"), 0.1, 1.0),
     range(knob("dedup.l2.candidateThreshold", Kind::Number, Tier::Advanced, "去重", "L2 候选阈值", "0.72"), 0.3, 1.0),
+    range(knob_d("dedup.l2.relateMinScore", Kind::Number, Tier::Internal, "去重", "连边最低相似分",
+        "两条近似项不够格合并时，至少到这个分数就连一条「相关」边、两条都留。\
+         连边是纯新增（不动正文、不标取代），所以门槛远低于合并 —— 但也不能低到\
+         「同项目任意两条」，那会把关联图撑成完全图", "0.72"), 0.3, 1.0),
     range(knob("dedup.l2.wDice", Kind::Number, Tier::Internal, "去重", "L2 集合相似度权重", "0.5"), 0.0, 1.0),
     range(knob("dedup.l2.wEdit", Kind::Number, Tier::Internal, "去重", "L2 编辑距离权重", "0.3"), 0.0, 1.0),
     range(knob("dedup.l2.wTitle", Kind::Number, Tier::Internal, "去重", "L2 标题权重", "0.2"), 0.0, 1.0),
@@ -369,9 +384,24 @@ static SCHEMA: &[Knob] = &[
     knob_d("review.autoResolve", Kind::Bool, Tier::Basic, "待确认", "高置信建议自动落地",
         "开：够格的建议当场落盘并记 `auto-*` 痕迹（全部可逆）；关：一律只入队等人点头。\
          关掉后队列会重新积压 —— 归类和去重都不会自己发生", "true"),
-    range(knob_d("review.autoResolveFloor", Kind::Number, Tier::Advanced, "待确认", "自动裁决最低置信",
-        "低于这个分数的归类 / 去重建议一律留给人。只作用于「改已有记忆」的两类 —— \
-         蒸馏与合并（只新增一条 l2、幂等可删）不看这个下限，否则 l2 永远长不出来", "0.85"), 0.0, 1.0),
+    // ── 这里原本有一个 `review.autoResolveFloor`（默认 0.85），已删除 ──
+    //
+    // 它是一道「全局最低置信」，挂在归类与去重两条判据之上。删掉的理由不是它
+    // 写错了，而是它**回答的问题和另外两把尺子重复，而它只有数字**：
+    //
+    //   · 去重：`enqueue` 传的 `confidence` 就是相似分本身，于是 floor 0.85 与
+    //     合并阈值 0.72 叠在同一件事上，真正生效的是更高的那个。用户在界面上
+    //     把合并阈值改到 0.72，行为一点不变 —— 真机 44 对的相似分全在 0.72~0.89，
+    //     就是被这一层挡住的，一条自动裁决都没触发。风险本来就该由
+    //     `dedup.l2.mergeMinCoverage` 判（「合了会不会丢东西」），不该由
+    //     「两个字符串有多像」的别名再投一次票。
+    //   · 归类：真机数据把根因钉在**证据类型**上，不在分数（6 条待归类全是
+    //     「标签/标题提到 agenthub」，讲的是「我们在讨论它」）。只看分数的话，
+    //     一条置信 0.95 的「提及」照样会被搬错抽屉。判据改成了路径证据。
+    //
+    // 留着一个没有读取点的旋钮，比删掉更坏：界面上能改、改完没反应，用户只会
+    // 怀疑整个配置页在骗人。所以整条删掉，语义分别下沉到
+    // `review.autoConfirmClassifyThreshold` 与 `dedup.l2.*` 三把尺子。
     knob_d("review.autoConfirmSupersede", Kind::Bool, Tier::Advanced, "待确认", "自动确认事实失效",
         "只作用于失效**判定流水本身**（`detect_supersede`，还要 `timeline.requireConfirm` 也关着）。\
          队列里的 supersede 建议永远不自动裁决：它会让一条真结论变成假的", "false"),
@@ -380,10 +410,14 @@ static SCHEMA: &[Knob] = &[
          要求「已登记」是因为 slug 相似度分辨不了同名前缀的项目（agent2api / agent2api-main）",
         "true"),
     range(knob_d("review.autoConfirmClassifyThreshold", Kind::Number, Tier::Advanced, "待确认",
-        "归类自动确认阈值", "低于它仍然进队列。词面相似度的 0.98 也未必对，所以门槛给得很高", "0.95"), 0.3, 1.0),
+        "归类自动确认阈值", "**前提是这条建议有路径证据**（`files` 里的目录段命中项目）——\
+         光靠标签/标题提到项目名的建议一条都不自动，多低都不行：那是「在讲它」不是「属于它」。\
+         真有路径证据时门槛可以放到 0.72，因为路径线索极稀少（真机 562 个记忆文件里，\
+         路径段命中已登记项目目录的 0 条），能走到这一步的已经不可能是噪音", "0.72"), 0.3, 1.0),
     knob_d("review.autoConfirmDedup", Kind::Bool, Tier::Advanced, "待确认", "自动确认去重采纳",
-        "开：精确重复（同 hash）与分数达到 dedup.l2.autoMergeThreshold 的近似项自动合并；\
-         只标取代、不物理删除，旧条目仍可恢复", "true"),
+        "开：精确重复（同 hash）无条件合并；近似项按覆盖率分三档 —— 短边被对方解释掉\
+         （>= mergeMinCoverage）就合并，够像但各有独有内容（>= relateMinScore）只连边、\
+         两条都留，其余留在队列。合并只标取代、不物理删除，被取代方正文会先并进幸存者", "true"),
     // ── 蒸馏结论默认直接落地（与上面三条相反，故意的）──────────
     //
     // 上面三条默认关，因为它们改的是**已有记忆**（搬项目、标失效、合并重复），

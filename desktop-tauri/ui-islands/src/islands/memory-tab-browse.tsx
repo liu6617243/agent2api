@@ -348,9 +348,16 @@ function Browse({
       review.reload()
       list.reload()
       onChanged()
-      if (result.applied > 0) {
-        setNotice(t('自动处理了 {n} 条，队列还剩 {left} 条需要你判断。', {
+      // ── 三种结果分开说，别合成一句话 ────────────────────────────
+      // 早先只有「处理了 N 条 / 一条都没处理」两档，于是「作废了 6 条归类建议」
+      // 这件事在界面上完全看不见 —— 用户只看到队列凭空少了 6 条，会以为它们
+      // 被静默删掉了。作废与落地是两件事：前者只改队列状态（可反向批准），
+      // 后者真的动了记忆。两句话分开说，用户才敢继续用这个按钮。
+      const retired = result.retired ?? 0
+      if (result.applied > 0 || retired > 0) {
+        setNotice(t('自动处理了 {n} 条、作废 {r} 条永远轮不到自动裁决的建议，队列还剩 {left} 条需要你判断。', {
           n: result.applied,
+          r: retired,
           left: result.kept,
         }))
       } else {

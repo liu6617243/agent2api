@@ -769,6 +769,30 @@ impl MemoryIndex {
         );
     }
 
+    /// 这两个 id 之间是否已经有一条边（任意方向、任意类型）。
+    ///
+    /// ── 为什么需要「任意类型」而不是只查 `same_topic` ──────────────
+    /// 调用方（`dedup_scan`）要回答的是「这一对判过没有」，而判过的痕迹有三种
+    /// 落法：`relate_pair` 连 `same_topic`、`apply_dedup` 连 `relates`、
+    /// `relink` 按共享标签连 `same_topic`。第三种是**自动生成的**，不代表判过
+    /// —— 但它同样意味着这两条已经在互相带出，再入队一次也只是多问一遍。
+    /// 所以判据取「有没有边」，由调用方叠加 `Related` 状态一起判：只靠边会把
+    /// 新配对（relink 早就连上了、但没人判过）永久挡掉。
+    pub fn linked(&self, left: &str, right: &str) -> bool {
+        if left.is_empty() || right.is_empty() || left == right {
+            return false;
+        }
+        let Ok(conn) = self.conn.lock() else { return false };
+        conn.query_row(
+            "SELECT 1 FROM mem_link
+              WHERE (from_id = ?1 AND to_id = ?2) OR (from_id = ?2 AND to_id = ?1)
+              LIMIT 1",
+            params![left, right],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
     /// 清空整张关联图。
     ///
     /// ── 为什么需要它 ────────────────────────────────────────────

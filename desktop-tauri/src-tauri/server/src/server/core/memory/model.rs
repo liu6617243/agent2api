@@ -129,6 +129,14 @@ pub enum DedupStatus {
     Merged,
     /// 疑似重复，进了待确认队列
     Pending,
+    /// 判过「相关但不同」，两边都留着，只连了一条边。
+    ///
+    /// ── 为什么需要一个终态值，而不是让这两条回到 `unique` ────────
+    /// 判完不改状态的话，下次巡检会把同一对重新判一遍、重新入队 —— 队列清空了
+    /// 一轮又长回来，用户看到的永远是「整理过但没变化」。这个值就是「我看过
+    /// 这一对，结论是它们该各留各的」的痕迹；`is_trusted()` 不看它，
+    /// 所以它不影响检索，只是让巡检不再重复提问。
+    Related,
 }
 
 impl DedupStatus {
@@ -136,6 +144,7 @@ impl DedupStatus {
         match raw.trim().to_ascii_lowercase().as_str() {
             "merged" => DedupStatus::Merged,
             "pending" => DedupStatus::Pending,
+            "related" => DedupStatus::Related,
             _ => DedupStatus::Unique,
         }
     }
@@ -145,6 +154,7 @@ impl DedupStatus {
             DedupStatus::Unique => "unique",
             DedupStatus::Merged => "merged",
             DedupStatus::Pending => "pending",
+            DedupStatus::Related => "related",
         }
     }
 }

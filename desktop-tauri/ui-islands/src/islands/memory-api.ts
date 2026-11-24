@@ -193,7 +193,7 @@ export type MemoryStatus = {
    */
   agents: { called: number; injected: number }
   projects: number
-  review: { pending: number | null; warnThreshold: number; autoResolve?: boolean; floor?: number }
+  review: { pending: number | null; warnThreshold: number; autoResolve?: boolean }
   /**
    * `count` / `inSync` 可能是 `null`：索引被重建或打开时压缩独占着那条全局
    * 连接，后端**不会排队**（否则整页会卡到网关 60 秒超时），而是给 `null`。
@@ -1238,6 +1238,13 @@ export type AutoResolveResult = {
   scanned: number
   applied: number
   appliedItems: { id: number; type: string; confidence: number; target: string }[]
+  /**
+   * 被判作废（`rejected`）的条数。目前只有一种来源：归类建议**没有路径证据**
+   * ——「标签/标题里提到某个项目」不等于「这些活是给那个项目干的」，这类建议
+   * 永远不该自动搬（真机 641 条活记忆里带 `files` 的是 0 条），也不该占着
+   * 「待确认」的位置等人点头。作废只改队列行，不动任何记忆，仍可反向批准。
+   */
+  retired: number
   kept: number
   pending: number
 }
