@@ -3449,14 +3449,18 @@ fn retire_reason_of(
         }
         let target_end = live_end_of(snapshot, &row.target);
         let candidate_end = live_end_of(snapshot, candidate);
-        match (target_end, candidate_end) {
+        // 这个 `return` 不能省：`if` 块没有 `else`，而且函数尾部还有 classify
+        // 分支要接着走 —— 少了它，match 的结果会被当成语句丢弃（E0308），
+        // dedup 分支于是永远返回 `None`，作废逻辑整体失效（真机表现为
+        // 「两端已解到同一条」的配对一直挂在队列里）。
+        return match (target_end, candidate_end) {
             // 两端解到同一活条目：正文已经在它身上了（或两端本来就是同一条）。
             (Some(left), Some(right)) if left == right => Some("auto-already-resolved"),
             // 有一端彻底没了：这对比不出来，也合不了。
             (None, _) | (_, None) => Some("auto-target-missing"),
             // 两端都还活着、且不是同一条 —— 还有得合，别动它。
             _ => None,
-        }
+        };
     }
     if row.kind != "classify" {
         return None;

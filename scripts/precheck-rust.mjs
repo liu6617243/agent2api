@@ -685,6 +685,111 @@ function scanDelimiters(files) {
   return problems
 }
 
+/// 找到 `from` 之后、同一深度上开启代码块的那个 `{`。
+///
+/// 只认深度 0：`if matches!(x, Foo { .. }) {` 里第一个 `{` 在括号内，属于
+/// 模式而不是块，认错了整段后续匹配全错位。
+///
+/// ── 碰到 `=>` 就放弃 ────────────────────────────────────────
+/// `match` 的**守卫**也长成 `if`：`Some(c) if c.is_null() => { ... }`。
+/// 那不是 `if` 语句，它后面的 `{` 是 match arm 的块 —— 拿它当 if 体会把整个
+/// arm 当成条件分支，于是「arm 块尾是 match」被误报成「if 块尾丢了返回值」。
+/// 所以深度 0 上先撞到 `=>` 说明这是守卫，直接返回 -1。
+///
+/// 碰到深度 0 的 `;` / `,` 同样放弃：那说明后面没有块，继续往文件末尾找
+/// 只会把不相干的 `{` 认成 if 体。
+function findBlockOpen(mask, from) {
+  let depth = 0
+  for (let i = from; i < mask.length && i < from + 400; i += 1) {
+    const c = mask[i]
+    if (c === '(' || c === '[') depth += 1
+    else if (c === ')' || c === ']') depth = Math.max(0, depth - 1)
+    else if (depth === 0 && c === '=' && mask[i + 1] === '>') return -1
+    else if (depth === 0 && (c === ';' || c === ',')) return -1
+    else if (c === '{' && depth === 0) return i
+  }
+  return -1
+}
+
+/// `close` 处那个 `}` 对应的 `{`（`matchBrace` 的反向版）。
+function matchBraceBack(mask, close) {
+  let depth = 0
+  for (let i = close; i >= 0; i -= 1) {
+    const c = mask[i]
+    if (c === '}') depth += 1
+    else if (c === '{') {
+      depth -= 1
+      if (depth === 0) return i
+    }
+  }
+  return -1
+}
+
+/// 「表达式被当成语句丢弃」：`if cond { <match 作为块尾表达式> }` 且没有 `else`。
+///
+/// ── 为什么必须补这道闸 ──────────────────────────────────────
+/// 2026-11-24：`retire_reason_of` 的 dedup 分支写成了
+///
+///     if row.kind == "dedup" {
+///         ...
+///         match (target_end, candidate_end) {           // ← 少了 return
+///             (Some(l), Some(r)) if l == r => Some("auto-already-resolved"),
+///             _ => None,
+///         }
+///     }                                                  // ← 没有 else
+///     if row.kind != "classify" { return None; }
+///
+/// 这个函数返回 `Option<&'static str>`，而「不带 else 的 if」要求块的值是 `()`。
+/// rustc 报 E0308（expected `()`, found `Option<&str>`），三个平台同时编译失败 ——
+/// 上一轮 4 个 job × 十几分钟全烧在这一行上。
+///
+/// 文字层面的特点非常固定：块内最后一条语句是 `match`，这些分支里至少有一个
+/// 产出值（`Some(...)` / `Ok(...)` / `Err(...)` / `None` / 布尔 / 字面量），而且
+/// `if` 后面没有 `else`。这三条同时成立就一定是把返回值丢了 —— 判据不需要知道
+/// 类型，因为「不带 else 的 if」本来就不允许有值。
+///
+/// ── 哪些情况故意放过 ────────────────────────────────────────
+///   * 块尾是 `match ... ;`（带分号 = 明确当语句用）；
+///   * 块尾是 `let x = match ...;` 或 `return match ...;`（分号挡住）；
+///   * 分支全是 `{}` / `()` 的 match（值就是 unit，合法）；
+///   * 有 `else` 的 if（可以带值）；
+///   * `loop { if c { match ... } }` 之类仍然会报 —— 那同样编译不过。
+///
+/// 宁可漏报：只认「块尾 match + 有值分支 + 无 else」这一种公认的错法。
+function scanDiscardedMatch(files) {
+  const problems = []
+  for (const file of files) {
+    const src = readFileSync(file, 'utf8')
+    const mask = maskCode(src)
+    const lineOf = at => mask.slice(0, at).split('\n').length
+    const ifRe = /\bif\b/g
+    let hit
+    while ((hit = ifRe.exec(mask)) !== null) {
+      const bodyOpen = findBlockOpen(mask, ifRe.lastIndex)
+      if (bodyOpen === -1) continue
+      const bodyClose = matchBrace(mask, bodyOpen)
+      if (bodyClose === -1) continue
+      // 有 else 就不是这条错法
+      if (/^\s*else\b/.test(mask.slice(bodyClose + 1, bodyClose + 40))) continue
+      const body = mask.slice(bodyOpen + 1, bodyClose)
+      const lastMatch = [...body.matchAll(/\bmatch\b/g)].pop()
+      if (!lastMatch) continue
+      const matchAt = bodyOpen + 1 + lastMatch.index
+      const armOpen = findBlockOpen(mask, matchAt + 5)
+      if (armOpen === -1) continue
+      const armClose = matchBrace(mask, armOpen)
+      if (armClose === -1) continue
+      // match 必须是块尾：后面只剩空白（分号会留一个 `;`，正好被这条挡掉）
+      if (mask.slice(armClose + 1, bodyClose).trim() !== '') continue
+      const arms = mask.slice(armOpen + 1, armClose)
+      // 至少一个分支产出值。字符串字面量在 mask 里已被抹空，`Some("x")` 仍匹配。
+      if (!/=>\s*(?:Some\s*\(|Ok\s*\(|Err\s*\(|None\b|true\b|false\b|&|\d)/.test(arms)) continue
+      problems.push({ file, line: lineOf(matchAt), ifLine: lineOf(bodyOpen) })
+    }
+  }
+  return problems
+}
+
 function scanModPaths(files) {
   const { declared, parentOf } = buildModuleTree(files)
   const problems = []
@@ -740,6 +845,7 @@ const pathProblems = scanModPaths(files)
 const byteProblems = scanByteStrings(files)
 const delimiterProblems = scanDelimiters(files)
 const dupProblems = scanDuplicateFns(files)
+const discardProblems = scanDiscardedMatch(files)
 const rel = file => path.relative(root, file).split(path.sep).join('/')
 
 if (
@@ -747,10 +853,11 @@ if (
   !pathProblems.length &&
   !byteProblems.length &&
   !delimiterProblems.length &&
-  !dupProblems.length
+  !dupProblems.length &&
+  !discardProblems.length
 ) {
   console.log(
-    `precheck:rust OK — ${files.length} 个文件 / ${types.size} 个类型定义，结构体字面量字段、mod 路径、括号平衡、重复函数都没问题。`,
+    `precheck:rust OK — ${files.length} 个文件 / ${types.size} 个类型定义，结构体字面量字段、mod 路径、括号平衡、重复函数、块尾 match 都没问题。`,
   )
   process.exit(0)
 }
@@ -798,6 +905,20 @@ if (delimiterProblems.length) {
     '这会在 CI 里以「unexpected closing delimiter / mismatched closing delimiter」编译失败，' +
       '而且是 rustc 看到的第一类错误 —— 先把它修了，后面的真错误才轮得到显示。',
   )
+}
+
+for (const item of discardProblems) {
+  console.error(
+    `✗ ${rel(item.file)}:${item.line} — 第 ${item.ifLine} 行的 \`if\` 块尾是一个带返回值的 \`match\`，但这个 \`if\` 没有 \`else\``,
+  )
+}
+if (discardProblems.length) {
+  console.error(`\nprecheck:rust 失败：${discardProblems.length} 处表达式的值被当成语句丢弃。`)
+  console.error(
+    '这会在 CI 里以 E0308（expected `()`, found `Option<&str>` 之类）编译失败：' +
+      '不带 `else` 的 `if` 块值必须是 `()`。',
+  )
+  console.error('要么给 match 前面加 `return`，要么在 match 后面补 `;` 把它明确当语句用。')
 }
 
 if (problems.length) {
