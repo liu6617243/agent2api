@@ -13,9 +13,33 @@
 //! ── 模型怎么选 ──────────────────────────────────────────────
 //! 三级回退，越靠前越具体：
 //!   1. `models.routing` 里 `task` 命中本任务的条目，取它的 `model`；
-//!   2. `models.taskEffort` 里该任务配了思考强度 → 说明用户在意质量，仍走
-//!      `models.routing` 的 `tags` 匹配（`light` / `heavy`），命中即用；
+//!   2. 按 [`task_tag`] 给的固定档位（`light` / `heavy`）在 `models.models`
+//!      里找带同一标签的模型，命中即用；
 //!   3. 都没有 → `models.fallbackModel`；再没有 → 网关目录里第一个非图像模型。
+//!
+//! ── 思考强度为什么不在配置里（2026-11-24）────────────────────
+//! 早先这里有一个 `models.taskEffort` 旋钮，默认值里 `summarize`/`tag` 是
+//! `low`/`minimal`，其余是 `medium`/`high`。它把两个不该混在一起的东西绑成了
+//! 一个字段：**"这个任务值不值得用更强的模型"**（选模型）和 **"要让上游多想"**
+//! （`reasoning_effort`）。
+//!
+//! 后一半是纯粹的破坏性旋钮：`max_tokens` 是 reason + content 的**共享预算**，
+//! 机械任务（打标签、写摘要、抽条目）本来只需要几百 token 的结论，一旦被设成
+//! `high`，上游会先把 1600 全花在思考上、`content` 返回空串、`finish_reason`
+//! 报 `length`。真机台账（`llm_call`）里 `summarize` 78 次失败 / 707k token、
+//! `tag` 25 次失败 / 134k token，全是这个形状。
+//!
+//! 而它错得**不可自查**：界面上写着"思考强度：高"，用户会理解成"更认真"，
+//! 没有任何线索指向"这是失败的原因"。错误信息里那句"调大 `models.taskMaxTokens`"
+//! 也只是绕道 —— 真正的因果在上游把预算吃完了。
+//!
+//! 所以这个字段**整体不再由记忆中枢发送**：记忆任务的输入是"给定素材、输出
+//! 结构化 JSON"，要的是稳定而不是深度推理；需要推理的模型自己会推理，不需要
+//! 我们替它加码。选模型那一半（`light` / `heavy`）继续保留，但改成代码里的
+//! 固定档位 [`task_tag`]，不再是配置项。
+//!
+//! `models.taskEffort` 这个键仍然留在 schema 里（跨实现配置契约，删键会让老
+//! 配置静默丢值），但标成 `wired=false`：改了没有任何行为影响。
 //!
 //! 为什么第 3 步不是「写死一个模型名」：这个仓库要能装在任何人的机器上，
 //! 写死必然在别人的账号里不存在。目录里有什么就用什么，才叫「本地可用」。
@@ -41,8 +65,6 @@ pub struct Request {
     pub task: String,
     pub system: String,
     pub user: String,
-    /// 覆盖思考强度（空 = 用 `models.taskEffort` 里该任务的配置）
-    pub effort: String,
     /// 覆盖模型（空 = 按任务选）
     pub model: String,
     pub max_tokens: u32,
@@ -55,11 +77,71 @@ impl Request {
             task: task.to_string(),
             system: system.into(),
             user: user.into(),
-            effort: String::new(),
             model: String::new(),
             max_tokens: max_tokens_for(task),
             temperature: 0.2,
         }
+    }
+
+    /// 按"这一批有几条"抬高输出预算。
+    ///
+    /// ── 为什么预算要跟着条数走，而不是一个固定数字 ────────────
+    /// 同一次调用可能只处理 3 条，也可能处理 20 条（`auto.tasks.*.batchSize`
+    /// 上限就是 200）。固定 1600 在 20 条时必然截断 —— 而截断的后果是**整批
+    /// 丢弃**，20 条的 token 全白花。
+    ///
+    /// 早先这里只有一张固定表，用户撞上截断之后唯一的出口是去调
+    /// `models.taskMaxTokens`：一个"我该填多少"完全靠猜的内部旋钮。猜小了
+    /// 继续截断，猜大了每条小任务都按大任务预留额度。让代码按条数算，
+    /// 用户就不用参与这个算术。
+    ///
+    /// ── 为什么尊重 `models.taskMaxTokens` 里显式写了的值 ──────────
+    /// 显式写一个更小的值通常是有意的（省额度、或上游对 `max_tokens` 有上限）。
+    /// 按条数一抬，等于把用户的意图盖掉，而且他看不出来是被谁改的。
+    /// 所以只在"这个任务没被显式配置过"时才自动抬高。
+    ///
+    /// ── 判"显式"必须走 [`config::explicit`]，不能走 `object_of` ────
+    /// `object_of` 在没配时回落到 schema 默认值，而 `models.taskMaxTokens` 的
+    /// 默认值里**就有** `tag` / `summarize` 这些键 —— 用它判断等于"永远都算
+    /// 显式配过"，自动抬高成了死代码。这种"读到了但读错了层"的 bug 不会报错，
+    /// 只会让功能静默失效。
+    pub fn for_items(mut self, items: usize, per_item: u32) -> Self {
+        let configured = config::explicit()
+            .get("models.taskMaxTokens")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if configured.contains_key(&self.task) {
+            return self;
+        }
+        let needed = per_item.saturating_mul(items.min(200) as u32);
+        if needed > self.max_tokens {
+            self.max_tokens = needed.min(32_000);
+        }
+        self
+    }
+}
+
+/// 任务对应的模型池标签。**代码里固定，不是配置项。**
+///
+/// ── 为什么固定 ──────────────────────────────────────────────
+/// 只有两个任务值得往"更强的模型"上靠：
+///   · `profile` —— 跨条目归纳人格与技术栈，需要长上下文与抽象能力；
+///   · `distill` —— 把一堆碎片压成架构决策，需要取舍判断。
+///
+/// 其余任务（打标签、写摘要、抽条目、失效判定、合并）都是**结构化抽取**：
+/// 输入已经给全，输出是短 JSON，模型再强也不会让结论更好，只会让 `max_tokens`
+/// 更快被吃掉。给它们开"高质量模型"是纯浪费。
+///
+/// 这个判断不需要用户参与 —— 用户既不知道每个任务的提示词长什么样，也无法从
+/// 界面上判断"该不该给它 heavy"。早先它是个下拉框，结果真机被设成
+/// `{"summarize":"high","tag":"high",…}`：机械任务全走 heavy，`reasoning_effort`
+/// 把输出预算吃干，`content` 空、`finish_reason=length`。
+pub fn task_tag(task: &str) -> Option<&'static str> {
+    match task {
+        "profile" => Some("heavy"),
+        "distill" => Some("light"),
+        _ => None,
     }
 }
 
@@ -201,14 +283,8 @@ pub fn model_for(task: &str) -> Option<String> {
             }
         }
     }
-    // 2. 该任务配了思考强度 = 用户在意图质量，按标签在模型池里找
-    let effort = config::object_of("models.taskEffort");
-    let wants_quality = effort
-        .get(task)
-        .and_then(Value::as_str)
-        .is_some_and(|level| matches!(level, "medium" | "high"));
-    if wants_quality {
-        let tag = if effort.get(task).and_then(Value::as_str) == Some("high") { "heavy" } else { "light" };
+    // 2. 任务固定的模型池标签（不是配置项，见 `task_tag`）
+    if let Some(tag) = task_tag(task) {
         let tagged = config::get("models.models").and_then(|value| value.as_array().cloned()).unwrap_or_default();
         for item in tagged {
             let has_tag = item
@@ -268,7 +344,7 @@ pub fn complete(request: Request) -> Result<Reply, LlmError> {
     };
     let key = internal_key().ok_or_else(|| LlmError::Unavailable("没有可用的网关 Key".into()))?;
 
-    let mut body = json!({
+    let body = json!({
         "model": model,
         "messages": [
             { "role": "system", "content": request.system },
@@ -278,19 +354,20 @@ pub fn complete(request: Request) -> Result<Reply, LlmError> {
         "max_tokens": request.max_tokens,
         "temperature": request.temperature,
     });
-    // 思考强度：任务级配置优先，其次调用方覆盖。空 = 不传（有些上游不认这个字段）
-    let effort = if request.effort.trim().is_empty() {
-        config::object_of("models.taskEffort")
-            .get(&request.task)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    } else {
-        request.effort.trim().to_string()
-    };
-    if !effort.is_empty() && effort != "minimal" {
-        body["reasoning_effort"] = json!(effort);
-    }
+    // ── 不写 `reasoning_effort`（2026-11-24）──────────────────────
+    // `max_tokens` 是 reason + content 的**共享预算**。上游一旦被要求多想，
+    // 会先把预算花在思考上，然后回一个空的 `content` + `finish_reason=length`；
+    // 记忆任务拿到空串只能丢弃重来，用户看到的是"摘要/打标老是失败"，
+    // 而真实原因是这一行多写了一个字段。
+    //
+    // 记忆任务的输入已经给全（素材 + 输出格式），要求的是**稳定的结构化输出**，
+    // 不是深度推理。需要推理的模型自己会推理，不用我们替它加码。所以这里
+    // 只发 `max_tokens`，让它全归 content。
+    //
+    // 想确认这一点：真机 `llm_call` 里失败行全是 `finish_reason=length` 且
+    // `completion_tokens` 打满上限（`summarize` 平均 2207 > 上限 1600），
+    // 成功行的 completion 也常常高过上限 —— reasoning 计费在 usage 里，
+    // 但 `content` 被挤没了。
 
     let timeout = config::number("models.timeout").max(5.0) as u64;
     let url = format!("{}/v1/chat/completions", gateway_base());
@@ -368,18 +445,18 @@ pub fn complete(request: Request) -> Result<Reply, LlmError> {
         .to_string();
     if reply.is_empty() {
         // ── 区分「截断」与「真空」────────────────────────────────
-        // 上游把输出预算吃满时会回 `finish_reason: "length"` 且 `content` 为空
-        //（思考型模型尤其常见：token 全花在 reasoning 上，正文一个字没留）。
-        // 早先这里一律报「模型返回空内容」，于是用户调了半天 prompt，真正该调的
-        // 是 `models.taskMaxTokens` 或 `models.taskEffort` —— 错误信息指错了方向。
+        // 上游把输出预算吃满时会回 `finish_reason: "length"` 且 `content` 为空。
+        // 2026-11-24 之前这里还会提示「或调小 `models.taskEffort`」—— 那个旋钮
+        // 已经整体不发送了（见文件头），现在只剩一个可调项，错误信息也只指一个
+        // 方向，不再把用户往一个不存在的开关上引。
         let truncated = data
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str)
             .is_some_and(|reason| reason == "length");
         let message = if truncated {
             format!(
-                "输出被 max_tokens={} 截断（finish_reason=length）：任务 {} 的预算不够，调大 models.taskMaxTokens.{}",
-                request.max_tokens, request.task, request.task
+                "输出被 max_tokens={} 截断（finish_reason=length）：任务 {} 一次要产出的条数或长度超过预算，调大 models.taskMaxTokens.{} 或减小 auto.tasks.{}.batchSize",
+                request.max_tokens, request.task, request.task, request.task
             )
         } else {
             "模型返回空内容".to_string()
@@ -474,5 +551,112 @@ mod tests {
     #[test]
     fn returns_none_for_garbage() {
         assert!(parse_json("完全不是 JSON").is_none());
+    }
+
+    /// 机械任务一律不往"更强的模型"上靠。
+    ///
+    /// ── 这条测试防的是什么 ────────────────────────────────────
+    /// 早先 `models.taskEffort` 是配置项，真机把它设成了
+    /// `{"summarize":"high","tag":"high","extract":"high",…}` ——
+    /// 于是打标签、写摘要这些**只输出短 JSON** 的任务全走了 heavy 模型。
+    /// 这不是"多花点钱"：`max_tokens` 是 reason + content 的共享预算，
+    /// 上游被要求多想就会把预算花在思考上，回一个空的 `content` +
+    /// `finish_reason=length`，整批丢弃重来。
+    ///
+    /// 真机台账（`llm_call`）：`summarize` 78 次失败烧 707k token、
+    /// `tag` 25 次失败烧 134k token。成功行的 `completion_tokens` 也常常
+    /// 高过 `max_tokens` —— 说明预算是被 reasoning 吃掉的，不是 content 太长。
+    ///
+    /// 判据：只有 `profile`（跨条目归纳）与 `distill`（取舍判断）配得上
+    /// 更强的模型；其余任务返回 `None`，走兜底模型。
+    #[test]
+    fn mechanical_tasks_do_not_ask_for_a_stronger_model() {
+        for task in [
+            "extract",
+            "summarize",
+            "tag",
+            "classify",
+            "supersede",
+            "dedup",
+            "consolidate",
+            "ingest",
+            "index-scan",
+            "cleanup",
+        ] {
+            assert_eq!(
+                task_tag(task),
+                None,
+                "{task} 是结构化抽取任务，不该往更强/更贵的模型上路由 —— 它的失败模式是内容被挤空，不是结论不够好"
+            );
+        }
+        assert_eq!(task_tag("profile"), Some("heavy"), "画像要跨条目归纳，值得 heavy");
+        assert_eq!(task_tag("distill"), Some("light"), "蒸馏要取舍判断，light 足够");
+    }
+
+    /// 每个任务的输出预算至少要能装下"一批结论"。
+    ///
+    /// ── 为什么 800 是下限 ────────────────────────────────────
+    /// 一次 `tag` 给 20 条各出 2-5 个标签，JSON 骨架（`{"items":[{"id":…,
+    /// "tags":[…]}]}`）本身就要几百 token。早先通用兜底是 1200，
+    /// 而 `supersede` 只要回答"哪几条被取代"，800 够用。
+    ///
+    /// 低于 800 的预算在真机上没出现过成功案例，只会稳定截断。
+    #[test]
+    fn every_task_budget_can_hold_a_batch() {
+        for task in [
+            "extract",
+            "summarize",
+            "tag",
+            "classify",
+            "supersede",
+            "distill",
+            "profile",
+            "consolidate",
+            "dedup",
+        ] {
+            let budget = max_tokens_for(task);
+            assert!(
+                budget >= 800,
+                "{task} 的默认输出预算只有 {budget} token，装不下一批结构化结论"
+            );
+        }
+    }
+
+    /// 预算随条数抬高：20 条绝不能还是 1600。
+    ///
+    /// ── 这条测试防的是什么 ────────────────────────────────────
+    /// 真机 `summarize` 一次处理 20 条、每条摘要 40 字，固定 1600 必然截断，
+    /// 截断后**整批丢弃**（20 条的 prompt token 全白花）。而用户的唯一出口是
+    /// 去调 `models.taskMaxTokens` —— 一个"该填多少"靠猜的内部旋钮。
+    ///
+    /// 判据：`for_items(20, …)` 之后必须显著高于 20 × 单条成本。
+    ///
+    /// 必须 `isolated`：`for_items` 会读 `config::explicit()` 判断"这个任务
+    /// 有没有被显式配过"。真机上 `models.taskMaxTokens` 一旦写过值，测试
+    /// 就会走"尊重显式配置"那条分支，断言全部落空 —— 而这种失败只在有配置
+    /// 的机器上出现，CI 上是绿的。
+    #[test]
+    fn budget_grows_with_batch_size() {
+        crate::test_support::isolated(
+            concat!(module_path!(), "::budget_grows_with_batch_size"),
+            || {
+                let single = Request::new("summarize", "", "");
+                let widened = Request::new("summarize", "", "").for_items(20, 100);
+                assert!(
+                    widened.max_tokens >= 2000,
+                    "20 条摘要仍然只给 {} token —— 真机上这就是整批截断的形状",
+                    widened.max_tokens
+                );
+                assert!(
+                    widened.max_tokens > single.max_tokens,
+                    "批数变多之后预算没有变：for_items 没生效"
+                );
+                // 上限别无限涨：200 条 × 1000 = 200k 会撞上游的硬上限
+                assert!(
+                    Request::new("tag", "", "").for_items(200, 1000).max_tokens <= 32_000,
+                    "自动预算没有封顶，200 条会把请求打到上游拒绝"
+                );
+            },
+        );
     }
 }

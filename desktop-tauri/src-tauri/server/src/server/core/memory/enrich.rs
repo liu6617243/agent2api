@@ -205,7 +205,11 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
          ]}}\n\n\
          素材：\n{material}"
     );
-    let reply = match llm::complete(Request::new("distill", SYSTEM_EXTRACT, ask)) {
+    // 一条结论是 `{"action":"new","title":…,"type":…,"body":"100-300 字",
+    // "importance":…,"evidence":[…]}`：300 汉字约 450 token，加上字段名与
+    // 转义，700 是安全线。提示词允许 3-8 条，按 8 条算 = 5600 —— 固定 3000
+    // 在真机上确实截断过（`distill` 成功样本 completion 到过 8490）。
+    let reply = match llm::complete(Request::new("distill", SYSTEM_EXTRACT, ask).for_items(8, 700)) {
         Ok(reply) => reply,
         Err(error) => return from_llm(error),
     };
@@ -378,7 +382,10 @@ pub fn tag(ids: &[String], force: bool, limit: usize) -> Outcome {
             .collect::<Vec<_>>()
             .join("\n\n")
     );
-    let reply = match llm::complete(Request::new("tag", SYSTEM_TAG, ask)) {
+    // 每条标签的输出是 `{"id":"mem_xxx","tags":["a","b","c","d","e"]}`，
+    // 中文标签按字算 token，再加上 id 与骨架，120 是够的余量。
+    // 传条数进去而不是写死：batchSize 可配到 200，20 条时固定预算必然截断。
+    let reply = match llm::complete(Request::new("tag", SYSTEM_TAG, ask).for_items(targets.len(), 120)) {
         Ok(reply) => reply,
         Err(error) => return from_llm(error),
     };
@@ -450,7 +457,9 @@ pub fn summarize(ids: &[String], limit: usize) -> Outcome {
             .collect::<Vec<_>>()
             .join("\n\n")
     );
-    let reply = match llm::complete(Request::new("summarize", SYSTEM_EXTRACT, ask)) {
+    // 每条摘要是 `{"id":"mem_xxx","summary":"不超过 40 字"}`。40 个汉字约
+    // 60-80 token，加 id 与骨架取 100；20 条要 2000，远超固定 1600。
+    let reply = match llm::complete(Request::new("summarize", SYSTEM_EXTRACT, ask).for_items(targets.len(), 100)) {
         Ok(reply) => reply,
         Err(error) => return from_llm(error),
     };
@@ -713,7 +722,10 @@ pub fn build_profile(sub: Option<&str>, force: bool) -> Outcome {
             .collect::<Vec<_>>()
             .join("\n\n")
     );
-    let reply = match llm::complete(Request::new("profile", SYSTEM_PROFILE, ask)) {
+    // 每条画像是 `{"sub":"…","title":"不超过 30 字","body":"一句话","evidence":[…]}`
+    // ——正文短，但 evidence 可能带 2-5 个 id。一类 1-4 条，四类最多 16 条，
+    // 每条按 250 token 算 = 4000。
+    let reply = match llm::complete(Request::new("profile", SYSTEM_PROFILE, ask).for_items(16, 250)) {
         Ok(reply) => reply,
         Err(error) => return from_llm(error),
     };

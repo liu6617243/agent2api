@@ -452,11 +452,11 @@ static SCHEMA: &[Knob] = &[
     // ===== 模型与路由 =====
     //
     // ── 本仓的模型选择只有一条链路（`llm::model_for`）───────────
-    // 显式路由（models.routing）→ 思考强度对应的标签（models.models 里的 tags）
-    // → 兜底模型（models.fallbackModel）→ 网关目录首个对话模型。所以真正接线
-    // 的只有这四个键 + timeout + gatewayBase。AgentHub 那套「模型来源排序 +
-    // 自定义供应商 + 用途标签集」在本仓没有对应的解析器，标 unwired 而不是
-    // 留一个改完没反应的输入框。
+    // 显式路由（models.routing）→ 任务固定档位（`llm::task_tag`）对应的标签
+    // （models.models 里的 tags）→ 兜底模型（models.fallbackModel）→ 网关目录
+    // 首个对话模型。所以真正接线的只有这四个键 + timeout + gatewayBase。
+    // AgentHub 那套「模型来源排序 + 自定义供应商 + 用途标签集」在本仓没有对应
+    // 的解析器，标 unwired 而不是留一个改完没反应的输入框。
     unwired(knob_d("models.sourceOrder", Kind::List, Tier::Advanced, "模型与网关", "模型来源优先级",
         "本仓未接入：模型只从本机网关目录里取，没有「网关 / 自定义供应商」两个来源可排序", "[\"gateway\",\"custom\"]")),
     unwired(knob_d("models.providers", Kind::List, Tier::Advanced, "模型与网关", "自定义供应商",
@@ -474,15 +474,42 @@ static SCHEMA: &[Knob] = &[
         "留空 = 自动探测本机端口（面板与网关分端口时也能找对）", "\"\""),
     knob_d("models.fallbackModel", Kind::Text, Tier::Advanced, "模型与网关", "兜底模型",
         "路由表与模型池都没命中时用它；留空 = 取模型目录里第一个对话模型", "\"\""),
-    knob("models.taskEffort", Kind::Map, Tier::Internal, "模型与网关", "各任务思考强度覆盖",
+    // ── 为什么这个键标了 unwired（2026-11-24）──────────────────────
+    // 它早先是接线的：`llm.rs` 读到 `high` 就往请求体写
+    // `reasoning_effort: "high"`。而 `max_tokens` 是 reason + content 的
+    // **共享预算** —— 机械任务（打标签、写摘要）本来只要几百 token 的结论，
+    // 被要求多想之后上游把 1600 全花在思考上，`content` 返回空串、
+    // `finish_reason=length`，整批丢弃重来。
+    //
+    // 真机台账：`summarize` 78 次失败烧 707k token、`tag` 25 次失败烧 134k
+    // token，失败原因全是「输出被 max_tokens 截断」或「模型返回空内容」。
+    //
+    // 更糟的是它**不可自查**：界面上写着「思考强度：高」，用户理解成「更认真」，
+    // 没有任何线索指向「这就是失败原因」。这类旋钮不该交给用户 —— 记忆任务的
+    // 输入已经给全（素材 + 输出格式），要的是稳定而不是深度推理。
+    //
+    // 所以：`reasoning_effort` 整体不再发送；「哪个任务配得上更强模型」改由
+    // 代码里的 `llm::task_tag` 固定（只有 profile / distill 有档位）。键本身
+    // 留着（跨实现配置契约，删键会让老配置静默丢值），值照存、界面照显示，
+    // 只是改了没有任何行为影响。
+    unwired(knob_d("models.taskEffort", Kind::Map, Tier::Internal, "模型与网关", "各任务思考强度覆盖",
+        "本仓未接入：记忆任务一律不发送 reasoning_effort（它是 max_tokens 的共享预算，让上游多想会把正文挤空）。任务该走哪个模型档位由代码固定，改这里不会有任何行为影响",
         "{\"extract\":\"low\",\"tag\":\"minimal\",\"classify\":\"minimal\",\"summarize\":\"low\",\
-          \"distill\":\"medium\",\"profile\":\"high\",\"dedup\":\"low\",\"supersede\":\"low\"}"),
+          \"distill\":\"medium\",\"profile\":\"high\",\"dedup\":\"low\",\"supersede\":\"low\"}")),
     // 各任务输出 token 上限。没列到的任务走 `llm::max_tokens_for` 里的默认表。
     //
     // 为什么这必须是一个可见的旋钮：`distill` / `profile` 一次要产出 3-8 条带证据
     // 的结论，1200 token 会被截断，截断后 JSON 解析失败，用户看到的是「深度记忆
     // 0 条」而不是「预算不够」。留一个能改的键，比让用户去猜 prompt 有用。
-    knob("models.taskMaxTokens", Kind::Map, Tier::Internal, "模型与网关", "各任务输出 token 上限",
+    //
+    // ── 平时不需要动它（2026-11-24）──────────────────────────────
+    // `tag` / `summarize` / `distill` / `profile` / `consolidate` 的预算现在会
+    // 按「这一批有几条」自动抬高（`Request::for_items`），所以正常用量下不会
+    // 再撞上截断。这里显式写值只在两种情况下有意义：上游对 `max_tokens` 有硬
+    // 上限，或者你想刻意压低单次消耗。**写了之后自动抬高就对你的任务失效** ——
+    // 那时截断就真是预算给少了，这条说明是给你看的。
+    knob_d("models.taskMaxTokens", Kind::Map, Tier::Internal, "模型与网关", "各任务输出 token 上限",
+        "留空 = 按每批条数自动算（推荐）。显式写值会关掉自动抬高，只在「上游卡 max_tokens」或「刻意省额度」时才需要",
         "{\"extract\":2400,\"tag\":1600,\"classify\":800,\"summarize\":1600,\
           \"distill\":3000,\"profile\":3000,\"consolidate\":3000,\"supersede\":800,\
           \"dedup\":800,\"insight\":1600}"),

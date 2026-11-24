@@ -72,13 +72,27 @@ const ROUTE_TASKS: {
   },
 ]
 
-const EFFORT_OPTIONS: { value: string; label: string }[] = [
-  { value: '', label: '用模型默认' },
-  { value: 'minimal', label: '最小（minimal）' },
-  { value: 'low', label: '低（low）' },
-  { value: 'medium', label: '中（medium）' },
-  { value: 'high', label: '高（high）' },
-]
+/**
+ * 任务 → 模型池标签。**与后端 `llm::task_tag` 逐字对齐。**
+ *
+ * ── 为什么这里是一张写死的表，不是配置 ──────────────────────
+ * 早先"思考强度"是个下拉框（写 `models.taskEffort`），用户能把它设成
+ * `{"summarize":"high","tag":"high",…}`。真机就是这么设的，然后
+ * `summarize` 失败 78 次烧 707k token、`tag` 失败 25 次烧 134k token ——
+ * 因为 `max_tokens` 是 reason + content 的共享预算，被要求多想的上游会把
+ * 预算花在思考上，回一个空 `content` + `finish_reason=length`。
+ *
+ * 这个旋钮错得**不可自查**：界面上写着"思考强度：高"，用户理解成"更认真"，
+ * 没有任何线索指向"这就是失败原因"。所以它不该存在 —— 判断"哪个任务配得上
+ * 更强的模型"是产品判断，不是用户配置。
+ *
+ * 只有两个任务值得：`profile`（跨条目归纳）与 `distill`（取舍判断）。
+ * 其余是结构化抽取，输入已给全、输出是短 JSON，换更强的模型不会让结论更好。
+ */
+const TASK_TAG: Record<string, 'heavy' | 'light' | undefined> = {
+  profile: 'heavy',
+  distill: 'light',
+}
 
 /** 分组 → 图标（`ui/icons.js` 里的键）。没列的用 info 兜底。 */
 const GROUP_ICONS: Record<string, string> = {
@@ -408,7 +422,6 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
 
         <RoutingTable
           routing={toRouting(value('models.routing'))}
-          effort={toMap(value('models.taskEffort'))}
           pool={toPool(value('models.models'))}
           fallback={String(value('models.fallbackModel') ?? '')}
           onChange={(task, patch) => {
@@ -424,16 +437,14 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
             if (merged.model.trim() || merged.tags.length > 0) next.push(merged)
             put('models.routing', next)
           }}
-          onEffortChange={(task, level) => {
-            // 不能「删键」：后端对 Map 类型做深合并，删掉的键会被旧值留下。
-            // 写空串等价于「没配」—— `model_for` 与 `complete` 都把空串当未设置。
-            put('models.taskEffort', { ...toMap(value('models.taskEffort')), [task]: level })
-          }}
         />
 
         <div className='mm-cfg-note'>
           <div>
-            {t('链路怎么看：先看是否指定了模型；没指定就按【思考强度】推出标签（高 → heavy、中 → light），在同标签的模型池里取第一个；都没有就用兜底模型；再没有就取模型目录里第一个对话模型。401/403 会立刻换下一个，429/5xx 由网关退避重试。')}
+            {t('链路怎么看：先看是否指定了模型；没指定就按任务的固定档位（画像 → heavy、蒸馏 → light）在同标签的模型池里取第一个；都没有就用兜底模型；再没有就取模型目录里第一个对话模型。401/403 会立刻换下一个，429/5xx 由网关退避重试。')}
+          </div>
+          <div>
+            {t('「思考强度」已经不在这里配：记忆任务的 max_tokens 是思考与正文共用的预算，让上游多想会把正文挤空（表现为「模型返回空内容」）。所以记忆任务一律不发送思考强度，只发 max_tokens。')}
           </div>
           <div>
             {t('分类与去重走本地规则、不消耗 token，所以那两行没有模型可配；提示词优化这个任务后端还没有实现。')}
@@ -681,18 +692,14 @@ function InjectPreview(): React.ReactElement {
 
 function RoutingTable({
   routing,
-  effort,
   pool,
   fallback,
   onChange,
-  onEffortChange,
 }: {
   routing: RouteRow[]
-  effort: Record<string, string>
   pool: { model: string; tags: string[] }[]
   fallback: string
   onChange: (task: string, patch: { model?: string; tags?: string[] }) => void
-  onEffortChange: (task: string, level: string) => void
 }): React.ReactElement {
   // 本地模型池里的名字，只用来给输入框出候选提示 —— 不是可选项的边界。
   const unique = Array.from(new Set(pool.map(item => item.model).filter(Boolean)))
@@ -704,7 +711,6 @@ function RoutingTable({
         <span>{t('绑定网关 / 供应商')}</span>
         <span>{t('指定模型')}</span>
         <span>{t('标签')}</span>
-        <span>{t('思考强度')}</span>
         <span>{t('将使用（推导）')}</span>
       </div>
 
@@ -727,9 +733,8 @@ function RoutingTable({
         }
 
         const row = routing.find(item => item.task === task)
-        const level = effort[task] ?? ''
-        const tag = level === 'high' ? 'heavy' : level === 'medium' ? 'light' : ''
-        const resolved = resolveModel(task, routing, effort, pool, fallback)
+        const tag = TASK_TAG[task]
+        const resolved = resolveModel(task, routing, pool, fallback)
         return (
           <div key={task} className='mm-route-row'>
             <span className='mm-route-task'>
@@ -744,17 +749,8 @@ function RoutingTable({
               onCommit={model => onChange(task, { model })}
             />
             <span className='mm-route-tag'>
-              {tag ? t(tag === 'heavy' ? '重（heavy）' : '轻（light）') : '—'}
+              {tag ? t(tag === 'heavy' ? '重（heavy）' : '轻（light）') : t('无（兜底）')}
             </span>
-            <select
-              className='mm-select mm-select-sm mm-route-effort'
-              value={level}
-              onChange={event => onEffortChange(task, event.target.value)}
-            >
-              {EFFORT_OPTIONS.map(option => (
-                <option key={option.value} value={option.value}>{t(option.label)}</option>
-              ))}
-            </select>
             <span className='mm-route-resolved'>
               {resolved.model ? <code>{resolved.model}</code> : t('模型目录首个')}
               <em>{t(resolved.via)}</em>
@@ -878,16 +874,15 @@ function ModelInput({
 function resolveModel(
   task: string,
   routing: RouteRow[],
-  effort: Record<string, string>,
   pool: { model: string; tags: string[] }[],
   fallback: string,
 ): { model: string; via: string } {
   const hit = routing.find(row => row.task === task && row.model.trim())
   if (hit) return { model: hit.model.trim(), via: '指定' }
 
-  const level = effort[task]
-  if (level === 'high' || level === 'medium') {
-    const tag = level === 'high' ? 'heavy' : 'light'
+  // 与后端 `llm::task_tag` 同一张表（见文件上方的 `TASK_TAG`）
+  const tag = TASK_TAG[task]
+  if (tag) {
     const found = pool.find(item => item.tags.includes(tag) && item.model.trim())
     if (found) return { model: found.model, via: `标签 ${tag}` }
   }
@@ -1200,15 +1195,6 @@ function toRouting(raw: unknown): RouteRow[] {
     })
   }
   return rows
-}
-
-function toMap(raw: unknown): Record<string, string> {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
-  const out: Record<string, string> = {}
-  for (const [key, item] of Object.entries(raw as Record<string, unknown>)) {
-    if (typeof item === 'string') out[key] = item
-  }
-  return out
 }
 
 function toPool(raw: unknown): { model: string; tags: string[] }[] {

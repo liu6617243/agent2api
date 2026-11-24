@@ -1712,7 +1712,11 @@ fn consolidate(project: Option<&str>, manual: bool) -> Outcome {
             .collect::<Vec<_>>()
             .join("\n\n")
     );
-    let reply = match super::llm::complete(super::llm::Request::new("consolidate", SYSTEM_EXTRACT, ask)) {
+    // 合并后的 body 要覆盖原来所有重要信息（提示词原文：不许丢细节），
+    // 所以一条 group 的正文可能 300-800 字。约定最多 5 组，按每组 900 算。
+    let reply = match super::llm::complete(
+        super::llm::Request::new("consolidate", SYSTEM_EXTRACT, ask).for_items(5, 900),
+    ) {
         Ok(reply) => reply,
         Err(error) => {
             return if error.is_unavailable() {
