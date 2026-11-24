@@ -400,20 +400,23 @@ static SCHEMA: &[Knob] = &[
     //     一条置信 0.95 的「提及」照样会被搬错抽屉。判据改成了路径证据。
     //
     // 留着一个没有读取点的旋钮，比删掉更坏：界面上能改、改完没反应，用户只会
-    // 怀疑整个配置页在骗人。所以整条删掉，语义分别下沉到
-    // `review.autoConfirmClassifyThreshold` 与 `dedup.l2.*` 三把尺子。
+    // 怀疑整个配置页在骗人。所以整条删掉，语义分别下沉到**证据类型**
+    // （归类）与 `dedup.l2.*` 三把尺子（去重）。
+    //
+    // `review.autoConfirmClassifyThreshold` 也在第二轮被删掉了，理由同源：
+    // 归类自动裁决的判据现在是**证据类型**（路径 / 提及），不是分数。留着它
+    // 会出现和 `autoResolveFloor` 一样的局面 —— 用户把阈值从 0.72 调到 0.5，
+    // 行为一点不变，因为真正决定那件事的是「这条建议有没有路径证据」。
     knob_d("review.autoConfirmSupersede", Kind::Bool, Tier::Advanced, "待确认", "自动确认事实失效",
         "只作用于失效**判定流水本身**（`detect_supersede`，还要 `timeline.requireConfirm` 也关着）。\
          队列里的 supersede 建议永远不自动裁决：它会让一条真结论变成假的", "false"),
     knob_d("review.autoConfirmClassify", Kind::Bool, Tier::Advanced, "待确认", "自动确认项目归类",
-        "开：归类建议在置信度达到 autoConfirmClassifyThreshold **且目标项目已登记**时自动归入。\
-         要求「已登记」是因为 slug 相似度分辨不了同名前缀的项目（agent2api / agent2api-main）",
+        "开：归类建议在**有路径证据**（`files` 的目录段与项目 slug 字面相等，或该路径落在\
+         项目登记的 `path` 里）且目标项目已登记、未归档时自动归入。\
+         只靠标签/标题提到项目名的建议一条都不自动，多低的阈值都不行 —— 那是「在讲它」\
+         不是「属于它」。要求「已登记」是因为名字相似度分辨不了同名前缀的项目\
+         （agent2api / agent2api-main）",
         "true"),
-    range(knob_d("review.autoConfirmClassifyThreshold", Kind::Number, Tier::Advanced, "待确认",
-        "归类自动确认阈值", "**前提是这条建议有路径证据**（`files` 里的目录段命中项目）——\
-         光靠标签/标题提到项目名的建议一条都不自动，多低都不行：那是「在讲它」不是「属于它」。\
-         真有路径证据时门槛可以放到 0.72，因为路径线索极稀少（真机 562 个记忆文件里，\
-         路径段命中已登记项目目录的 0 条），能走到这一步的已经不可能是噪音", "0.72"), 0.3, 1.0),
     knob_d("review.autoConfirmDedup", Kind::Bool, Tier::Advanced, "待确认", "自动确认去重采纳",
         "开：精确重复（同 hash）无条件合并；近似项按覆盖率分三档 —— 短边被对方解释掉\
          （>= mergeMinCoverage）就合并，够像但各有独有内容（>= relateMinScore）只连边、\

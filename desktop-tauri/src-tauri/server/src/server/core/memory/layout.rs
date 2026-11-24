@@ -292,6 +292,12 @@ pub fn find_git_root(cwd: &str) -> Option<String> {
 /// 不用 Levenshtein 原值的原因：`agent2api` 与 `Agent2API-main` 的编辑距离是 5，
 /// 但语义上几乎是同一个项目；而「包含关系」正好捕捉这一类（目录名 = 仓库名 +
 /// 后缀）。两条混起来比任何单一指标都稳。
+///
+/// ── 这个分数不能用来判「是不是同一个目录」────────────────────
+/// 它是给**猜测**用的：`classify` 拿它覆盖模糊带（0.72~0.95），猜错了只是入队
+/// 问人。而「路径里出现了项目名」是**字面事实**，判错就是把两条记忆并进一个
+/// 项目。两者的容错差一个数量级，所以严格的场合走 [`name_is_same_project`]，
+/// 不要在这里加阈值 —— 这个函数刻意保留「`agent2api` ≈ `Agent2API-main`」。
 pub fn name_similarity(a: &str, b: &str) -> f64 {
     let left = normalize_name(a);
     let right = normalize_name(b);
@@ -318,6 +324,77 @@ pub fn name_similarity(a: &str, b: &str) -> f64 {
     };
     // 加权：编辑距离为主，包含关系做加成，上限 1.0
     (edit * 0.75 + contained * 0.45).min(1.0)
+}
+
+/// 这个路径段是不是「就是这个项目」的目录。只认**结构性**相等，不做模糊容忍。
+///
+/// 两种情况算命中：
+///
+///   1. 段 == slug（归一化后逐字相等）；
+///   2. slug 是 `<owner>--<repo>` 形态时，段 == 其中某一段。`--` 是 slug 的固定
+///      拼接符（见 [`slug_join`]），拆出来的不是猜的 —— 真机 `aimod-cc--agent2api`
+///      的检出目录就叫 `agent2api`。
+///
+/// ── 为什么不用 `project.name` ────────────────────────────────
+/// `name` 是显示名，可以起成任何东西：真机登记表里有 `name: "南昌地铁cbtc-ats
+/// 模拟软件"` 配 `slug: "cbtc-ats"`，也有 `name: "Agent2API"` 配
+/// `slug: "agent2api-main"`。后一种正是「`agent2api` 目录被算成 `agent2api-main`
+/// 项目」的来源 —— name 归一化后逐字相等，于是两个仓库并成一个。
+///
+/// ── 为什么不用 [`name_similarity`] ───────────────────────────
+/// 它给 `agent2api` / `Agent2API-main` 打的分数**就是** 0.98（剥离检出后缀那条
+/// 分支），任何以它为准的阈值要么放过这条，要么连 `agent2api-main` /
+/// `Agent2API` 也一起挡掉。两个场合的判错代价差一个数量级：classify 猜错只是
+/// 入队问人，归属判错是把记忆静默塞进另一个项目 —— 所以这里不用分数，用字面。
+pub fn name_is_same_project(segment: &str, slug: &str) -> bool {
+    let segment = normalize_name(segment);
+    if segment.is_empty() {
+        return false;
+    }
+    let whole = normalize_name(slug);
+    if !whole.is_empty() && segment == whole {
+        return true;
+    }
+    slug.split("--")
+        .map(normalize_name)
+        .filter(|part| !part.is_empty())
+        .any(|part| part == segment)
+}
+
+/// 这条路径是不是这个项目登记的那棵树（同名、同前缀即算在其中）。
+///
+/// `Project.path` 是登记时写下的**真实目录**，所以它比任何名称比较都硬：
+/// `git clone url 我的目录` 检出成什么样它就记什么样，和 slug 可以毫无关系。
+///
+/// 判「是不是在自己的树里」而不是「是不是相等」：`cwd` 常常是子目录
+/// （`D:\work\app\src\server` 而项目根是 `D:\work\app`）。反过来不成立 ——
+/// 项目根在 `cwd` 里（`cwd = D:\work` 而项目是 `D:\work\app`）说明这条记忆是从
+/// 上层目录写的，不属于这个项目。
+///
+/// 比较按段做、不做字符串前缀：`D:\work\app` 与 `D:\work\app-legacy` 的字符
+/// 前缀相同，但那**正是**两个仓库被并成一个的入口。
+pub fn path_is_inside_project(cwd: &str, project_path: &str) -> bool {
+    let cwd_segments = path_segments(cwd);
+    let project_segments = path_segments(project_path);
+    if cwd_segments.is_empty() || project_segments.is_empty() {
+        return false;
+    }
+    if project_segments.len() > cwd_segments.len() {
+        return false;
+    }
+    cwd_segments.starts_with(&project_segments)
+}
+
+/// 按段拆路径，分隔符与平台无关。
+///
+/// 与 `mod.rs::push_path_segments` 同一套口径（那边不能依赖 `layout` 的实现细节
+/// 来保证一致，所以两处都只做「拆」这一件事，判据才是共享的）。
+fn path_segments(raw: &str) -> Vec<String> {
+    raw.split(['/', '\\'])
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty() && part != "." && part != "..")
+        .map(|part| part.to_lowercase())
+        .collect()
 }
 
 fn normalize_name(raw: &str) -> String {
@@ -608,6 +685,54 @@ mod tests {
     fn short_substring_is_not_a_match() {
         // `app` ⊂ `application` 不该被判成同一项目
         assert!(name_similarity("app", "application") < 0.72);
+    }
+
+    #[test]
+    fn same_project_needs_the_literal_slug() {
+        // 这个函数的调用方是「路径里出现这个目录 = 这条记忆属于这个项目」，
+        // 判错的代价是把记忆静默搬进别的项目。所以它只认字面，不认分数。
+        assert!(name_is_same_project("agent2api-main", "agent2api-main"));
+        assert!(name_is_same_project("Agent2API-Main", "agent2api-main"), "大小写不该算差异");
+        assert!(
+            !name_is_same_project("agent2api", "agent2api-main"),
+            "剥后缀的相似度是 0.98，正是它把两个仓库并成一个"
+        );
+        assert!(!name_is_same_project("agent2api-main", "agent2api"), "反方向同样不认");
+        // `name_similarity` 对这两者的分数就是 0.98：这就是不能用它当判据的原因
+        assert!((name_similarity("agent2api", "agent2api-main") - 0.98).abs() < 1e-9);
+    }
+
+    #[test]
+    fn same_project_accepts_the_owner_repo_half() {
+        // `<owner>--<repo>` 是 slug 的固定形态，拆出来的段不是猜的：
+        // 真机 `aimod-cc--agent2api` 的检出目录就叫 `agent2api`。
+        assert!(name_is_same_project("agent2api", "aimod-cc--agent2api"));
+        assert!(name_is_same_project("aimod-cc", "aimod-cc--agent2api"));
+        assert!(!name_is_same_project("aimod", "aimod-cc--agent2api"), "半个 owner 不是 owner");
+        // 单段 slug 不该被 `--` 之外的东西拆开
+        assert!(!name_is_same_project("agent2api", "agent2api-main"));
+        assert!(!name_is_same_project("", "agent2api-main"));
+        assert!(!name_is_same_project("agent2api-main", ""));
+    }
+
+    #[test]
+    fn project_path_covers_the_renamed_checkout() {
+        // `git clone url 我的目录`：目录名与 slug 毫无关系，只有登记下来的
+        // `path` 知道它是谁。这条是「名字判据」的补丁，不是它的替代。
+        assert!(path_is_inside_project("D:\\work\\我的目录\\src", "D:\\work\\我的目录"));
+        assert!(path_is_inside_project("D:\\work\\我的目录", "D:/work/我的目录/"), "分隔符与尾斜杠不该影响判断");
+        assert!(path_is_inside_project("/home/me/app/src", "/home/me/app/"), "大小写与平台无关");
+
+        // 子目录在内，上层目录不在 —— `cwd` 常常是子目录，但反方向的包含
+        // 说明这条记忆是从上层目录写的，不属于这个项目。
+        assert!(!path_is_inside_project("D:\\work", "D:\\work\\app"));
+
+        // 前缀相同的兄弟目录不是同一个项目（这条最容易写错成字符串前缀比较）
+        assert!(!path_is_inside_project("D:\\work\\app-legacy\\src", "D:\\work\\app"));
+        assert!(!path_is_inside_project("D:\\work\\app2\\src", "D:\\work\\app"));
+
+        assert!(!path_is_inside_project("", "D:\\work\\app"));
+        assert!(!path_is_inside_project("D:\\work\\app", ""));
     }
 
     #[test]

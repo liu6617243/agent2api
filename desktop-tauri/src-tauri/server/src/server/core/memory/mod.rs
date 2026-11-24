@@ -2983,10 +2983,18 @@ fn auto_eligible(row: &index::ReviewRow, projects: &[store::Project]) -> bool {
             //
             // 所以判据按证据类型分：只有 `files` 里的路径段命中才算证据。这时
             // 阈值可以降到「够格进候选」的位置（0.72），因为路径证据本身极稀少 ——
-            // 真机 562 个记忆文件里带 `files` 的有 81 条，而路径段命中已登记项目
-            // 目录的 **0 条**（`files` 存的是 `src/server/...` 这类仓库内相对路径，
-            // 不含项目目录名），能走到这一步的已经不可能是噪音。反过来，
-            // `Mention` 级的一条也不自动，阈值给多低都没用。
+            // 真机 649 个活条目里带 `files` 的一小批，而路径段与已登记 slug **字面
+            // 相等**的 0 条（`files` 存的是 `src/server/...` 这类仓库内相对路径），
+            // 能走到这一步的已经不可能是噪音。反过来，`Mention` 级的一条也不自动，
+            // 阈值给多低都没用。
+            //
+            // ── 分数为什么不再当闸 ──────────────────────────────────
+            // `row.confidence` 是**入队那一刻**按名字相似度算的：巡检给的是标题/标签
+            // 的模糊分，写入侧给的是 `layout::classify` 的模糊分（真机 0.64~0.80）。
+            // 而 `classify_evidence_of` 判的是**证据类型**——cwd 落在这个项目的目录里，
+            // 就是确定的归属，哪怕当年算出来的名字分只有 0.65。拿一个与证据无关的
+            // 旧分数去否决一份硬证据，等于让「写记忆时工作目录在哪儿」这条最硬的
+            // 事实永远落不了地。
             let slug = row
                 .payload
                 .get("suggestion")
@@ -3001,14 +3009,17 @@ fn auto_eligible(row: &index::ReviewRow, projects: &[store::Project]) -> bool {
             if !target.is_trusted() || target.project.as_deref() == Some(slug) {
                 return false;
             }
-            if classify_evidence_of(&row.payload, &target, projects).is_none() {
+            // 只有路径证据才可能自动：`Mention` 级（标签/标题提到项目名）代表
+            // 「这条在讲它」，不代表「这条属于它」。判据见 `ClassifyEvidenceOf`。
+            // `OtherProject` 也不行 —— 那条建议指向的目标是错的，搬了就是错搬。
+            if classify_evidence_of(&row.payload, &target, projects) != ClassifyEvidenceOf::OwnProject {
                 return false;
             }
-            if !classify_score_ok(row.confidence, config::number("review.autoConfirmClassifyThreshold")) {
-                return false;
-            }
-            // slug 必须已经在注册表里 —— 用户的意图已经表过一次态。
-            projects.iter().any(|project| project.slug == slug)
+            // slug 必须已经在注册表里、且未归档 —— 用户的意图已经表过一次态。
+            // 归档项目的语义是「不再接新记忆」，把记忆往里搬是反向操作。
+            projects
+                .iter()
+                .any(|project| project.slug == slug && !project.archived)
         }
         "dedup" => {
             if !config::bool_of("review.autoConfirmDedup") {
@@ -3022,13 +3033,11 @@ fn auto_eligible(row: &index::ReviewRow, projects: &[store::Project]) -> bool {
     }
 }
 
-/// 归类建议的置信度够不够格自动搬。`threshold` 由配置给，这里只做比较 ——
-/// 纯函数才能单测，而配置读取会让测试依赖测试机上的 `config.json`。
-fn classify_score_ok(confidence: f64, threshold: f64) -> bool {
-    confidence >= threshold
-}
-
-/// 这条归类建议有没有「归属级」证据。`Some(slug)` = 有，`None` = 只有提及。
+/// 这条归类建议有没有「归属级」证据，以及证据指向谁。
+///
+/// 返回三态（见 [`ClassifyEvidenceOf`]）：`OwnProject` 才可自动搬；`OtherProject`
+/// 说明入队时按名字把目标猜错了，该作废但原因要如实写；`Mention` 表示只有标签/
+/// 标题提到项目名 —— 那是「在讲它」，不是「属于它」。
 ///
 /// ── 证据有两个来源：`files` 与 `cwd` ──────────────────────────
 /// 两者都是「这条记忆**落在**哪个目录」，而不是「它在**讲**什么」：
@@ -3046,6 +3055,13 @@ fn classify_score_ok(confidence: f64, threshold: f64) -> bool {
 /// 只认 `files` 的话，这类建议会被当作「仅提及」直接作废 —— 把最该自动的一批
 /// 连人看的机会都掐掉。
 ///
+/// ── 为什么还要读 `Project.path` ────────────────────────────
+/// 目录名匹配有个天然盲区：`git clone url 我的目录` 检出的目录名与 slug 毫无
+/// 关系，路径段怎么比都不命中，可用户确实在那个项目里干活。`Project.path` 是
+/// 登记时写下的真实目录，按「段前缀」比一下就是确定的答案 —— 但真机上这个字段
+/// 现在几乎全是 `null`（登记表是旧版本写的，只存了 slug/name），所以它只能当
+/// 加强项，不能当唯一判据。
+///
 /// ── 为什么不直接读载荷里的 `evidence` ────────────────────────
 /// 载荷是入队那一刻写下的，而条目本身可能已经被改过（补了 `files`、换了标签）。
 /// 更重要的是：老队列里那批建议**根本没有** `evidence` 键（这个字段是这一轮
@@ -3055,61 +3071,129 @@ fn classify_evidence_of(
     payload: &Value,
     target: &MemoryEntry,
     projects: &[store::Project],
-) -> Option<String> {
-    let slug = payload.get("suggestion").and_then(Value::as_str)?;
-    if slug.is_empty() {
-        return None;
-    }
-    // 路径段 → 项目。`files` 与 `cwd` 走同一套比较：都是「某个目录名像不像这个
-    // 项目」。这里只判「有没有」，不比相似度阈值 —— 相似度已经在入队时算过了，
-    // 重复算一遍只会让两条路径的阈值有可能不一致。
+) -> ClassifyEvidenceOf {
+    let Some(slug) = payload.get("suggestion").and_then(Value::as_str).filter(|slug| !slug.is_empty()) else {
+        return ClassifyEvidenceOf::Mention;
+    };
+    // 路径段 → 项目。两条判据按强度排序：
+    //
+    //   ① `Project.path` 登记的真实目录 —— 最硬。`git clone url 我的目录` 检出成
+    //      什么样它就记什么样，与 slug 可以毫无关系；
+    //   ② 路径段与 slug 结构相等 —— 覆盖「没记 path 的老项目」与「仓库内相对
+    //      路径里带项目名」。
+    //
+    // 只判「有没有」，不在这里比相似度：相似度已经在上游分过档，重复算一遍只会
+    // 让两处阈值有机会不一致。
     let mut segments: Vec<String> = Vec::new();
+    let mut paths: Vec<&str> = Vec::new();
     for file in &target.files {
         push_path_segments(file, &mut segments);
+        paths.push(file.as_str());
     }
     // `cwd` 也可能是文件路径（客户端偶尔把文件当 cwd 报），同样按路径段拆。
     if let Some(cwd) = payload.get("cwd").and_then(Value::as_str) {
         push_path_segments(cwd, &mut segments);
+        paths.push(cwd);
     }
-    if segments_hit(&segments, slug, projects) {
-        Some(slug.to_string())
-    } else {
-        None
+
+    let mut owner: Option<String> = segments_owner(&segments, projects);
+    for project in projects {
+        if project.archived || project.slug == store::GLOBAL_SLUG {
+            continue;
+        }
+        let Some(root) = project.path.as_deref() else {
+            continue;
+        };
+        if !paths.iter().any(|path| layout::path_is_inside_project(path, root)) {
+            continue;
+        }
+        // `path` 是登记下来的真实目录，比目录名硬；两者冲突说明登记表本身矛盾
+        // （同一个项目登记了两棵树），此时不做裁决。
+        if owner.is_some() && owner.as_deref() != Some(project.slug.as_str()) {
+            return ClassifyEvidenceOf::OtherProject(String::new());
+        }
+        owner = Some(project.slug.clone());
     }
+
+    match owner {
+        Some(found) if found == slug => ClassifyEvidenceOf::OwnProject,
+        // 有路径证据，但指向另一个项目：入队时按名字猜错了目标。这种建议
+        // 批准下去就是错搬，必须能自己消失，且原因要如实写。
+        Some(found) => ClassifyEvidenceOf::OtherProject(found),
+        None => ClassifyEvidenceOf::Mention,
+    }
+}
+
+/// 一条归类建议的证据落点。三态而不是 `Option`：`Option` 把「没有路径证据」
+/// 和「路径证据指向别处」压成同一个 `None`，于是入队时猜错项目的建议会被记成
+/// 「只是提及」—— 那既不解释它为什么消失，也掩盖了一个真实的目标判错。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClassifyEvidenceOf {
+    /// 路径证据指向建议要去的那个项目 —— 可自动搬
+    OwnProject,
+    /// 路径证据指向另一个项目（空串 = 横跨多个项目，没有唯一答案）
+    OtherProject(String),
+    /// 只有标签 / 标题提到项目名：不自动，也只是「在讲它」
+    Mention,
 }
 
 /// 把一条路径拆成目录段（`C:\a\b\c.rs` → ["C:", "a", "b", "c.rs"]）。
 ///
-/// 空串直接跳过：`Path::new("")` 的 `components()` 会给出一个空 `Normal` 段，
-/// 那段拿去和项目名比相似度会得到 0，无害但白跑一遍；而调用方有一半的场合
-/// （`cwd` 没报、`files` 里有空元素）都会送空串过来。
+/// ── 为什么手写 split，而不用 `Path::components()` ─────────────
+/// 记忆是**跨机器**的：一份在 Windows 上写下、`files` 里带反斜杠的条目，同步到
+/// 另一台机器后用 `Path::components()` 拆只会得到一个整段
+/// `D:\work\agent2api\src`，于是「路径里有项目目录」这条判据在非 Windows 上
+/// 永远不成立 —— 自动裁决会静默退化成一概不做，且没有任何报错。所以两种分隔符
+/// 都认，与当前平台无关。
+///
+/// 空串直接跳过：调用方有一半的场合（`cwd` 没报、`files` 里有空元素）都会送
+/// 空串过来，而空段拿去比相似度只会得 0。
 fn push_path_segments(path: &str, out: &mut Vec<String>) {
     if path.trim().is_empty() {
         return;
     }
-    for part in std::path::Path::new(path).components() {
-        if let std::path::Component::Normal(segment) = part {
-            let segment = segment.to_string_lossy();
-            if !segment.is_empty() {
-                out.push(segment.to_string());
-            }
+    for segment in path.split(['/', '\\']) {
+        let segment = segment.trim();
+        // `.` / `..` 不是名字，混进去只会白跑比较
+        if segment.is_empty() || segment == "." || segment == ".." {
+            continue;
         }
+        out.push(segment.to_string());
     }
 }
 
-/// 这些路径段里有没有一个「就是这个项目」。
+/// 「这个项目名下」的路径段里有几个。`classify_evidence_of` 用它区分
+/// 「证据指向建议的目标」/「证据指向别处」/「没有路径证据」。
 ///
-/// 0.98 而不是 0.72：`files` 里的目录名是**字面事实**，不是猜测。用模糊区
-/// （0.72）会让 `agent2api` 命中 `agent2api-main` 的路径 —— 那正是两个不同
-/// 项目被合并成一个的开始。只有近乎同名才算「就是这个目录」。
-fn segments_hit(segments: &[String], slug: &str, projects: &[store::Project]) -> bool {
-    segments.iter().any(|segment| {
-        projects.iter().any(|project| {
-            project.slug == slug
-                && (layout::name_similarity(segment, &project.slug) >= 0.98
-                    || layout::name_similarity(segment, &project.name) >= 0.98)
-        })
-    })
+/// 判据是 [`layout::name_is_same_project`]：结构性相等，不是相似度。刻意不引入
+/// 任何数字阈值 —— 用模糊区（0.72）会把 `agent2api` 判成 `agent2api-main` 的
+/// 路径；而 `name_similarity` 在剥离检出后缀那条分支上给这两者打的分数**恰好
+/// 就是** 0.98，所以「0.98 足够严」是个错觉，它挡不住这条。归属错了的代价是
+/// 记忆静默流进另一个项目，用户在自己项目里再也搜不到它 —— 这个场合不猜。
+///
+/// 返回 `Some("")` 表示路径横跨两个已登记项目：多仓库工程没有唯一答案，
+/// 调用方据此判「有证据但指向不明」，而不是「没有证据」。
+fn segments_owner(segments: &[String], projects: &[store::Project]) -> Option<String> {
+    let mut owner: Option<String> = None;
+    for project in projects {
+        // `_global` 是兜底桶，不是「某个目录里的项目」。而且它归一化后是
+        // `global`，一个叫 `global` 的普通目录就能命中 —— 那条建议毫无意义。
+        // 归档项目同理排除：它的语义是「不再接新记忆」。
+        if project.archived || project.slug == store::GLOBAL_SLUG {
+            continue;
+        }
+        if !segments
+            .iter()
+            .any(|segment| layout::name_is_same_project(segment, &project.slug))
+        {
+            continue;
+        }
+        if owner.is_some() {
+            return Some(String::new());
+        }
+        owner = Some(project.slug.clone());
+    }
+    owner
 }
 
 /// 一条 dedup 建议该自动落成什么。`None` = 不动它，留在队列里。
@@ -3474,10 +3558,14 @@ fn retire_reason_of(
     if !slug.is_empty() && target.project.as_deref() == Some(slug) {
         return Some("auto-already-classified");
     }
-    if classify_evidence_of(&row.payload, target, projects).is_none() {
-        return Some("auto-mention-only");
+    match classify_evidence_of(&row.payload, target, projects) {
+        ClassifyEvidenceOf::OwnProject => None,
+        // 有路径证据，但它指向另一个项目：入队时按名字把目标猜错了。
+        // 留着等人点头只会在「全选确认」时被批量搬错，作废是对的，但原因
+        // 必须写清楚 —— 这不是「只是提及」，是目标判错。
+        ClassifyEvidenceOf::OtherProject(_) => Some("auto-wrong-project"),
+        ClassifyEvidenceOf::Mention => Some("auto-mention-only"),
     }
-    None
 }
 
 /// 扫一遍队列，把够格的自动裁决掉。
@@ -4926,21 +5014,10 @@ mod tests {
     // 会去动它不该动的东西，而那种错误是静默的。
 
     #[test]
-    fn classify_threshold_only_matters_after_path_evidence() {
-        // 阈值还是那个比较函数，但它现在只是**第二道**闸：第一道是「有没有路径
-        // 证据」（`classify_evidence_of`）。真机 6 条待归类的置信度是
-        // 0.64/0.64/0.69/0.74/0.80/0.80 —— 全都低于任何像样的阈值，这本身就说明
-        // 「靠提记得来的分数」整体偏低，拿它当判据只会两边不讨好。
-        assert!(!classify_score_ok(0.64, 0.72), "0.64 连进候选都不够");
-        assert!(classify_score_ok(0.72, 0.72));
-        assert!(classify_score_ok(1.0, 0.72));
-    }
-
-    #[test]
     fn path_segments_only_match_near_exact_names() {
         // 路径段是**字面事实**，不是猜测。用模糊阈值（0.72）会让 `agent2api`
         // 命中 `agent2api-main` 的路径 —— 那正是两个不同项目被并成一个的开始。
-        let projects = vec![store::Project {
+        let project = store::Project {
             slug: "agent2api-main".into(),
             name: "Agent2API".into(),
             remote: None,
@@ -4951,18 +5028,64 @@ mod tests {
             merged_into: None,
             pinned: false,
             archived: false,
-        }];
+        };
+        let projects = vec![project.clone()];
 
         let mut segments = Vec::new();
         push_path_segments("D:\\Personal\\Desktop\\agent2api-main\\src\\server", &mut segments);
         assert!(segments.iter().any(|s| s == "agent2api-main"), "路径段该被拆开: {segments:?}");
-        assert!(segments_hit(&segments, "agent2api-main", &projects));
+        assert_eq!(
+            segments_owner(&segments, &projects).as_deref(),
+            Some("agent2api-main"),
+            "路径段逐字等于 slug 就该认领"
+        );
         // 目录名 `agent2api`（不带 -main）不该命中 `agent2api-main`
         let mut other = Vec::new();
         push_path_segments("D:\\work\\agent2api\\src", &mut other);
-        assert!(
-            !segments_hit(&other, "agent2api-main", &projects),
+        assert_eq!(
+            segments_owner(&other, &projects),
+            None,
             "前缀相同的另一个仓库不该被当成同一个项目"
+        );
+
+        // ── 显示名不是归属证据 ───────────────────────────────────
+        // 真机登记表里有 `name: "Agent2API"` 配 `slug: "agent2api-main"`。只要判据
+        // 里带上 `project.name`，`agent2api` 这个目录段就会与 name 归一化后逐字
+        // 相等，于是「不带 -main 的目录」照样算命中。这里把它钉死：
+        // 反着摆一个 name 恰好等于目录段、slug 完全无关的项目。
+        let name_only = vec![store::Project {
+            slug: "app-x".into(),
+            name: "agent2api".into(),
+            ..project.clone()
+        }];
+        assert_eq!(
+            segments_owner(&other, &name_only),
+            None,
+            "name 逐字相等也不能算命中：name 是显示名，不是目录名"
+        );
+        // 而 slug 逐字相等就必须命中（判据是 slug，不是别的）
+        let mut app_x = Vec::new();
+        push_path_segments("D:\\work\\app-x\\src", &mut app_x);
+        assert_eq!(segments_owner(&app_x, &name_only).as_deref(), Some("app-x"), "slug 逐字相等就该命中");
+
+        // ── 归档项目不接新记忆 ───────────────────────────────────
+        let archived = vec![store::Project { archived: true, ..project.clone() }];
+        assert_eq!(
+            segments_owner(&segments, &archived),
+            None,
+            "归档项目不该再收记忆"
+        );
+
+        // ── 横跨两个项目 = 有证据但没有唯一答案 ───────────────────
+        // 这不是「没有证据」：作废原因要区分两者，否则一次真实的目标判错会被
+        // 记成「只是提及」。
+        let two = vec![project.clone(), store::Project { slug: "agenthub".into(), ..project.clone() }];
+        let mut cross = Vec::new();
+        push_path_segments("D:\\work\\agent2api-main\\agenthub", &mut cross);
+        assert_eq!(
+            segments_owner(&cross, &two),
+            Some(String::new()),
+            "横跨两个项目要返回空串，不能随便挑一个"
         );
 
         // 空串与空元素不该产出段（`Path::new("")` 会给出一个空 Normal 段）
@@ -4970,6 +5093,91 @@ mod tests {
         push_path_segments("", &mut empty);
         push_path_segments("   ", &mut empty);
         assert!(empty.is_empty(), "空路径不该产出任何段: {empty:?}");
+    }
+
+    #[test]
+    fn evidence_of_separates_mention_from_wrong_project() {
+        // 三态判据的用处：`Option` 会把「有路径证据但指向别处」压成「没有证据」。
+        let target_project = store::Project {
+            slug: "agent2api-main".into(),
+            name: "Agent2API".into(),
+            remote: None,
+            path: None,
+            created_at: 0,
+            updated_at: 0,
+            remotes: Vec::new(),
+            merged_into: None,
+            pinned: false,
+            archived: false,
+        };
+        let projects = vec![target_project.clone(), store::Project { slug: "agenthub".into(), ..target_project }];
+
+        // ① 目标就是路径里的那个项目 → 可自动搬
+        let mut entry = MemoryEntry::draft("x", "t", MemoryKind::Knowledge, "b");
+        entry.files = vec!["D:\\work\\agent2api-main\\src\\main.rs".into()];
+        let payload = json!({ "suggestion": "agent2api-main" });
+        assert_eq!(
+            classify_evidence_of(&payload, &entry, &projects),
+            ClassifyEvidenceOf::OwnProject
+        );
+
+        // ② 路径里的项目不是建议的目标 → 目标判错，不是「只是提及」
+        let wrong = json!({ "suggestion": "agenthub", "cwd": "D:\\work\\agent2api-main" });
+        assert_eq!(
+            classify_evidence_of(&wrong, &entry, &projects),
+            ClassifyEvidenceOf::OtherProject("agent2api-main".into())
+        );
+
+        // ③ 只有标签/标题，没有路径 → 只是提及
+        entry.files.clear();
+        let mention = json!({ "suggestion": "agenthub" });
+        assert_eq!(
+            classify_evidence_of(&mention, &entry, &projects),
+            ClassifyEvidenceOf::Mention
+        );
+
+        // ④ `cwd` 单独就够：写入时用户就在那个仓库里干活
+        let by_cwd = json!({ "suggestion": "agent2api-main", "cwd": "D:\\work\\agent2api-main" });
+        assert_eq!(
+            classify_evidence_of(&by_cwd, &entry, &projects),
+            ClassifyEvidenceOf::OwnProject
+        );
+
+        // ⑤ 归档项目不接新记忆，哪怕路径完全对得上
+        let archived = vec![store::Project { archived: true, ..projects[0].clone() }];
+        assert_eq!(
+            classify_evidence_of(&by_cwd, &entry, &archived),
+            ClassifyEvidenceOf::Mention,
+            "归档项目里的路径不算归属证据"
+        );
+    }
+
+    #[test]
+    fn path_segments_are_split_the_same_on_every_os() {
+        // 记忆跨机器：Windows 上写下的 `files` 会被 Mac / Linux 读回来判。用
+        // `Path::components()` 的话，反斜杠路径在非 Windows 上只是一个整段，
+        // 自动裁决就静默退化成一概不做 —— 而没有任何地方会报错。
+        let mut win = Vec::new();
+        push_path_segments("D:\\work\\agent2api-main\\src\\server\\x.rs", &mut win);
+        assert_eq!(
+            win,
+            vec!["D:", "work", "agent2api-main", "src", "server", "x.rs"],
+            "Windows 路径必须按反斜杠拆开，与当前平台无关"
+        );
+
+        let mut unix = Vec::new();
+        push_path_segments("/home/me/agent2api-main/src", &mut unix);
+        assert_eq!(unix, vec!["home", "me", "agent2api-main", "src"]);
+
+        // 混着写的（WSL / MSYS 里 `cd /d/work` 这种）也别漏
+        let mut mixed = Vec::new();
+        push_path_segments("D:/work\\agent2api-main/src", &mut mixed);
+        assert!(mixed.iter().any(|s| s == "agent2api-main"), "{mixed:?}");
+
+        // `.` / `..` 不是名字
+        let mut dotted = Vec::new();
+        push_path_segments("./a/../b//c", &mut dotted);
+        assert_eq!(dotted, vec!["a", "b", "c"], "相对段与空段都该被丢掉: {dotted:?}");
     }
 
     #[test]

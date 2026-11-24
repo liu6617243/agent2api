@@ -1023,16 +1023,26 @@ fn best_project_match(
     // ── 第一级：`files` 的路径段 ────────────────────────────────
     // 只认路径里出现的项目目录名，不比文件名：`lib.rs` / `index.ts` 到处都是，
     // 拿它当线索等于给每条记忆都发一张「像某个项目」的通行证。
+    //
+    // 这一级的判据与 `mod.rs::segments_hit` 是**同一个**（`name_is_same_project`），
+    // 不在这里另算一遍相似度：两处各用一套阈值就会出现「巡检按 0.72 入队、
+    // 自动裁决按字面否掉」，于是建议一条也落不了地，还都被 `retire_reason_of`
+    // 判成「不是路径证据」作废 —— 白跑一趟，队列里连解释都留不下。
     let mut path_hits: Vec<String> = Vec::new();
     for file in &entry.files {
-        for part in std::path::Path::new(file).components() {
-            if let std::path::Component::Normal(segment) = part {
-                path_hits.push(segment.to_string_lossy().to_string());
+        for segment in file.split(['/', '\\']) {
+            let segment = segment.trim();
+            if segment.is_empty() || segment == "." || segment == ".." {
+                continue;
             }
+            path_hits.push(segment.to_string());
         }
     }
-    if let Some((slug, score)) = best_of(&path_hits, projects, threshold) {
-        return Some((slug, score, ClassifyEvidence::Path));
+    if let Some(slug) = best_path_hit(&path_hits, projects) {
+        // 置信度给 1.0：`name_is_same_project` 是**结构相等**，不是估计值。
+        // 这个数字现在只用于队列展示排序 —— 自动裁决的判据是证据类型，不看分数
+        // （`review.autoConfirmClassifyThreshold` 已删，理由见 config.rs 注释）。
+        return Some((slug, 1.0, ClassifyEvidence::Path));
     }
 
     // ── 第二级：标签与标题 ──────────────────────────────────────
@@ -1045,6 +1055,31 @@ fn best_project_match(
     best_of(&hints, projects, threshold).map(|(slug, score)| (slug, score, ClassifyEvidence::Mention))
 }
 
+/// 路径段命中哪个项目。判据与 `mod.rs::segments_hit` 一致（结构相等），
+/// 归档项目除外 —— 它不再接新记忆。
+fn best_path_hit(segments: &[String], projects: &[store::Project]) -> Option<String> {
+    if segments.is_empty() {
+        return None;
+    }
+    // 先收集所有命中再挑：一条记忆的 `files` 可能横跨两个项目（多仓库工程），
+    // 这时「随便挑一个」会把记忆搬进错的那半。存在歧义就不归，留在全局。
+    // 用 `HashSet` 而不是 `dedup()`：后者只压相邻重复，同一个 slug 在中间被
+    // 另一个项目隔开时会算成两条，歧义判据就凭空报「两个都命中」。
+    let hits: std::collections::HashSet<&str> = projects
+        .iter()
+        .filter(|project| !project.archived && project.slug != store::GLOBAL_SLUG)
+        .filter(|project| {
+            segments.iter().any(|segment| super::layout::name_is_same_project(segment, &project.slug))
+        })
+        .map(|project| project.slug.as_str())
+        .collect();
+    if hits.len() == 1 {
+        hits.into_iter().next().map(str::to_string)
+    } else {
+        None
+    }
+}
+
 /// 在一组线索里找最像的项目。`threshold` 以下是「都不像」。
 fn best_of(hints: &[String], projects: &[store::Project], threshold: f64) -> Option<(String, f64)> {
     if hints.is_empty() {
@@ -1052,6 +1087,10 @@ fn best_of(hints: &[String], projects: &[store::Project], threshold: f64) -> Opt
     }
     let mut best: Option<(String, f64)> = None;
     for project in projects {
+        // 归档项目与兜底桶都不参与：前者用户已经明确停用，后者根本不是项目。
+        if project.archived || project.slug == store::GLOBAL_SLUG {
+            continue;
+        }
         let score = hints.iter().fold(0.0f64, |acc, hint| {
             let score = super::layout::name_similarity(hint, &project.name)
                 .max(super::layout::name_similarity(hint, &project.slug));
@@ -2218,5 +2257,63 @@ mod tests {
             Some(Cadence::Daily(time)) => assert_eq!(time, "09:05"),
             _ => panic!("应当解析成 daily"),
         }
+    }
+
+    fn project(slug: &str, archived: bool) -> store::Project {
+        store::Project {
+            slug: slug.into(),
+            name: slug.into(),
+            remote: None,
+            path: None,
+            created_at: 0,
+            updated_at: 0,
+            remotes: Vec::new(),
+            merged_into: None,
+            pinned: false,
+            archived,
+        }
+    }
+
+    #[test]
+    fn path_evidence_beats_name_similarity() {
+        // 巡检与自动裁决必须用同一套判据。早先巡检按 `name_similarity >= 0.62`
+        // 认路径证据、自动裁决按字面复核，结果建议能入队却永远落不了地。
+        let projects = vec![project("agent2api-main", false), project("agenthub", false)];
+        let hits = vec!["D:".to_string(), "work".into(), "agent2api-main".into(), "src".into()];
+        assert_eq!(best_path_hit(&hits, &projects).as_deref(), Some("agent2api-main"));
+
+        // 只差后缀的邻居不算：这是「两个仓库并成一个」的入口
+        let near = vec!["work".to_string(), "agent2api".into(), "src".into()];
+        assert_eq!(best_path_hit(&near, &projects), None);
+    }
+
+    #[test]
+    fn ambiguous_path_hits_stay_unclassified() {
+        // 一条记忆的 `files` 横跨两个已登记项目时不能随便挑一个：挑错就是把
+        // 笔记搬进另一个项目，而界面上看起来「什么都没发生」。
+        let projects = vec![project("alpha", false), project("beta", false)];
+        let cross = vec!["work".to_string(), "alpha".into(), "beta".into()];
+        assert_eq!(best_path_hit(&cross, &projects), None);
+        // 同一个项目出现两次不是歧义（`HashSet` 去重，不是 `dedup` 压相邻）
+        let repeat = vec!["alpha".to_string(), "beta".into(), "alpha".into()];
+        assert_eq!(best_path_hit(&repeat, &projects), None, "两个项目都在，仍然是歧义");
+        let single_repeat = vec!["alpha".to_string(), "x".into(), "alpha".into()];
+        assert_eq!(best_path_hit(&single_repeat, &projects).as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn archived_and_global_never_take_new_memories() {
+        let projects = vec![
+            project("retired", true),
+            project(store::GLOBAL_SLUG, false),
+            project("live", false),
+        ];
+        let retired = vec!["retired".to_string()];
+        assert_eq!(best_path_hit(&retired, &projects), None, "归档项目不该再接记忆");
+        // `_global` 归一化后是 `global`，一个叫 `global` 的普通目录就能命中它
+        let general = vec!["global".to_string()];
+        assert_eq!(best_path_hit(&general, &projects), None, "兜底桶不是项目");
+        let live = vec!["live".to_string()];
+        assert_eq!(best_path_hit(&live, &projects).as_deref(), Some("live"));
     }
 }
