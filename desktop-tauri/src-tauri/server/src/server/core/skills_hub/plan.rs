@@ -647,6 +647,8 @@ fn plan_actions(config: &Value) -> Planned {
             let link_path = tool_dir.join(name);
             if mount::is_link(&link_path) {
                 if mount::points_to(&link_path, &central) && link_path.exists() {
+                    // `tool` 要同时进结构体与 note，先备好文本再 move
+                    let note = format!("{tool} 挂载有效");
                     actions.push(Action {
                         kind: "skip",
                         skill: name.clone(),
@@ -654,7 +656,7 @@ fn plan_actions(config: &Value) -> Planned {
                         dir: tool_dir.clone(),
                         mount_name: name.clone(),
                         replace_real: false,
-                        note: format!("{tool} 挂载有效"),
+                        note,
                         sources: Vec::new(),
                         entry: None,
                     });

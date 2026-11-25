@@ -432,7 +432,8 @@ pub fn skill(name: &str) -> Result<Value, String> {
         "health": if has_central { json!(scan::health_check(&central)) } else { json!([]) },
         "skillMd": if has_central { scan::skill_md_raw(&central) } else { String::new() },
         "body": if has_central { scan::skill_body(&central) } else { String::new() },
-        "children": if has_central { scan::list_children(&central) } else { json!([]) },
+        // `list_children` 返回 `Vec<Value>`，与 `json!([])` 不同型 → 两边都过一层 `json!`
+        "children": if has_central { json!(scan::list_children(&central)) } else { json!([]) },
         "fileCount": if has_central { scan::count_files(&central) } else { 0 },
         "mounts": mounts,
     }))

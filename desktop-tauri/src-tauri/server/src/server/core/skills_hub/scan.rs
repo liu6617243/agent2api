@@ -94,7 +94,7 @@ pub fn parse_skill_md(dir: &Path) -> Result<SkillMd, String> {
             if current_key == "metadata" {
                 if let Some((key, value)) = split_key_value(trimmed) {
                     if key == "version" {
-                        parsed.version = strip_quotes(value);
+                        parsed.version = strip_quotes(&value);
                     }
                 }
             }
@@ -143,7 +143,7 @@ pub fn parse_skill_md(dir: &Path) -> Result<SkillMd, String> {
             joined.trim().to_string()
         } else {
             index += 1;
-            strip_quotes(value)
+            strip_quotes(&value)
         };
         match key.as_str() {
             "name" => parsed.name = resolved,
