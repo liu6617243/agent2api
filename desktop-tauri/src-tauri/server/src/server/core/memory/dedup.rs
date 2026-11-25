@@ -146,12 +146,14 @@ impl Verdict {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
-        let keep = if raw_keep == "new" {
+        // DELETE 先判、且不看模型写的 `keep`：它的语义固定是「丢掉新写的这条」。
+        // 这一支必须排在 `raw_keep` 判断之前 —— 模型写 `keep:"new"` 时如果先看
+        // 模型的话，就会把「新条该丢」执行成「旧条该丢」，等于判据说合、执行说废。
+        let keep = if op == "DELETE" {
+            "candidate"
+        } else if raw_keep == "new" {
             "new"
         } else if raw_keep == "candidate" || raw_keep == "other" || raw_keep == "old" {
-            "candidate"
-        } else if op == "DELETE" {
-            // DELETE 的语义固定是「丢掉新写的这条」，方向不需要模型再说一遍。
             "candidate"
         } else {
             // UPDATE 没给方向时留新的那条：新记忆通常带着刚补上的口径，
