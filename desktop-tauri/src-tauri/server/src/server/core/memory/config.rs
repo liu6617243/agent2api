@@ -96,38 +96,26 @@ pub struct Knob {
     pub options: &'static [&'static str],
     /// 改了立刻生效（`false` = 需要重启或重建索引）
     pub hot: bool,
-    /// 运行时代码**真的读它**（`false` = 只落盘、只显示，没有任何行为影响）。
-    ///
-    /// ── 为什么要这个字段，而不是把未接入的键直接删掉 ────────────
-    /// 这张表是**跨实现的配置契约**：磁盘上同一份 `config.json` 两边都能读
-    /// （见文件头）。删键会让「老配置 → 新代码」静默丢值，「新配置 → 老代码」
-    /// 被当未知键丢弃；而保留一个能改、能存、看不出没接线的旋钮，是更糟的一种：
-    /// 用户照着自己的理解调完、界面显示「已保存」、行为一点没变，然后开始怀疑
-    /// 整个页面是不是假的。
-    ///
-    /// 所以未接入的键**留着、标出来**：`wired=false` 下发到前端 → 控件置灰 +
-    /// 「本仓未接入」徽标；后端单测 `unwired_knobs_explain_themselves` 要求
-    /// 每个未接入的键都在 `desc` 里写清「为什么没接线」，不允许出现「静默的
-    /// 死旋钮」。同时 `wired_knobs_have_a_reader` 用源码扫描确保每个
-    /// `wired=true` 的键都真的有读取点 —— 这条是防**新加水**，比防旧水更重要。
-    pub wired: bool,
 }
 
+/// 这张表里**只放真的有读取点的旋钮**。
+///
+/// ── 为什么不给「暂时没接线的键」留位置（2026-11-25）──────────
+/// 早先这里有一个 `wired: bool`：值为 `false` 的键照存、照显示、界面挂一枚
+/// 「本仓未接入」徽标，用来和 AgentHub 共用同一份 `config.json`（跨实现配置
+/// 契约）。真机上这一批键加起来二十多个，界面上是一片灰掉的开关 —— 用户看到
+/// 的是「这页有一半是假的」，而不是「这是一份兼容清单」。契约的价值撑不起
+/// 这个观感，所以整批删除：`config.json` 里残留的老值会被当成未知键静默忽略
+/// （见文件头的读写规则），不会让配置解析失败。
+///
+/// 防复发的闸门仍在：单测 `every_knob_has_a_reader` 扫描源码，要求每个键都能
+/// 在 Rust 或前端找到字面量读取点。新增一个没人读的旋钮，测试直接红。
 const fn knob(key: &'static str, kind: Kind, tier: Tier, group: &'static str, label: &'static str, default_json: &'static str) -> Knob {
-    Knob { key, kind, tier, group, label, desc: "", default_json, min: None, max: None, options: &[], hot: true, wired: true }
+    Knob { key, kind, tier, group, label, desc: "", default_json, min: None, max: None, options: &[], hot: true }
 }
 
 const fn knob_d(key: &'static str, kind: Kind, tier: Tier, group: &'static str, label: &'static str, desc: &'static str, default_json: &'static str) -> Knob {
-    Knob { key, kind, tier, group, label, desc, default_json, min: None, max: None, options: &[], hot: true, wired: true }
-}
-
-/// 标成「本仓未接入」：值照存、界面照显示，但不影响任何行为。
-///
-/// `desc` 必须由调用方写好「为什么」—— 用户看到灰掉的开关时需要的是原因，
-/// 不是一句「暂不支持」。这条由单测 `unwired_knobs_explain_themselves` 钉住。
-const fn unwired(mut item: Knob) -> Knob {
-    item.wired = false;
-    item
+    Knob { key, kind, tier, group, label, desc, default_json, min: None, max: None, options: &[], hot: true }
 }
 
 const fn range(mut item: Knob, min: f64, max: f64) -> Knob {
@@ -193,14 +181,9 @@ static SCHEMA: &[Knob] = &[
         "[\"zcode\",\"codex\",\"workbuddy\",\"claude\",\"dsh\",\"trae-solo\",\"antigravity\"]"),
         &["zcode", "codex", "workbuddy", "claude", "dsh", "trae-solo", "cursor", "qoder", "qoder-cn", "antigravity"]),
     knob("agents.custom", Kind::List, Tier::Advanced, "Agent 接入", "自定义 Agent（本机）", "[]"),
-    // 这两条是 AgentHub 的轮询式接入模型（定时探活 + 自动校验）留下的。本仓的
-    // 接入是「用户点一下才握手」：没有后台巡检线程，也没有「刚接完就自动测一遍」
-    // 的动作。保留键是为了与 AgentHub 共用同一份 config.json，标 unwired 让界面
-    // 说清楚，而不是让人以为开了它就会有后台任务跑起来。
-    unwired(knob_d("agents.autoVerify", Kind::Bool, Tier::Basic, "Agent 接入", "接入后自动校验",
-        "本仓未接入：接入是手动的，没有「写入后自动握手」这一步；点接入页的「测试连接」等价", "true")),
-    unwired(range(knob_d("agents.verifyInterval", Kind::Number, Tier::Advanced, "Agent 接入", "连接巡检间隔（秒）",
-        "本仓未接入：没有后台巡检线程；探活只在点「测试连接 / 全部校验」时发生", "300"), 30.0, 3600.0)),
+    // 这里原本还有 `agents.autoVerify` / `agents.verifyInterval`（AgentHub 的
+    // 「定时探活 + 接入后自动校验」）。本仓的接入是「用户点一下才握手」，没有
+    // 后台巡检线程 —— 两个键都没有读取点，已删除；等价动作是接入页的「测试连接」。
     knob_d("agents.injectAgentsMd", Kind::Bool, Tier::Advanced, "Agent 接入", "注入 AGENTS.md 受控块",
         "关掉则只在 MCP initialize.instructions 里给行为约定", "true"),
     range(knob("agents.coreMaxTokens", Kind::Number, Tier::Internal, "Agent 接入", "memory_core token 上限", "800"), 200.0, 4000.0),
@@ -284,16 +267,10 @@ static SCHEMA: &[Knob] = &[
     // ===== 双时间轴 =====
     knob("timeline.enabled", Kind::Bool, Tier::Advanced, "双时间轴", "启用双时间轴", "true"),
     knob("timeline.autoDetect", Kind::Bool, Tier::Advanced, "双时间轴", "蒸馏时自动识别取代", "true"),
-    // ── 这个旋钮已经没有读取点了（2026-11-24）────────────────────
-    // 它原来是 `detect_supersede` 的「要不要当场自动应用」开关。那条捷径已经删掉
-    // （改由队列统一裁决，判据是覆盖率而不是置信度），于是这里没有任何代码读它。
-    //
-    // 留着会变成第二个「改了没反应」的旋钮 —— 用户关掉它，期望是「失效建议
-    // 自动生效」，实际什么都不变，因为现在唯一决定那件事的是
-    // `review.autoConfirmSupersede` + 覆盖率。所以标成 unwired 并说清楚去哪改。
-    unwired(knob_d("timeline.requireConfirm", Kind::Bool, Tier::Advanced, "双时间轴", "失效判定需人工确认",
-        "本仓未接入：失效建议的落地现在统一由「待确认 → 自动确认事实失效」决定\
-         （判据是旧条正文是否已被新条覆盖）。这个键改了不会有任何行为影响", "true")),
+    // 这里原本还有一个 `timeline.requireConfirm`（「失效判定需人工确认」）。它属于
+    // 已经删掉的「置信度过线就当场落地」那条捷径；现在失效建议统一走
+    // `review.autoConfirmSupersede`（判据是旧条正文是否已被新条覆盖），那个键
+    // 没有任何读取点，已删除。
 
     // ===== 自动化 =====
     knob("auto.enabled", Kind::Bool, Tier::Basic, "自动化", "自动化总开关", "true"),
@@ -325,13 +302,12 @@ static SCHEMA: &[Knob] = &[
 
     // ===== 去重 =====
     //
-    // ── L3 / L4 为什么整组都标 unwired ─────────────────────────
-    // 本仓的去重只实现了两级：L1 精确哈希（`find_hash_duplicate`，写入前挡同一
-    // 内容）与 L2 词面近似（`near_duplicate`，只产建议进待确认队列）。
-    // L3（BM25 粗排候选）与 L4（让模型做 ADD/UPDATE/DELETE/NONE 四操作判定）
-    // 需要一套带 `dedup_status` 的状态机 + 逐条模型的裁决流水，本仓没有。
-    // 留键是为了 config.json 与 AgentHub 互通；标 unwired 是为了不让用户以为
-    // 打开「L4 语义判定」就会开始耗 token 判重 —— 那件事没接。
+    // ── 本仓只有 L1 / L2 两级 ───────────────────────────────────
+    // L1 = 精确哈希（`find_hash_duplicate`，写入前挡同一内容）；L2 = 词面近似
+    // （`near_duplicate`，只产建议进待确认队列）。L3（BM25 粗排候选）与 L4
+    // （让模型做 ADD/UPDATE/DELETE/NONE 四操作判定）需要一套带 `dedup_status`
+    // 的状态机 + 逐条模型的裁决流水，本仓没有实现 —— 所以 `dedup.l3.*` /
+    // `dedup.l4.*` 那一组键已整体删除（留着只是让界面多出几个改了没反应的开关）。
     knob("dedup.enabled", Kind::Bool, Tier::Basic, "去重", "去重总开关", "true"),
     knob("dedup.l1.enabled", Kind::Bool, Tier::Basic, "去重", "L1 精确哈希去重", "true"),
     opts(knob_d("dedup.l1.normalizeLevel", Kind::Enum, Tier::Advanced, "去重", "归一化强度",
@@ -367,22 +343,6 @@ static SCHEMA: &[Knob] = &[
     range(knob("dedup.l2.wDice", Kind::Number, Tier::Internal, "去重", "L2 集合相似度权重", "0.5"), 0.0, 1.0),
     range(knob("dedup.l2.wEdit", Kind::Number, Tier::Internal, "去重", "L2 编辑距离权重", "0.3"), 0.0, 1.0),
     range(knob("dedup.l2.wTitle", Kind::Number, Tier::Internal, "去重", "L2 标题权重", "0.2"), 0.0, 1.0),
-    unwired(range(knob_d("dedup.l3.topK", Kind::Number, Tier::Advanced, "去重", "L3 BM25 候选条数",
-        "本仓未接入 L3：没有 BM25 粗排这一级，L2 直接对同类型条目做词面相似度", "8"), 1.0, 30.0)),
-    unwired(knob_d("dedup.l4.enabled", Kind::Bool, Tier::Basic, "去重", "L4 语义判定（耗 token）",
-        "本仓未接入 L4：没有让模型做 ADD/UPDATE/DELETE/NONE 判定的流水；近似重复只产待确认建议", "false")),
-    unwired(range(knob_d("dedup.l4.minCandidateScore", Kind::Number, Tier::Advanced, "去重", "L4 触发最低候选分",
-        "本仓未接入 L4：没有候选分门槛这一环（L2 的门槛是 dedup.l2.candidateThreshold）", "0.62"), 0.0, 1.0)),
-    // ── 失效判定也不再读这个数了（2026-11-24）────────────────────
-    // 它原来喂 `detect_supersede` 的「置信度过线就当场落地」那条捷径。那条捷径
-    // 已删（改由队列的 `pair_outcome` 用正文覆盖率裁决），于是这里没有任何读取
-    // 点。留着它就是下一个「改了没反应」的旋钮 —— 标 unwired 并说清楚现在由
-    // 什么决定，比让用户猜好。
-    unwired(range(knob_d("dedup.l4.autoUpdateThreshold", Kind::Number, Tier::Advanced, "去重", "L4 UPDATE 自动执行置信",
-        "本仓未接入：失效建议的落地改由「待确认 → 自动确认事实失效」按正文覆盖率决定，\
-         不再看模型给的置信度（置信度只说明模型有多确信，说明不了合并会不会丢内容）", "0.8"), 0.0, 1.0)),
-    unwired(range(knob_d("dedup.l4.batchSize", Kind::Number, Tier::Internal, "去重", "L4 单批条数",
-        "本仓未接入 L4：没有分批判重；单批条数由 auto.tasks 里各任务的 batchSize 决定", "20"), 1.0, 50.0)),
     range(knob_d("dedup.pendingWarnThreshold", Kind::Number, Tier::Advanced, "去重", "队列积压告警阈值",
         "待确认队列超过这个数时界面提示积压；归类巡检也用它，但只数归类自己那一类的 pending（别处的积压不该让归类停摆）",
         "50"), 1.0, 999.0),
@@ -484,45 +444,31 @@ static SCHEMA: &[Knob] = &[
     // 显式路由（models.routing）→ 任务固定档位（`llm::task_tag`）对应的标签
     // （models.models 里的 tags）→ 兜底模型（models.fallbackModel）→ 网关目录
     // 首个对话模型。所以真正接线的只有这四个键 + timeout + gatewayBase。
-    // AgentHub 那套「模型来源排序 + 自定义供应商 + 用途标签集」在本仓没有对应
-    // 的解析器，标 unwired 而不是留一个改完没反应的输入框。
-    unwired(knob_d("models.sourceOrder", Kind::List, Tier::Advanced, "模型与网关", "模型来源优先级",
-        "本仓未接入：模型只从本机网关目录里取，没有「网关 / 自定义供应商」两个来源可排序", "[\"gateway\",\"custom\"]")),
-    unwired(knob_d("models.providers", Kind::List, Tier::Advanced, "模型与网关", "自定义供应商",
-        "本仓未接入：模型只从本机网关目录读取，这组自定义供应商（名称 / 基址 / 密钥）没有解析器", "[]")),
+    // AgentHub 那套「模型来源排序 / 自定义供应商 / 用途标签集 / 失败重试次数」
+    // 在本仓没有对应的解析器 —— 那几个键已删除，而不是留成灰掉的输入框。
+    // 调用失败由自动化任务的下一轮重试，不在这里叠一层 `maxRetries`。
     knob("models.models", Kind::List, Tier::Advanced, "模型与网关", "模型池", "[]"),
     knob_d("models.routing", Kind::List, Tier::Internal, "模型与网关", "按标签降级链",
         "每项 {\"task\":\"extract\",\"tags\":[\"light\"],\"model\":\"...\"}", "[]"),
-    unwired(knob_d("models.tagDefs", Kind::List, Tier::Internal, "模型与网关", "用途标签集",
-        "本仓未接入：自动化任务的用途标签写在代码里的路由表，这组标签集没有解析器",
-        "[\"light\",\"heavy\",\"dedup\",\"classify\",\"distill\",\"extract\",\"tag\",\"summarize\",\"profile\",\"supersede\",\"consolidate\",\"insight\"]")),
     range(knob("models.timeout", Kind::Number, Tier::Advanced, "模型与网关", "请求超时（秒）", "60"), 5.0, 600.0),
-    unwired(range(knob_d("models.maxRetries", Kind::Number, Tier::Advanced, "模型与网关", "失败重试次数",
-        "本仓未接入：内部模型调用失败即返回，重试由自动化任务下一轮承担；不在这里叠一层", "3"), 0.0, 10.0)),
     knob_d("models.gatewayBase", Kind::Text, Tier::Internal, "模型与网关", "网关基址",
         "留空 = 自动探测本机端口（面板与网关分端口时也能找对）", "\"\""),
     knob_d("models.fallbackModel", Kind::Text, Tier::Advanced, "模型与网关", "兜底模型",
         "路由表与模型池都没命中时用它；留空 = 取模型目录里第一个对话模型", "\"\""),
-    // ── 为什么这个键标了 unwired（2026-11-25 二次修）──────────────
-    // 它早先是接线的：`llm.rs` 读到 `high` 就往请求体写
-    // `reasoning_effort: "high"`。而 `max_tokens` 是 reason + content 的
-    // **共享预算** —— 机械任务本只要几百 token 的结论，被要求多想之后上游把
-    // 预算全花在思考上，`content` 返回空串、`finish_reason=length`，整批丢弃。
+    // ── 思考强度为什么不是一个旋钮（2026-11-25 二次修）──────────
+    // 这里原本有一个 `models.taskEffort`（各任务思考强度覆盖）。它把两个不该
+    // 混在一起的东西绑成一个字段：「这个任务值不值得用更强的模型」（选模型）
+    // 与「要让上游多想」（`reasoning_effort`）。
     //
-    // 2026-11-24 的处置是「干脆不发 `reasoning_effort`」；但真机 + 本机实测证明
-    // **不发 ≠ 不想**：`deepseek-v4.1-flash` 别名背后几十个上游 mapping 绑定的
-    // reasoning 全是 `null`，网关不注入，模型就按默认最高档狂想，`max_tokens`
-    // 照样被吃满、正文为空（`request_raw`：20 条素材 → reasoning=2000、正文 0）。
-    // 本机实测同一 prompt 发 `reasoning_effort=minimal`，思考从 723 降到 17 token，
-    // 正文一条不少。
+    // 真机把它设成 `{"summarize":"high","tag":"high","extract":"high",…}` 之后，
+    // 打标签、写摘要这些只输出短 JSON 的任务全走了 heavy 模型 + 高思考；而
+    // `max_tokens` 是 reason + content 的**共享预算**，上游把预算花在思考上，
+    // 返回空 `content` + `finish_reason=length`，整批丢弃。台账：`summarize`
+    // 78 次失败烧 707k token、`tag` 25 次失败烧 134k token。
     //
-    // 所以现在**由代码对每个任务固定发一档**（`llm::effort_for`：机械任务 minimal、
-    // 判断类 low）。真正的旋钮在代码里，不在这个配置项 —— 所以这个键仍标 unwired：
-    // 值照存、界面照显示（跨实现配置契约），但改了不改变实际发出的档位。
-    unwired(knob_d("models.taskEffort", Kind::Map, Tier::Internal, "模型与网关", "各任务思考强度覆盖",
-        "本仓未接入：记忆任务的思考档位由代码固定（llm::effort_for：机械任务 minimal、判断类 low），改这里不会有任何行为影响",
-        "{\"extract\":\"low\",\"tag\":\"minimal\",\"classify\":\"minimal\",\"summarize\":\"low\",\
-          \"distill\":\"medium\",\"profile\":\"high\",\"dedup\":\"low\",\"supersede\":\"low\"}")),
+    // 现在档位由代码对每个任务固定发（`llm::effort_for`：机械任务 minimal、
+    // 判断类 low），这个键没有读取点，已删除 —— 用户不该有机会把「更认真」
+    // 调成「一次都不成功」。
     // 各任务输出 token 上限。没列到的任务走 `llm::max_tokens_for` 里的默认表。
     //
     // 为什么这必须是一个可见的旋钮：`distill` / `profile` 一次要产出 3-8 条带证据
@@ -569,21 +515,19 @@ static SCHEMA: &[Knob] = &[
 
     // ===== WebDAV 同步 =====
     //
-    // ── 为什么这里有一整组 `sync.modules.*` ──────────────────────
-    // 记忆同步原本只同步「记忆」自己（general / projects / profile）。界面上
-    // 要能一眼说清「同一个网盘里，谁在哪个目录」，所以每个可能上云的模块都
-    // 有一个**根目录名**旋钮，默认值与 AgentHub 对齐（`/agent-skills` 这些）。
-    // 目录名留空 = 该模块不参与同步 —— 这比另加一个「启用」开关少一个可能与
-    // 目录名不一致的状态。
-    //
-    // 但**本仓只有记忆实现了同步**（见 `sync::MODULES` 里 `implemented: true` 那一条）。
-    // 其余几个旋钮照实存在、照实落盘、也照实显示，只是运行时不读它们 —— 界面上
-    // 明确标注「未实现」，不做一个点了没反应的「立即同步」。
+    // ── 本仓只有「记忆」自己上云 ───────────────────────────────
+    // 同步包的内容是记忆目录下的 general / projects / profile（见 `sync::sync_roots`）。
+    // 这里原本还有一组 `sync.modules.*`（技能仓库 / 用量统计 / 号池 / 提示词库的
+    // 远端根目录）：本仓从来没实现过那四个模块的同步，那些目录名只用于界面展示，
+    // 改了不会让任何东西开始传 —— 已连同界面上那四个输入框一起删除。记忆的远端
+    // 目录只有 `sync.remoteDir` 一个键，不再有第二个投影。
     knob("sync.enabled", Kind::Bool, Tier::Basic, "同步", "同步总开关", "true"),
     opts(knob_d("sync.provider", Kind::Enum, Tier::Basic, "同步", "存储类型",
         "本仓只实现 WebDAV；S3 需要重写打包与列目录，尚未接入",
         "\"webdav\""), &["webdav", "s3"]),
-    knob("sync.auto", Kind::Bool, Tier::Basic, "同步", "自动定时同步", "true"),
+    knob_d("sync.auto", Kind::Bool, Tier::Basic, "同步", "自动定时同步",
+        "开：后台线程按下面的「自动同步间隔」定期跑一次；关：只在点「立即同步」时传。手动同步不受这个开关影响",
+        "true"),
     knob_d("sync.url", Kind::Text, Tier::Basic, "同步", "WebDAV 地址",
         "留空 = 用默认地址（坚果云 dav.jianguoyun.com）；换别家网盘就填它给的地址", "\"\""),
     knob_d("sync.username", Kind::Text, Tier::Basic, "同步", "WebDAV 用户名",
@@ -597,36 +541,27 @@ static SCHEMA: &[Knob] = &[
     opts(knob_d("sync.preset", Kind::Enum, Tier::Advanced, "同步", "存储预设",
         "仅备忘：帮你记住这台服务器是哪家的，不改变任何同步行为", "\"custom\""),
         &["custom", "jianguoyun", "nextcloud", "synology", "fnos"]),
-    unwired(knob_d("sync.confirmPhrase", Kind::Secret, Tier::Advanced, "同步", "号池包加密口令",
-        "本仓未接入号池同步：这个口令只被记录与回显「已设置」，不参与任何加解密", "\"\"")),
-    range(knob("sync.intervalMin", Kind::Number, Tier::Advanced, "同步", "同步间隔（分钟）", "60"), 5.0, 1440.0),
+    // 自动同步的节奏。默认 1440 分钟 = 24 小时。
+    //
+    // 为什么是 24 小时而不是更密：同步传的是**整包** tar.gz（记忆几百个文件几 MB），
+    // 一小时一次只是把同一份字节反复压、反复传；而更疏就变成「昨天在另一台机器上
+    // 记的事，今天还没到」。一天一次刚好对上「换台设备接着干活」的节奏。
+    //
+    // 生效者是 `sync::spawn_auto` 那条巡检线程：每 60 秒看一次「距上次尝试是否
+    // 已过 intervalMin」，到点跑一次 `run(false)`。改这里最多一分钟内生效。失败也
+    // 按同一个间隔重试（不每分钟重连，免得网络故障期把日志刷满）。
+    range(knob_d("sync.intervalMin", Kind::Number, Tier::Advanced, "同步", "自动同步间隔（分钟）",
+        "默认 1440（24 小时）；后台线程每分钟校验一次是否到点", "1440"), 5.0, 1440.0),
     range(knob("sync.packSizeLimitMB", Kind::Number, Tier::Internal, "同步", "单包体积上限 (MB)", "50"), 1.0, 2048.0),
     knob_d("sync.excludeIndex", Kind::Bool, Tier::Internal, "同步", "索引库不入同步包",
         "索引可重建，且是二进制无法三方合并", "true"),
 
-    // ===== 各模块同步根目录 =====
-    //
-    // 五个键里只有「记忆」那一行真的驱动同步；其余四个本仓没有对应的模块实现，
-    // 目录名只用于界面展示（同步页要能一眼说清「同一个网盘里谁在哪个目录」）。
-    // 所以那四个标 unwired：改了不会让任何东西开始同步。
-    unwired(knob_d("sync.modules.skills", Kind::Text, Tier::Advanced, "同步目录", "技能仓库根目录",
-        "本仓未接入技能同步：这里只决定同步页上显示的目录名，不会真的传", "\"/agent-skills\"")),
-    unwired(knob_d("sync.modules.dosage", Kind::Text, Tier::Advanced, "同步目录", "用量统计根目录",
-        "本仓未接入用量同步：这里只决定同步页上显示的目录名，不会真的传", "\"/dosage-sync\"")),
-    unwired(knob_d("sync.modules.pool", Kind::Text, Tier::Advanced, "同步目录", "号池管家号池根目录",
-        "本仓未接入号池同步：这里只决定同步页上显示的目录名，不会真的传", "\"/agenthub-proxy\"")),
-    unwired(knob_d("sync.modules.memory", Kind::Text, Tier::Advanced, "同步目录", "记忆中枢根目录",
-        "本仓未接入路径自定义：记忆上传目录由 `sync.remoteDir` 决定，改这里不会换目录（只影响同步页显示的目录名）",
-        "\"/agenthub-memory\"")),
-    unwired(knob_d("sync.modules.prompts", Kind::Text, Tier::Advanced, "同步目录", "提示词库根目录",
-        "本仓未接入提示词库同步：这里只决定同步页上显示的目录名，不会真的传", "\"/agenthub-prompts\"")),
-
     // ===== 界面 =====
-    // 这四条以前是纯死键：`ui.pageSize` 后端当成「没传 limit 时的默认值」，
-    // 而前端每次都显式传 50，等于永远不生效；`ui.defaultTab` / `ui.tabs` /
-    // `ui.realtimeRefresh` 前端根本不读。现在前三条由 `memory-page.tsx` 真读
-    //（`ui.tabs` 还带一条硬保护：配置页签永远可见，否则用户把「配置」关掉之后
-    // 就再也改不回来了）；`ui.realtimeRefresh` 本仓没有轮询，标 unwired。
+    // 这三条以前是纯死键：`ui.pageSize` 后端当成「没传 limit 时的默认值」，
+    // 而前端每次都显式传 50，等于永远不生效；`ui.defaultTab` / `ui.tabs` 前端
+    // 根本不读。现在它们由 `memory-page.tsx` 真读（`ui.tabs` 还带一条硬保护：
+    // 配置页签永远可见，否则用户把「配置」关掉之后就再也改不回来了）。
+    // `ui.realtimeRefresh`（浏览页实时刷新）本仓没有轮询，已删除。
     range(knob_d("ui.pageSize", Kind::Number, Tier::Basic, "界面", "列表每页条数",
         "浏览页每页条数；后端在 `limit` 缺省时也用这个值", "50"), 10.0, 500.0),
     opts(knob("ui.defaultTab", Kind::Enum, Tier::Advanced, "界面", "默认页签", "\"dashboard\""),
@@ -635,8 +570,6 @@ static SCHEMA: &[Knob] = &[
         "只控制顶栏显示哪些页签；「配置」始终可见 —— 否则关掉它就再也改不回来",
         "[\"dashboard\",\"browse\",\"projects\",\"profile\",\"agents\",\"auto\",\"import\",\"sync\"]"),
         &["dashboard", "browse", "projects", "profile", "agents", "auto", "import", "sync", "settings"]),
-    unwired(knob_d("ui.realtimeRefresh", Kind::Bool, Tier::Basic, "界面", "浏览页实时刷新",
-        "本仓未接入轮询：浏览页只在写入后 / 点「刷新」时重取，没有后台定时重拉。开关打开也不会开始轮询", "true")),
 ];
 
 pub fn schema() -> &'static [Knob] {
@@ -1273,10 +1206,6 @@ pub fn schema_json() -> Value {
                     "max": item.max,
                     "options": item.options,
                     "hot": item.hot,
-                    // 运行时代码有没有真的读它。`false` = 只落盘、只显示，
-                    // 前端据此把控件置灰并挂「本仓未接入」徽标 —— 不让用户
-                    // 对着一个改完没反应的输入框猜自己是不是操作错了。
-                    "wired": item.wired,
                     // 只有秘密字段有：库里有没有值。页面据此把占位符写成
                     // 「已保存口令，输入任意字符即进入修改」而不是「未设置」。
                     "set": if item.kind == Kind::Secret { Some(secret_set(item.key)) } else { None },
@@ -1405,7 +1334,7 @@ mod tests {
         // 两个字段少一个，界面就会把一个秘密当普通文本回显出来。
         let schema = schema_json();
         let rows = schema.as_array().expect("schema 是数组");
-        for key in ["sync.password", "sync.confirmPhrase"] {
+        for key in ["sync.password"] {
             let row = rows
                 .iter()
                 .find(|item| item["key"] == json!(key))
@@ -1441,18 +1370,14 @@ mod tests {
     }
 
     #[test]
-    fn every_module_has_a_directory_knob() {
-        // 页面「模块根目录」按 `sync::MODULES` 渲染，而那一组旋钮必须真实存在：
-        // 少一个键，保存时 `apply_one` 会把它当未知键静默丢弃，用户改完没反应。
-        for key in [
-            "sync.modules.skills",
-            "sync.modules.dosage",
-            "sync.modules.pool",
-            "sync.modules.memory",
-            "sync.modules.prompts",
-        ] {
-            assert!(find(key).is_some(), "缺旋钮 {key}");
-        }
+    fn auto_sync_due_is_24_hours_by_default() {
+        // 自动同步的默认节奏是 24 小时（1440 分钟）。这条被单测钉住，是因为
+        // 它是「另一台机器能看见昨天记的东西」的唯一定时器：改成 60 分钟只是
+        // 把同一份整包反复上传，改成一周会让另一台机器上的记忆长期是旧的，
+        // 而两种偏差都不会让任何代码报错 —— 只会让人觉得「同步好像没生效」。
+        let knob = find("sync.intervalMin").expect("存在");
+        assert_eq!(default_of(knob.key), Some(json!(1440)));
+        assert_eq!(knob.max, Some(1440.0));
     }
 
     /// 并发写配置时，每一处改动都必须留下来。
@@ -1498,42 +1423,16 @@ mod tests {
         );
     }
 
-    /// 每条 `wired=false` 的旋钮，说明里必须自己解释清楚。
-    ///
-    /// ── 这条测试防的是什么 ────────────────────────────────────
-    /// 把键标成「未接入」很容易，但界面上那句「本仓未接入」如果不带原因，
-    /// 用户看到的就是一个**没有出口的死胡同**：它为什么没接？我还要不要配？
-    /// 有没有等价操作？所以要求 `desc` 至少有一点实质长度，并且必须出现
-    /// 「本仓未接入」这句话 —— 前端徽标用的是同一个词，两边对得上。
-    ///
-    /// 长度门槛不用很高（24 字符）：只拦「空说明」和「就写个 not implemented」，
-    /// 不强迫每条都写小作文。
-    #[test]
-    fn unwired_knobs_explain_themselves() {
-        for item in schema() {
-            if item.wired {
-                continue;
-            }
-            assert!(
-                item.desc.contains("本仓未接入"),
-                "{} 标了 wired=false，但说明里没有「本仓未接入」：这会让界面上的徽标变成没头没尾的一句话",
-                item.key
-            );
-            assert!(
-                item.desc.chars().count() >= 24,
-                "{} 的说明太短（{} 字），没讲清楚「为什么没有」或「等价操作是什么」",
-                item.key,
-                item.desc.chars().count()
-            );
-        }
-    }
-
-    /// 每条 `wired=true` 的旋钮，本仓源码里必须真有读取点。
+    /// 每条旋钮，本仓源码里必须真有读取点。
     ///
     /// ── 为什么把源码扫描写进单测 ───────────────────────────────
     /// 「加了旋钮但忘了读取」是这类 schema 驱动的配置最典型的 bug，而且它
     /// **不会让任何测试失败** —— 配置落盘正常、界面渲染正常，只有用户改了
     /// 发现没效果。人工 review 一百多个键看不出来，扫描源码能。
+    ///
+    /// 2026-11-25 之前这条测试有个逃生口：标 `wired=false` 的键可以没有读取点
+    /// （界面挂「本仓未接入」）。逃生口本身成了问题 —— 二十多个键挂在那里，页面
+    /// 一半是灰的。现在没有逃生口：要么接上读取点，要么别把它写进 schema。
     ///
     /// 判据：在 `memory/`、`tool_services/`、`api/` 的 `.rs` 里找完整字面量
     /// `"<key>"` / `'<key>'`，且不在 `config.rs` 自身（schema 定义当然含全部键）。
@@ -1547,7 +1446,7 @@ mod tests {
     /// 「键 → 仓库内相对路径」，测试运行时用 `fs` 去读；文件不在（例如只
     /// 打了服务端包的场景）就跳过这一条，不误报。
     #[test]
-    fn wired_knobs_have_a_reader() {
+    fn every_knob_has_a_reader() {
         // 把「读取点所在的 Rust 文件」列全。新增了读取点却没进这张表，就会
         // 误报成死键 —— 那时把文件名加进来即可，比放宽判据安全得多。
         const SOURCES: &[(&str, &str)] = &[
@@ -1587,9 +1486,6 @@ mod tests {
             .map(std::path::Path::to_path_buf);
         let mut missing: Vec<String> = Vec::new();
         for item in schema() {
-            if !item.wired {
-                continue;
-            }
             // Rust 串用双引号，TSX 里习惯用单引号（`values['ui.pageSize']`），
             // 两种都算命中。
             let double = format!("\"{}\"", item.key);
@@ -1618,9 +1514,9 @@ mod tests {
         }
         assert!(
             missing.is_empty(),
-            "这些旋钮标了 wired=true，但源码里找不到 `\"key\"` 字面量读取点：{}\n\
-             要么把读取点接上，要么用 `unwired(...)` 包起来并写清原因 —— \
-             两者都不做，用户改了它不会有任何效果。",
+            "这些旋钮在源码里找不到 `\"key\"` 字面量读取点：{}\n\
+             要么把读取点接上，要么别把它写进 schema —— \
+             留在表里而没人读，用户改了它不会有任何效果。",
             missing.join(", ")
         );
     }

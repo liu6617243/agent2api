@@ -338,17 +338,6 @@ export type Knob = {
   options?: string[]
   hot?: boolean
   /**
-   * 这个旋钮在**本仓**有没有真实读取点。
-   *
-   * `false` = 值照样落盘、照样能导入导出（跨实现共用同一份 `config.json`），
-   * 但本仓没有任何运行时代码读它 —— 改了不会有任何行为变化。设置页因此把它
-   * 置灰并标「本仓未接入」，而不是让人调完发现没用、再回来怀疑是自己没保存。
-   *
-   * 后端每条 `wired=false` 的说明里都必须写清楚「为什么没有」和「等价操作是
-   * 什么」，由单测 `unwired_knobs_explain_themselves` 钉住。
-   */
-  wired?: boolean
-  /**
    * 只有 `secret` 类有：库里**有没有值**。
    *
    * 秘密字段下发的 `value` 恒为空串（后端 `flat()` 脱敏），所以「空输入框」
@@ -675,8 +664,6 @@ export type SyncStatus = {
   username?: string
   /** 有没有存过 WebDAV 密码（密码本身永不下发） */
   hasPassword?: boolean
-  /** 有没有单独配过号池包口令（留空 = 沿用 WebDAV 密码） */
-  hasConfirmPhrase?: boolean
   /** 存储预设 id（只用来填默认值，不改变同步行为） */
   preset?: string
   device: string
@@ -703,8 +690,6 @@ export type SyncStatus = {
   package: string
   /** 本机记忆根目录（同步的就是这个目录下的 general / projects / profile） */
   localDir?: string
-  /** 五个模块各自的远端目录，以及本仓有没有实现它的同步 */
-  modules?: SyncModuleDir[]
   devices?: {
     devices: {
       package: string
@@ -718,22 +703,6 @@ export type SyncStatus = {
     configured: boolean
   }
   skippedPaths?: { paths: string[] }
-}
-
-/**
- * 模块目录（`sync::MODULES`）。
- *
- * `id` 是稳定的机器名，`dir` 是生效值（可能为空串 = 该模块不参与同步），
- * `implemented` 是本仓**真的实现了同步**的那一个 —— 五个里只有 `memory`。
- */
-export type SyncModuleDir = {
-  id: string
-  label: string
-  key: string
-  dir: string
-  /** 默认目录名（如 `/agent-skills`）：界面用它写「（默认 …）」并在改过后提示怎么还原 */
-  def: string
-  implemented: boolean
 }
 
 export type SyncConflict = {

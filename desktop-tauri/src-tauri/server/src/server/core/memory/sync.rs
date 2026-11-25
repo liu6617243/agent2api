@@ -27,6 +27,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -335,85 +337,15 @@ fn remote_url() -> String {
     format!("{}/{}", base_url(), remote_dir())
 }
 
-/// 一个模块的同步目录：名字 + 本仓是否真的实现了它。
-///
-/// ── 为什么把「未实现」写进结构里而不是藏起来 ──────────────────
-/// 界面上要有「模块根目录」那一组输入框（五个模块在同一个网盘里各占一个目录），
-/// 否则用户没法理解「记忆同步只是这一套里的一支」。但本仓只有记忆实现了同步，
-/// 另外四个的目录名只是**存下来备用**。把 `implemented` 一起下发，页面就能给
-/// 未实现的模块画灰按钮 + 写「未实现」，而不是做一个点了没反应的「立即同步」。
-pub struct ModuleDir {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub key: &'static str,
-    pub def: &'static str,
-    pub implemented: bool,
-}
-
-pub const MODULES: &[ModuleDir] = &[
-    ModuleDir { id: "skills", label: "技能仓库", key: "sync.modules.skills", def: "/agent-skills", implemented: false },
-    ModuleDir { id: "dosage", label: "用量统计", key: "sync.modules.dosage", def: "/dosage-sync", implemented: false },
-    ModuleDir { id: "pool", label: "号池管家号池", key: "sync.modules.pool", def: "/agenthub-proxy", implemented: false },
-    // 记忆自己的目录走 `sync.remoteDir`（历史键，已有用户在用）。这里只作为
-    // 展示行出现，读写都落到 `sync.remoteDir`，避免同一件事两个键。
-    ModuleDir { id: "memory", label: "记忆中枢", key: "sync.modules.memory", def: "/agenthub-memory", implemented: true },
-    ModuleDir { id: "prompts", label: "提示词库", key: "sync.modules.prompts", def: "/agenthub-prompts", implemented: false },
-];
-
-/// 模块目录的生效值。
-///
-/// 记忆那行恒等于 `sync.remoteDir`（见 `MODULES` 注释）。其余四个：
-///   · 没显式配过 → 用默认名（界面上显示 `/agent-skills` 这种）；
-///   · 显式配成空串 → **空串**，语义是「这个模块不参与同步」，界面把这一行
-///     画成「已关闭」而不是回落到默认名 —— 否则用户没法表达「我不要它」。
-pub fn module_dir(item: &ModuleDir) -> String {
-    if item.id == "memory" {
-        return format!("/{}", remote_dir());
-    }
-    let explicit = config::stored().values.contains_key(item.key);
-    resolve_module_path(item.def, &config::text_of(item.key), explicit)
-}
-
-/// 「默认 / 显式空 / 自定义」三态归一成最终目录（`module_dir` 的纯函数内核）。
-///
-/// 单独拆出来是为了**可测**：`module_dir` 要读磁盘上的 config.json，测试里没法
-/// 断言「显式配成空串」这种只存在于内存的状态；这里三个入参把那种状态直接表达
-/// 成 `explicit = true, raw = ""`。
-fn resolve_module_path(def: &str, raw: &str, explicit: bool) -> String {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        // 显式配成空 = 用户主动关掉这个模块；没配过 = 用默认。
-        // 这两者在界面上是「已关闭」与「/agent-skills」，不能混成一个。
-        return if explicit { String::new() } else { def.to_string() };
-    }
-    if raw.starts_with('/') {
-        raw.to_string()
-    } else {
-        format!("/{raw}")
-    }
-}
-
-/// 模块目录清单（同步页「模块根目录」那一组）。
-///
-/// `def` 一起下发：界面要在标签后面写「（默认 /agent-skills）」—— 用户改过目录
-/// 之后得知道「原来应该长什么样」，否则想还原只能去翻文档。
-pub fn modules_json() -> Value {
-    Value::Array(
-        MODULES
-            .iter()
-            .map(|item| {
-                json!({
-                    "id": item.id,
-                    "label": item.label,
-                    "key": item.key,
-                    "dir": module_dir(item),
-                    "def": item.def,
-                    "implemented": item.implemented,
-                })
-            })
-            .collect(),
-    )
-}
+// ── 这里原本有一张「各模块同步目录」表（`MODULES` / `modules_json`）────
+//
+// 它把技能仓库 / 用量统计 / 号池管家 / 提示词库的远端根目录也列进同步页，
+// 而本仓从来没实现过那四个模块的同步 —— 界面上就是四个灰掉的按钮加一句
+// 「未实现」。2026-11-25 整组删除（连同 `sync.modules.*` 四个配置键）。
+//
+// 现在的事实只有两条，不需要一张表来表达：
+//   · 同步哪些数据 —— `sync_roots()`：general / projects / profile；
+//   · 传到远端哪个目录 —— `remote_dir()`：`sync.remoteDir`，默认 agent2api-memory。
 
 fn auth_headers(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     let user = config::text_of("sync.username").trim().to_string();
@@ -1096,6 +1028,124 @@ pub fn run(manual: bool) -> super::enrich::Outcome {
     Outcome::Done(summary)
 }
 
+// ── 自动同步：按 sync.intervalMin 定期跑 ─────────────────────
+
+/// 自动同步的默认 / 最大间隔（分钟）：24 小时。
+const DEFAULT_INTERVAL_MIN: i64 = 1440;
+
+/// 巡检节奏：每隔这么久看一次「到点没有」。
+///
+/// 60 秒而不是「睡到点再醒」：`sync.intervalMin` 是热配置，用户把它从 1440 改成
+/// 5 之后，一条睡在 24 小时长睡里的线程不会知道 —— 改完毫无反应。一分钟空转的
+/// 成本可以忽略（只读一次配置与一个 kv 时间戳，不碰网络）。
+const AUTO_TICK: Duration = Duration::from_secs(60);
+
+/// 巡检线程是否已经起来（桌面壳重启后端时会再次调用 [`spawn_auto`]）。
+static AUTO_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 最近一次**成功**同步的时刻（epoch ms）；从没同步过是 0。
+fn last_sync_at() -> i64 {
+    index::global()
+        .sync_get(LAST_KEY)
+        .and_then(|(raw, _)| raw.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// 生效的自动同步间隔（分钟）。
+///
+/// schema 里有 `min` / `max`，但 `config.json` 是手可改的文本 —— 用户手写一个
+/// `0` 或 `100000` 时，`apply_one` 那边的校验不会回头再跑一遍。这里夹一次：
+/// 下限 5 分钟（再密就只是把同一份整包反复上传），上限 24 小时（默认值即上限）。
+fn interval_minutes() -> i64 {
+    clamp_interval(config::number("sync.intervalMin"))
+}
+
+/// 间隔的边界归一（纯函数，见下面 `interval_is_clamped_to_sane_bounds`）。
+fn clamp_interval(value: f64) -> i64 {
+    if value.is_finite() {
+        (value as i64).clamp(5, DEFAULT_INTERVAL_MIN)
+    } else {
+        DEFAULT_INTERVAL_MIN
+    }
+}
+
+/// 现在该不该自动跑：记忆中枢开着 + 同步总开关 + 自动同步 + 填过账号。
+///
+/// 与 `run(false)` 里的判据同一口径，但先在这里问一遍：否则每 60 秒都会进一次
+/// `run(false)` 拿回一条 `Skipped`，而那条跳过会把 `last_attempt` 推进 ——
+/// 「配置不全导致的跳过」不该被算成一次尝试。
+fn auto_ready() -> bool {
+    config::bool_of(config::ENABLE_KEY)
+        && config::bool_of("sync.enabled")
+        && config::bool_of("sync.auto")
+        && has_credentials()
+}
+
+/// 启动自动同步线程。重复调用无副作用。
+///
+/// ── 为什么它是一条独立线程，而不是 `schedule.rs` 里的一个任务 ──
+/// `schedule.rs` 的任务表是「记忆中枢的 AI / 维护任务」：每个任务有 intervalMin
+/// 或 daily 节奏、有 `auto.tasks` 里的开关、跑完写 `task_run` 台账。同步不属于
+/// 那一族 —— 它的开关是 `sync.enabled` + `sync.auto`，节奏是 `sync.intervalMin`，
+/// 做的是网络传输而不是模型调用。塞进任务表会让「同步」出现在自动化页的任务
+/// 列表里，而那一页的「立即执行」按钮对它毫无意义（同步页自己有「立即同步」）。
+///
+/// ── 为什么失败也等满一个间隔再试 ────────────────────────────
+/// 断网时每分钟重试一次只会把同步日志刷满，并且真的在打远端（每次 401 或超时）。
+/// 失败后等满 `intervalMin` 再试，用户想立刻重试点「立即同步」即可。
+///
+/// ── 为什么第一轮的起算点是「上次成功同步」而不是开机时刻 ──────
+/// 重启后端不该让一台十分钟前刚同步过的机器再传一次整包。从没同步过（0）时，
+/// 开机一分钟后就会跑第一轮 —— 配好账号的机器不必等到第二天。
+pub fn spawn_auto() {
+    if AUTO_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("memory-sync".to_string())
+        .spawn(|| {
+            crate::server::logging::log(
+                "[Memory]",
+                &format!("同步巡检线程已启动（间隔读 sync.intervalMin，默认 {DEFAULT_INTERVAL_MIN} 分钟）"),
+            );
+            let mut last_attempt = last_sync_at();
+            loop {
+                std::thread::sleep(AUTO_TICK);
+                if !auto_ready() {
+                    continue;
+                }
+                let wait = interval_minutes().saturating_mul(60_000);
+                // 锚点取「上次尝试」与「上次成功」里更晚的那个：手动同步也会写
+                // `LAST_KEY`，不比对的话，刚点过「立即同步」的机器一分钟后会被
+                // 后台再传一遍整包。
+                let anchor = last_attempt.max(last_sync_at());
+                let now = crate::server::logging::now_ms();
+                if anchor > 0 && now.saturating_sub(anchor) < wait {
+                    continue;
+                }
+                // 先记「尝试过」再跑：这一轮无论成功失败，下一轮都在一个完整间隔
+                // 之后 —— 失败重试由用户点「立即同步」触发，不由后台刷屏。
+                last_attempt = now;
+                match run(false) {
+                    super::enrich::Outcome::Done(summary) => crate::server::logging::log(
+                        "[Memory]",
+                        &format!("自动同步完成：{summary}"),
+                    ),
+                    super::enrich::Outcome::Skipped(reason) => {
+                        crate::server::logging::log("[Memory]", &format!("自动同步跳过：{reason}"))
+                    }
+                    super::enrich::Outcome::Failed(error) => {
+                        crate::server::logging::log("[Memory]", &format!("⚠️ 自动同步失败：{error}"))
+                    }
+                }
+            }
+        });
+    if spawned.is_err() {
+        AUTO_RUNNING.store(false, Ordering::SeqCst);
+        crate::server::logging::log("[Memory]", "⚠️ 同步巡检线程启动失败");
+    }
+}
+
 fn conflicted_paths() -> Vec<String> {
     // 用**不截断**的查询。原来这里走 `conflict_list(200)`，冲突超过 200 条时
     // 第 201 条起的路径不会从基线里摘掉 → 下一轮三方比对把它读成「本地没变、
@@ -1363,9 +1413,6 @@ pub fn status() -> Value {
         // `auth_headers`。
         "username": config::text_of("sync.username"),
         "hasPassword": config::secret_set("sync.password"),
-        // 号池包口令：留空 = 沿用 WebDAV 密码，所以「有没有」要单独说清，
-        // 不然界面分不出「没配」和「沿用」。
-        "hasConfirmPhrase": config::secret_set("sync.confirmPhrase"),
         "preset": preset,
         "device": device,
         "deviceName": config::text_of("sync.deviceName"),
@@ -1387,9 +1434,6 @@ pub fn status() -> Value {
         "lastSyncAt": last_at,
         "lastResult": last_result,
         "localFiles": local_manifest().files.len(),
-        // 五个模块的目录与「本仓实现了没有」。页面上的「模块根目录」与
-        // 「快速同步」两张卡都读这一份，免得两处各拼一遍。
-        "modules": modules_json(),
         // 本机记忆根目录：界面上要显示「同步的是哪个目录」，否则用户没法确认
         // 自己到底在同步哪一份数据（换过 storage.root 的人尤其需要这个）。
         "localDir": store::root().to_string_lossy().to_string(),
@@ -2131,16 +2175,16 @@ mod tests {
     }
 
     #[test]
-    fn module_path_keeps_three_states_apart() {
-        // 三态是这套目录配置的全部难点：没配过 / 显式关掉 / 自定义。
-        // 混掉任意两个都会出现「用户说不要了，界面又给回默认名」这种鬼故事。
-        assert_eq!(resolve_module_path("/agent-skills", "", false), "/agent-skills");
-        assert_eq!(resolve_module_path("/agent-skills", "   ", false), "/agent-skills");
-        assert_eq!(resolve_module_path("/agent-skills", "", true), "");
-        assert_eq!(resolve_module_path("/agent-skills", "/mine/skills", true), "/mine/skills");
-        // 没写前导斜杠的按「相对根」补齐：用户填 `skills` 时不该得到一个
-        // 拼出来是 `https://host/davskills` 的地址。
-        assert_eq!(resolve_module_path("/agent-skills", "skills", true), "/skills");
+    fn interval_is_clamped_to_sane_bounds() {
+        // `config.json` 是手可改的文本：写个 0 会变成「每分钟传一次整包」，
+        // 写个十万会变成「半年才同步一次」。两者都不会报错，只会让人觉得
+        // 「同步坏了」—— 所以在读出口夹一道。
+        assert_eq!(clamp_interval(1440.0), 1440, "默认值就是上限：24 小时");
+        assert_eq!(clamp_interval(0.0), 5);
+        assert_eq!(clamp_interval(-30.0), 5);
+        assert_eq!(clamp_interval(100_000.0), 1440);
+        assert_eq!(clamp_interval(f64::NAN), 1440, "读不出数字时退回默认，不是 0");
+        assert_eq!(clamp_interval(90.0), 90, "整数分钟原样保留");
     }
 
     #[test]
@@ -2163,22 +2207,5 @@ mod tests {
         // 缺字段是 `None`（沿用已保存值），不是 `Some("")`（清空）
         let sparse: Probe = serde_json::from_value(json!({})).expect("空对象也合法");
         assert!(sparse.url.is_none() && sparse.remote_dir.is_none());
-    }
-
-    #[test]
-    fn module_list_covers_every_module_and_only_memory_is_live() {
-        // 界面上「模块根目录」与「快速同步」两张卡都按这份清单渲染：漏一个
-        // 模块，用户就会觉得「少了一格」；多标一个 implemented，页面就会
-        // 给一个点了没反应的「立即同步」。
-        let ids: Vec<&str> = MODULES.iter().map(|item| item.id).collect();
-        for expected in ["skills", "dosage", "pool", "memory", "prompts"] {
-            assert!(ids.contains(&expected), "模块清单缺 {expected}");
-        }
-        assert_eq!(ids.len(), 5);
-        let live: Vec<&str> = MODULES.iter().filter(|item| item.implemented).map(|item| item.id).collect();
-        assert_eq!(live, vec!["memory"], "只有记忆中枢实现了同步");
-        for item in MODULES {
-            assert!(item.def.starts_with('/'), "{} 的默认目录要以 / 开头", item.id);
-        }
     }
 }

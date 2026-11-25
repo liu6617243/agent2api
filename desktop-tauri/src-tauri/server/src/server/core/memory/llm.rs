@@ -37,8 +37,9 @@
 //! （`upstream::payload` 的 `read_client_level` → `apply_reasoning`）。
 //!
 //! 选模型那一半（`light` / `heavy`）继续保留，但仍是代码里的固定档位
-//! [`task_tag`]、不是配置项。`models.taskEffort` 键留在 schema 里（跨实现配置契约，
-//! 删键会让老配置静默丢值），标 `wired=false`：真正决定思考的是 [`effort_for`]。
+//! [`task_tag`]、不是配置项。`models.taskEffort` 这个键已从 schema 删除
+//! （2026-11-25）：真正决定思考的是 [`effort_for`]，留着它只会让用户把
+//! 「更认真」调成「一次都不成功」。
 //!
 //! 为什么第 3 步不是「写死一个模型名」：这个仓库要能装在任何人的机器上，
 //! 写死必然在别人的账号里不存在。目录里有什么就用什么，才叫「本地可用」。

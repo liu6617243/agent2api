@@ -942,21 +942,15 @@ function KnobRow({
 }): React.ReactElement {
   // 开关不挂「默认 开/关」：那一行右半边本来就空，再写一句等于噪音。
   const hint = knob.kind === 'boolean' ? '' : defaultHint(knob)
-  // `wired === false`（含后端没下发这个字段之外的显式 false）：本仓没有读取点。
-  // 走 `=== false` 而不是 `!knob.wired`：老后端不下发 `wired` 时值是
-  // `undefined`，那种情况必须当作「已接入」处理，否则升级过程中整页旋钮
-  // 会突然全灰 —— 一次版本错配不该让页面变成不可用。
-  const unwired = knob.wired === false
   return (
     <div
-      className={`mm-cfg-knob${dirty ? ' dirty' : ''}${unwired ? ' unwired' : ''}${
+      className={`mm-cfg-knob${dirty ? ' dirty' : ''}${
         knob.kind === 'list' || knob.kind === 'map' ? ' wide' : ''
       }`}
     >
       <div className='mm-cfg-knob-main'>
         <div className='mm-cfg-knob-label'>
           <span>{t(knob.label)}</span>
-          {unwired ? <em className='mm-cfg-unwired'>{t('本仓未接入')}</em> : null}
           {knob.hot === false ? <em className='mm-cfg-hot'>{t('需重启 / 重建索引')}</em> : null}
           {dirty ? <em className='mm-cfg-dirty'>{t('未保存')}</em> : null}
         </div>
@@ -965,16 +959,14 @@ function KnobRow({
       </div>
 
       <div className='mm-cfg-knob-control'>
-        {/* 禁用而不是隐藏：值仍然要能看见、能导出 —— 它是跨实现共享的配置，
-            隐藏会让人以为这个键不存在，进而在另一台机器上「怎么和我这里不一样」 */}
-        <fieldset className='mm-cfg-knob-lock' disabled={unwired}>
+        <fieldset className='mm-cfg-knob-lock'>
           <KnobControl knob={knob} value={value} onChange={onChange} />
         </fieldset>
       </div>
 
       <div className='mm-cfg-knob-default'>
         {hint ? <span className='mm-cfg-default-hint'>{hint}</span> : null}
-        <Button type='button' size='sm' variant='ghost' disabled={unwired} onClick={onDefault}>
+        <Button type='button' size='sm' variant='ghost' onClick={onDefault}>
           {t('默认')}
         </Button>
       </div>

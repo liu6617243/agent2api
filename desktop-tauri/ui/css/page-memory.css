@@ -2822,7 +2822,7 @@
   gap: 10px 12px;
 }
 .mm-sync-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
-/* 标签行按文字流排（不用 flex）：名字 + 「（默认 …）」+「未实现」三段长度不一，
+/* 标签行按文字流排（不用 flex）：名字 + 「（默认 …）」两段长度不一，
    flex 下会各自成为一个不可断的盒，挤了就整段跳行；文字流只会在空格处断，
    断出来的两行读起来仍是同一句话。 */
 .mm-sync-field-label {
@@ -2831,23 +2831,8 @@
   color: var(--text-3);
   line-height: 1.5;
 }
-/* 「未实现」小标：跟在模块名后面。用描边而不是填充 —— 四个模块都带这个标，
-   填成色块会让「模块根目录」这张卡看起来满屏告警。 */
-.mm-sync-tag {
-  display: inline-block;
-  margin-left: 6px;
-  padding: 0 5px;
-  vertical-align: 1px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-xs);
-  font-size: 10px;
-  line-height: 15px;
-  color: var(--text-3);
-  white-space: nowrap;
-}
-/* 标签后的补充说明（「（默认 /agent-skills）」「（仅备忘…）」）。
-   比标签再浅一档、不加粗：它解释标签，不该跟标签抢同一层的注意力。
-   用按钮字重 400 + text-3，与 .mm-sync-tag 的区别是「这是说明」而不是「这是状态」。 */
+/* 标签后的补充说明（「（仅备忘…）」）。
+   比标签再浅一档、不加粗：它解释标签，不该跟标签抢同一层的注意力。 */
 .mm-sync-field-aside {
   margin-left: 2px;
   font-size: 11px;
@@ -2935,16 +2920,6 @@
   font-size: 12.5px;
   font-weight: 500;
   color: var(--text);
-}
-/* 号池那行专属的一句「包里是什么」（含凭据、按账号去重）。单独一类而不是复用
-   `.mm-quick-sub`：那一类是 `nowrap + ellipsis` 的单行值（根目录），这句话有两行
-   长，用同一套样式会被截成「号池账号（含凭据）加密打包同…」—— 恰好把「按账号
-   去重」这半句吃掉，而那半句才是「为什么可以放心同步」的理由。 */
-.mm-quick-desc {
-  font-size: 11px;
-  line-height: 1.55;
-  color: var(--text-3);
-  white-space: normal;
 }
 .mm-quick-sub {
   font-size: 11.5px;
@@ -3431,25 +3406,10 @@
   font-weight: 500;
   color: var(--warn);
 }
-/* 「本仓未接入」：不是警告（配置没问题），是状态说明 —— 用中性灰，
-   和 `mm-cfg-hot` 的橙分开，免得一片橙色让人以为配置出错了 */
-.mm-cfg-unwired {
-  font-style: normal;
-  font-size: 10px;
-  font-weight: 500;
-  color: var(--text-3);
-  border: 1px solid var(--hairline);
-  border-radius: var(--r-xs);
-  padding: 0 4px;
-  line-height: 1.5;
-  background: var(--surface-inset);
-}
-/* 整行压暗：值仍然可读（要能导出、能对照另一台机器），但一眼看出不可改 */
-.mm-cfg-knob.unwired .mm-cfg-knob-control,
-.mm-cfg-knob.unwired .mm-cfg-knob-default { opacity: 0.55; }
-/* fieldset 默认带 padding/border，这里只借用它的 `disabled` 语义 */
+/* 「本仓未接入」那枚小标已随整批未接入旋钮删除（2026-11-25）：schema 里只留
+   真有读取点的键，界面不再需要「置灰 + 说明」这一套。 */
+/* fieldset 默认带 padding/border，这里只借用它的分组语义 */
 .mm-cfg-knob-lock { border: 0; margin: 0; padding: 0; min-width: 0; display: contents; }
-.mm-cfg-knob-lock:disabled { cursor: not-allowed; }
 .mm-cfg-knob-key { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-3); }
 .mm-cfg-knob-desc { font-size: 11.5px; color: var(--text-3); line-height: 1.6; margin-top: 1px; }
 .mm-cfg-knob-control { display: flex; align-items: center; gap: 7px; min-width: 0; }

@@ -1133,7 +1133,7 @@ pub async fn post_sync_setup(State(_state): State<ServerState>, body: Bytes) -> 
         }
         // 远端目录名会被直接拼进 URL 路径，`../` 能跑出远端目录 —— 在入口
         // 拦住比在拼 URL 处拦更早，且错误信息能指到具体字段。
-        if key.ends_with("remoteDir") || key.starts_with("sync.modules.") {
+        if key.ends_with("remoteDir") {
             if let Some(text) = value.as_str() {
                 if text.contains("..") || text.contains('\\') {
                     return errors::management_error(400, format!("{key} 不能包含 .. 或反斜杠"));
