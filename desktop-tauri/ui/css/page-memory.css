@@ -3117,7 +3117,7 @@
      页头（标题 + 事实源 + 已同步 / 恢复默认 / 保存配置）
      模块与存储卡（启用状态 / 当前根目录 / 配置备份）
      供应商提示条（蓝）
-     按标签的路由卡 + 链路说明（青）
+     模型路由卡（每个任务用哪个模型）+ 链路说明（青）
      分组 chip 导航
      当前分组的旋钮卡
 
@@ -3249,13 +3249,13 @@
 .mm-route { display: flex; flex-direction: column; }
 .mm-route-row {
   display: grid;
-  /* 五条轨道对应五个单元格：任务 / 网关 / 指定模型 / 标签 / 将使用。
-     ── 为什么这里曾经是六条（2026-11-25 修）────────────────────
-     删掉「思考强度」那一列时只删了表头与单元格，**没有删轨道**：剩下
-     `… 92px 132px minmax(140px, 1fr)`，最后那条 1fr 空转、把富余宽度全吃掉，
-     而「将使用」被挤在写死的 132px 里 —— 真机上长模型名一律截成
-     `deepseek-v4.1-...`，用户看不出后面几位。轨道数与单元格数必须一一对应。 */
-  grid-template-columns: 116px 108px minmax(150px, 1.1fr) 92px minmax(140px, 1fr);
+  /* 四条轨道对应四个单元格：任务 / 网关 / 指定模型 / 将使用。
+     ── 为什么这里历经六条、五条、现在四条（2026-11-25）─────────
+     删列时最容易漏的就是轨道：删掉「思考强度」那一轮只删了表头与单元格，
+     留下一条空转的 1fr，把「将使用」挤进写死的 132px（真机上长模型名截成
+     `deepseek-v4.1-...`）。这次删「标签」列时轨道同步从五条降到四条 ——
+     轨道数与单元格数必须一一对应，否则富余宽度会被看不见的格子吃掉。 */
+  grid-template-columns: 116px 108px minmax(150px, 1.1fr) minmax(140px, 1fr);
   gap: 10px;
   align-items: center;
   padding: 7px 0;
@@ -3272,7 +3272,6 @@
 .mm-route-task { display: flex; align-items: baseline; gap: 6px; color: var(--text); }
 .mm-route-task code { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-3); }
 .mm-route-fixed { color: var(--text-3); font-size: 11.5px; }
-.mm-route-tag { color: var(--ok); font-size: 11.5px; }
 .mm-route-resolved { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
 .mm-route-resolved code {
   font-family: var(--font-mono);
@@ -3343,54 +3342,6 @@
   font-size: 11.5px;
   color: var(--text-3);
 }
-
-/* 模型池：重档 / 轻档各一行。
-   ── 为什么是两行而不是一个通用数组编辑器 ────────────────────────
-   `models.models` 原来是配置页里一个显示 `[]` 的 textarea（`[{model,tags}]`）。
-   而后端 `llm::task_tag` 只认两个标签：画像 → heavy、蒸馏 → light，其余任务
-   根本不看标签。也就是说那个"能装任意标签的数组"里，真正会被读到的只有两格。
-   摆一个通用数组编辑器让人手写它，是拿格式换不到能力。 */
-.mm-pool {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 10px;
-  padding: 9px 11px;
-  border: 1px solid var(--hairline);
-  border-radius: var(--r-sm);
-  background: var(--surface-inset);
-}
-.mm-pool-head { font-size: 11.5px; font-weight: 600; color: var(--text-2); }
-/* 三列：标签徽标 | 输入框 | 一句说明。行高对齐到输入框的 26px，
-   不让说明文字把整行撑高（那样两行之间会显得一块一块的）。 */
-.mm-pool-row {
-  display: grid;
-  grid-template-columns: minmax(96px, 120px) minmax(0, 260px) minmax(0, 1fr);
-  align-items: center;
-  gap: 4px 10px;
-}
-.mm-pool-tag {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
-  font-size: 11.5px;
-  color: var(--text-2);
-  white-space: nowrap;
-}
-/* 标签键（heavy / light）走等宽小字：它是要对着后端那张表核对的字面量，
-   不是给人读的文案。 */
-.mm-pool-tag code {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text-3);
-  border: 1px solid var(--hairline);
-  border-radius: var(--r-xs);
-  padding: 0 4px;
-}
-/* `.mm-route-inert` 默认 `grid-column: 3 / -1`（它是给路由表那句合并说明用的）。
-   在模型池这一行里它本来就落在第三列，显式清掉跨列声明 —— 否则窄屏那份
-   `grid-column: 1` 覆盖会把它顶到第一列，和标签徽标叠在一起。 */
-.mm-pool-row .mm-route-inert { grid-column: auto; }
 
 /* 分组导航 chips */
 .mm-cfg-nav { display: flex; flex-wrap: wrap; gap: 6px; flex: 0 0 auto; }

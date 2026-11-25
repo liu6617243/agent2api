@@ -11,11 +11,15 @@
 //! 打本进程网关，拿回来的就是已经算过账的那次调用。
 //!
 //! ── 模型怎么选 ──────────────────────────────────────────────
-//! 三级回退，越靠前越具体：
+//! 两级回退，越靠前越具体：
 //!   1. `models.routing` 里 `task` 命中本任务的条目，取它的 `model`；
-//!   2. 按 [`task_tag`] 给的固定档位（`light` / `heavy`）在 `models.models`
-//!      里找带同一标签的模型，命中即用；
-//!   3. 都没有 → `models.fallbackModel`；再没有 → 网关目录里第一个非图像模型。
+//!   2. 都没有 → `models.fallbackModel`；再没有 → 网关目录里第一个非图像模型。
+//!
+//! 这里曾经还有一级「任务按固定档位（`light` / `heavy`）到 `models.models`
+//! 模型池里找同标签的模型」。2026-11-25 拆掉：档位只覆盖 `profile` 与
+//! `distill` 两个任务，而这两个任务在路由表里各有一行「指定模型」，池子能做的
+//! 事逐行能做得更直接；真机上 `models.models` 一直是空的 —— 有概念、没值。
+//! 「哪个任务配得上更强的模型」这个判断因此不再有第二个落点。
 //!
 //! ── 思考强度：每个任务固定发一档（2026-11-25 二次修）────────────
 //! 早先这里有一个 `models.taskEffort` 旋钮，默认值里 `summarize`/`tag` 是
@@ -36,12 +40,12 @@
 //! → reasoning 17 / 20 条正文一条不少。网关会优先采用客户端这份档位
 //! （`upstream::payload` 的 `read_client_level` → `apply_reasoning`）。
 //!
-//! 选模型那一半（`light` / `heavy`）继续保留，但仍是代码里的固定档位
-//! [`task_tag`]、不是配置项。`models.taskEffort` 这个键已从 schema 删除
-//! （2026-11-25）：真正决定思考的是 [`effort_for`]，留着它只会让用户把
-//! 「更认真」调成「一次都不成功」。
+//! 模型那一层（`light` / `heavy` 档位池）已在 2026-11-25 拆掉，见上面「模型
+//! 怎么选」。`models.taskEffort` 这个键更早就从 schema 删除了（2026-11-25）：
+//! 真正决定思考的是 [`effort_for`]，留着它只会让用户把「更认真」调成「一次都
+//! 不成功」。
 //!
-//! 为什么第 3 步不是「写死一个模型名」：这个仓库要能装在任何人的机器上，
+//! 为什么兜底不是「写死一个模型名」：这个仓库要能装在任何人的机器上，
 //! 写死必然在别人的账号里不存在。目录里有什么就用什么，才叫「本地可用」。
 //!
 //! ── 没有可用模型时怎么办 ────────────────────────────────────
@@ -179,29 +183,6 @@ pub fn effort_for(task: &str) -> &'static str {
         // 其余（extract / summarize / tag / classify / dedup / insight / …）都是
         // 结构化抽取，最小思考足够，且实测正文更完整、更快。
         _ => "minimal",
-    }
-}
-
-/// 任务对应的模型池标签。**代码里固定，不是配置项。**
-///
-/// ── 为什么固定 ──────────────────────────────────────────────
-/// 只有两个任务值得往"更强的模型"上靠：
-///   · `profile` —— 跨条目归纳人格与技术栈，需要长上下文与抽象能力；
-///   · `distill` —— 把一堆碎片压成架构决策，需要取舍判断。
-///
-/// 其余任务（打标签、写摘要、抽条目、失效判定、合并）都是**结构化抽取**：
-/// 输入已经给全，输出是短 JSON，模型再强也不会让结论更好，只会让 `max_tokens`
-/// 更快被吃掉。给它们开"高质量模型"是纯浪费。
-///
-/// 这个判断不需要用户参与 —— 用户既不知道每个任务的提示词长什么样，也无法从
-/// 界面上判断"该不该给它 heavy"。早先它是个下拉框，结果真机被设成
-/// `{"summarize":"high","tag":"high",…}`：机械任务全走 heavy，`reasoning_effort`
-/// 把输出预算吃干，`content` 空、`finish_reason=length`。
-pub fn task_tag(task: &str) -> Option<&'static str> {
-    match task {
-        "profile" => Some("heavy"),
-        "distill" => Some("light"),
-        _ => None,
     }
 }
 
@@ -384,24 +365,7 @@ pub fn model_for(task: &str) -> Option<String> {
             }
         }
     }
-    // 2. 任务固定的模型池标签（不是配置项，见 `task_tag`）
-    if let Some(tag) = task_tag(task) {
-        let tagged = config::get("models.models").and_then(|value| value.as_array().cloned()).unwrap_or_default();
-        for item in tagged {
-            let has_tag = item
-                .get("tags")
-                .and_then(Value::as_array)
-                .is_some_and(|tags| tags.iter().any(|value| value.as_str() == Some(tag)));
-            if has_tag {
-                if let Some(model) = item.get("model").and_then(Value::as_str) {
-                    if !model.trim().is_empty() {
-                        return Some(model.trim().to_string());
-                    }
-                }
-            }
-        }
-    }
-    // 3. 用户指定的兜底，再不行就问目录
+    // 2. 用户指定的兜底，再不行就问目录
     let fallback = config::text_of("models.fallbackModel");
     if !fallback.trim().is_empty() {
         return Some(fallback.trim().to_string());
@@ -875,46 +839,6 @@ mod tests {
         // 真空：任何 finish_reason 都是 Empty。
         assert_eq!(read_output("", "stop"), Output::Empty);
         assert_eq!(read_output("", "length"), Output::Empty);
-    }
-
-    /// 机械任务一律不往"更强的模型"上靠。
-    ///
-    /// ── 这条测试防的是什么 ────────────────────────────────────
-    /// 早先 `models.taskEffort` 是配置项，真机把它设成了
-    /// `{"summarize":"high","tag":"high","extract":"high",…}` ——
-    /// 于是打标签、写摘要这些**只输出短 JSON** 的任务全走了 heavy 模型。
-    /// 这不是"多花点钱"：`max_tokens` 是 reason + content 的共享预算，
-    /// 上游被要求多想就会把预算花在思考上，回一个空的 `content` +
-    /// `finish_reason=length`，整批丢弃重来。
-    ///
-    /// 真机台账（`llm_call`）：`summarize` 78 次失败烧 707k token、
-    /// `tag` 25 次失败烧 134k token。成功行的 `completion_tokens` 也常常
-    /// 高过 `max_tokens` —— 说明预算是被 reasoning 吃掉的，不是 content 太长。
-    ///
-    /// 判据：只有 `profile`（跨条目归纳）与 `distill`（取舍判断）配得上
-    /// 更强的模型；其余任务返回 `None`，走兜底模型。
-    #[test]
-    fn mechanical_tasks_do_not_ask_for_a_stronger_model() {
-        for task in [
-            "extract",
-            "summarize",
-            "tag",
-            "classify",
-            "supersede",
-            "dedup",
-            "consolidate",
-            "ingest",
-            "index-scan",
-            "cleanup",
-        ] {
-            assert_eq!(
-                task_tag(task),
-                None,
-                "{task} 是结构化抽取任务，不该往更强/更贵的模型上路由 —— 它的失败模式是内容被挤空，不是结论不够好"
-            );
-        }
-        assert_eq!(task_tag("profile"), Some("heavy"), "画像要跨条目归纳，值得 heavy");
-        assert_eq!(task_tag("distill"), Some("light"), "蒸馏要取舍判断，light 足够");
     }
 
     /// 每个任务的输出预算至少要能装下"一批结论"。

@@ -108,7 +108,7 @@ pub struct Knob {
     ///
     /// 取值：
     ///   · `""`      —— 配置页自己画控件（绝大多数键）；
-    ///   · `"self"`  —— 就在配置页上方那张表里改（模型池 / 路由表）；
+    ///   · `"self"`  —— 就在配置页上方那张表里改（路由表）；
     ///   · 页签键    —— `"sync"` / `"auto"` / `"import"` / `"agents"`，配置页给一句
     ///                  「去 XX 页改」的指路，点了直接切过去。
     ///
@@ -137,7 +137,7 @@ const fn knob_d(key: &'static str, kind: Kind, tier: Tier, group: &'static str, 
     Knob { key, kind, tier, group, label, desc, default_json, min: None, max: None, options: &[], hot: true, owner: "" }
 }
 
-/// 由**本页上方那张表**维护的键（模型池 / 路由表）：配置页不再给控件，只留一行。
+/// 由**本页上方那张表**维护的键（路由表）：配置页不再给控件，只留一行。
 const fn inline(mut item: Knob) -> Knob {
     item.owner = "self";
     item
@@ -508,25 +508,32 @@ static SCHEMA: &[Knob] = &[
     // ===== 模型与路由 =====
     //
     // ── 本仓的模型选择只有一条链路（`llm::model_for`）───────────
-    // 显式路由（models.routing）→ 任务固定档位（`llm::task_tag`）对应的标签
-    // （models.models 里的 tags）→ 兜底模型（models.fallbackModel）→ 网关目录
-    // 首个对话模型。所以真正接线的只有这四个键 + timeout + gatewayBase。
+    // 显式路由（models.routing）→ 兜底模型（models.fallbackModel）→ 网关目录
+    // 首个对话模型。所以真正接线的只有 routing + timeout + gatewayBase +
+    // fallbackModel 这四个键。
     // AgentHub 那套「模型来源排序 / 自定义供应商 / 用途标签集 / 失败重试次数」
     // 在本仓没有对应的解析器 —— 那几个键已删除，而不是留成灰掉的输入框。
     // 调用失败由自动化任务的下一轮重试，不在这里叠一层 `maxRetries`。
-    // ── 模型池 / 路由表为什么不在配置页里手写（2026-11-25）────────
-    // `models.models` 与 `models.routing` 都是对象数组，配置页唯一能画的控件是
-    // 一个显示 `[]` 的 textarea —— 页面顶上那张截图里的「空白框」就是它。
-    // 它们各自已经有真正的界面：模型池在同步页上方的「按标签的路由」表里配
-    // （`RoutingTable` 直接读写这两个键），所以配置页只留一行指路。
-    inline(knob("models.models", Kind::List, Tier::Advanced, "模型与网关", "模型池", "[]")),
-    inline(knob_d("models.routing", Kind::List, Tier::Internal, "模型与网关", "按标签降级链",
-        "每项 {\"task\":\"extract\",\"tags\":[\"light\"],\"model\":\"...\"}", "[]")),
+    //
+    // ── 为什么没有 `models.models`（模型池）了（2026-11-25）────────
+    // 它是一份 `[{model, tags}]`，但 `llm::task_tag` 只给 `profile`（heavy）与
+    // `distill`（light）两个任务分档 —— 也就是「一个能装任意标签的数组」里
+    // 真正会被读到的只有两格，而这两格各自对应的任务在路由表里本来就有一行
+    // 「指定模型」。同一件事的第二种写法，还多一条隐式优先级（路由 > 标签池）。
+    // 真机上这个键一直是空的。于是键随之删除：选模型只剩「这一行指定 → 兜底 →
+    // 目录首个」，少一层间接。老 config.json 里若还有这个键，按未知键静默忽略。
+    //
+    // ── 路由表为什么不在配置页里手写 ────────────────────────────
+    // `models.routing` 是对象数组，配置页唯一能画的控件是一个显示 `[]` 的
+    // textarea —— 页面顶上那张表才是它真正的界面（`RoutingTable` 直接读写这个
+    // 键），所以这里只留一行指路。
+    inline(knob_d("models.routing", Kind::List, Tier::Internal, "模型与网关", "按任务指定模型",
+        "每项 {\"task\":\"extract\",\"model\":\"...\"}", "[]")),
     range(knob("models.timeout", Kind::Number, Tier::Advanced, "模型与网关", "请求超时（秒）", "60"), 5.0, 600.0),
     knob_d("models.gatewayBase", Kind::Text, Tier::Internal, "模型与网关", "网关基址",
         "留空 = 自动探测本机端口（面板与网关分端口时也能找对）", "\"\""),
     knob_d("models.fallbackModel", Kind::Text, Tier::Advanced, "模型与网关", "兜底模型",
-        "路由表与模型池都没命中时用它；留空 = 取模型目录里第一个对话模型", "\"\""),
+        "路由表没指定时用它；留空 = 取模型目录里第一个对话模型", "\"\""),
     // ── 思考强度为什么不是一个旋钮（2026-11-25 二次修）──────────
     // 这里原本有一个 `models.taskEffort`（各任务思考强度覆盖）。它把两个不该
     // 混在一起的东西绑成一个字段：「这个任务值不值得用更强的模型」（选模型）

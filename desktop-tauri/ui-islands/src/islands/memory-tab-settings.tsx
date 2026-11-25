@@ -5,7 +5,7 @@ import * as m from './memory-api'
 import { Empty, Panel, useLoad } from './memory-shared'
 
 /**
- * 配置页：模块与存储 + 按标签的路由 + 按分组的旋钮。
+ * 配置页：模块与存储 + 每个任务用哪个模型 + 按分组的旋钮。
  *
  * ── 为什么有「草稿」这一层 ──────────────────────────────────
  * 原来每改一个旋钮就 `PUT` 一次。调一屏参数（比如把检索权重试三组）等于
@@ -22,7 +22,7 @@ import { Empty, Panel, useLoad } from './memory-shared'
  *
  * ── 哪些东西是「按当前配置推导」而不是「读回来的」────────────
  * 路由表最右列的「将使用」是前端按 `llm::model_for` 的同一套规则算的（指定 →
- * 标签 → 兜底 → 目录首个）。后端没有「解析给我看」的接口，前端复算一遍是唯一
+ * 兜底 → 目录首个）。后端没有「解析给我看」的接口，前端复算一遍是唯一
  * 不新增接口的做法，所以它在界面上明确标成「推导」—— 真实生效结果以调用台账
  * 为准。改 `llm.rs` 的选模型规则时，这里的 `resolveModel` 要跟着改。
  */
@@ -32,8 +32,8 @@ import { Empty, Panel, useLoad } from './memory-shared'
  * 路由表里的任务行 —— 与 `schedule.rs` 的 `TASKS` 对齐，一个不漏。
  *
  * `llm: false` 的任务**确实存在、也确实在跑**，但走本地规则（0 token），
- * 没有「指定模型 / 标签」可配。这种行把三列合成一句说明，
- * 而不是摆三个禁用下拉装作能配。
+ * 没有「指定模型」可配。这种行把后两列合成一句说明，
+ * 而不是摆一串禁用下拉装作能配。
  *
  * ── 为什么没有「提示词优化」这一行（2026-11-25）───────────────
  * 早先这里有一行 `optimize / 提示词优化 / 未实现`，为了"把后端计划中的任务
@@ -77,26 +77,24 @@ const ROUTE_TASKS: {
 ]
 
 /**
- * 任务 → 模型池标签。**与后端 `llm::task_tag` 逐字对齐。**
+ * ── 模型只有一条路：指定 → 兜底 → 目录首个（2026-11-25 拆掉「标签档位」）──
  *
- * ── 为什么这里是一张写死的表，不是配置 ──────────────────────
- * 早先"思考强度"是个下拉框（写 `models.taskEffort`），用户能把它设成
- * `{"summarize":"high","tag":"high",…}`。真机就是这么设的，然后
- * `summarize` 失败 78 次烧 707k token、`tag` 失败 25 次烧 134k token ——
- * 因为 `max_tokens` 是 reason + content 的共享预算，被要求多想的上游会把
- * 预算花在思考上，回一个空 `content` + `finish_reason=length`。
+ * 这里曾经有一张 `任务 → heavy/light` 的固定表，配合下面的「模型池（按标签）」
+ * 两行输入框：画像走重档、蒸馏走轻档，池子里给两档各绑一个模型。
  *
- * 这个旋钮错得**不可自查**：界面上写着"思考强度：高"，用户理解成"更认真"，
- * 没有任何线索指向"这就是失败原因"。所以它不该存在 —— 判断"哪个任务配得上
- * 更强的模型"是产品判断，不是用户配置。
+ * 它被拆掉，因为它**表达不了任何新东西**：`llm::task_tag` 只给 `profile` 与
+ * `distill` 两个任务分档，而这两个任务在路由表里各有一行「指定模型」。池子能做的
+ * 事（给这两行配默认模型）路由表逐行就能做，而且更直接 —— 填完当场在「将使用」
+ * 列看到结果。真实机器上 `models.models` 一直是空的，两档从来没被配过：这是一套
+ * 有概念、没值的机制。
  *
- * 只有两个任务值得：`profile`（跨条目归纳）与 `distill`（取舍判断）。
- * 其余是结构化抽取，输入已给全、输出是短 JSON，换更强的模型不会让结论更好。
+ * 于是选模型收敛成一件事：**这一行指定了就用它，没指定用兜底模型，兜底也没配就
+ * 用目录里第一个对话模型**。少一层间接，少一个「谁优先」的隐式规则。
+ *
+ * 早先还有一个 `models.taskEffort` 下拉（"思考强度"），同样是产品判断而不是用户
+ * 配置 —— 它把人引向"调高就更认真"，实际后果是 `max_tokens` 被 reasoning 吃光、
+ * 正文返回空。现在思考强度按任务固定发一档，见 `llm::effort_for`。
  */
-const TASK_TAG: Record<string, 'heavy' | 'light' | undefined> = {
-  profile: 'heavy',
-  distill: 'light',
-}
 
 /** 分组 → 图标（`ui/icons.js` 里的键）。没列的用 info 兜底。 */
 const GROUP_ICONS: Record<string, string> = {
@@ -120,61 +118,6 @@ const GROUP_ICONS: Record<string, string> = {
 }
 
 type RouteRow = { task: string; tags: string[]; model: string }
-
-/**
- * 模型池里真实存在的标签 —— 只有这两个。
- *
- * `llm::task_tag` 是同一张表的 Rust 版本：画像跨条目归纳要重档，蒸馏要取舍
- * 判断走轻档，其余任务不按标签选模型。所以模型池不需要是「任意标签的数组」，
- * 它就是这两格。改后端那张表时这里要跟着改（两边都有注释指向对方）。
- */
-const TAG_ROWS: { tag: 'heavy' | 'light'; label: string; note: string }[] = [
-  { tag: 'heavy', label: '重档（heavy）', note: '画像这类需要跨条目归纳的任务' },
-  { tag: 'light', label: '轻档（light）', note: '蒸馏这类要取舍判断的任务' },
-]
-
-/** 从 `models.models` 里取某个标签绑的模型名；没有就空串。 */
-function poolPick(raw: unknown, tag: string): string {
-  if (!Array.isArray(raw)) return ''
-  for (const item of raw) {
-    if (!item || typeof item !== 'object') continue
-    const row = item as Record<string, unknown>
-    const tags = Array.isArray(row.tags) ? row.tags.map(String) : []
-    if (!tags.includes(tag)) continue
-    const model = typeof row.model === 'string' ? row.model.trim() : ''
-    if (model) return model
-  }
-  return ''
-}
-
-/**
- * 把某个标签的模型名写回 `models.models`，保留其它标签的条目。
- *
- * 传空串 = 摘掉这个标签（连同「只挂着这个标签」的空壳条目）。不这么写的话，
- * 清空输入框会在数组里留下一行 `{model:"",tags:["heavy"]}`，而 `model_for`
- * 会跳过空 model 继续找下一个 —— 看起来「清了但没清干净」。
- */
-function poolSet(raw: unknown, tag: string, model: string): { model: string; tags: string[] }[] {
-  const rows = toPool(raw)
-  const next: { model: string; tags: string[] }[] = []
-  for (const row of rows) {
-    const tags = row.tags.filter(item => item !== tag)
-    if (row.tags.includes(tag) && model.trim()) {
-      next.push({ model: model.trim(), tags: [...new Set([...tags, tag])] })
-      continue
-    }
-    // 这个标签被摘掉了：若它原本是这行唯一的标签，整行一起删；否则留其余标签
-    if (row.tags.includes(tag)) {
-      if (tags.length > 0) next.push({ model: row.model, tags })
-      continue
-    }
-    next.push(row)
-  }
-  if (model.trim() && !rows.some(row => row.tags.includes(tag))) {
-    next.push({ model: model.trim(), tags: [tag] })
-  }
-  return next
-}
 
 /**
  * owner → 页签名。**与 `memory-page.tsx` 的 `TABS` 逐字对齐**（后端那条
@@ -368,7 +311,7 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
    * 赶走。归并之后是**一句话 + 一个按钮**：「这一组有 10 项在「同步」页改」，
    * 下面用小字把键名列出来，想知道具体是哪些的人看得到，不想知道的可以走。
    *
-   * `owner === 'self'` 单独处理：它指的是**本页上方**那张表（模型池 / 路由表），
+   * `owner === 'self'` 单独处理：它指的是**本页上方**那张表（路由表），
    * 不是别的页签，所以给的是「回到上方」而不是跳页签。
    */
   const signposts: { owner: string; knobs: m.Knob[] }[] = []
@@ -504,7 +447,7 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
 
       {/* ── 供应商提示 ── */}
       <div className='mm-cfg-banner'>
-        <span>{t('供应商与模型池在「模型管理」里维护；本页只保留记忆中枢自己的路由规则。')}</span>
+        <span>{t('供应商与模型列表在「模型管理」里维护；本页只管记忆中枢每个任务用哪个模型。')}</span>
         <Button
           type='button'
           size='sm'
@@ -521,7 +464,7 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
       {/* ── 路由表 ── */}
       <section className='mm-cfg-card mm-cfg-route-card' id='mm-cfg-route'>
         <div className='mm-cfg-card-head'>
-          <div className='mm-cfg-card-title'>{t('按标签的路由与降级链')}</div>
+          <div className='mm-cfg-card-title'>{t('每个任务用哪个模型')}</div>
           <div className='mm-cfg-card-actions'>
             <Button type='button' size='sm' variant='ghost' onClick={reloadOnly}>
               {t('刷新链路')}
@@ -529,12 +472,11 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
           </div>
         </div>
         <div className='mm-cfg-card-sub'>
-          {t('每行可指定模型；不指定则按标签在下面的模型池里挑。记忆任务固定走本机网关。')}
+          {t('每行可指定模型；不指定就用兜底模型。记忆任务固定走本机网关。')}
         </div>
 
         <RoutingTable
           routing={toRouting(value('models.routing'))}
-          pool={toPool(value('models.models'))}
           fallback={String(value('models.fallbackModel') ?? '')}
           onChange={(task, patch) => {
             const rows = toRouting(value('models.routing'))
@@ -551,39 +493,12 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
           }}
         />
 
-        {/* ── 模型池：两个标签各一个模型名 ──────────────────────────
-            它原来是 `models.models` 那个 JSON 数组（`[{model,tags}]`）的手写
-            textarea，框里只有 `[]`。而这个数组在本仓只服务两个固定标签
-            （`llm::task_tag`：画像 → heavy、蒸馏 → light），其余任务根本不看
-            标签 —— 也就是说「一个能装任意标签的数组」里，真正会被读到的只有
-            两格。摆一个通用数组编辑器让人手写它，是拿格式换不到能力。
-
-            所以这里收敛成两行：重/轻各填一个模型名。空 = 不指定，走兜底。 */}
-        <div className='mm-pool'>
-          <div className='mm-pool-head'>{t('模型池（按标签）')}</div>
-          {TAG_ROWS.map(({ tag, label, note }) => (
-            <div key={tag} className='mm-pool-row'>
-              <span className='mm-pool-tag'>
-                {t(label)}
-                <code>{tag}</code>
-              </span>
-              <ModelInput
-                task={`pool:${tag}`}
-                value={poolPick(value('models.models'), tag)}
-                options={Array.from(new Set(toPool(value('models.models')).map(item => item.model)))}
-                onCommit={model => put('models.models', poolSet(value('models.models'), tag, model))}
-              />
-              <span className='mm-route-inert'>{t(note)}</span>
-            </div>
-          ))}
-        </div>
-
         <div className='mm-cfg-note'>
           <div>
-            {t('链路怎么看：先看是否指定了模型；没指定就按任务的固定档位（画像 → heavy、蒸馏 → light）在同标签的模型池里取第一个；都没有就用兜底模型；再没有就取模型目录里第一个对话模型。401/403 会立刻换下一个，429/5xx 由网关退避重试。')}
+            {t('链路怎么看：这一行指定了模型就用它；没指定用兜底模型；兜底也没配就取模型目录里第一个对话模型。401/403 会立刻换下一个，429/5xx 由网关退避重试。')}
           </div>
           <div>
-            {t('「思考强度」已经不在这里配：记忆任务的 max_tokens 是思考与正文共用的预算，让上游多想会把正文挤空（表现为「模型返回空内容」）。所以记忆任务一律不发送思考强度，只发 max_tokens。')}
+            {t('「思考强度」已经不在这里配：记忆任务的 max_tokens 是思考与正文共用的预算，让上游多想会把正文挤空（表现为「模型返回空内容」）。思考强度按任务固定发一档，不开放配置。')}
           </div>
           <div>
             {t('分类走本地规则、不消耗 token，所以那一行没有模型可配；去重写入时也走本地规则，只有后台 L4 模型裁决这一项才调模型。')}
@@ -922,17 +837,19 @@ function InjectPreview(): React.ReactElement {
 
 function RoutingTable({
   routing,
-  pool,
   fallback,
   onChange,
 }: {
   routing: RouteRow[]
-  pool: { model: string; tags: string[] }[]
   fallback: string
   onChange: (task: string, patch: { model?: string; tags?: string[] }) => void
 }): React.ReactElement {
-  // 本地模型池里的名字，只用来给输入框出候选提示 —— 不是可选项的边界。
-  const unique = Array.from(new Set(pool.map(item => item.model).filter(Boolean)))
+  // 候选来自**本表里别的行已经填过的模型名**：只是输入提示，不是选项边界。
+  // 原来这份候选来自模型池（`models.models`），池子撤掉后改从表里自取 ——
+  // 用户填过一次 `deepseek-v4.1`，下一行敲 `deep` 就能看到它。
+  const unique = Array.from(
+    new Set(routing.map(item => item.model.trim()).filter(Boolean)),
+  )
 
   return (
     <div className='mm-route'>
@@ -940,7 +857,6 @@ function RoutingTable({
         <span>{t('任务')}</span>
         <span>{t('绑定网关 / 供应商')}</span>
         <span>{t('指定模型')}</span>
-        <span>{t('标签')}</span>
         <span>{t('将使用（推导）')}</span>
       </div>
 
@@ -961,8 +877,7 @@ function RoutingTable({
         }
 
         const row = routing.find(item => item.task === task)
-        const tag = TASK_TAG[task]
-        const resolved = resolveModel(task, routing, pool, fallback)
+        const resolved = resolveModel(task, routing, fallback)
         return (
           <div key={task} className='mm-route-row'>
             <span className='mm-route-task'>
@@ -976,9 +891,6 @@ function RoutingTable({
               options={unique}
               onCommit={model => onChange(task, { model })}
             />
-            <span className='mm-route-tag'>
-              {tag ? t(tag === 'heavy' ? '重（heavy）' : '轻（light）') : t('无（兜底）')}
-            </span>
             {/* 「将使用」这一列要回答的是「真正会跑哪个模型」，而不是把左边
                 输入框的内容再抄一遍。
 
@@ -990,7 +902,7 @@ function RoutingTable({
 
                 所以分两种：指定过 → 只标来源（模型就在左边那格，而且更宽）；
                 没指定 → 这才是这一列存在的意义，给出推导出的具体模型 + 依据
-                （标签 / 兜底 / 目录首个）。 */}
+                （兜底 / 目录首个）。 */}
             <span className='mm-route-resolved'>
               {resolved.via === '指定' ? (
                 <em title={resolved.model}>{t('按指定模型')}</em>
@@ -1055,7 +967,7 @@ function ModelInput({
     if (trimmed !== value) onCommit(trimmed)
   }
 
-  // 候选只是提示：输入框接受任何字符串，这里是「本地模型池里像的那几个」
+  // 候选只是提示：输入框接受任何字符串，这里是「本表其它行填过、且长得像的那几个」
   const typed = text.trim()
   const hints = typed
     ? options
@@ -1069,7 +981,7 @@ function ModelInput({
         className='mm-input mm-route-model-input'
         type='text'
         value={text}
-        placeholder={t('留空 = 按标签 + 优先级')}
+        placeholder={t('留空 = 用兜底模型')}
         aria-label={t('{task} 指定模型', { task })}
         spellCheck={false}
         autoComplete='off'
@@ -1120,18 +1032,10 @@ function ModelInput({
 function resolveModel(
   task: string,
   routing: RouteRow[],
-  pool: { model: string; tags: string[] }[],
   fallback: string,
 ): { model: string; via: string } {
   const hit = routing.find(row => row.task === task && row.model.trim())
   if (hit) return { model: hit.model.trim(), via: '指定' }
-
-  // 与后端 `llm::task_tag` 同一张表（见文件上方的 `TASK_TAG`）
-  const tag = TASK_TAG[task]
-  if (tag) {
-    const found = pool.find(item => item.tags.includes(tag) && item.model.trim())
-    if (found) return { model: found.model, via: `标签 ${tag}` }
-  }
 
   if (fallback.trim()) return { model: fallback.trim(), via: '兜底' }
   return { model: '', via: '目录首个' }
@@ -1433,19 +1337,6 @@ function toRouting(raw: unknown): RouteRow[] {
     })
   }
   return rows
-}
-
-function toPool(raw: unknown): { model: string; tags: string[] }[] {
-  if (!Array.isArray(raw)) return []
-  const out: { model: string; tags: string[] }[] = []
-  for (const item of raw) {
-    if (!item || typeof item !== 'object') continue
-    const row = item as Record<string, unknown>
-    const model = typeof row.model === 'string' ? row.model : ''
-    if (!model.trim()) continue
-    out.push({ model, tags: Array.isArray(row.tags) ? row.tags.map(String) : [] })
-  }
-  return out
 }
 
 function iconHtml(name: string, size = 14): string {
