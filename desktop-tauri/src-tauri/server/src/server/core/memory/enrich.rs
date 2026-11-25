@@ -68,6 +68,50 @@ fn from_llm(error: LlmError) -> Outcome {
     }
 }
 
+/// 切块上限：一块最多被对半切三层（5 条 → 2+3 → 1+1 / 1+2 → 1+1）。
+///
+/// ── 为什么切块也要封顶（2026-11-25）────────────────────────────
+/// 「截断就切一半」听起来自愈，但它是递归的，而且每次都要多打一次模型 ——
+/// 真机单次 prompt 约 9.5k token。一条素材如果天生就不适合这个任务（正文
+/// 里全是代码块、或者格式要求它输出很长），它会一路切到单条，每次都截断。
+/// 没有上限的话，一轮摘要的调用次数按 `块数 × 2^深度` 涨，token 是线性烧的。
+///
+/// 三层够用：一个 5 条的块最坏拆成 5 个单条（5→2+3→1+1 / 1+2→1+1），路径最长
+/// 3 步。再往下没有收益 —— 单条仍装不下，说明问题在素材本身，不在块大小。
+///
+/// 代价要说清：最坏情况一个 5 条块要 9 次调用（切成 n 个叶子时内部节点是 n-1，
+/// 一共 2n-1 次），20 条一轮最坏 36 次。这比「一次 20 条、失败即全丢」贵得多，
+/// 但它换来的是**结果真的拿到了**；而正常路径只有 4 次（每块一次，不触发切分）。
+const MAX_SPLIT_DEPTH: u8 = 3;
+
+/// 一次增强任务里，一批素材的调用结果。
+///
+/// ── 为什么要把「截断」从「失败」里单独拎出来（2026-11-25）──────────
+/// 调用方在这里做的是**批量**：一批失败要决定「跳过这一块继续下一块」还是
+/// 「整轮报失败」。两者对截断的处理不同 —— 截断说明这一块的素材对预算来说
+/// 太大，只要切更小就有可能成功；而网络错误、上游 5xx 是这一轮整个通道坏了，
+/// 继续切块只是把同样的错重复一遍，还多烧几次 prompt token。
+///
+/// 判据靠 [`LlmError::is_truncated`]，不靠错误文案匹配。
+enum BatchError {
+    /// 这一块内容放不进预算 —— 可以再切小重试
+    TooBig,
+    /// 通道不可用（没模型 / 没 Key / 预算用完）—— 整轮挂起
+    Unavailable(String),
+    /// 真失败（网络、上游错误、非法 JSON）
+    Failed(String),
+}
+
+fn classify(error: LlmError) -> BatchError {
+    if error.is_unavailable() {
+        BatchError::Unavailable(error.message().to_string())
+    } else if error.is_truncated() {
+        BatchError::TooBig
+    } else {
+        BatchError::Failed(error.message().to_string())
+    }
+}
+
 const SYSTEM_EXTRACT: &str = "You maintain a local project memory store. \
 Summarise raw work logs into durable conclusions. \
 Only state things the log actually supports; never invent file names, APIs or numbers. \
@@ -346,6 +390,17 @@ pub fn distill(project: Option<&str>, limit: usize) -> Outcome {
 }
 
 /// 给一条记忆补标签（只补空标签的条目，或强制全部）。
+///
+/// ── 为什么也切成小块、并允许「截断后对半切」（2026-11-25）──────────
+/// `tag` 和 `summarize` 是同一类失败：真机近三天 33 次调用里 14 次失败，一半
+/// 是 `finish_reason=length`（20 条 × 每条 5 个中文标签 + 骨架，1600 根本不够，
+/// 思考还要再分走一份），另一半是「结果不是合法 JSON」—— 那正是**截断吃掉
+/// 了 JSON 尾巴**的形状：正文非空、括号没闭合、解析失败。
+///
+/// 所以两处一起修才有意义：切小块（单块思考量有上限）+ 截断后对半切（真实
+/// 长度不可控）+ `complete` 里按截断重试一次（预算估计有偏差）。
+const TAG_CHUNK: usize = 5;
+
 pub fn tag(ids: &[String], force: bool, limit: usize) -> Outcome {
     let mut targets: Vec<model::MemoryEntry> = store::load_all()
         .into_iter()
@@ -360,6 +415,52 @@ pub fn tag(ids: &[String], force: bool, limit: usize) -> Outcome {
     targets.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
     targets.truncate(limit.clamp(1, 20));
 
+    let mut tally = ChunkTally::default();
+    for chunk in targets.chunks(TAG_CHUNK) {
+        if let Some(reason) = tag_chunk(chunk, 0, &mut tally) {
+            if tally.done > 0 {
+                return Outcome::Done(json!({
+                    "tagged": tally.done,
+                    "model": tally.model,
+                    "stopped": reason,
+                }));
+            }
+            return Outcome::Skipped(reason);
+        }
+    }
+    if tally.done == 0 {
+        if let Some(error) = &tally.first_error {
+            return Outcome::Failed(format!("打标签失败（{} 块）：{error}", tally.failed));
+        }
+        if tally.oversized > 0 {
+            return Outcome::Failed(format!(
+                "{} 条素材单条就超出输出预算（已切到单条仍是 finish_reason=length），跳过",
+                tally.oversized
+            ));
+        }
+        return Outcome::Skipped("模型没给出可用标签".into());
+    }
+    crate::server::logging::log("[Memory]", &format!("自动打标签：{} 条", tally.done));
+    Outcome::Done(json!({
+        "tagged": tally.done,
+        "model": tally.model,
+        "chunksFailed": tally.failed,
+        "chunksSplit": tally.split,
+        "oversized": tally.oversized,
+    }))
+}
+
+/// 给一批条目打标签；被截断就对半切，切到单条或切满 [`MAX_SPLIT_DEPTH`] 为止。
+///
+/// 返回 `Some(原因)` 只表示「通道不可用」；真失败记进 `tally` 后继续下一块。
+fn tag_chunk(
+    targets: &[model::MemoryEntry],
+    depth: u8,
+    tally: &mut ChunkTally,
+) -> Option<String> {
+    if targets.is_empty() {
+        return None;
+    }
     let ask = format!(
         "为下面每条记忆给出 2-5 个检索标签（中文优先，专有名词保留原文）。\n\
          标签要能在「以后想找这条」时被想到，不要写「代码」「项目」这种无信息量的词。\n\n\
@@ -376,12 +477,42 @@ pub fn tag(ids: &[String], force: bool, limit: usize) -> Outcome {
     // 传条数进去而不是写死：batchSize 可配到 200，20 条时固定预算必然截断。
     let reply = match llm::complete(Request::new("tag", SYSTEM_TAG, ask).for_items(targets.len(), 120)) {
         Ok(reply) => reply,
-        Err(error) => return from_llm(error),
+        Err(error) => {
+            return match classify(error) {
+                BatchError::Unavailable(reason) => Some(reason),
+                // 截断：对半切开重跑。`depth` 封顶，切到单条也认了 —— 再往下
+                // 只会在同一个「装不下」上反复烧 prompt。
+                BatchError::TooBig => {
+                    if targets.len() > 1 && depth < MAX_SPLIT_DEPTH {
+                        tally.split += 1;
+                        let mid = targets.len() / 2;
+                        if let Some(reason) = tag_chunk(&targets[..mid], depth + 1, tally) {
+                            return Some(reason);
+                        }
+                        tag_chunk(&targets[mid..], depth + 1, tally)
+                    } else {
+                        tally.oversized += 1;
+                        None
+                    }
+                }
+                BatchError::Failed(message) => {
+                    tally.failed += 1;
+                    tally.first_error.get_or_insert(message);
+                    None
+                }
+            };
+        }
     };
+    if tally.model.is_empty() {
+        tally.model = reply.model.clone();
+    }
     let Some(parsed) = llm::parse_json(&reply.text) else {
-        return Outcome::Failed("打标签结果不是合法 JSON，已丢弃".into());
+        tally.failed += 1;
+        tally
+            .first_error
+            .get_or_insert_with(|| "打标签结果不是合法 JSON".into());
+        return None;
     };
-    let mut touched = 0usize;
     for item in parsed.get("items").and_then(Value::as_array).into_iter().flatten() {
         let Some(id) = item.get("id").and_then(Value::as_str) else { continue };
         let tags: Vec<String> = item
@@ -410,18 +541,54 @@ pub fn tag(ids: &[String], force: bool, limit: usize) -> Outcome {
             continue;
         }
         let _ = index::global().upsert(&entry);
-        touched += 1;
+        tally.done += 1;
     }
-    if touched == 0 {
-        return Outcome::Skipped("模型没给出可用标签".into());
-    }
-    crate::server::logging::log("[Memory]", &format!("自动打标签：{touched} 条"));
-    Outcome::Done(json!({ "tagged": touched, "model": reply.model }))
+    None
 }
 
 /// 给一条 l1 记忆生成一句摘要，落到 `summary` 字段（供检索行显示）。
 ///
 /// 不新建条目：摘要是「这条记忆自己的一句话」，属于原条目的一个字段。
+///
+/// ── 为什么按小块处理，不再一次喂 20 条（2026-11-25）──────────────
+/// 真机 `request_raw` 的铁证：一次 20 条素材 → `max_tokens=2000` 全被
+/// `reasoning_tokens` 吃光（`finish_reason=length`，正文 0 字）。根因是没发
+/// `reasoning_effort`，模型默认狂想 —— 已由 `llm::effort_for` 从源头压到
+/// `minimal`（见该函数说明，实测思考从 2000 降到 0~30）。切块是第二道保险：
+/// 单块素材少、即便偶发多想也不会把预算吃光；且**一块失败不连累整批** ——
+/// 原来的实现是「20 条一次调用，截断即全部丢弃」，切块后最坏只丢一块。
+///
+/// 切块是起点，不是终点：块再小也可能装不下（某条正文恰好很长）。所以真被
+/// 截断时**对半再切**，切到单条为止；单条都装不下的，记一次「放不进」而不是
+/// 反复重试 —— 反复重试只是把同一份 prompt 烧一遍又一遍。
+const SUMMARIZE_CHUNK: usize = 5;
+
+/// 一轮批量增强任务的账（`tag` / `summarize` 共用）。
+///
+/// ── 为什么要把四种结局分开记（2026-11-25）──────────────────────
+/// 「任务失败」这四个字盖住了四件不同的事，而它们该做的处置完全不同：
+///   · `done`     —— 真的写进去了，正常收工；
+///   · `split`    —— 装不下、切小了才成，说明块大小偏大；
+///   · `oversized`—— 单条都装不下，得把那条正文压短或单独处理；
+///   · `failed`   —— 网络/上游/非法 JSON，是通道问题，与条数无关。
+/// 只报一个「failed」的话，用户看到失败也不知道该调什么。
+///
+/// `tag` 与 `summarize` 共用同一份账：两者形状完全一样（一批条目进、短 JSON
+/// 出），各写一份只会让两边的统计口径漂开。
+#[derive(Default)]
+struct ChunkTally {
+    done: usize,
+    /// 整块被截断后对半切开重跑的块数
+    split: usize,
+    /// 单条仍装不下、放弃的条数
+    oversized: usize,
+    /// 真失败（网络、上游错误、非法 JSON）的块数
+    failed: usize,
+    /// 第一次真失败的原文，供报错用
+    first_error: Option<String>,
+    model: String,
+}
+
 pub fn summarize(ids: &[String], limit: usize) -> Outcome {
     let targets: Vec<model::MemoryEntry> = store::load_all()
         .into_iter()
@@ -435,6 +602,61 @@ pub fn summarize(ids: &[String], limit: usize) -> Outcome {
     if targets.is_empty() {
         return Outcome::Skipped("没有需要摘要的记忆（正文都太短或已有摘要）".into());
     }
+    let mut tally = ChunkTally::default();
+    for chunk in targets.chunks(SUMMARIZE_CHUNK) {
+        if let Some(reason) = summarize_chunk(chunk, 0, &mut tally) {
+            // 通道不可用（没模型 / 没 Key / 预算用完）：这一轮整轮挂起。
+            // 已经写进去的那几条摘要照样算数 —— 它们是真结果，不该因为
+            // 后面的块调不动而被抹掉。
+            if tally.done > 0 {
+                return Outcome::Done(json!({
+                    "summarized": tally.done,
+                    "model": tally.model,
+                    "stopped": reason,
+                }));
+            }
+            return Outcome::Skipped(reason);
+        }
+    }
+    if tally.done > 0 {
+        // 成功也把「切过几次 / 失败几块」带出去：这两个数是判断「块大小是否
+        // 定得太大」的唯一线索，只报成功条数等于把调参依据丢掉。
+        return Outcome::Done(json!({
+            "summarized": tally.done,
+            "model": tally.model,
+            "chunksFailed": tally.failed,
+            "chunksSplit": tally.split,
+            "oversized": tally.oversized,
+        }));
+    }
+    if let Some(error) = tally.first_error {
+        return Outcome::Failed(format!(
+            "摘要全部失败（{} 块）：{error}",
+            tally.failed
+        ));
+    }
+    if tally.oversized > 0 {
+        // 装不下但也没报错 —— 这是「素材太长」，不是「通道坏了」。
+        return Outcome::Failed(format!(
+            "{} 条素材单条就超出输出预算（已切到单条仍是 finish_reason=length），跳过",
+            tally.oversized
+        ));
+    }
+    Outcome::Skipped("模型没给出可用摘要".into())
+}
+
+/// 摘要一批条目；被截断就对半切，切到单条或切满 [`MAX_SPLIT_DEPTH`] 为止。
+///
+/// 返回 `Some(原因)` 只表示「通道不可用，这一轮别继续了」。真失败（网络、
+/// 上游错误、非法 JSON）记进 `tally` 后继续下一块 —— 一块坏不该拖死整轮。
+fn summarize_chunk(
+    targets: &[model::MemoryEntry],
+    depth: u8,
+    tally: &mut ChunkTally,
+) -> Option<String> {
+    if targets.is_empty() {
+        return None;
+    }
     let ask = format!(
         "为下面每条记忆写一句不超过 40 字的摘要，说明「这条记的是什么、结论是什么」。\n\
          不要以「这条记忆」开头。\n\n\
@@ -442,26 +664,65 @@ pub fn summarize(ids: &[String], limit: usize) -> Outcome {
          条目：\n{}",
         targets
             .iter()
-            .map(|entry| format!("[{}] {}\n{}", entry.id, entry.title, model::truncate_chars(&entry.body, 900)))
+            .map(|entry| format!(
+                "[{}] {}\n{}",
+                entry.id,
+                entry.title,
+                model::truncate_chars(&entry.body, 900)
+            ))
             .collect::<Vec<_>>()
             .join("\n\n")
     );
     // 每条摘要是 `{"id":"mem_xxx","summary":"不超过 40 字"}`。40 个汉字约
-    // 60-80 token，加 id 与骨架取 100；20 条要 2000，远超固定 1600。
+    // 60-80 token，加 id 与骨架取 100；`for_items` 再加固定余量，思考已由
+    // `effort_for` 压到 minimal，不再另加思考预留。
     let reply = match llm::complete(Request::new("summarize", SYSTEM_EXTRACT, ask).for_items(targets.len(), 100)) {
         Ok(reply) => reply,
-        Err(error) => return from_llm(error),
+        Err(error) => {
+            return match classify(error) {
+                BatchError::Unavailable(reason) => Some(reason),
+                // 这一批放不进预算：对半切开重跑。切到单条或切满深度还不行，
+                // 记一次 oversized 认了 —— 问题在素材本身，不在于块大小。
+                BatchError::TooBig => {
+                    if targets.len() > 1 && depth < MAX_SPLIT_DEPTH {
+                        tally.split += 1;
+                        let mid = targets.len() / 2;
+                        if let Some(reason) = summarize_chunk(&targets[..mid], depth + 1, tally) {
+                            return Some(reason);
+                        }
+                        summarize_chunk(&targets[mid..], depth + 1, tally)
+                    } else {
+                        tally.oversized += 1;
+                        None
+                    }
+                }
+                BatchError::Failed(message) => {
+                    tally.failed += 1;
+                    tally.first_error.get_or_insert(message);
+                    None
+                }
+            };
+        }
     };
+    if tally.model.is_empty() {
+        tally.model = reply.model.clone();
+    }
     let Some(parsed) = llm::parse_json(&reply.text) else {
-        return Outcome::Failed("摘要结果不是合法 JSON，已丢弃".into());
+        // 这一步仍可能中招：模型给了非空正文但整体不是 JSON。整体切块已经
+        // 把概率压低，真碰上就记一次失败，不回退成「按纯文本猜」。
+        tally.failed += 1;
+        tally
+            .first_error
+            .get_or_insert_with(|| "摘要结果不是合法 JSON".into());
+        return None;
     };
-    let mut touched = 0usize;
     for item in parsed.get("items").and_then(Value::as_array).into_iter().flatten() {
         let Some(id) = item.get("id").and_then(Value::as_str) else { continue };
         let summary = item.get("summary").and_then(Value::as_str).unwrap_or("").trim();
         if summary.is_empty() {
             continue;
         }
+        // 只认这一块里的 id：模型编出来的 id 不该写到别的条目上。
         let Some(mut entry) = targets.iter().find(|entry| entry.id == id).cloned() else { continue };
         entry.summary_text = model::truncate_chars(summary, 120);
         entry.updated_at = crate::server::logging::now_ms();
@@ -470,12 +731,9 @@ pub fn summarize(ids: &[String], limit: usize) -> Outcome {
             continue;
         }
         let _ = index::global().upsert(&entry);
-        touched += 1;
+        tally.done += 1;
     }
-    if touched == 0 {
-        return Outcome::Skipped("模型没给出可用摘要".into());
-    }
-    Outcome::Done(json!({ "summarized": touched, "model": reply.model }))
+    None
 }
 
 /// 事实失效判定：拿一条新记忆去比同主题的旧记忆，产 `supersede` 建议。
@@ -918,5 +1176,74 @@ mod tests {
         assert_eq!(Outcome::Done(json!({})).label(), "done");
         assert_eq!(Outcome::Skipped("x".into()).label(), "skipped");
         assert!(Outcome::Failed("x".into()).is_failed());
+    }
+
+    /// 摘要按 5 条一块调用，而不是 20 条一口气。
+    ///
+    /// ── 这条测试防的是什么 ────────────────────────────────────
+    /// 真机 `request_raw` 铁证：一次 20 条素材 → `max_tokens=2000` 被
+    /// `reasoning_tokens=2000` 全吃光、正文 0 字、`finish_reason=length`。
+    /// 思考量随「这一批几条」线性增长，批越大越容易被思考吃干。切块后单次
+    /// 思考量有上限，一块失败也不连累整批。
+    ///
+    /// 判据：20 条必须被切成 4 块（每块 ≤ 5 条），不能是一块 20 条。
+    #[test]
+    fn summarize_chunks_are_small() {
+        assert_eq!(SUMMARIZE_CHUNK, 5, "摘要块大小变了？先确认台账里截断的形状也跟着变了");
+        let twenty: Vec<usize> = (0..20).collect();
+        let sizes: Vec<usize> = twenty.chunks(SUMMARIZE_CHUNK).map(|s| s.len()).collect();
+        assert_eq!(sizes, vec![5, 5, 5, 5], "20 条没被切成 4 个 5 条的小块");
+        assert!(
+            sizes.iter().all(|&n| n <= 5),
+            "存在大于 5 条的块，思考仍可能吃干正文"
+        );
+    }
+
+    /// `tag` 与 `summarize` 必须用同一个块大小。
+    ///
+    /// ── 这条测试防的是什么 ────────────────────────────────────
+    /// 两个任务形状完全一样（一批条目进、短 JSON 出），真机上的失败率也一起
+    /// 高：近三天 `tag` 33 次里 14 次失败、`summarize` 142 次里 70 次失败，
+    /// 一半是 `finish_reason=length`、一半是「不是合法 JSON」—— 后者正是
+    /// 截断吃掉 JSON 尾巴的形状。
+    ///
+    /// 如果只给 `summarize` 切块、`tag` 仍一次 20 条，修好一半的 bug 会以
+    /// 「摘要好了、标签还在挂」的形式回来，而且看起来像另一个问题。
+    #[test]
+    fn tag_and_summarize_share_chunk_size() {
+        assert_eq!(
+            TAG_CHUNK, SUMMARIZE_CHUNK,
+            "打标签与写摘要的块大小分叉了：同一类失败会在两个任务上分开复现"
+        );
+        assert!(TAG_CHUNK <= 5, "打标签块太大（{TAG_CHUNK} 条），思考仍可能吃干正文");
+    }
+
+    /// 截断 / 通道故障 / 真失败必须分三类，不能都算 failed。
+    ///
+    /// ── 这条测试防的是什么 ────────────────────────────────────
+    /// `classify` 决定三件后果完全不同的事：
+    ///   · `Unavailable` → 整轮挂起（别把「没配模型」记成失败）；
+    ///   · `TooBig`      → 对半切重跑（这是唯一一种「切小就能救」的失败）;
+    ///   · `Failed`      → 记一笔继续下一块。
+    /// 三者一旦混成一类，最坏的组合会出现：**把截断当普通失败**（切块逻辑成
+    /// 死代码，整批照样丢）或者**把通道故障当截断**（对半切到单条，把同一个
+    /// 500 重试 log2(20) 次）。两者都不会让编译失败。
+    #[test]
+    fn batch_errors_are_classified_by_cause() {
+        assert!(matches!(
+            classify(LlmError::Unavailable("没配模型".into())),
+            BatchError::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify(LlmError::Truncated("finish_reason=length".into())),
+            BatchError::TooBig
+        ));
+        assert!(matches!(
+            classify(LlmError::Failed("网关返回 HTTP 500".into())),
+            BatchError::Failed(_)
+        ));
+        // `Truncated` 绝不能落进 Failed：落进去就等于「切块重跑」这条路径不存在。
+        let truncated = classify(LlmError::Truncated("x".into()));
+        assert!(!matches!(truncated, BatchError::Failed(_)), "截断被当成普通失败，切块救不回来");
     }
 }

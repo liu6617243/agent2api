@@ -503,26 +503,24 @@ static SCHEMA: &[Knob] = &[
         "留空 = 自动探测本机端口（面板与网关分端口时也能找对）", "\"\""),
     knob_d("models.fallbackModel", Kind::Text, Tier::Advanced, "模型与网关", "兜底模型",
         "路由表与模型池都没命中时用它；留空 = 取模型目录里第一个对话模型", "\"\""),
-    // ── 为什么这个键标了 unwired（2026-11-24）──────────────────────
+    // ── 为什么这个键标了 unwired（2026-11-25 二次修）──────────────
     // 它早先是接线的：`llm.rs` 读到 `high` 就往请求体写
     // `reasoning_effort: "high"`。而 `max_tokens` 是 reason + content 的
-    // **共享预算** —— 机械任务（打标签、写摘要）本来只要几百 token 的结论，
-    // 被要求多想之后上游把 1600 全花在思考上，`content` 返回空串、
-    // `finish_reason=length`，整批丢弃重来。
+    // **共享预算** —— 机械任务本只要几百 token 的结论，被要求多想之后上游把
+    // 预算全花在思考上，`content` 返回空串、`finish_reason=length`，整批丢弃。
     //
-    // 真机台账：`summarize` 78 次失败烧 707k token、`tag` 25 次失败烧 134k
-    // token，失败原因全是「输出被 max_tokens 截断」或「模型返回空内容」。
+    // 2026-11-24 的处置是「干脆不发 `reasoning_effort`」；但真机 + 本机实测证明
+    // **不发 ≠ 不想**：`deepseek-v4.1-flash` 别名背后几十个上游 mapping 绑定的
+    // reasoning 全是 `null`，网关不注入，模型就按默认最高档狂想，`max_tokens`
+    // 照样被吃满、正文为空（`request_raw`：20 条素材 → reasoning=2000、正文 0）。
+    // 本机实测同一 prompt 发 `reasoning_effort=minimal`，思考从 723 降到 17 token，
+    // 正文一条不少。
     //
-    // 更糟的是它**不可自查**：界面上写着「思考强度：高」，用户理解成「更认真」，
-    // 没有任何线索指向「这就是失败原因」。这类旋钮不该交给用户 —— 记忆任务的
-    // 输入已经给全（素材 + 输出格式），要的是稳定而不是深度推理。
-    //
-    // 所以：`reasoning_effort` 整体不再发送；「哪个任务配得上更强模型」改由
-    // 代码里的 `llm::task_tag` 固定（只有 profile / distill 有档位）。键本身
-    // 留着（跨实现配置契约，删键会让老配置静默丢值），值照存、界面照显示，
-    // 只是改了没有任何行为影响。
+    // 所以现在**由代码对每个任务固定发一档**（`llm::effort_for`：机械任务 minimal、
+    // 判断类 low）。真正的旋钮在代码里，不在这个配置项 —— 所以这个键仍标 unwired：
+    // 值照存、界面照显示（跨实现配置契约），但改了不改变实际发出的档位。
     unwired(knob_d("models.taskEffort", Kind::Map, Tier::Internal, "模型与网关", "各任务思考强度覆盖",
-        "本仓未接入：记忆任务一律不发送 reasoning_effort（它是 max_tokens 的共享预算，让上游多想会把正文挤空）。任务该走哪个模型档位由代码固定，改这里不会有任何行为影响",
+        "本仓未接入：记忆任务的思考档位由代码固定（llm::effort_for：机械任务 minimal、判断类 low），改这里不会有任何行为影响",
         "{\"extract\":\"low\",\"tag\":\"minimal\",\"classify\":\"minimal\",\"summarize\":\"low\",\
           \"distill\":\"medium\",\"profile\":\"high\",\"dedup\":\"low\",\"supersede\":\"low\"}")),
     // 各任务输出 token 上限。没列到的任务走 `llm::max_tokens_for` 里的默认表。

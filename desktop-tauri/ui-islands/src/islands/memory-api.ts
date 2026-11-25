@@ -485,6 +485,15 @@ export type LlmCall = {
   latencyMs: number
   ok: boolean
   error: string | null
+  /**
+   * 成功行的预算快照：`max_tokens=7424 reasoning=2100`。
+   *
+   * 为什么要在界面上留这一格：`completionTokens` 是「思考 + 正文」的总和，
+   * 单看它分不清「写了 2000 字正文」和「想了 2000 token、正文一个字没写」。
+   * 后者正是「摘要老是失败」的真实形状 —— 而它出现在**成功行**上（截断前
+   * 那几次恰好收住了），只盯失败行永远看不出来。
+   */
+  note?: string | null
 }
 
 export type Outcome = {

@@ -1270,10 +1270,15 @@ impl MemoryIndex {
     }
 
     /// 最近若干条调用台账（自动化页面的「运行统计」）。
+    ///
+    /// `note` 一起带出去：它现在承载「这次预算是多少、思考吃掉多少」
+    /// （`max_tokens=7424 reasoning=2100`）。失败行没有 note，但**成功行有** ——
+    /// 而「摘要老是失败」这类问题恰恰要看成功行：思考吃掉 90% 预算的成功调用，
+    /// 就是下一轮失败的预告。
     pub fn recent_llm(&self, limit: usize) -> Vec<Value> {
         let Ok(conn) = self.conn.lock() else { return Vec::new() };
         let mut statement = match conn.prepare(
-            "SELECT at, task, model, provider, prompt_tokens, completion_tokens, latency_ms, ok, error
+            "SELECT at, task, model, provider, prompt_tokens, completion_tokens, latency_ms, ok, error, note
                FROM llm_call ORDER BY id DESC LIMIT ?1",
         ) {
             Ok(statement) => statement,
@@ -1294,6 +1299,7 @@ impl MemoryIndex {
                     "latencyMs": row.get::<_, i64>(6).unwrap_or(0),
                     "ok": row.get::<_, i64>(7).unwrap_or(1) != 0,
                     "error": row.get::<_, Option<String>>(8)?,
+                    "note": row.get::<_, Option<String>>(9)?,
                 }))
             })
             .map(|rows| rows.flatten().collect())

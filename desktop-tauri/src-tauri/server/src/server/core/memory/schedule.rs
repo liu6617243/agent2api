@@ -1617,7 +1617,16 @@ fn extract(project: Option<&str>, manual: bool) -> Outcome {
          ]}}\n\n\
          流水：\n{material}"
     );
-    let reply = match super::llm::complete(super::llm::Request::new("extract", SYSTEM_EXTRACT, ask)) {
+    // ── 预算按「这一批多少条素材」算正文 + 固定余量（2026-11-25）─────
+    // 固定 2400 的失败形态和 summarize 一模一样：真机 `llm_call` 里 extract
+    // 失败 26 次、completion 打满 1200/2400 上限、正文被思考挤空
+    // （`finish_reason=length`）。根因是没发 `reasoning_effort`，模型默认狂想
+    // 吃满共享预算 —— 已由 `llm::effort_for` 从源头压到 `minimal`（见该函数说明）。
+    // 这里 `for_items(batch, 120)` 只按「每条素材 120 token 正文 + 固定余量」估，
+    // 真被截断时 `complete` 还会自己翻倍重试一次，所以不必再包一层重试。
+    let reply = match super::llm::complete(
+        super::llm::Request::new("extract", SYSTEM_EXTRACT, ask).for_items(recent.len(), 120),
+    ) {
         Ok(reply) => reply,
         Err(error) => {
             return if error.is_unavailable() {
@@ -1628,7 +1637,18 @@ fn extract(project: Option<&str>, manual: bool) -> Outcome {
         }
     };
     let Some(parsed) = super::llm::parse_json(&reply.text) else {
-        return Outcome::Failed("抽取结果不是合法 JSON，已丢弃".into());
+        // ── 非空但解析不了，多半是 JSON 尾巴被切掉（2026-11-25）──────
+        // `complete` 已经保证「finish_reason=length 且解析不了」时加预算重试过，
+        // 走到这里说明加倍之后仍然装不下，或者模型压根没按格式输出。两种都不该
+        // 当「模型没抽到东西」静默跳过 —— 报 failed，让台账里留下这一笔。
+        return Outcome::Failed(format!(
+            "抽取结果不是合法 JSON，已丢弃（max_tokens={}，思考 {} token）",
+            reply.max_tokens,
+            reply
+                .reasoning_tokens
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "未报".into())
+        ));
     };
     let items = parsed.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut created = 0usize;
