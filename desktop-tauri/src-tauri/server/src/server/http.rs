@@ -453,6 +453,38 @@ pub fn panel_router(state: ServerState) -> Router {
         )
         .route("/api/memory/sync/log", get(api::memory::get_sync_log))
         .route("/api/memory/sync/preview", get(api::memory::get_sync_preview))
+        // ── 技能仓库（侧边栏「资源库 → 技能仓库」）──
+        // 读接口 GET（可被排障工具按 URL 直接打开），写接口一律 POST。
+        // 全部挂 protected：sync 会把渠道目录里的副本收进中央、把目录换成交接
+        // 链接，remove 会删真身，响应里还带用户的完整技能目录结构。
+        // 「预览」与「执行」是两个端点 —— 「这个动作不写数据」该是端点级承诺，
+        // 不是请求体里的布尔开关（与记忆中枢历史导入同一口径）。
+        .route("/api/skills-hub/overview", get(api::skills_hub::get_overview))
+        .route("/api/skills-hub/library", get(api::skills_hub::get_library))
+        .route("/api/skills-hub/skill", get(api::skills_hub::get_skill))
+        .route("/api/skills-hub/conflicts", get(api::skills_hub::get_conflicts))
+        .route("/api/skills-hub/preview", get(api::skills_hub::get_preview))
+        .route("/api/skills-hub/reports", get(api::skills_hub::get_reports))
+        .route("/api/skills-hub/report", get(api::skills_hub::get_report))
+        .route(
+            "/api/skills-hub/config",
+            get(api::skills_hub::get_config).put(api::skills_hub::put_config),
+        )
+        .route("/api/skills-hub/config/reset", post(api::skills_hub::post_config_reset))
+        .route("/api/skills-hub/tools", get(api::skills_hub::get_tools))
+        .route("/api/skills-hub/probe", get(api::skills_hub::get_probe))
+        .route("/api/skills-hub/custom-dir", post(api::skills_hub::post_custom_dir).delete(api::skills_hub::delete_custom_dir))
+        .route("/api/skills-hub/daily-check", get(api::skills_hub::get_daily_check))
+        .route("/api/skills-hub/daily-check/run", post(api::skills_hub::post_daily_check_run))
+        .route("/api/skills-hub/sync", post(api::skills_hub::post_sync))
+        .route("/api/skills-hub/resolve", post(api::skills_hub::post_resolve))
+        .route("/api/skills-hub/repair", post(api::skills_hub::post_repair))
+        .route("/api/skills-hub/trash", get(api::skills_hub::get_trash))
+        .route("/api/skills-hub/trash/restore", post(api::skills_hub::post_trash_restore))
+        .route("/api/skills-hub/trash/purge", post(api::skills_hub::post_trash_purge))
+        .route("/api/skills-hub/adopt", post(api::skills_hub::post_adopt))
+        .route("/api/skills-hub/remove", post(api::skills_hub::post_remove))
+        .route("/api/skills-hub/mount/toggle", post(api::skills_hub::post_mount_toggle))
         // ── 设置页「版本信息」──
         // 一次取全：版本 / 环境 / 路径 / 开关状态 / 关键计数（见 api::system_info
         // 的模块头）。挂 protected —— 数据目录、可执行文件路径与 Key 数量都属于

@@ -186,6 +186,10 @@ pub mod session;
 // 侧边栏布局（GET/PUT /api/sidebar-layout）：桌面壳与网页端两个 origin
 // 共享同一份菜单布局，见该文件模块头
 pub mod sidebar_layout;
+// 技能仓库（/api/skills-hub/*，侧边栏「资源库 → 技能仓库」）：把各客户端
+// `skills/` 里的同名副本收成一份中央真身。全部端点挂 protected —— 这个模块
+// 会动磁盘，见该文件模块头
+pub mod skills_hub;
 pub mod stats_api;
 pub mod storage_api;
 pub mod timeouts_api;

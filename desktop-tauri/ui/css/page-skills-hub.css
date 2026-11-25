@@ -1,0 +1,983 @@
+/* ─────────────────────────────────────────────
+   技能仓库页（page-skills-hub.css）
+
+   五个页签共用一条顶部分段控件（仪表盘 / 技能库 / 同步 / 去重 / 配置）。
+   骨架类名全部以 .sk- 前缀自持；控件（Badge / Button / Switch /
+   SegmentedControl / MetricCard）来自组件库，不在这里画 —— 与记忆中枢、
+   签到页同一约定。
+
+   这条链路有一件事跟别的页面不同：**它会动用户的磁盘**。
+   所以配色把「会改文件」和「只是提示」明确分开：
+     · .sk-chip-bad / Badge destructive  «链接断了、真身丢了»：客户端现在读不到
+     · Badge warning  «要人裁决»：同步不会替你选
+     · .sk-muted / --text-3  «没有/未记录»：缺数据给灰，不伪造内容
+
+   ── 为什么抽屉用 position: fixed 而不是页面内绝对定位 ─────────
+   `.page` 本身是 `overflow-y: auto` 的滚动容器，绝对定位的遮罩只会盖住内容
+   高度（滚到下面时上方漏一条）。抽屉要盖住整个窗口，所以走 fixed。同理
+   dashboard 的长列表也在 `.page` 里滚，抽屉不能跟着一起滚。
+
+   ── 为什么表格用 grid 而不是 <table> ──────────────────────────
+   这些「表」的每列宽度是按内容语义定的（渠道名窄、路径弹性、状态固定宽），
+   `<table>` 的自动列宽会让长路径把整表撑出横向滚动，而路径本来就是该截断
+   的东西。所有 .sk-table / .sk-matrix 都是 grid 行，列宽写死在
+   grid-template-columns 里，单元格自己 overflow 处理。
+   ───────────────────────────────────────────── */
+
+/* ── 页面容器 ────────────────────────────────────────────────
+   `.page.active` 默认 `overflow-y: auto`。技能仓库整页固定高度、只有中间
+   内容区滚动（顶栏与徽标常驻），否则用户在同步页滚到底再切到配置页，
+   滚动位置会被继承，落点莫名。 */
+.page.active[data-page="skills-hub"] {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding-bottom: 0;
+}
+
+.sk-page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+}
+
+/* ── 顶栏 ── */
+.sk-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  flex: none;
+}
+.sk-tabs { display: flex; gap: 4px; flex-wrap: wrap; min-width: 0; }
+.sk-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* 徽标按钮：Badge 本身是 span，套一层 button 才有「点了会跳页」的手感 */
+.sk-badge-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  display: inline-flex;
+  border-radius: var(--r-sm);
+}
+.sk-badge-btn:hover { filter: brightness(1.08); }
+.sk-badge-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+.sk-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-anchor: none;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.sk-boot {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--text-3);
+  font-size: 12.5px;
+  min-height: 160px;
+}
+
+.sk-error {
+  flex: none;
+  padding: 9px 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--danger);
+  background: var(--danger-soft);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+/* ── 面板三态 ── */
+.sk-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+.sk-panel-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 18px 14px;
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+.sk-panel-error {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--danger);
+  background: var(--danger-soft);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.sk-panel-error > span:first-child { flex: 1; min-width: 0; }
+
+.sk-inline-error {
+  margin: 2px 0 8px;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--danger);
+  background: var(--danger-soft);
+  font-size: 12px;
+}
+
+/* ── 区块（Section）──────────────────────────────────────────
+   卡片是内容块，永远不参与父级 flex 收缩：父级是固定高度滚动列，留默认
+   flex-shrink:1 + min-height:0 会让卡片被压得比内容还矮，内容插到下一张卡
+   上（重影）。 */
+.sk-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  flex: 0 0 auto;
+  min-width: 0;
+}
+.sk-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.sk-section-copy { min-width: 0; flex: 1 1 240px; }
+.sk-section-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.sk-section-hint {
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--text-3);
+}
+.sk-section-action { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+/* ── 仪表盘 ── */
+.sk-dash { display: flex; flex-direction: column; gap: 12px; }
+.sk-dash-cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+
+/* hero：中央仓库路径 + 上次检测 + 三个动作 */
+.sk-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2, var(--surface-inset));
+  flex: 0 0 auto;
+}
+.sk-hero-main { display: flex; flex-direction: column; gap: 8px; min-width: 0; flex: 1 1 320px; }
+.sk-hero-path { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.sk-hero-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-3);
+}
+.sk-hero-path code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sk-hero-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sk-mode { font-size: 11.5px; color: var(--text-3); }
+.sk-hero-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+/* 统计卡下的第二行说明。组件库的 MetricCard 只管大数字，这行字随接口
+   一起变（「来源 N 处 → 真身 M 份」），所以由页面自己画。 */
+.sk-metric-sub {
+  margin-top: 2px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+
+/* ── 渠道矩阵 ────────────────────────────────────────────────
+   五列：渠道（含「自定义」徽标）/ 目录（弹性、可截断）/ 技能数 / 挂载数 / 状态。
+   数字列用 .sk-num 右对齐，一眼就能纵向比大小。 */
+.sk-matrix { display: flex; flex-direction: column; min-width: 0; }
+.sk-matrix-head,
+.sk-matrix-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.9fr) minmax(180px, 2fr) 56px 56px 96px;
+  gap: 10px;
+  align-items: center;
+  padding: 7px 0;
+  font-size: 12px;
+  min-width: 0;
+}
+.sk-matrix-head {
+  padding: 4px 0;
+  font-size: 11.5px;
+  color: var(--text-3);
+  border-bottom: 1px solid var(--border);
+}
+.sk-matrix-row { border-bottom: 1px solid var(--hairline); }
+.sk-matrix-row:last-child { border-bottom: 0; }
+.sk-matrix-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sk-matrix-dir {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sk-num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ── 迷你清单（待裁决 / 孤儿 / 最近同步）─────────────────── */
+.sk-mini-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.sk-mini-list > li {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 7px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  min-width: 0;
+}
+.sk-mini-title {
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sk-mini-sub {
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+
+/* ── chips（失效挂载 / L3 相似度）────────────────────────────
+   chip 是可点的：点开就是那个技能的详情抽屉。所以 cursor:pointer 且悬停
+   有反馈 —— 不做成纯装饰的圆角标签。 */
+.sk-chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.sk-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--border);
+  background: var(--surface-2, var(--surface-inset));
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.5;
+  cursor: pointer;
+  max-width: 100%;
+}
+.sk-chip:hover { border-color: var(--primary-bd); color: var(--text); }
+.sk-chip:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+/* 失效挂载 = 客户端现在读不到这个技能。用 danger 而不是 warn：这不是
+   「再看一眼」级提醒，是「功能已经坏了」。 */
+.sk-chip-bad {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--text);
+}
+.sk-chip-bad:hover { border-color: var(--danger); filter: brightness(1.06); }
+.sk-chip-sub {
+  font-size: 10.5px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── 技能库 ── */
+.sk-lib { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.sk-lib-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  flex: none;
+}
+.sk-search {
+  width: 260px;
+  max-width: 100%;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  color: var(--text);
+  font-size: 12px;
+  font-family: inherit;
+}
+.sk-search::placeholder { color: var(--text-3); }
+.sk-search:focus { outline: none; border-color: var(--primary-bd); }
+
+/* 卡片网格：最小 240px，窄窗口自动降列而不是挤成一条。 */
+.sk-skill-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+.sk-skill-card {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 11px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+  font-family: inherit;
+  color: inherit;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+.sk-skill-card:hover {
+  border-color: var(--primary-bd);
+  background: var(--surface-2, var(--surface-inset));
+}
+.sk-skill-card:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.sk-skill-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.sk-skill-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  font-family: var(--font-mono);
+}
+/* 描述截两行：技能描述往往是一整句「把 X 转成 Y」，一行看不完，全展示又
+   会把卡片高度撑得参差不齐。 */
+.sk-skill-desc {
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.sk-skill-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: auto;
+}
+.sk-skill-tags { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; min-width: 0; }
+.sk-skill-hash {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  flex: none;
+}
+.sk-skill-sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding-top: 6px;
+  border-top: 1px solid var(--hairline);
+}
+.sk-skill-source {
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface-inset);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.sk-skill-time {
+  font-size: 10.5px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.sk-lib-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-top: 2px;
+}
+.sk-lib-foot-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+.sk-muted { font-size: 11.5px; color: var(--text-3); }
+
+/* ── 表（同步预览 / 孤儿 / 回收站 / 已合并重复）────────────────
+   四列默认；具体网格由使用处的修饰类覆盖（见下）。 */
+.sk-table { display: flex; flex-direction: column; min-width: 0; }
+.sk-table-head,
+.sk-table-row {
+  display: grid;
+  grid-template-columns: 84px minmax(120px, 1.2fr) minmax(100px, 0.9fr) minmax(140px, 1.6fr);
+  gap: 10px;
+  align-items: center;
+  padding: 7px 0;
+  font-size: 12px;
+  min-width: 0;
+}
+.sk-table-head {
+  padding: 4px 0;
+  font-size: 11.5px;
+  color: var(--text-3);
+  border-bottom: 1px solid var(--border);
+}
+.sk-table-row { border-bottom: 1px solid var(--hairline); }
+.sk-table-row:last-child { border-bottom: 0; }
+
+/* 回收站是五列（技能 / 体积 / 存了 / 还剩 / 动作） */
+.sk-table:has(> .sk-table-row > span:nth-child(5)) .sk-table-head,
+.sk-table:has(> .sk-table-row > span:nth-child(5)) .sk-table-row {
+  grid-template-columns: minmax(120px, 1.4fr) 80px 72px 72px 72px;
+}
+
+.sk-cell-name {
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sk-cell-tool {
+  font-size: 11.5px;
+  color: var(--text-2);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sk-cell-note {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-3);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sk-row-actions { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+
+/* ── 同步 ── */
+.sk-sync { display: flex; flex-direction: column; gap: 12px; }
+.sk-diff {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+  background: var(--surface-inset);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.75;
+  color: var(--text-2);
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.sk-report-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.sk-report-list > li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 8px;
+  border-radius: var(--r-sm);
+  min-width: 0;
+}
+.sk-report-list > li:hover { background: var(--surface-inset); }
+.sk-report-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--primary);
+  cursor: pointer;
+  text-align: left;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sk-report-link:hover { text-decoration: underline; }
+.sk-report-link.is-active { font-weight: 600; text-decoration: underline; }
+
+.sk-report-body {
+  margin: 8px 0 0;
+  padding: 12px 14px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-inset);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.75;
+  color: var(--text-2);
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ── 去重 ── */
+.sk-dedup { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.sk-conflict-list { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.sk-conflict {
+  /* 左侧 3px 竖条是「这条要你动手」的标记，用 warn（不是 danger）：
+     冲突本身不是错误，是两种都合理的选择摆在一起。 */
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--r-sm);
+  padding: 10px 12px;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.sk-conflict.is-open { background: var(--surface-2, var(--surface)); }
+.sk-conflict-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.sk-conflict-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text);
+  min-width: 0;
+}
+.sk-conflict-detail {
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+.sk-conflict-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--hairline);
+  min-width: 0;
+}
+.sk-conflict-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* 左右 diff：窄窗口（< 760px）自动叠成一列，而不是横向挤压 */
+.sk-diff-cols {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+@media (max-width: 760px) {
+  .sk-diff-cols { grid-template-columns: minmax(0, 1fr); }
+}
+.sk-diff-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  min-width: 0;
+}
+.sk-diff-col-head { font-size: 11.5px; font-weight: 600; color: var(--text-2); }
+.sk-diff-path {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sk-diff-md {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--r-xs, var(--r-sm));
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.7;
+  color: var(--text-2);
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ── 配置 ── */
+.sk-settings { display: flex; flex-direction: column; gap: 12px; }
+
+/* 一行开关：左侧「标签 + 说明」占弹性，右侧控件定宽右对齐。
+   说明文字必须能换行 —— 挂载模式的解释有好几行，截断就说不清后果了。 */
+.sk-field {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+.sk-field:last-of-type { border-bottom: 0; }
+.sk-field-copy { flex: 1 1 280px; min-width: 0; }
+.sk-field-label { font-size: 12px; color: var(--text); }
+.sk-field-hint {
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+.sk-field-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.sk-field-value { font-size: 11.5px; color: var(--text-2); white-space: nowrap; }
+
+.sk-input {
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  color: var(--text);
+  font-size: 12px;
+  font-family: inherit;
+  min-width: 0;
+}
+.sk-input:focus { outline: none; border-color: var(--primary-bd); }
+/* 数字输入框固定窄宽：留宽了会让人以为能填路径 */
+.sk-input-num { width: 84px; text-align: right; font-variant-numeric: tabular-nums; }
+
+.sk-add-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+}
+.sk-add-row > .sk-input { flex: 1 1 240px; }
+
+.sk-custom-dirs { display: flex; flex-direction: column; gap: 4px; padding-top: 8px; }
+.sk-custom-dir {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 8px;
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  min-width: 0;
+}
+.sk-custom-dir > code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* 探测建议：只给建议、不自动加，所以整块用虚线框 —— 视觉上就是「还没生效」 */
+.sk-suggest {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+}
+.sk-suggest-list { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.sk-suggest-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 4px 0;
+  min-width: 0;
+}
+.sk-suggest-name { font-size: 11.5px; color: var(--text-2); }
+.sk-suggest-dir {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  flex: 1 1 200px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 键值对（详情 / 差异链接 / 配置-位置）────────────────────
+   两列 grid：「键」固定 72px、「值」弹性并在需要时换行（路径很长）。 */
+.sk-kv {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 5px 12px;
+  align-items: baseline;
+  font-size: 11.5px;
+  min-width: 0;
+}
+.sk-kv > span {
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.sk-kv > code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+/* ── 空态 ── */
+.sk-empty {
+  padding: 16px 14px;
+  color: var(--text-3);
+  font-size: 12.5px;
+  line-height: 1.7;
+  border: 1px dashed var(--border);
+  border-radius: var(--r-sm);
+}
+
+/* ── 体检徽标 ── */
+.sk-health {
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+  font-size: 10.5px;
+  white-space: nowrap;
+  flex: none;
+}
+.sk-health-warn { background: var(--warn-soft); color: var(--warn); }
+.sk-health-bad { background: var(--danger-soft); color: var(--danger); }
+
+.sk-health-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sk-health-item {
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  font-size: 11.5px;
+  line-height: 1.6;
+  border-left: 3px solid var(--warn);
+  background: var(--warn-soft);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.sk-health-bad.sk-health-item,
+.sk-health-item.sk-health-bad {
+  border-left-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+/* ── 详情抽屉 ────────────────────────────────────────────────
+   fixed 而非 absolute：`.page` 是滚动容器，absolute 遮罩只盖内容高度。 */
+.sk-drawer-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgb(0 0 0 / 0.42);
+}
+.sk-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 61;
+  width: min(520px, 94vw);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px 20px;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  overflow: auto;
+  box-shadow: -12px 0 32px rgb(0 0 0 / 0.28);
+}
+.sk-drawer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex: none;
+}
+.sk-drawer-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.sk-drawer-name {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.sk-drawer-body { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.sk-drawer-desc {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+.sk-drawer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding-top: 10px;
+  margin-top: auto;
+  border-top: 1px solid var(--hairline);
+}
+
+.sk-sub-title {
+  margin-top: 2px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-3);
+  letter-spacing: 0.02em;
+}
+
+.sk-md {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+  background: var(--surface-inset);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.75;
+  color: var(--text-2);
+  max-height: 300px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.sk-children {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  min-width: 0;
+}
+.sk-child {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-2);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sk-child-size { font-size: 10px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+
+/* ── 窄窗口 ──────────────────────────────────────────────────
+   渠道矩阵与四列表在 720px 以下会挤：把目录列降到等宽并把「技能 / 挂载」
+   两列压窄。不做横向滚动 —— 这几张表的用途是「扫一眼有没有缺口」，
+   要横向拖动就失去意义了。 */
+@media (max-width: 720px) {
+  .sk-matrix-head,
+  .sk-matrix-row { grid-template-columns: minmax(96px, 1fr) minmax(120px, 1.4fr) 44px 44px 84px; }
+  .sk-table-head,
+  .sk-table-row { grid-template-columns: 72px minmax(96px, 1fr) minmax(80px, 1fr); }
+  .sk-table-head > span:nth-child(4),
+  .sk-table-row > span:nth-child(4) { display: none; }
+  .sk-search { width: 100%; }
+}

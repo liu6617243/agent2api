@@ -139,7 +139,7 @@ function applyZoom(percent) {
 // ─── 页面导航 ────────────────────────────────
 
 const PAGE_KEY = 'workbuddy-desktop-page';
-const PAGES = ['assistant', 'overview', 'accounts', 'checkin', 'memory', 'routing', 'gateway', 'agent', 'tools', 'proxies', 'keys', 'docs', 'logs', 'tasks', 'requests', 'plugins', 'settings'];
+const PAGES = ['assistant', 'overview', 'accounts', 'checkin', 'memory', 'skills-hub', 'routing', 'gateway', 'agent', 'tools', 'proxies', 'keys', 'docs', 'logs', 'tasks', 'requests', 'plugins', 'settings'];
 /** 页签中文名：顶栏面包屑用。overview 的用户可见名是「报表」、gateway 的是「模型管理」
  *  （内部标识保持不变：localStorage 记忆、showPage 与 CSS 的 [data-page] 选择器都依赖它）
  *
@@ -152,6 +152,7 @@ const PAGE_LABELS = {
   accounts: wbI18n.t('账号'),
   checkin: wbI18n.t('签到中心'),
   memory: wbI18n.t('记忆中枢'),
+  'skills-hub': wbI18n.t('技能仓库'),
   routing: wbI18n.t('路由'),
   gateway: wbI18n.t('模型管理'),
   agent: wbI18n.t('Agent 配置'),

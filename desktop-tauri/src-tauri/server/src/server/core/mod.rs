@@ -110,6 +110,10 @@ pub mod maintenance;
 /// 项目，替客户端塞必然跨项目串味）。对外只暴露 `/mcp/memory` 的 17 个工具，
 /// 由客户端按需调用。
 pub mod memory;
+/// 技能仓库（资源库 → 技能仓库）：把各客户端 `skills/` 里的同名副本收敛成
+/// 一份中央真身，各渠道目录只留指向它的链接。扫描只读，写入一律走
+/// 台账 + 回收站，见该模块头。
+pub mod skills_hub;
 pub mod model_meta;
 pub mod model_rules;
 pub mod models;

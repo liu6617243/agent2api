@@ -199,6 +199,15 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 换机时还会被旧凭据覆盖。保留键的身份让 `cloud_sync::snapshot` 的键筛选
     // 天然排除它，不必再维护一份「别同步这个键」的清单。
     "cloudSync",
+    // 技能仓库的渠道 / 挂载配置（core::skills_hub::tools 的 `KV_KEY`）：整份
+    // `{mountMode, trashDays, l3Enabled, l3Threshold, tools:{…}, customDirs:[…]}`
+    // 一个键。不是网关配置 —— 配置写入绝不能动它（否则改一次 API Key 就把用户
+    // 手挑的渠道目录和挂载模式退回默认，下一次同步会往错的地方建链接）。
+    "skillsHubConfig",
+    // 上一次技能巡检的结论（core::skills_hub 的 `CHECK_KEY`）。落库的理由是
+    // 「上次检测是什么时候、结论是什么」要跨进程记住 —— 重启一次就看到「尚未
+    // 运行检测」等于这个功能不存在。同样属于「其它零散状态」，配置写入不能动。
+    "skillsHubDailyCheck",
 ];
 
 /// 这个键是否属于「其它零散状态」（即不归网关配置管）。
