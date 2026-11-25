@@ -32,17 +32,28 @@ import { Empty, Panel, useLoad } from './memory-shared'
  * 路由表里的任务行 —— 与 `schedule.rs` 的 `TASKS` 对齐，一个不漏。
  *
  * `llm: false` 的任务**确实存在、也确实在跑**，但走本地规则（0 token），
- * 没有「指定模型 / 标签 / 思考强度」可配。这种行把三列合成一句说明，
+ * 没有「指定模型 / 标签」可配。这种行把三列合成一句说明，
  * 而不是摆三个禁用下拉装作能配。
  *
- * `todo: true` 是后端还没有实现的任务，单独标出来，不留空壳控件。
+ * ── 为什么没有「提示词优化」这一行（2026-11-25）───────────────
+ * 早先这里有一行 `optimize / 提示词优化 / 未实现`，为了"把后端计划中的任务
+ * 也列出来"。它的问题不是占位，是**它描述的东西不存在**：
+ *
+ *   · 后端 `schedule.rs` 的 `TASKS`（11 项）里没有 `optimize`，
+ *     `grep -r optimize server/src` 零命中 —— 它不是"还没接上"，是没有；
+ *   · 用户对它的可执行动作为零：不能配、不能开、不能看它的执行记录；
+ *   · 它还得配两处说明（行内「未实现」+ 底部 note 里那句"后端还没有实现"），
+ *     等于为了一个幽灵行付三次版面。
+ *
+ * 一个「某个不存在的功能的状态」不是信息 —— 这和早先删掉的「可能过时的记忆」
+ * （恒绿假指示灯）、「待确认 0」那类恒常绿灯是同一种东西。真要提示能力差距，
+ * 该写在变更日志里，而不是在配置表里占一行。
  */
 const ROUTE_TASKS: {
   task: string
   label: string
   llm: boolean
   note?: string
-  todo?: boolean
 }[] = [
   { task: 'extract', label: '提取', llm: true },
   { task: 'summarize', label: '摘要', llm: true },
@@ -62,13 +73,6 @@ const ROUTE_TASKS: {
     label: '去重',
     llm: false,
     note: '本地规则：L1 哈希 + L2 文本近似（L3/L4 未实现）',
-  },
-  {
-    task: 'optimize',
-    label: '提示词优化',
-    llm: false,
-    todo: true,
-    note: '后端还没有这个任务',
   },
 ]
 
@@ -447,7 +451,7 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
             {t('「思考强度」已经不在这里配：记忆任务的 max_tokens 是思考与正文共用的预算，让上游多想会把正文挤空（表现为「模型返回空内容」）。所以记忆任务一律不发送思考强度，只发 max_tokens。')}
           </div>
           <div>
-            {t('分类与去重走本地规则、不消耗 token，所以那两行没有模型可配；提示词优化这个任务后端还没有实现。')}
+            {t('分类与去重走本地规则、不消耗 token，所以那两行没有模型可配。')}
           </div>
         </div>
       </section>
@@ -728,20 +732,18 @@ function RoutingTable({
         <span>{t('将使用（推导）')}</span>
       </div>
 
-      {ROUTE_TASKS.map(({ task, label, llm, note, todo }) => {
-        /* 不调模型的任务：三列合并成一句说明。它们真的在跑，只是没有模型可配。 */
+      {ROUTE_TASKS.map(({ task, label, llm, note }) => {
+        /* 不调模型的任务（分类 / 去重）：后三列合并成一句说明。它们真的在跑，
+           只是没有模型可配。 */
         if (!llm) {
           return (
-            <div key={task} className={`mm-route-row${todo ? ' todo' : ''}`}>
+            <div key={task} className='mm-route-row'>
               <span className='mm-route-task'>
                 {t(label)}
                 <code>{task}</code>
               </span>
-              <span className='mm-route-fixed'>{todo ? '—' : t('不经过网关')}</span>
-              <span className='mm-route-inert'>
-                {todo ? <em className='mm-route-todo'>{t('未实现')}</em> : null}
-                {t(note ?? '')}
-              </span>
+              <span className='mm-route-fixed'>{t('不经过网关')}</span>
+              <span className='mm-route-inert'>{t(note ?? '')}</span>
             </div>
           )
         }
@@ -765,9 +767,27 @@ function RoutingTable({
             <span className='mm-route-tag'>
               {tag ? t(tag === 'heavy' ? '重（heavy）' : '轻（light）') : t('无（兜底）')}
             </span>
+            {/* 「将使用」这一列要回答的是「真正会跑哪个模型」，而不是把左边
+                输入框的内容再抄一遍。
+
+                ── 为什么指定过的行不再重复模型名（2026-11-25）──────────
+                用户指定了模型时，推导结果恒等于输入框里的值 —— 同一个字符串
+                在相邻两格出现两次，右边那格还只有 132px，长名字被截成
+                `deepseek-v4.1-...`。这不是「推导」，是回声。真机上八行全都
+                指定了模型，于是整列是八条同样的回声。
+
+                所以分两种：指定过 → 只标来源（模型就在左边那格，而且更宽）；
+                没指定 → 这才是这一列存在的意义，给出推导出的具体模型 + 依据
+                （标签 / 兜底 / 目录首个）。 */}
             <span className='mm-route-resolved'>
-              {resolved.model ? <code>{resolved.model}</code> : t('模型目录首个')}
-              <em>{t(resolved.via)}</em>
+              {resolved.via === '指定' ? (
+                <em title={resolved.model}>{t('按指定模型')}</em>
+              ) : (
+                <>
+                  {resolved.model ? <code>{resolved.model}</code> : null}
+                  <em>{t(resolved.via)}</em>
+                </>
+              )}
             </span>
           </div>
         )

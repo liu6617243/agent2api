@@ -3270,7 +3270,13 @@
 .mm-route { display: flex; flex-direction: column; }
 .mm-route-row {
   display: grid;
-  grid-template-columns: 116px 108px minmax(150px, 1.1fr) 92px 132px minmax(140px, 1fr);
+  /* 五条轨道对应五个单元格：任务 / 网关 / 指定模型 / 标签 / 将使用。
+     ── 为什么这里曾经是六条（2026-11-25 修）────────────────────
+     删掉「思考强度」那一列时只删了表头与单元格，**没有删轨道**：剩下
+     `… 92px 132px minmax(140px, 1fr)`，最后那条 1fr 空转、把富余宽度全吃掉，
+     而「将使用」被挤在写死的 132px 里 —— 真机上长模型名一律截成
+     `deepseek-v4.1-...`，用户看不出后面几位。轨道数与单元格数必须一一对应。 */
+  grid-template-columns: 116px 108px minmax(150px, 1.1fr) 92px minmax(140px, 1fr);
   gap: 10px;
   align-items: center;
   padding: 7px 0;
@@ -3357,19 +3363,6 @@
   gap: 7px;
   font-size: 11.5px;
   color: var(--text-3);
-}
-/* 后端还没有的任务：整行压暗，避免看着像能配 */
-.mm-route-row.todo .mm-route-task { color: var(--text-3); }
-.mm-route-todo {
-  font-style: normal;
-  font-size: 10px;
-  font-weight: 500;
-  color: var(--warn);
-  border: 1px solid var(--warn);
-  border-radius: var(--r-xs);
-  padding: 0 4px;
-  line-height: 1.5;
-  white-space: nowrap;
 }
 
 /* 分组导航 chips */
@@ -3553,17 +3546,13 @@
   .mm-route-row { grid-template-columns: minmax(90px, 1fr) minmax(0, 1.4fr); }
   /* 窄屏只有两列，合并列改成从第 2 列起（写 3 / -1 在这里会越界） */
   .mm-route-inert { grid-column: 2 / -1; }
-  /* 模型名独占一整行：两列里塞进「任务 / 网关 / 模型 / 标签 / 强度 / 推导」
-     六项时，输入框只能分到半列宽（约 150px），长模型名显示不全、也没法确认
-     自己敲对了哪个。让它跨两列，剩下四格按两列两行排，读起来仍然成对。 */
+  /* 模型名独占一整行：两列里塞进「任务 / 网关 / 模型 / 标签 / 推导」五项时，
+     输入框只能分到半列宽（约 150px），长模型名显示不全、也没法确认自己敲对了
+     哪个。让它跨两列，剩下三格按两列两行排，读起来仍然成对。 */
   .mm-route-model { grid-column: 1 / -1; }
-  /* 标签与强度合成一对放在同一行：`.mm-route-tag` 一格（`—` / `轻（light）`），
-     `.mm-route-effort` 占其余宽。两者一个是被动推导、一个是主动选择，摆在一起
-     正好能相互对照 —— 选了「低（low）」右边标签就变「轻（light）」。 */
-  .mm-route-effort { grid-column: 2 / -1; }
-  /* 推导结果也跨两列：模型独占一行后，剩下「标签 / 强度 / 推导」三格按两列排
-     会剩一个右边空位，读起来像少了一格。让推导整行展开，「— | 轻（light）」
-     一行、「deepseek-v3 兜底」一行，成对且不留空。 */
+  /* 推导结果也跨两列：模型独占一行后，剩下「标签 / 推导」两格按两列排会剩一个
+     右边空位，读起来像少了一格。让推导整行展开，「— | 轻（light）」一行、
+     「按指定模型」或「deepseek-v3 兜底」一行，成对且不留空。 */
   .mm-route-resolved { grid-column: 1 / -1; }
   .mm-route-head { display: none; }
   .mm-cfg-item { grid-template-columns: minmax(0, 1fr); }

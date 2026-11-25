@@ -970,5 +970,6 @@
   "{n} 条还挂着（去重 / 归类 / 失效判定）—— 每类都有判据，正常应该清空，剩下的多半是某类自动裁决被关掉或落地失败 · 在「浏览 → 待确认」看{crowded}": "{n} ainda na fila (deduplicação / classificação / substituição) — cada tipo tem uma regra, então o normal é ficar vazio. O que sobra costuma indicar que algum tipo de resolução automática está desligado, ou que a gravação em disco falhou · veja Navegar → Pendentes{crowded}",
   "自动裁决没收尾的失效 / 归类 / 查重建议": "Sugestões de substituição / classificação / deduplicação que a resolução automática não concluiu",
   "条待确认": "pendentes",
-  "去待确认清单": "Abrir lista de pendentes"
+  "去待确认清单": "Abrir lista de pendentes",
+  "按指定模型": "modelo atribuído"
 }
