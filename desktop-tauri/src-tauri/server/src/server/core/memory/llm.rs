@@ -829,6 +829,16 @@ mod tests {
     /// 把上游那次 `length` 标出来。判错的两种方式都会静默坏事：
     ///   · 全当 `Complete` → 「条数少」那一档不留任何痕迹；
     ///   · 全当 `Empty` → 明明拿到完整结果，扔掉重来，白烧 9.5k prompt。
+    ///
+    /// ── 「裸数组被切」这一档其实到不了消费方（2026-11-25 复核）──────
+    /// `enrich.rs` 里所有消费点都写 `parsed.get("items").and_then(as_array)`：
+    /// 回退救回的是**一个对象**（`{"id":"a",…}`），不是 `[{…}]`，所以 `.get("items")`
+    /// 必然 `None`，那一块一条都写不进去。也就是说这档在数据上等价于「整块丢弃」，
+    /// 只是它被记成 `ok=1 partial=1` 而不是 `ok=0`。
+    ///
+    /// 这不影响本函数的分档判据（`Partial` 的语义就是「有正文但可能不全」），
+    /// 但看台账时要知道：**`partial=1` 且条数为 0 是可能的**，别把它当成
+    /// 「模型给了内容所以没问题」。
     #[test]
     fn truncated_json_is_recognised_as_partial() {
         // 典型形态：完整 JSON 之后跟着一段被切断的解释文字。
@@ -838,14 +848,24 @@ mod tests {
             Output::Partial,
             "截断但解析得出的结果被当成了完全成功 —— 上游报的 length 就丢了"
         );
-        // 裸数组被切：只能救出第一个对象。同样标 Partial（有结果、可能不全）。
+        // 裸数组被切：回退取「第一个 `{` 到最后一个 `}`」，救出的是**第一个
+        // 对象本身**，不是 `[{…}]` 这样的单元素数组。
+        //
+        // ⚠ 这里曾经断言 `as_array().len() == Some(1)`，CI 三个平台一起红：
+        // 回退切的边界是花括号，不是方括号，所以外层 `[` 和 `]` 根本没进来，
+        // `parse_json` 返回的是 `{"id":"a",…}` 这个 object。断言写错了形状，
+        // 不是 `parse_json` 的行为错了 —— 对象形态一样能说明「残片只剩一条」。
         let pieces = r#"[{"id":"a","summary":"甲"},{"id":"b","summ"#;
         assert_eq!(read_output(pieces, "length"), Output::Partial);
+        let salvaged = parse_json(pieces).expect("第一个对象完整，应当能救回来");
         assert_eq!(
-            parse_json(pieces)
-                .and_then(|value| value.as_array().map(Vec::len)),
-            Some(1),
-            "残片只剩一条 —— 正是「条数悄悄少」那一档，必须留痕"
+            salvaged.get("id").and_then(Value::as_str),
+            Some("a"),
+            "残片只剩第一个对象 —— 正是「条数悄悄少」那一档，必须留痕"
+        );
+        assert!(
+            salvaged.get("summary").and_then(Value::as_str).is_some(),
+            "救回来的对象应当是完整的，不是半个字段"
         );
         // 截断且解析不出：连残片都没有 → Empty（走 Truncated → 加预算重试）。
         assert_eq!(read_output(r#"{"items":[{"id":"a","summ"#, "length"), Output::Empty);
