@@ -230,6 +230,30 @@ function Profile(): React.ReactElement {
     }
   }
 
+  /**
+   * 解除全部置顶。
+   *
+   * 不做二次确认：这个动作可逆（再逐条钉回去即可），而且它不会删任何结论 ——
+   * 只让下一次重生成把那些条目也纳入替换范围。用一句 `note` 把「会发生什么」
+   * 说清楚，比一个「确定吗？」的弹窗更有用。
+   */
+  const unpinAll = async () => {
+    setBusy('unpin')
+    setActionError('')
+    setNote('')
+    try {
+      const result = await m.unpinAllProfile()
+      setNote(result.cleared > 0
+        ? t('已解除 {n} 条置顶：下一次重新生成会把它们一起替换掉', { n: result.cleared })
+        : t('没有置顶条目需要解除'))
+      reload()
+    } catch (caught) {
+      setActionError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy('')
+    }
+  }
+
   const saveDraft = async () => {
     if (!draft) return
     if (!draft.title.trim()) {
@@ -366,7 +390,22 @@ function Profile(): React.ReactElement {
             label={t('记忆素材 {n} 条', { n: num(data.material ?? data.total) })}
           />
           {data.pinned > 0 ? (
-            <Badge variant='brand' shape='tag'>{t('{n} 条已置顶', { n: data.pinned })}</Badge>
+            <span className='mm-prof-pin-group'>
+              <Badge variant='brand' shape='tag'>{t('{n} 条已置顶', { n: data.pinned })}</Badge>
+              {/* 钉住 = 重生成时保留。它是这一页唯一能让结果「定型」的动作：
+                  某一整批全被钉住之后，四类条数就锁死在同一个数字上，点多少次
+                  重新生成都不变。所以给一个一次性的出口，不用逐条点。 */}
+              <Button
+                type='button'
+                size='sm'
+                variant='ghost'
+                disabled={busy !== ''}
+                title={t('摘掉全部置顶标记：下一次重新生成会把这些结论一起替换掉')}
+                onClick={() => void unpinAll()}
+              >
+                {busy === 'unpin' ? t('解除中…') : t('全部取消置顶')}
+              </Button>
+            </span>
           ) : null}
           {!data.enabled ? (
             <Badge variant='warning' shape='tag'>{t('画像已关闭')}</Badge>

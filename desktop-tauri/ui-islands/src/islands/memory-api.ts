@@ -1350,6 +1350,22 @@ export function pinProfileItem(id: string, pinned: boolean): Promise<{ entry: Me
   return api('POST', '/api/memory/profile/pin', { id, pinned })
 }
 
+/**
+ * 一次性解除**所有**画像置顶。
+ *
+ * ── 为什么需要它 ────────────────────────────────────────────
+ * 置顶的语义是「重生成时保留这一条」，所以钉住的条目永远不会被替换。一旦某一
+ * 整批（一次生成 16 条）都被钉住，之后每次重生成只会换掉剩下的非钉条目 ——
+ * 四类的条数就锁死在同一个数字上（本机实测：每类 8 条、置顶 16 条，
+ * 点几次「重新生成全量画像」都不变）。逐条取消要点十几次，还得先切进编辑模式，
+ * 所以给一个批量出口。
+ *
+ * 返回的 `cleared` 是真的被摘掉钉子的条数（0 = 本来就没有钉子）。
+ */
+export function unpinAllProfile(): Promise<{ cleared: number; profile: ProfileView }> {
+  return api('POST', '/api/memory/profile/unpin-all', {})
+}
+
 /** 写进客户端的 key 身份（不含明文）。`picked=true` 表示前端没选、由后端挑的第一把。 */
 export type AgentInstalledKey = { id: string; name: string; picked: boolean }
 

@@ -412,6 +412,9 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/memory/profile", get(api::memory::get_profile))
         .route("/api/memory/profile/build", post(api::memory::post_profile_build))
         .route("/api/memory/profile/pin", post(api::memory::post_profile_pin))
+        // 批量解除画像置顶：钉住的条目会逃过重生成，整批钉住会让四类条数定型，
+        // 所以留一个一次性的清理出口（见 `memory::unpin_all_profile`）。
+        .route("/api/memory/profile/unpin-all", post(api::memory::post_profile_unpin_all))
         // 历史导入：来源清单 / 干跑预览 / 真导入。预览与导入是两个端点 ——
         // 「这个动作不写数据」应该是端点级承诺，不是请求体里的布尔开关。
         .route("/api/memory/import", get(api::memory::get_import))

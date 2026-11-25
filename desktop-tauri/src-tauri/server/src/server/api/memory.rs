@@ -820,8 +820,20 @@ pub async fn post_profile_pin(State(_state): State<ServerState>, body: Bytes) ->
     }
 }
 
-// ── 项目卡操作 ───────────────────────────────────────────────
+/// 解除**全部**画像置顶（批量出口）。
+///
+/// 对应画像页顶部「已置顶 N 条」旁边那个按钮：置顶会让条目逃过重生成，
+/// 一旦某一整批都被钉住，四类条数就定型在同一个数字上（见
+/// `memory::unpin_all_profile` 的说明）。逐条取消要点十几次，所以给一次性的
+/// 批量入口 —— 它不做任何「该不该解」的判断，解不解除由用户点。
+pub async fn post_profile_unpin_all(State(_state): State<ServerState>) -> Response {
+    match memory::unpin_all_profile() {
+        Ok(value) => ok_json(value),
+        Err(message) => errors::management_error(500, message),
+    }
+}
 
+// ── 项目卡操作 ───────────────────────────────────────────────
 /// 改一张项目卡（重命名 / 置顶 / 归档）。只动登记表，不动记忆文件。
 pub async fn post_project_update(State(_state): State<ServerState>, body: Bytes) -> Response {
     let payload = match parse_body(&body) {

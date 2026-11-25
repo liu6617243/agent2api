@@ -1272,6 +1272,57 @@ pub fn profile_view() -> Value {
     })
 }
 
+/// 一次性解除**全部**画像条目的「手动置顶」（`pinned` 与 `PROFILE_PIN_TAG` 一起摘）。
+///
+/// ── 为什么需要一个批量出口 ──────────────────────────────────
+/// 置顶是画像页上唯一「人的判断压过模型」的动作，语义是「重生成时保留这一条」。
+/// 但它同时也是批量替换里唯一会让结果**定型**的因素：某一整批被钉住之后，
+/// 每次重生成只会换掉剩下的非钉条目，四类的条数就锁死在同一个数字上 ——
+/// 用户看到的是「每类都 8 条 / 置顶 16 条，点几次重新生成都不变」。
+///
+/// 逐条取消要点十几次（还得先切进「编辑条目」模式），所以给一个批量出口。
+/// 它与「本批素材被模型完整覆盖」无关，纯粹是用户对存量数据的一次清理。
+///
+/// ── 只动画像 ────────────────────────────────────────────────
+/// 普通记忆的 `pinned` 是浏览页的排序偏好，跟画像的重生成没有关系；对它们动手
+/// 等于替用户改了一个他没提到的地方。判据因此收窄成「`kind == Profile` 且
+/// 真的带钉（`pinned` 或标记任一）」，只在钉没了之后才跳过。
+///
+/// ── 为什么不动 `updated_at` ─────────────────────────────────
+/// `profile_view()` 用「画像里最新的 `updated_at`」当作「上一版生成时刻」，
+/// 据此算 `freshSinceProfile`（界面上那句「生成之后又新增了 N 条」）。解除置顶
+/// 不是重新生成，把时间戳推到现在的后果是那句话直接变成 0 —— 一次清理顺手
+/// 抹掉了「你的画像已经落后了」的唯一提示。
+pub fn unpin_all_profile() -> Result<Value, String> {
+    let mut cleared = 0usize;
+    for mut entry in store::load_all() {
+        if entry.kind != MemoryKind::Profile || !entry.is_trusted() {
+            continue;
+        }
+        let tagged = entry.tags.iter().any(|tag| tag == PROFILE_PIN_TAG);
+        if !entry.pinned && !tagged {
+            continue;
+        }
+        entry.pinned = false;
+        entry.tags.retain(|tag| tag != PROFILE_PIN_TAG);
+        // 路径按「类型 / 层 / 项目 / 日期」算，这几项一个都没动，所以落点不变；
+        // 仍然让 `store::save` 自己算路径，避免手写一份会漂的第二事实源。
+        store::save(&entry)?;
+        // 索引里存着 `pinned` 这一列（浏览页的筛选读它），不跟着改就会「文件说没钉、
+        // 索引说钉着」。
+        let _ = index::global().upsert(&entry);
+        cleared += 1;
+    }
+    if cleared > 0 {
+        bump_revision();
+        crate::server::logging::log(
+            "[Memory]",
+            &format!("画像置顶：批量解除 {cleared} 条（下一次重生成会一并替换）"),
+        );
+    }
+    Ok(json!({ "cleared": cleared, "profile": profile_view() }))
+}
+
 /// 自检：文件根、条数、索引状态、回收站、队列积压
 ///
 /// ── 为什么「项目数」不再走 `projects()` ──────────────────────
@@ -5878,6 +5929,61 @@ mod tests {
             pair_outcome(&row, &all),
             PairOutcome::Merge,
             "旧条的内容已被新条讲全，该判失效"
+        );
+    }
+
+    /// 批量解除置顶只动**画像**，而且 `pinned` 与标记一起摘。
+    ///
+    /// 真机撞到的情况：某一轮生成的 16 条画像被打上 `pin`，于是每次重生成都
+    /// 「保留」它们，四类条数从此锁死在 8 条、置顶数锁死在 16 —— 用户点多少次
+    /// 「重新生成全量画像」都不变。出口是这个批量动作；这里钉住它两条边界：
+    /// ① 普通记忆的 `pinned` 是浏览页的排序偏好，不许连坐；
+    /// ② 只摘 `pinned` 不摘 `pin` 等于没解（`profile_view` 与 `build_profile`
+    ///    判的是「两者同时成立」），所以两者必须一起变。
+    #[test]
+    fn unpin_all_profile_clears_only_profile_pins() {
+        crate::test_support::isolated(
+            concat!(module_path!(), "::unpin_all_profile_clears_only_profile_pins"),
+            || {
+                let mut pinned_profile = MemoryEntry::draft(
+                    "p-pin",
+                    "被钉住的画像",
+                    MemoryKind::Profile,
+                    "这条结论在重生成时会被保留，于是四类条数永远不变。",
+                );
+                pinned_profile.layer = Layer::L2;
+                pinned_profile.tags = vec!["identity".to_string(), PROFILE_PIN_TAG.to_string()];
+                pinned_profile.pinned = true;
+                store::save(&pinned_profile).expect("画像应当能落盘");
+
+                let mut pinned_ordinary = MemoryEntry::draft(
+                    "m-pin",
+                    "被钉住的普通结论",
+                    MemoryKind::Insight,
+                    "普通记忆的置顶只是浏览页的排序偏好，与画像重生成无关。",
+                );
+                pinned_ordinary.layer = Layer::L2;
+                pinned_ordinary.pinned = true;
+                store::save(&pinned_ordinary).expect("普通记忆应当能落盘");
+
+                let view = unpin_all_profile().expect("批量解除应当成功");
+                assert_eq!(view["cleared"], 1, "只该解画像那一条：{view}");
+
+                let reloaded = store::load_all();
+                let profile = reloaded.iter().find(|entry| entry.id == "p-pin").expect("画像还在");
+                assert!(!profile.pinned, "画像的 pinned 应当被摘下");
+                assert!(
+                    !profile.tags.iter().any(|tag| tag == PROFILE_PIN_TAG),
+                    "标记没摘掉等于没解 —— 重生成照样跳过它：{:?}",
+                    profile.tags
+                );
+                let ordinary = reloaded.iter().find(|entry| entry.id == "m-pin").expect("普通记忆还在");
+                assert!(ordinary.pinned, "普通记忆的置顶不该被连坐");
+
+                // 再跑一次：已经没有钉子可摘，`cleared` 必须是 0（幂等）。
+                let again = unpin_all_profile().expect("第二次也应当成功");
+                assert_eq!(again["cleared"], 0, "没有钉子时不该报解除了东西：{again}");
+            },
         );
     }
 }
