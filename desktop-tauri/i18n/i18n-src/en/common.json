@@ -348,7 +348,6 @@
   "已完成 {percent}%": "",
   "已开启自动检查": "Automatic checks on",
   "已恢复推荐勾选": "Recommended selection restored",
-  "已恢复默认分组：概览 / 转发链路 / 诊断 / 系统": "Restored the default groups: Overview / Forwarding / Diagnostics / System",
   "已改动 {n} 条映射": "Changed {n} mappings",
   "已新建分组「{name}」，点组头的 ＋ 把菜单移进来": "Created group \"{name}\" — use ＋ on its header to move menus in",
   "已是最新版本": "You are on the latest version",

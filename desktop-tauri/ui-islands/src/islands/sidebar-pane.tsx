@@ -282,7 +282,7 @@ function SidebarPaneBody({ api }: { api: LayoutApi }) {
     const finish = (ok: boolean) => {
       if (!ok) return
       apply(api.defaultLayout())
-      toast(t('已恢复默认分组：概览 / 转发链路 / 诊断 / 系统'))
+      toast(t('已恢复默认分组：概览 / 转发链路 / 诊断 / 资源库 / 系统'))
     }
     if (ask) {
       void ask({

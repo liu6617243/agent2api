@@ -80,11 +80,6 @@
     // /旅行这类专属面板，都由插件申报）。没装插件时页面显示空态并指路，比一个
     // 凭空消失的菜单项清楚得多。
     { key: 'checkin', label: wbI18n.t('签到中心'), icon: 'checkin' },
-    // 记忆中枢：位置沿用初版（排在「路由」之前），但**这个顺序不再有数据流含义** ——
-    // 记忆已经不走转发链路，只暴露 `/mcp/memory` 由客户端按需调用（初版的
-    // 「转发前注入」已整体删除，理由见 tool_services/memory_mcp 的模块头）。
-    // 挪位置会打乱既有用户的肌肉记忆，收益为零，所以保持原样。
-    { key: 'memory', label: wbI18n.t('记忆中枢'), icon: 'memory' },
     { key: 'routing', label: wbI18n.t('路由'), icon: 'route' },
     { key: 'gateway', label: wbI18n.t('模型管理'), icon: 'gateway' },
     { key: 'agent', label: wbI18n.t('Agent 配置'), icon: 'agent' },
@@ -97,6 +92,14 @@
     { key: 'requests', label: wbI18n.t('请求日志'), icon: 'requests' },
     { key: 'logs', label: wbI18n.t('日志'), icon: 'logs' },
     { key: 'tasks', label: wbI18n.t('自动维护'), icon: 'tasks' },
+    // 记忆中枢：单独归「资源库」组（目前该组只有这一项）。
+    //
+    // 早先它排在「路由」之前、属「转发链路」组 —— 那是初版的位置，当时记忆是
+    // 转发前注入的一段。那条链路早删了（记忆只暴露 `/mcp/memory` 由客户端按需
+    // 调用，理由见 tool_services/memory_mcp 的模块头），再把它摆在转发链路的
+    // 第一位只会误导「它参与转发」。记忆是**本机攒下来的资料**，与插件 / 设置
+    // 这类「系统级入口」不是一回事，所以既不留在转发链路，也不塞进系统组。
+    { key: 'memory', label: wbI18n.t('记忆中枢'), icon: 'memory' },
     // 提供商插件：各家 provider 的转发与账号实现都在插件包里，这一页是装插件的
     // 唯一入口。排在「设置」上面 —— 它是「让软件能用起来」的前置步骤，与设置同级
     // 但更靠前（没装插件时账号页与模型页都是空的）。
@@ -207,6 +210,7 @@
     概览: wbI18n.t('概览'),
     转发链路: wbI18n.t('转发链路'),
     诊断: wbI18n.t('诊断'),
+    资源库: wbI18n.t('资源库'),
     系统: wbI18n.t('系统'),
   };
 
@@ -216,7 +220,7 @@
   }
 
   /**
-   * 默认布局 —— 「概览 / 转发链路 / 诊断 / 系统」。
+   * 默认布局 —— 「概览 / 转发链路 / 诊断 / 资源库 / 系统」。
    *
    * 与改动前的「智能 / 运行状态 / 转发能力 / 诊断」相比，调整的三处及理由：
    *   · 「智能」只有 AI 助手一项，单项成组只多占一行，且「智能」这个词指向不明
@@ -229,6 +233,11 @@
    *   · 「转发能力」改叫「转发链路」：模型管理 / Agent / 网络代理是同一个转发链
    *     的三段（发给谁 / 谁来发 / 从哪出去），网关 Key 与文档是「怎么接进来」。
    *     五项归属本身没问题，只把组名说得更准。
+   *   · 「资源库」是新拆出来的组（排在「系统」之上），目前只有记忆中枢一项。
+   *     单项成组确实多占一行，但记忆不属于「转发链路」（它早就不参与转发了），
+   *     也不属于「系统」（那是插件 / 设置这类产品级入口）—— 把它塞进任何一边
+   *     都是在误导它是什么。分组名同时是未来的落点（会话记录、附件这类本机
+   *     攒下来的资料都会归到这里），不是只为一项临时造的名字。
    */
   function defaultLayout() {
     return {
@@ -236,12 +245,13 @@
         { id: 'g-overview', label: '概览', custom: false, hidden: false,
           items: ['assistant', 'overview', 'accounts', 'checkin'] },
         { id: 'g-forward', label: '转发链路', custom: false, hidden: false,
-          // memory 排在最前：它是这条链路的第一段（「给请求带上什么」），
-          // 之后才是「发给谁 / 谁来发 / 从哪出去」。老用户升级时由上面的
-          // 「新菜单补位」逻辑插到 routing 之前，不需要单独迁移。
-          items: ['memory', 'routing', 'gateway', 'agent', 'tools', 'proxies', 'keys', 'docs'] },
+          items: ['routing', 'gateway', 'agent', 'tools', 'proxies', 'keys', 'docs'] },
         { id: 'g-diag', label: '诊断', custom: false, hidden: false,
           items: ['requests', 'logs', 'tasks'] },
+        // 记忆中枢的家。老用户布局里没有这一组，由 `normalizeLayout` 里的
+        // 「资源库迁移」一次性建组并把 memory 搬进来（见那里的注释）。
+        { id: 'g-res', label: '资源库', custom: false, hidden: false,
+          items: ['memory'] },
         { id: 'g-system', label: '系统', custom: false, hidden: false,
           items: ['plugins', 'settings'] },
       ],
@@ -313,6 +323,44 @@
 
     // 一条分组都没有（首次运行 / 数据坏了）：直接用默认布局
     if (groups.length === 0) return defaultLayout();
+
+    // ── 内置分组「资源库」：建组，并把 memory 一次性搬进来 ─────────────
+    //
+    // 为什么不能只靠下面的「新菜单补位」：补位只处理**布局里完全没有**的菜单键。
+    // 升级前 memory 已经躺在「转发链路」组里，补位看不见它，于是新分组永远空着、
+    // 记忆留在原地 —— 用户升级后看到的就是「改了但没生效」。
+    //
+    // 判定用「这一组在不在」+「记忆是不是还在老地方」两个条件，不用数据版本号：
+    // 布局对象本身没有版本字段（存盘形状见模块头），而「没有 g-res 且 memory 还
+    // 留在转发链路组」正好等价于「这份布局是升级前存的」。搬过之后条件不再成立，
+    // 用户之后把 memory 拖到哪一组都算数（含拖出资源库）。
+    //
+    // 为什么要看「记忆还在老地方」：只按「没有 g-res」判断的话，用户删掉资源库组
+    // 之后（组内菜单会被并入第一组）下次启动这一组又会被建回来 —— 一条删不掉的
+    // 分组比位置不合意更烦人。用户已经把它拖走 / 删过这一组，就尊重现状。
+    const memoryPlaced = groups.some(group => group.items.includes('memory'));
+    const forwardHome = groups.find(group => group.id === 'g-forward')
+      || groups.find(group => group.label === '转发链路');
+    const legacyHome = memoryPlaced
+      ? Boolean(forwardHome && forwardHome.items.includes('memory'))
+      : true;
+    if (!groups.some(group => group.id === 'g-res') && legacyHome) {
+      const resources = { id: 'g-res', label: '资源库', custom: false, hidden: false, items: ['memory'] };
+      // 搬：先从各分组摘掉 memory（同一菜单只留一份，与上面的去重同一取向）
+      for (const group of groups) {
+        const at = group.items.indexOf('memory');
+        if (at >= 0) group.items.splice(at, 1);
+      }
+      // seen 要跟着记：否则下面的补位会把它当成「新菜单」再插一次，组里出现两份
+      seen.add('memory');
+      // 位置：压在「系统」组上面（要求的顺序）。系统组被删过就退到末尾 ——
+      // 位置不理想也比记忆凭空消失好。
+      const anchor = groups.findIndex(
+        group => group.id === 'g-system' || group.items.includes('settings'),
+      );
+      if (anchor >= 0) groups.splice(anchor, 0, resources);
+      else groups.push(resources);
+    }
 
     // 新版本新增的菜单补进**默认位置**：升级后新功能不能「凭空消失」，
     // 也不该被随手塞到第一组末尾 —— 那会让「提供商插件」这种有明确归属
