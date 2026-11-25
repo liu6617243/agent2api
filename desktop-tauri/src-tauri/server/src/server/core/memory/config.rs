@@ -293,6 +293,7 @@ static SCHEMA: &[Knob] = &[
           \"tag\":{\"enabled\":false,\"intervalMin\":30,\"batchSize\":20},\
           \"classify\":{\"enabled\":true,\"intervalMin\":60},\
           \"supersede\":{\"enabled\":false,\"daily\":\"11:00\",\"autoApplyConfidence\":0.9},\
+          \"dedup\":{\"enabled\":false,\"intervalMin\":120,\"batchSize\":20},\
           \"distill\":{\"enabled\":false,\"daily\":\"11:10\"},\
           \"consolidate\":{\"enabled\":false,\"weekly\":1,\"weeklyTime\":\"11:00\"},\
           \"profile\":{\"enabled\":false,\"weekly\":1,\"weeklyTime\":\"11:10\"},\
@@ -302,12 +303,18 @@ static SCHEMA: &[Knob] = &[
 
     // ===== 去重 =====
     //
-    // ── 本仓只有 L1 / L2 两级 ───────────────────────────────────
-    // L1 = 精确哈希（`find_hash_duplicate`，写入前挡同一内容）；L2 = 词面近似
-    // （`near_duplicate`，只产建议进待确认队列）。L3（BM25 粗排候选）与 L4
-    // （让模型做 ADD/UPDATE/DELETE/NONE 四操作判定）需要一套带 `dedup_status`
-    // 的状态机 + 逐条模型的裁决流水，本仓没有实现 —— 所以 `dedup.l3.*` /
-    // `dedup.l4.*` 那一组键已整体删除（留着只是让界面多出几个改了没反应的开关）。
+    // ── 四级分工（2026-11-25 补齐 L3 / L4）────────────────────────
+    // L1 = 精确哈希（`find_hash_duplicate`，写入前挡同一内容）；
+    // L2 = 词面近似（`near_duplicate` + `pair_similarity`，过阈值产建议）；
+    // L3 = BM25 召回（`index::bm25_candidates`，给模型挑出该看的几条候选）；
+    // L4 = 模型四操作裁决（`dedup::judge`，ADD/UPDATE/DELETE/NONE）。
+    //
+    // 为什么 L3/L4 是**任务**而不是写入路径的一部分：写入必须永远不等网络。
+    // 所以 L1/L2 在写入时当场跑（纯本地、几百微秒），L3/L4 由 `dedup` 任务
+    // 在后台给已排队的建议补裁决，再把结论写回队列载荷交给统一裁决点。
+    //
+    // 默认关 L4：它每次都要调模型，而「判重准一点」不像抽取/摘要那样是记忆
+    // 能不能长出来的前提。开着 L1+L2 时系统已经完全可用，L4 是可选的精度升级。
     knob("dedup.enabled", Kind::Bool, Tier::Basic, "去重", "去重总开关", "true"),
     knob("dedup.l1.enabled", Kind::Bool, Tier::Basic, "去重", "L1 精确哈希去重", "true"),
     opts(knob_d("dedup.l1.normalizeLevel", Kind::Enum, Tier::Advanced, "去重", "归一化强度",
@@ -343,6 +350,32 @@ static SCHEMA: &[Knob] = &[
     range(knob("dedup.l2.wDice", Kind::Number, Tier::Internal, "去重", "L2 集合相似度权重", "0.5"), 0.0, 1.0),
     range(knob("dedup.l2.wEdit", Kind::Number, Tier::Internal, "去重", "L2 编辑距离权重", "0.3"), 0.0, 1.0),
     range(knob("dedup.l2.wTitle", Kind::Number, Tier::Internal, "去重", "L2 标题权重", "0.2"), 0.0, 1.0),
+
+    // ── L3：候选召回（便宜的那一层）─────────────────────────────
+    knob_d("dedup.l3.enabled", Kind::Bool, Tier::Advanced, "去重", "L3 语义候选召回",
+        "开：判重前用 BM25 从全库召回几条「词面相关」的邻居，一起交给模型。\
+         关：模型只看入队那一条配对（L2 给的唯一候选）—— 省一次索引查询，代价是\
+         「同一件事的另一种说法」若没进 L2 阈值就永远见不到模型", "true"),
+    range(knob_d("dedup.l3.topK", Kind::Number, Tier::Advanced, "去重", "L3 召回候选数",
+        "每组最多几条候选交给模型。3 是折中：一条记忆真正「可能重复」的对象通常不到 3 条，\
+         给多了模型反而容易在弱相关的那条上做合并 —— 而合并的代价是被取代那条的独有内容\
+         退出检索，事后无法从数据里看出丢了什么", "3"), 1.0, 10.0),
+
+    // ── L4：模型裁决（贵的那一层）───────────────────────────────
+    knob_d("dedup.l4.enabled", Kind::Bool, Tier::Advanced, "去重", "L4 模型语义判重",
+        "开：后台 `dedup` 任务把够格的近似建议交给模型做 ADD/UPDATE/DELETE/NONE 裁决，\
+         结论写回队列后由统一裁决点落地。关：只跑 L1/L2（纯本地），近似建议仍进队列等人。\
+         开启后每轮会消耗 token（默认两小时一轮、每轮最多几条建议）", "false"),
+    range(knob_d("dedup.l4.minCandidateScore", Kind::Number, Tier::Advanced, "去重", "L4 最低候选分",
+        "词面相似分低于它的建议不送模型：那一档里绝大多数是同项目的无关条目，\
+         过一次模型只是把「显然不像」翻译成「模型说不像」。默认与 L2 候选阈值同档", "0.72"), 0.5, 1.0),
+    range(knob_d("dedup.l4.autoUpdateThreshold", Kind::Number, Tier::Advanced, "去重", "L4 自动执行置信度",
+        "模型裁决置信度到这个数，才允许它改写落地方向（载荷里的 keep / candidate）。\
+         之下时模型意见只留在队列页作参考，动作仍由词面判据定 —— 一个半信半疑的\
+         「这两条是一回事」不值得拿一条真结论去赌", "0.85"), 0.5, 1.0),
+    range(knob_d("dedup.l4.batchSize", Kind::Number, Tier::Advanced, "去重", "L4 单次判几组",
+        "一次模型调用里放几组配对。越大越省往返，但一组截断会带走整批（截断的整批丢弃是\
+         本仓的既定策略）；5 组 × 最多 4 条候选在真机素材上没撞到过截断", "5"), 1.0, 20.0),
     range(knob_d("dedup.pendingWarnThreshold", Kind::Number, Tier::Advanced, "去重", "队列积压告警阈值",
         "待确认队列超过这个数时界面提示积压；归类巡检也用它，但只数归类自己那一类的 pending（别处的积压不该让归类停摆）",
         "50"), 1.0, 999.0),
@@ -1461,6 +1494,7 @@ mod tests {
             ("sync.rs", include_str!("sync.rs")),
             ("schedule.rs", include_str!("schedule.rs")),
             ("enrich.rs", include_str!("enrich.rs")),
+            ("dedup.rs", include_str!("dedup.rs")),
             ("llm.rs", include_str!("llm.rs")),
             ("inject.rs", include_str!("inject.rs")),
             ("retain.rs", include_str!("retain.rs")),

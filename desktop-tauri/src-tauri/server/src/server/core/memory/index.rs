@@ -726,8 +726,54 @@ impl MemoryIndex {
         Some(rows)
     }
 
-    fn search_scan(&self, tokens: &[String]) -> Vec<IndexRow> {
+    /// L3 候选召回：按 BM25 取一批**词面相关**的邻居。
+    ///
+    /// ── 为什么不直接复用 `search` ─────────────────────────────
+    /// 检索是「用户问了一句话，找出全命中它的记忆」，所以 `search_fts` 把词与词
+    /// 之间拼成 AND。判重问的是另一个问题：「库里哪几条跟这条**像**」—— 一条
+    /// 长正文里能提出几十个词，AND 下去整个库一条都不命中（实测：满篇 CJK 的
+    /// 结论 AND 表达式恒为空结果）。所以这里用 OR，并只取前 [`L3_QUERY_TOKENS`]
+    /// 个词：表达式越长越接近「全都匹配一点」，反而失去区分度。
+    ///
+    /// ── 为什么只回 id + 分 ────────────────────────────────────
+    /// 调用方（`dedup::judge`）还要拿 id 去快照里换成整条记忆、按层与类别过滤，
+    /// 在这里顺手把整行读出来只是多一次反序列化；L3 的职责就一条：给一批候选，
+    /// 精确判据不在这里。
+    ///
+    /// 返回的分数是 `-bm25()`：SQLite 的 `bm25()` 越负越像，翻成正数后调用方
+    /// 按降序读就是「越像越前」。分数只用于排序，不参与任何阈值判断 —— 词面分
+    /// 回答不了「是不是同一件事」，那是 L4 的问题。
+    pub fn bm25_candidates(&self, text: &str, exclude: &str, limit: usize) -> Vec<(String, f64)> {
+        if !self.fts {
+            return Vec::new();
+        }
+        let mut tokens = tokenize_query(text);
+        tokens.truncate(L3_QUERY_TOKENS);
+        let Some(expression) = fts_any_expression(&tokens) else {
+            return Vec::new();
+        };
         let Ok(conn) = self.conn.lock() else { return Vec::new() };
+        let mut statement = match conn.prepare(
+            "SELECT entries_fts.id AS id, bm25(entries_fts) AS rank
+               FROM entries_fts
+               JOIN entries e ON e.id = entries_fts.id
+              WHERE entries_fts MATCH ?1 AND e.deleted_at IS NULL AND e.id != ?2
+              ORDER BY rank
+              LIMIT ?3",
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return Vec::new(),
+        };
+        let mapped = statement.query_map(params![expression, exclude, limit.clamp(1, 50) as i64], |row| {
+            let id: String = row.get("id")?;
+            let rank: f64 = row.get("rank")?;
+            Ok((id, -rank))
+        });
+        mapped.map(|rows| rows.flatten().collect()).unwrap_or_default()
+    }
+
+
+    fn search_scan(&self, tokens: &[String]) -> Vec<IndexRow> {        let Ok(conn) = self.conn.lock() else { return Vec::new() };
         let sql = format!("SELECT {ENTRY_SELECT}, body FROM entries WHERE deleted_at IS NULL");
         let mut statement = match conn.prepare(&sql) {
             Ok(statement) => statement,
@@ -1368,6 +1414,25 @@ impl MemoryIndex {
         mapped.map(|rows| rows.flatten().collect()).unwrap_or_default()
     }
 
+    /// 改写一条队列行的载荷（不动置信度与状态）。
+    ///
+    /// ── 为什么不能复用 `enqueue` ─────────────────────────────────
+    /// `enqueue` 命中 pending 行时执行的是
+    /// `SET payload = ?, confidence = MAX(confidence, ?)` —— 它的语义是「同一目标
+    /// 又产生了一条建议，用更准的覆盖」。L4 判重写的不是建议本身，而是「模型对
+    /// 这一对的裁决」，两者性质不同；更关键的是 `confidence` 在队列里是**入队
+    /// 那一刻的相似分**，用它承载模型置信度会让「这一行当初为什么进队列」永久
+    /// 丢失，事后无法复核。
+    pub fn annotate(&self, id: i64, payload: &Value) -> bool {
+        let Ok(conn) = self.conn.lock() else { return false };
+        conn.execute(
+            "UPDATE review_queue SET payload = ?2 WHERE id = ?1",
+            params![id, payload.to_string()],
+        )
+        .map(|changed| changed > 0)
+        .unwrap_or(false)
+    }
+
     /// 按 id 精确取一条（含已裁决的）。
     ///
     /// ── 为什么不能用 `review_list` 代取 ──────────────────────────
@@ -1375,8 +1440,7 @@ impl MemoryIndex {
     /// 入队的低分建议（比如 0.64 的归类）会排在 500 名之后，于是「入队后立刻问
     /// 一次能不能自动裁决」永远查不到自己那一行 —— 自动裁决在那批建议上静默失效，
     /// 而失效的表现只是「队列没清」，看起来像判据太严，不像 bug。
-    pub fn review_get(&self, id: i64) -> Option<ReviewRow> {
-        let Ok(conn) = self.conn.lock() else { return None };
+    pub fn review_get(&self, id: i64) -> Option<ReviewRow> {        let Ok(conn) = self.conn.lock() else { return None };
         conn.query_row(
             "SELECT id, kind, target, payload, confidence, status, created_at, resolved_at, resolution
                FROM review_queue WHERE id = ?1",
@@ -2096,6 +2160,14 @@ pub fn normalize(text: &str) -> String {
 }
 
 /// 把用户输入切成检索单元：ASCII 词（保留原词）与 CJK 连续段（拆成单字）。
+/// L3 候选召回一次最多用多少个检索单元。
+///
+/// 取前 40 个而不是整篇：正文越长，OR 表达式里的词越杂，排出来的「相关」就越
+/// 接近「随机」；而 FTS5 的表达式太长本身也会明显变慢。40 个词足够覆盖一条
+/// 两三百字的结论的主题词，代价是长正文后半段不参与粗排 —— 这正是「粗排」的
+/// 定位：宁可漏给 L4 少看几条，也不要在这一层引入一次全表评分。
+const L3_QUERY_TOKENS: usize = 40;
+
 pub fn tokenize_query(query: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut ascii = String::new();
@@ -2136,9 +2208,27 @@ pub fn tokenize_query(query: &str) -> Vec<String> {
 /// 为什么 CJK 用短语而不是「AND 单字」：单字 AND 会让「记忆」命中一切同时含
 /// 「记」和「忆」的正文（顺序与相邻都不管），噪音大到没法用。
 fn fts_expression(tokens: &[String]) -> Option<String> {
-    if tokens.is_empty() {
-        return None;
+    let parts = fts_parts(tokens);
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" AND "))
     }
+}
+
+/// 检索侧用同一批零件，只把连接词换成 OR —— 判重（L3 候选召回）要的是「像」，
+/// 不是「全命中」。两者共用 [`fts_parts`]，改分词口径时不会一边改一边忘。
+fn fts_any_expression(tokens: &[String]) -> Option<String> {
+    let parts = fts_parts(tokens);
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" OR "))
+    }
+}
+
+/// 把检索单元切成 FTS5 的一段一段：ASCII 词做前缀匹配，相邻 CJK 字拼短语。
+fn fts_parts(tokens: &[String]) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     let mut run: Vec<String> = Vec::new();
     let flush_run = |run: &mut Vec<String>, parts: &mut Vec<String>| {
@@ -2159,11 +2249,7 @@ fn fts_expression(tokens: &[String]) -> Option<String> {
         }
     }
     flush_run(&mut run, &mut parts);
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" AND "))
-    }
+    parts
 }
 
 #[cfg(test)]

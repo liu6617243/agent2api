@@ -27,7 +27,7 @@ import { Empty, Panel, useLoad } from './memory-shared'
  * 为准。改 `llm.rs` 的选模型规则时，这里的 `resolveModel` 要跟着改。
  */
 
-/** 真正会调 LLM 的任务。`classify` / `dedup` 是纯本地规则，不在这张表里。 */
+/** 真正会调 LLM 的任务。`classify` 是纯本地规则，不在这张表里。 */
 /**
  * 路由表里的任务行 —— 与 `schedule.rs` 的 `TASKS` 对齐，一个不漏。
  *
@@ -65,15 +65,15 @@ const ROUTE_TASKS: {
     note: '本地规则：slug 模糊匹配 + Git 地址 / 目录名，0 token',
   },
   { task: 'supersede', label: '失效判定', llm: true },
+  {
+    task: 'dedup',
+    label: '语义判重',
+    llm: true,
+    note: '写入时仍是 L1 哈希 + L2 文本近似（0 token）；这里开的是后台 L4 模型裁决，关闭不影响 L1/L2',
+  },
   { task: 'distill', label: '蒸馏', llm: true },
   { task: 'consolidate', label: '合并', llm: true },
   { task: 'profile', label: '画像', llm: true },
-  {
-    task: 'dedup',
-    label: '去重',
-    llm: false,
-    note: '本地规则：L1 哈希 + L2 文本近似（L3/L4 未实现）',
-  },
 ]
 
 /**
@@ -451,7 +451,7 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
             {t('「思考强度」已经不在这里配：记忆任务的 max_tokens 是思考与正文共用的预算，让上游多想会把正文挤空（表现为「模型返回空内容」）。所以记忆任务一律不发送思考强度，只发 max_tokens。')}
           </div>
           <div>
-            {t('分类与去重走本地规则、不消耗 token，所以那两行没有模型可配。')}
+            {t('分类走本地规则、不消耗 token，所以那一行没有模型可配；去重写入时也走本地规则，只有后台 L4 模型裁决这一项才调模型。')}
           </div>
         </div>
       </section>
@@ -733,7 +733,7 @@ function RoutingTable({
       </div>
 
       {ROUTE_TASKS.map(({ task, label, llm, note }) => {
-        /* 不调模型的任务（分类 / 去重）：后三列合并成一句说明。它们真的在跑，
+        /* 不调模型的任务（现在只有分类）：后三列合并成一句说明。它真的在跑，
            只是没有模型可配。 */
         if (!llm) {
           return (

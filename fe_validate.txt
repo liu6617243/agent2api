@@ -1,0 +1,43 @@
+grep -c style (matching lines)=1
+total occurrences=1
+=== reviewDetail dedup snippet ===
+      // 在信息量偏向新条时写 `keep=new`，此时被取代的是 candidate�?
+      const who = keep === 'candidate'
+        ? t('本条会被它取�?)
+        : t('{id} 会被本条取代', { id: candidate })
+      // 结果由覆盖率判，不由「谁点了批准」判 —�?所以这里说「按判据」，而不�?
+      // 「批准后就一定取代」。真机上一半的配对是「相似但各有独有内容」，
+      // 那种只会连一条相关边、两条都留着�?
+      const base = t('�?{id} 相似�?{n}%：批准会按同一套判据处置（短边被覆盖才 {who}；各有独有内容就只连一条相关边、两条都留；这条不成立则什么都不动）。{reason}', {
+        id: candidate,
+        n: Math.round(score * 100),
+        who,
+        reason: reason ? `�?{reason}）` : '',
+      })
+      // L4 补裁把结论写回同一行的 payload。老建议（�?L2）没有这些键，输�?
+      // 必须与原来逐字一�?—�?所以只�?modelOp 非空时才接一句，绝不为了
+      // 「统一格式」多冒一句空话�?
+      const modelOp = pick('modelOp')
+      if (!modelOp) return base
+      const opLabel: Record<string, string> = {
+        ADD: t('新增（两条都留，只连相关边）'),
+        UPDATE: t('合并'),
+        DELETE: t('丢弃本条（内容已被候选覆盖）'),
+        NONE: t('无关（不连边�?),
+      }
+      // 未知 op 原样显示：后端将来加第五种操作时，这里不认识也不该把裁决吞掉�?
+      const verdictOp = opLabel[modelOp] ?? modelOp
+      const confidence = typeof payload.modelConfidence === 'number' ? payload.modelConfidence : null
+      const why = pick('modelWhy')
+      let verdict = t('模型裁决：{op}', { op: verdictOp })
+      if (confidence !== null) {
+        verdict += t('（置�?{n}%�?, { n: Math.round(confidence * 100) })
+        // 0.85 是后端的自动执行线。前端读不到配置，写死在这里与它对齐�?
+        // 低于它只作参考，界面必须说清「这条没真的执行」�?
+        if (confidence < 0.85) verdict += t('（置信度未过自动执行线，仅作参考）')
+      }
+      if (why) verdict += t('—�?{why}', { why })
+      return `${base} ${verdict}`
+    }
+    case 'classify': {
+      const suggestion = pick('suggestion')

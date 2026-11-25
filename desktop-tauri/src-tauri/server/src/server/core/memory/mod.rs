@@ -42,6 +42,7 @@
 
 pub mod agents;
 pub mod config;
+pub mod dedup;
 pub mod enrich;
 pub mod import;
 pub mod import_registry;
@@ -161,12 +162,13 @@ pub const PROFILE_PIN_TAG: &str = "pin";
 ///
 /// 条目数必须与 `schedule::TASKS` 一致 —— `status()` 是按 `TASKS` 遍历、
 /// 用这张表取名字的，少一条就会出现「有卡没名」或「有名没卡」。
-pub const TASK_LABELS: [(&str, &str); 11] = [
+pub const TASK_LABELS: [(&str, &str); 12] = [
     ("extract", "抽取结构化信息"),
     ("summarize", "生成摘要"),
     ("tag", "自动打标签"),
     ("classify", "项目归类建议"),
     ("supersede", "失效判定"),
+    ("dedup", "语义判重（L4）"),
     ("distill", "L2 蒸馏"),
     ("consolidate", "去重合并"),
     ("profile", "人格 / 偏好画像"),
@@ -3235,6 +3237,17 @@ fn pair_outcome(row: &index::ReviewRow, all: &[MemoryEntry]) -> PairOutcome {
     if !this_entry.is_trusted() || !other_entry.is_trusted() {
         return PairOutcome::Retire("auto-untrusted");
     }
+    // ── L4：模型裁决优先于词面判据 ────────────────────────────────
+    // 载荷里有 `modelOp` 就是 `dedup::judge` 已经判过这一对。它在词面判据之前
+    // 生效，因为词面分根本回答不了这个问题：`dedup_gate` 只能问「短边覆盖率够
+    // 不够」，而「这两条是不是在说同一件事」是语义问题 —— 相似分 0.72 那一档
+    // 里同时住着「同一件事的两次表述」和「同领域的两个结论」。
+    //
+    // 没写过线的模型意见不会进这里（`model_verdict` 自己看置信度），所以这条
+    // 分支不会绕过 `dedup.l4.autoUpdateThreshold` 的保护。
+    if let Some(outcome) = model_verdict(row, this_entry, other_entry) {
+        return outcome;
+    }
     let score = row.payload.get("score").and_then(Value::as_f64).unwrap_or(row.confidence);
     // 方向必须明确才合并：载荷缺 `keep` 时 `apply_verdict` 会退回「新条取代
     // 候选」的老语义，而巡检给的 `candidate` 恰恰是要留的那条 —— 那种合并会
@@ -3316,6 +3329,62 @@ fn dedup_gate(
         return PairOutcome::Merge;
     }
     PairOutcome::Relate
+}
+
+/// L4 裁决 → 动作。载荷里没有模型结论、或置信度没过线时返回 `None`，
+/// 交回词面判据（[`dedup_gate`]）处置。
+///
+/// ── 为什么是「覆盖」而不是「替换」 ────────────────────────────
+/// 词面判据并不是错的，它只是不够：`find_hash_duplicate` 挡字节重复、`dedup_gate`
+/// 挡「短边被长边解释掉」——这两件事模型也做得好，但做这两件事不需要模型。
+/// 模型补的是中间那一档（像但说不好是不是同一件事）。所以 L4 只在**有结论且
+/// 够确信**时接手，其余一律落回原判据，行为与加 L4 之前完全一致。
+///
+/// ── 四个操作怎么映射到三种动作 ────────────────────────────────
+///   · `ADD`    —— 候选里没有同一件事 → [`PairOutcome::Relate`]：两条都留，
+///     连一条边。连边不动正文，可反悔。
+///   · `NONE`   —— 连「相关」都不是 → 作废这条建议，什么都不动。注意这与
+///     「低于连边阈值」是同一类结论，所以复用 `auto-*` 作废理由的写法。
+///   · `UPDATE` —— 同一件事，信息更全的那条留下 → [`PairOutcome::Merge`]。
+///     方向由载荷里的 `keep` 决定（`dedup::judge` 写），不是在这里猜。
+///   · `DELETE` —— 同一件事且新条没有新信息 → 同样是 `Merge`，方向固定为
+///     「留候选」（`dedup::judge` 已把 `keep` 写成 `candidate`）。
+///
+/// ── 跨层为什么降级成连边 ─────────────────────────────────────
+/// 与 [`dedup_gate`] 同一条理由：l1 是流水（带发生顺序与当时的上下文），l2 是
+/// 沉淀。模型说「这两条是同一件事」很可能对，但把 l1 并进 l2 会丢掉「什么时候
+/// 知道的」这一层信息，而合并的结果是被取代那条退出检索 —— 丢掉的部分再也读
+/// 不到了。同一件事这个结论仍然成立，那正是连边。
+fn model_verdict(
+    row: &index::ReviewRow,
+    this_entry: &MemoryEntry,
+    other_entry: &MemoryEntry,
+) -> Option<PairOutcome> {
+    let op = row
+        .payload
+        .get("modelOp")
+        .and_then(Value::as_str)?
+        .trim()
+        .to_ascii_uppercase();
+    let confidence = row
+        .payload
+        .get("modelConfidence")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    // 没过线 = 「模型觉得像，但没那么确定」。这一档交给词面判据：它的结论虽然
+    // 粗，但至少是同一条数据算出来的，可复核；半信半疑的模型意见执行下去，
+    // 出错时既没有数据依据也没有人能解释。
+    if confidence < config::number("dedup.l4.autoUpdateThreshold") {
+        return None;
+    }
+    let same_layer = this_entry.layer == other_entry.layer;
+    Some(match op.as_str() {
+        "ADD" => PairOutcome::Relate,
+        "NONE" => PairOutcome::Retire("auto-model-none"),
+        "UPDATE" | "DELETE" if same_layer => PairOutcome::Merge,
+        "UPDATE" | "DELETE" => PairOutcome::Relate,
+        _ => return None,
+    })
 }
 
 /// 这条归类建议有没有「归属级」证据，以及证据指向谁。
@@ -5581,6 +5650,88 @@ mod tests {
         // 降到 0.72 之后，0.723 这种「同一件事的两次表述」进入可比范围 ——
         // 能不能合由覆盖率说了算，不再由这个数字一票否决。
         assert!(dedup_score_ok(0.723, 0.72));
+    }
+
+    /// 造一条带模型裁决的 `dedup` 建议。
+    fn dedup_row(op: &str, confidence: f64) -> index::ReviewRow {
+        index::ReviewRow {
+            id: 1,
+            kind: "dedup".to_string(),
+            target: "new".to_string(),
+            payload: json!({
+                "candidate": "old",
+                "score": 0.80,
+                "modelOp": op,
+                "modelConfidence": confidence,
+            }),
+            confidence: 0.80,
+            status: "pending".to_string(),
+            created_at: 0,
+            resolved_at: None,
+            resolution: None,
+        }
+    }
+
+    /// L4 的四个操作到三种动作的映射，以及两条保护线。
+    ///
+    /// 这条映射错了不会报错，只会静默地丢内容：`NONE` 被当成 `Merge` 就是把
+    /// 两条无关结论压成一条；`ADD` 被当成 `Merge` 同理。所以逐格钉住。
+    #[test]
+    fn model_verdict_maps_four_operations_to_three_actions() {
+        let mut new = MemoryEntry::draft("new", "新条", MemoryKind::Insight, "新条的正文");
+        new.layer = Layer::L2;
+        let mut old = MemoryEntry::draft("old", "旧条", MemoryKind::Insight, "旧条的正文");
+        old.layer = Layer::L2;
+
+        assert_eq!(
+            model_verdict(&dedup_row("ADD", 0.95), &new, &old),
+            Some(PairOutcome::Relate),
+            "两条都留，只连边"
+        );
+        assert_eq!(
+            model_verdict(&dedup_row("NONE", 0.95), &new, &old),
+            Some(PairOutcome::Retire("auto-model-none")),
+            "连相关都不是：这条建议该被作废，不是该被合并"
+        );
+        assert_eq!(
+            model_verdict(&dedup_row("UPDATE", 0.95), &new, &old),
+            Some(PairOutcome::Merge)
+        );
+        assert_eq!(
+            model_verdict(&dedup_row("DELETE", 0.95), &new, &old),
+            Some(PairOutcome::Merge),
+            "DELETE 也是合并，方向由载荷 keep=candidate 表达"
+        );
+    }
+
+    /// 两条保护线：置信度不够就交回词面判据；跨层只连边不合并。
+    ///
+    /// ── 为什么跨层要降级 ──────────────────────────────────────
+    /// 与 `dedup_gate` 同一条理由：把一条 l1 流水并进 l2 沉淀，会丢掉「什么时候
+    /// 知道的」这一层信息，而合并后被取代那条退出检索，丢的部分再也读不到。
+    #[test]
+    fn model_verdict_falls_back_below_threshold_and_never_merges_across_layers() {
+        let mut new = MemoryEntry::draft("new", "新条", MemoryKind::Insight, "新条的正文");
+        new.layer = Layer::L2;
+        let mut old = MemoryEntry::draft("old", "旧条", MemoryKind::Insight, "旧条的正文");
+        old.layer = Layer::L2;
+
+        // 默认阈值 0.85：0.60 的结论只当参考，动作仍归 `dedup_gate`。
+        assert_eq!(model_verdict(&dedup_row("UPDATE", 0.60), &new, &old), None);
+        // 没有模型结论的老载荷：完全走原判据，行为与加 L4 之前一致。
+        let mut row = dedup_row("UPDATE", 0.95);
+        row.payload = json!({ "candidate": "old", "score": 0.80 });
+        assert_eq!(model_verdict(&row, &new, &old), None);
+        // 自创操作名不能被执行。
+        assert_eq!(model_verdict(&dedup_row("MERGE", 0.99), &new, &old), None);
+
+        let mut l1 = new.clone();
+        l1.layer = Layer::L1;
+        assert_eq!(
+            model_verdict(&dedup_row("UPDATE", 0.95), &l1, &old),
+            Some(PairOutcome::Relate),
+            "跨层同一件事：连边，不合并"
+        );
     }
 
     /// 造一条「已被 `superseded_by` 指向 `to`」的记忆，用来模拟串行合并的中途状态。

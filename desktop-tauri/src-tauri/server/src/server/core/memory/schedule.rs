@@ -56,12 +56,16 @@ const TICK: Duration = Duration::from_secs(60);
 /// 动作有两个入口、两套开关、两份统计 —— 用户关掉卡片上的开关以为停了，
 /// 同步页点一下还是照跑。所以调度器只认这 11 个，`sync` 模块本身照旧
 /// 供同步页使用。
-pub const TASKS: [&str; 11] = [
+pub const TASKS: [&str; 12] = [
     "extract",
     "summarize",
     "tag",
     "classify",
     "supersede",
+    // 语义判重（L3 召回 + L4 模型裁决）。它不是写入路径的一部分：写入仍然只做
+    // L1/L2（纯本地），这一项负责给**已经排队**的近似建议补一份模型裁决，
+    // 见 `dedup::judge` 的模块注释。
+    "dedup",
     "distill",
     "consolidate",
     "profile",
@@ -106,6 +110,10 @@ fn default_interval(task: &str) -> i64 {
         // 这里只是「两次之间至少隔多久」的兜底
         "supersede" | "distill" | "cleanup" => 1_440,
         "consolidate" | "profile" => 10_080,
+        // 判重：两小时一轮。队列积压是「一批写入产生的近似对被攒着」，
+        // 而不是匀速产生；两小时足够把一次导入产生的几十对判完，又不至于
+        // 让空队列的机器每半小时白醒一次。
+        "dedup" => 120,
         _ => 30,
     }
 }
@@ -135,13 +143,13 @@ fn task_enabled(task: &str) -> bool {
 /// 前端抄一份必然漂移 —— 漂移的后果是界面写着「零成本」而它在扣额度。
 ///
 /// 口径是**当前实现**：`extract` / `summarize` / `tag` / `distill` /
-/// `consolidate` / `profile` / `supersede` 会调 `llm`；其余四个纯本地
+/// `consolidate` / `profile` / `supersede` / `dedup` 会调 `llm`；其余四个纯本地
 /// （`classify` / `ingest` / `index-scan` / `cleanup`）。
 /// `task_enabled` 的「没配就默认关」用的也是这条线，两边同一份事实。
 fn task_uses_model(task: &str) -> bool {
     matches!(
         task,
-        "extract" | "summarize" | "tag" | "distill" | "consolidate" | "profile" | "supersede"
+        "extract" | "summarize" | "tag" | "distill" | "consolidate" | "profile" | "supersede" | "dedup"
     )
 }
 
@@ -791,6 +799,7 @@ fn run_inner(task: &str, project: Option<&str>, manual: bool) -> Outcome {
         "distill" => enrich::distill(project, 0),
         "profile" => enrich::build_profile(None, manual),
         "supersede" => supersede_recent(project),
+        "dedup" => super::dedup::judge(task_batch("dedup")),
         "consolidate" => consolidate(project, manual),
         other => Outcome::Skipped(format!("未知任务：{other}")),
     }
@@ -922,6 +931,21 @@ fn detail_of(task: &str, outcome: &Outcome) -> String {
                 // 与「扫都没扫」的区别。
                 "classify" => format!("扫描 {} 条未归类，新增 {} 条建议", n("unclassified"), n("suggested")),
                 "supersede" => format!("检查 {} 条，产出 {} 条失效建议", n("checked"), n("suggestions")),
+                // 判重报三个数：看了几对、模型判了几对、其中几对当场落地。
+                // 「检查 0 对」与「判 0 对」必须分开写 —— 前者是没活干（队列里
+                // 没有够格的近似对），后者是模型没给出可用结论（不可用 / 全部
+                // 解析失败）。合成一句「检查 0 对」会让后者看起来像前者。
+                "dedup" => {
+                    let (checked, judged) = (n("checked"), n("judged"));
+                    let (applied, related, retired) = (n("applied"), n("related"), n("retired"));
+                    if judged == 0 {
+                        format!("检查 {checked} 对，模型没有给出可用裁决")
+                    } else {
+                        format!(
+                            "检查 {checked} 对，模型裁决 {judged} 对（合并 {applied}、连边 {related}、作废 {retired}）"
+                        )
+                    }
+                }
                 "consolidate" => {
                     let (checked, queued, applied) = (n("checked"), n("queued"), n("applied"));
                     let kept = n("keptForReview");
@@ -2078,6 +2102,7 @@ fn task_summary(task: &str) -> &'static str {
         "tag" => "按内容更新 2-5 个标签，优先与已有概念复用",
         "classify" => "未归属项目的碎片自动匹配相似归档（零成本）",
         "supersede" => "识别「新事实推翻旧事实」，输出失效建议",
+        "dedup" => "近似建议交给模型做四操作裁决（加/并/删/无关）",
         "distill" => "将项目原始碎片深度蒸馏为架构决策与取舍手册",
         "consolidate" => "全库记忆查重：自动合并雷同、存储换入队列",
         "profile" => "跨项目深度归纳人格、沟通、技术栈与工作习惯",
