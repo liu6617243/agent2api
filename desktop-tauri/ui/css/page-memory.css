@@ -2764,6 +2764,10 @@
   color: var(--text-2);
   word-break: break-all;
 }
+/* 「同步行为」卡：三行都是能操作的控件（21px 的开关、30px 的数字框），
+   套用状态卡的 0 行距会让相邻两行贴在一起，分不清开关属于哪一个标签。
+   10px 行距仍然是「一块能一眼扫完」的密度，只是不再粘连。 */
+.mm-sync-grid.mm-sync-behave { row-gap: 10px; }
 
 /* 说明块：讲清边界（同步哪几块、本地目录在哪、按什么节奏）。
    不画上边界线 —— 目标界面里这句脚注就是紧接着「冲突」行往下排的一行小字，
@@ -3340,6 +3344,54 @@
   color: var(--text-3);
 }
 
+/* 模型池：重档 / 轻档各一行。
+   ── 为什么是两行而不是一个通用数组编辑器 ────────────────────────
+   `models.models` 原来是配置页里一个显示 `[]` 的 textarea（`[{model,tags}]`）。
+   而后端 `llm::task_tag` 只认两个标签：画像 → heavy、蒸馏 → light，其余任务
+   根本不看标签。也就是说那个"能装任意标签的数组"里，真正会被读到的只有两格。
+   摆一个通用数组编辑器让人手写它，是拿格式换不到能力。 */
+.mm-pool {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 9px 11px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+}
+.mm-pool-head { font-size: 11.5px; font-weight: 600; color: var(--text-2); }
+/* 三列：标签徽标 | 输入框 | 一句说明。行高对齐到输入框的 26px，
+   不让说明文字把整行撑高（那样两行之间会显得一块一块的）。 */
+.mm-pool-row {
+  display: grid;
+  grid-template-columns: minmax(96px, 120px) minmax(0, 260px) minmax(0, 1fr);
+  align-items: center;
+  gap: 4px 10px;
+}
+.mm-pool-tag {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+/* 标签键（heavy / light）走等宽小字：它是要对着后端那张表核对的字面量，
+   不是给人读的文案。 */
+.mm-pool-tag code {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-3);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-xs);
+  padding: 0 4px;
+}
+/* `.mm-route-inert` 默认 `grid-column: 3 / -1`（它是给路由表那句合并说明用的）。
+   在模型池这一行里它本来就落在第三列，显式清掉跨列声明 —— 否则窄屏那份
+   `grid-column: 1` 覆盖会把它顶到第一列，和标签徽标叠在一起。 */
+.mm-pool-row .mm-route-inert { grid-column: auto; }
+
 /* 分组导航 chips */
 .mm-cfg-nav { display: flex; flex-wrap: wrap; gap: 6px; flex: 0 0 auto; }
 .mm-cfg-nav-item {
@@ -3419,6 +3471,43 @@
 .mm-cfg-text { width: 230px; }
 .mm-cfg-chips { display: flex; gap: 4px; flex-wrap: wrap; }
 .mm-cfg-empty { padding: 10px 0; font-size: 12px; color: var(--text-3); }
+
+/* 指路条：这一组有一部分在别处改。
+   ── 为什么不是一行灰字 ──────────────────────────────────────
+   早先这里是「（在专用页面修改）」—— 既不说哪个页面，也点不动。用户读完
+   只知道"不在这儿"，还得自己一排页签去找。现在左边写清"有几项、在哪个页"，
+   右边给一个能一步跳过去的按钮；页签被 `ui.tabs` 关掉时 `mm:tab` 会拒绝跳转
+   （页面壳那条保护），按钮点了没反应比跳到一个不存在的高亮项好。 */
+.mm-cfg-owned {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 6px 0 8px;
+  padding: 8px 11px;
+  border: 1px dashed var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-2, transparent);
+}
+.mm-cfg-owned-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.mm-cfg-owned-title { font-size: 12px; color: var(--text-2); }
+/* 键名列一行小字：想核对"到底哪几项"的人看得到，不想知道的人可以忽略。 */
+.mm-cfg-owned-keys { font-size: 11px; color: var(--text-3); line-height: 1.6; }
+/* 按钮是裸文本样式，不套组件库的 Button：它只是这张卡里的一句指路，
+   长出边框和底色会跟下面真正的控件抢视线。 */
+.mm-cfg-pageonly-go {
+  flex: 0 0 auto;
+  height: 26px;
+  padding: 0 9px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--primary-fg);
+  font-size: 11.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.mm-cfg-pageonly-go:hover { border-color: var(--primary-bd); background: var(--primary-soft); }
 
 .mm-cfg-json { display: flex; flex-direction: column; gap: 5px; width: 100%; }
 .mm-cfg-json-input {

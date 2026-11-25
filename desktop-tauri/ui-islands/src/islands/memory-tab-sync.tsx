@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Button, Input, SegmentedControl } from '@ui'
+import { Button, Input, SegmentedControl, Switch } from '@ui'
 import { t } from '../i18n'
 import * as m from './memory-api'
 import { Empty, Panel, StateBadge, fullTime, timeText, useLoad } from './memory-shared'
@@ -239,6 +239,14 @@ function Sync(): React.ReactElement {
   const [lastRun, setLastRun] = React.useState<m.Outcome | null>(null)
   const [showLog, setShowLog] = React.useState(false)
   const [showPreview, setShowPreview] = React.useState(false)
+  /**
+   * 同步间隔输入框的草稿（`null` = 没在编辑，直接显示已保存的值）。
+   *
+   * 为什么不 onChange 直接存：输入「60」时中间会先经过「6」，存下去立刻 reload，
+   * `data.intervalMin` 变成 6、框里的值被回写成 6，用户再敲一下就得到「66」——
+   * 一个他从没打算填的数。所以中间态只活在草稿里，失焦或回车才提交。
+   */
+  const [intervalDraft, setIntervalDraft] = React.useState<string | null>(null)
   const preview = useLoad(() => (showPreview ? m.loadSyncPreview() : Promise.resolve(null)), [showPreview])
 
   // ── 凭据与目录的草稿 ──
@@ -309,6 +317,23 @@ function Sync(): React.ReactElement {
   // 用户才知道该回到上面那张卡补什么。
   const ready = data.configured && data.hasPassword !== false
   const blocked = !data.configured ? t('还没填 WebDAV 账号') : t('还没填 WebDAV 密码')
+
+  /**
+   * 「间隔」的唯一写入点：失焦 / 回车。
+   *
+   * 越界值（<5 或 >1440）不提交，也不弹一句报错：输入框是受控的，草稿一清就
+   * 自动回到已保存的值 —— 用户看到「填了 0 又变回去」就懂了。报错反而要解释
+   * 「0 不代表关掉自动同步，关掉请用上面的开关」，那是一句话说不完的注解。
+   */
+  const commitInterval = () => {
+    const raw = (intervalDraft ?? '').trim()
+    setIntervalDraft(null)
+    if (!raw) return
+    const next = Math.round(Number(raw))
+    if (!Number.isFinite(next) || next === data.intervalMin) return
+    if (next < 5 || next > 1440) return
+    void act('interval', () => m.saveSyncSetup({ 'sync.intervalMin': next }))
+  }
 
   return (
     <div className='mm-sync'>
@@ -642,6 +667,91 @@ function Sync(): React.ReactElement {
           </Button>
         </div>
       </section>
+
+      {/* ── 同步行为（总开关 / 自动定时 / 间隔）──
+          这三个键原来只在配置页的「同步」分组里有控件，而配置页现在把它们标成
+          owner=`sync`（那一页只留一句「去同步页改」）。所以编辑入口必须落在这一
+          页 —— 否则「去同步页」指过去是一片只读状态，用户会以为功能坏了。
+
+          为什么放在「快速同步」下面而不是塞进「同步状态」那张卡：状态卡是参考
+          数据（地址 / 上次同步 / 冲突数），这三项是**能改的东西**。混在一起，
+          整卡会在「读」和「写」之间反复横跳；分开之后，卡片标题就是语义分界。
+
+          为什么即时保存而不是给一个「保存」按钮：开关没有中间态，改了就是改了；
+          一键保存还会引出「我改了没保存就切页签」的旧问题。 */}
+      <section className='mm-cfg-card'>
+        <div className='mm-cfg-card-head'>
+          <div className='mm-cfg-card-title'>{t('同步行为')}</div>
+          <span className='mm-cfg-card-note'>
+            {t('决定「什么时候自动跑」；手动「立即同步」不受这三项影响')}
+          </span>
+        </div>
+
+        <div className='mm-sync-grid mm-sync-behave'>
+          <span>{t('同步总开关')}</span>
+          <div className='mm-sync-cell'>
+            <Switch
+              aria-label={t('同步总开关')}
+              checked={data.enabled}
+              disabled={busy === 'enabled'}
+              onCheckedChange={next => {
+                // 只在真的变了时发请求：Base UI 的开关在点按时总会回调，
+                // 同值提交会让 `act()` 白跑一轮 reload（页面闪一下）。
+                if (next === data.enabled) return
+                void act('enabled', () => m.saveSyncSetup({ 'sync.enabled': next }))
+              }}
+            />
+            <span className='mm-muted'>
+              {data.enabled
+                ? t('定时同步按下面的节奏触发')
+                : t('定时同步已停；手动「立即同步」仍然会跑')}
+            </span>
+          </div>
+
+          <span>{t('自动定时同步')}</span>
+          <div className='mm-sync-cell'>
+            <Switch
+              aria-label={t('自动定时同步')}
+              checked={data.auto}
+              /* 总开关关着时它没有意义（后端 `auto_ready()` 要求两者都为真），
+                 但值仍然照实显示 —— 关掉总开关不该顺手把用户的自动同步偏好抹掉。 */
+              disabled={!data.enabled || busy === 'auto'}
+              onCheckedChange={next => {
+                if (next === data.auto) return
+                void act('auto', () => m.saveSyncSetup({ 'sync.auto': next }))
+              }}
+            />
+            <span className={data.enabled && data.auto ? 'mm-sync-on' : 'mm-muted'}>
+              {!data.enabled
+                ? t('先打开上面的总开关')
+                : data.auto
+                  ? intervalText(data.intervalMin)
+                  : t('只剩手动同步')}
+            </span>
+          </div>
+
+          <span>{t('同步间隔')}</span>
+          <div className='mm-sync-cell'>
+            <Input
+              type='number'
+              className='mm-cfg-number'
+              aria-label={t('同步间隔（分钟）')}
+              min={5}
+              max={1440}
+              step={5}
+              disabled={!data.auto}
+              value={intervalDraft ?? String(data.intervalMin)}
+              onChange={event => setIntervalDraft(event.target.value)}
+              onBlur={commitInterval}
+              onKeyDown={event => {
+                // 回车 = 失焦：不逼用户去点别处才能提交一个数字。
+                if (event.key === 'Enter') event.currentTarget.blur()
+              }}
+            />
+            <span className='mm-muted'>{t('分钟（5 – 1440，改完点开别处即生效）')}</span>
+          </div>
+        </div>
+      </section>
       {/* ── 同步状态 ── */}
       <section className='mm-cfg-card'>
         <div className='mm-sync-head'>
@@ -654,7 +764,7 @@ function Sync(): React.ReactElement {
           <div className='mm-cfg-card-actions'>
             <StateBadge state={badge.state} label={badge.label} />
             {data.configured && !data.enabled ? (
-              <span className='mm-cfg-card-note'>{t('同步功能已关闭')}</span>
+              <span className='mm-cfg-card-note'>{t('总开关已关')}</span>
             ) : null}
           </div>
         </div>
@@ -726,9 +836,12 @@ function Sync(): React.ReactElement {
 
         {/* 「凭什么这么同步」的边界说明。目标界面里那句话讲的是共用凭据与根目录
             隔离，我们的实现是「记忆目录独立，凭据在配置页单独填」，所以照实写：
-            同步范围 + 本地目录 + 运行节奏。全挤在一行里 —— 它们回答的是同一个
-            问题「这页说的同步，具体是哪份数据、按什么节奏」，分成两行会让这张卡
-            凭空长高一截，而它本该是「五行数据 + 一句脚注」的形状。
+            同步范围 + 本地目录。回答的是同一个问题「这页说的同步，具体是哪份数据」，
+            挤在一行里就够 —— 分成两行会让这张卡凭空长高一截，而它本该是
+            「五行数据 + 一句脚注」的形状。
+
+            运行节奏**不在这里**：它已经由上面「同步行为」那张卡的开关与间隔输入框
+            表达，同一件事在两处各写一遍，迟早出现一处改了另一处没改。
             文件数与单包上限只在 `title` 里：几百个文件是常态、上限只有超限时才被
             想起（超限会直接把原因写进「当前阶段」），两者都不值得占脚注的宽度。 */}
         <div
@@ -741,10 +854,6 @@ function Sync(): React.ReactElement {
         >
           {t('同步 general / projects / profile，index.db 等可重建文件不入包；本地目录：')}
           {data.localDir ? <code>{data.localDir}</code> : null}
-          <span className='mm-sync-sep'> · </span>
-          <span className={data.auto ? 'mm-sync-on' : ''}>
-            {data.auto ? intervalText(data.intervalMin) : t('自动同步已关')}
-          </span>
         </div>
 
         {test?.from === 'status' ? (

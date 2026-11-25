@@ -121,6 +121,88 @@ const GROUP_ICONS: Record<string, string> = {
 
 type RouteRow = { task: string; tags: string[]; model: string }
 
+/**
+ * 模型池里真实存在的标签 —— 只有这两个。
+ *
+ * `llm::task_tag` 是同一张表的 Rust 版本：画像跨条目归纳要重档，蒸馏要取舍
+ * 判断走轻档，其余任务不按标签选模型。所以模型池不需要是「任意标签的数组」，
+ * 它就是这两格。改后端那张表时这里要跟着改（两边都有注释指向对方）。
+ */
+const TAG_ROWS: { tag: 'heavy' | 'light'; label: string; note: string }[] = [
+  { tag: 'heavy', label: '重档（heavy）', note: '画像这类需要跨条目归纳的任务' },
+  { tag: 'light', label: '轻档（light）', note: '蒸馏这类要取舍判断的任务' },
+]
+
+/** 从 `models.models` 里取某个标签绑的模型名；没有就空串。 */
+function poolPick(raw: unknown, tag: string): string {
+  if (!Array.isArray(raw)) return ''
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const row = item as Record<string, unknown>
+    const tags = Array.isArray(row.tags) ? row.tags.map(String) : []
+    if (!tags.includes(tag)) continue
+    const model = typeof row.model === 'string' ? row.model.trim() : ''
+    if (model) return model
+  }
+  return ''
+}
+
+/**
+ * 把某个标签的模型名写回 `models.models`，保留其它标签的条目。
+ *
+ * 传空串 = 摘掉这个标签（连同「只挂着这个标签」的空壳条目）。不这么写的话，
+ * 清空输入框会在数组里留下一行 `{model:"",tags:["heavy"]}`，而 `model_for`
+ * 会跳过空 model 继续找下一个 —— 看起来「清了但没清干净」。
+ */
+function poolSet(raw: unknown, tag: string, model: string): { model: string; tags: string[] }[] {
+  const rows = toPool(raw)
+  const next: { model: string; tags: string[] }[] = []
+  for (const row of rows) {
+    const tags = row.tags.filter(item => item !== tag)
+    if (row.tags.includes(tag) && model.trim()) {
+      next.push({ model: model.trim(), tags: [...new Set([...tags, tag])] })
+      continue
+    }
+    // 这个标签被摘掉了：若它原本是这行唯一的标签，整行一起删；否则留其余标签
+    if (row.tags.includes(tag)) {
+      if (tags.length > 0) next.push({ model: row.model, tags })
+      continue
+    }
+    next.push(row)
+  }
+  if (model.trim() && !rows.some(row => row.tags.includes(tag))) {
+    next.push({ model: model.trim(), tags: [tag] })
+  }
+  return next
+}
+
+/**
+ * owner → 页签名。**与 `memory-page.tsx` 的 `TABS` 逐字对齐**（后端那条
+ * `owner_points_at_a_real_place` 单测校验 owner 只能是这些键之一）。
+ *
+ * 这张表只为了把 `owner="sync"` 翻译成「去同步页」—— 配置页不 import 页面壳，
+ * 否则 `memory-page` ↔ `memory-tab-settings` 会互相 import。
+ */
+const OWNER_TABS: Record<string, string> = {
+  agents: '接入',
+  auto: '自动化',
+  import: '导入',
+  sync: '同步',
+}
+
+/**
+ * 切到别的页签。
+ *
+ * ── 为什么用事件而不是回调 ──────────────────────────────────
+ * 配置页在 `memory-page` 里隔着 `TabBoundary`，把 `switchTab` 传下来要多一层
+ * 自己用不到的 prop；而页面壳**已经在听** `mm:tab`（画像页的证据 chip 走同一条路）。
+ * 更要紧的是那个监听器自带一条保护：被 `ui.tabs` 关掉的页签不接受外部跳转 ——
+ * 这里自己写一套 `switchTab` 就会绕过它，切到一个顶栏上根本不存在的高亮项。
+ */
+function goTab(tab: string): void {
+  window.dispatchEvent(new CustomEvent('mm:tab', { detail: { tab } }))
+}
+
 /** 「请求级注入」那一组。下面要把预览卡片挂到这一组下面。 */
 const INJECT_GROUP = '请求级注入'
 
@@ -129,6 +211,7 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
   const [draft, setDraft] = React.useState<Record<string, unknown>>({})
   const [category, setCategory] = React.useState('')
   const [advancedOpen, setAdvancedOpen] = React.useState<Record<string, boolean>>({})
+  const [internalOpen, setInternalOpen] = React.useState<Record<string, boolean>>({})
   const [busy, setBusy] = React.useState('')
   const [actionError, setActionError] = React.useState('')
   const [confirmReset, setConfirmReset] = React.useState(false)
@@ -276,9 +359,34 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
   }
 
   const items = data.schema.filter(knob => knob.group === active)
-  const basic = items.filter(knob => knob.tier === 'basic')
-  const advanced = items.filter(knob => knob.tier !== 'basic')
+  /**
+   * 本组里「不在本页改」的键，按 owner 归并成指路条。
+   *
+   * ── 为什么归并成一条，而不是每个键一行 ─────────────────────
+   * 「同步」那一组有十项全是同步页维护的。逐键画一行，用户在这一组看到的是
+   * 十行一模一样的「去同步页改」—— 那不是指路，那是把注意力从真正能调的项上
+   * 赶走。归并之后是**一句话 + 一个按钮**：「这一组有 10 项在「同步」页改」，
+   * 下面用小字把键名列出来，想知道具体是哪些的人看得到，不想知道的可以走。
+   *
+   * `owner === 'self'` 单独处理：它指的是**本页上方**那张表（模型池 / 路由表），
+   * 不是别的页签，所以给的是「回到上方」而不是跳页签。
+   */
+  const signposts: { owner: string; knobs: m.Knob[] }[] = []
+  for (const knob of items) {
+    const owner = knob.owner ?? ''
+    if (!owner) continue
+    const row = signposts.find(item => item.owner === owner)
+    if (row) row.knobs.push(knob)
+    else signposts.push({ owner, knobs: [knob] })
+  }
+  // 本页的（self）排在后面：跳页签的更需要被看见
+  signposts.sort((a, b) => (a.owner === 'self' ? 1 : 0) - (b.owner === 'self' ? 1 : 0))
+
+  const basic = items.filter(knob => knob.tier === 'basic' && !knob.owner)
+  const advanced = items.filter(knob => knob.tier === 'advanced' && !knob.owner)
+  const internal = items.filter(knob => knob.tier === 'internal' && !knob.owner)
   const advOpen = advancedOpen[active] ?? false
+  const intOpen = internalOpen[active] ?? false
   const enabledNow = 'enabled' in draft ? draft.enabled === true : data.config.enabled
 
   return (
@@ -411,7 +519,7 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
       </div>
 
       {/* ── 路由表 ── */}
-      <section className='mm-cfg-card'>
+      <section className='mm-cfg-card mm-cfg-route-card' id='mm-cfg-route'>
         <div className='mm-cfg-card-head'>
           <div className='mm-cfg-card-title'>{t('按标签的路由与降级链')}</div>
           <div className='mm-cfg-card-actions'>
@@ -421,7 +529,7 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
           </div>
         </div>
         <div className='mm-cfg-card-sub'>
-          {t('每行可指定模型；不指定则按标签在模型池里挑。记忆任务固定走本机网关。')}
+          {t('每行可指定模型；不指定则按标签在下面的模型池里挑。记忆任务固定走本机网关。')}
         </div>
 
         <RoutingTable
@@ -442,6 +550,33 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
             put('models.routing', next)
           }}
         />
+
+        {/* ── 模型池：两个标签各一个模型名 ──────────────────────────
+            它原来是 `models.models` 那个 JSON 数组（`[{model,tags}]`）的手写
+            textarea，框里只有 `[]`。而这个数组在本仓只服务两个固定标签
+            （`llm::task_tag`：画像 → heavy、蒸馏 → light），其余任务根本不看
+            标签 —— 也就是说「一个能装任意标签的数组」里，真正会被读到的只有
+            两格。摆一个通用数组编辑器让人手写它，是拿格式换不到能力。
+
+            所以这里收敛成两行：重/轻各填一个模型名。空 = 不指定，走兜底。 */}
+        <div className='mm-pool'>
+          <div className='mm-pool-head'>{t('模型池（按标签）')}</div>
+          {TAG_ROWS.map(({ tag, label, note }) => (
+            <div key={tag} className='mm-pool-row'>
+              <span className='mm-pool-tag'>
+                {t(label)}
+                <code>{tag}</code>
+              </span>
+              <ModelInput
+                task={`pool:${tag}`}
+                value={poolPick(value('models.models'), tag)}
+                options={Array.from(new Set(toPool(value('models.models')).map(item => item.model)))}
+                onCommit={model => put('models.models', poolSet(value('models.models'), tag, model))}
+              />
+              <span className='mm-route-inert'>{t(note)}</span>
+            </div>
+          ))}
+        </div>
 
         <div className='mm-cfg-note'>
           <div>
@@ -480,7 +615,11 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
           <div className='mm-cfg-card-title'>{t(active)}</div>
           <div className='mm-cfg-card-actions'>
             <span className='mm-cfg-card-note'>
-              {t('{n} 项（改完点「保存配置」生效，标「需重启」的还要重启或重建索引）', { n: items.length })}
+              {basic.length + advanced.length > 0
+                ? t('{n} 项可调（改完点「保存配置」生效，标「需重启」的还要重启或重建索引）', {
+                    n: basic.length + advanced.length,
+                  })
+                : t('这一组没有在本页调的项')}
             </span>
             {advanced.length > 0 ? (
               <Button
@@ -494,8 +633,64 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
                   : t('高级项 {n} ▼ 展开', { n: advanced.length })}
               </Button>
             ) : null}
+            {internal.length > 0 ? (
+              <Button
+                type='button'
+                size='sm'
+                variant='ghost'
+                title={t('调优与排障用的细粒度参数，改错会让检索或同步变差')}
+                onClick={() => setInternalOpen(current => ({ ...current, [active]: !intOpen }))}
+              >
+                {intOpen
+                  ? t('排障项 {n} ▲ 收起', { n: internal.length })
+                  : t('排障项 {n} ▼ 展开', { n: internal.length })}
+              </Button>
+            ) : null}
           </div>
         </div>
+
+        {/* ── 指路条：这一组有一部分不在本页改 ──────────────────
+            结构化值（任务表 / 来源清单 / 自定义 Agent）摆在这里的唯一画法是一个
+            显示 `[]` 的 textarea。那不是设置项，是一道「你会不会写 JSON」的考试；
+            而写错的后果不是报错，是「改了没反应」。这些键都已经有专用界面，
+            所以这里只留一句「在哪改」和一个能直接跳过去的按钮。
+
+            指路条放在控件**上方**：用户点进这一组就是想找那几个键，先告诉他
+            它们在哪，比让他滚到底部才发现要快一步。 */}
+        {signposts.map(({ owner, knobs }) => {
+          const tab = OWNER_TABS[owner]
+          return (
+            <div key={owner} className='mm-cfg-owned'>
+              <div className='mm-cfg-owned-main'>
+                <div className='mm-cfg-owned-title'>
+                  {owner === 'self'
+                    ? t('有 {n} 项在本页上方的表里改', { n: knobs.length })
+                    : t('有 {n} 项在「{tab}」页改', { n: knobs.length, tab: tab ?? owner })}
+                </div>
+                <div className='mm-cfg-owned-keys'>
+                  {knobs.map(knob => t(knob.label)).join(' · ')}
+                </div>
+              </div>
+              {owner === 'self' ? (
+                <button
+                  type='button'
+                  className='mm-cfg-pageonly-go'
+                  onClick={() =>
+                    document
+                      .querySelector('.mm-cfg-route-card')
+                      ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                  }
+                >
+                  {t('回到上方 ›')}
+                </button>
+              ) : (
+                <button type='button' className='mm-cfg-pageonly-go' onClick={() => goTab(owner)}>
+                  {t('去{tab}页 ›', { tab: tab ?? owner })}
+                </button>
+              )}
+            </div>
+          )
+        })}
 
         {[...basic, ...(advOpen ? advanced : [])].map(knob => (
           <KnobRow
@@ -507,6 +702,23 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
             onDefault={() => put(knob.key, knob.default)}
           />
         ))}
+
+        {/* 排障项：分档权重、引擎上限这类东西。默认收起，而且**单独一档**
+            而不是混进「高级项」—— 早先 `tier !== 'basic'` 一个条件把两档并成
+            一档，于是「权重·相关度 / 图扩散深度 / 单文件上限」这些和「备份保留
+            份数」平起平坐地摊在同一个折叠区里，用户看到的是几十行数字框。 */}
+        {intOpen
+          ? internal.map(knob => (
+              <KnobRow
+                key={knob.key}
+                knob={knob}
+                value={value(knob.key)}
+                dirty={isDirty(knob.key)}
+                onChange={next => put(knob.key, next)}
+                onDefault={() => put(knob.key, knob.default)}
+              />
+            ))
+          : null}
 
         {items.length === 0 ? <div className='mm-cfg-empty'>{t('这一组还没有旋钮。')}</div> : null}
       </section>

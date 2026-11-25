@@ -96,6 +96,25 @@ pub struct Knob {
     pub options: &'static [&'static str],
     /// 改了立刻生效（`false` = 需要重启或重建索引）
     pub hot: bool,
+    /// 这个键的编辑入口归谁：`""` = 本页（配置页）自己画控件。
+    ///
+    /// 绝大多数键是 `""`。被标走的只有两类，共同点是**别处已经有一个比配置页
+    /// 更好的编辑器**：
+    ///   · `auto.tasks` / `import.sources` / `agents.custom` 这类**结构化值**：
+    ///     形状是嵌套对象或对象数组，配置页唯一的兜底画法就是一个 `<textarea>`
+    ///     里显示 `[]` 让人手写 JSON —— 那不是设置项，那是一道考试；
+    ///   · `sync.enabled` / `sync.auto` / `sync.intervalMin`：它们和「填地址、
+    ///     测连接、看远端有没有包」是同一个动作的上下一步，拆到两页反而要来回跳。
+    ///
+    /// 取值：
+    ///   · `""`      —— 配置页自己画控件（绝大多数键）；
+    ///   · `"self"`  —— 就在配置页上方那张表里改（模型池 / 路由表）；
+    ///   · 页签键    —— `"sync"` / `"auto"` / `"import"` / `"agents"`，配置页给一句
+    ///                  「去 XX 页改」的指路，点了直接切过去。
+    ///
+    /// 约束由单测 `owner_points_at_a_real_place` 兜着：页签键必须是真实存在的
+    /// 页签，否则指路按钮会跳到一个不存在的地方。
+    pub owner: &'static str,
 }
 
 /// 这张表里**只放真的有读取点的旋钮**。
@@ -111,11 +130,27 @@ pub struct Knob {
 /// 防复发的闸门仍在：单测 `every_knob_has_a_reader` 扫描源码，要求每个键都能
 /// 在 Rust 或前端找到字面量读取点。新增一个没人读的旋钮，测试直接红。
 const fn knob(key: &'static str, kind: Kind, tier: Tier, group: &'static str, label: &'static str, default_json: &'static str) -> Knob {
-    Knob { key, kind, tier, group, label, desc: "", default_json, min: None, max: None, options: &[], hot: true }
+    Knob { key, kind, tier, group, label, desc: "", default_json, min: None, max: None, options: &[], hot: true, owner: "" }
 }
 
 const fn knob_d(key: &'static str, kind: Kind, tier: Tier, group: &'static str, label: &'static str, desc: &'static str, default_json: &'static str) -> Knob {
-    Knob { key, kind, tier, group, label, desc, default_json, min: None, max: None, options: &[], hot: true }
+    Knob { key, kind, tier, group, label, desc, default_json, min: None, max: None, options: &[], hot: true, owner: "" }
+}
+
+/// 由**本页上方那张表**维护的键（模型池 / 路由表）：配置页不再给控件，只留一行。
+const fn inline(mut item: Knob) -> Knob {
+    item.owner = "self";
+    item
+}
+
+/// 由**别的页签**维护的键：配置页显示一行指路 + 一个「去 XX 页」按钮。
+///
+/// 判据不是「值是不是数组」——`import.ignored`、`privacy.redactRules` 也是数组，
+/// 但它们**没有**别的界面，删掉输入框就等于删掉功能。只有已经存在一个更好的
+/// 编辑界面时，配置页这份手写 JSON 才是纯粹的负担。
+const fn owned_by(mut item: Knob, tab: &'static str) -> Knob {
+    item.owner = tab;
+    item
 }
 
 const fn range(mut item: Knob, min: f64, max: f64) -> Knob {
@@ -180,7 +215,7 @@ static SCHEMA: &[Knob] = &[
     opts(knob("agents.enabled", Kind::Multi, Tier::Basic, "Agent 接入", "启用的 Agent",
         "[\"zcode\",\"codex\",\"workbuddy\",\"claude\",\"dsh\",\"trae-solo\",\"antigravity\"]"),
         &["zcode", "codex", "workbuddy", "claude", "dsh", "trae-solo", "cursor", "qoder", "qoder-cn", "antigravity"]),
-    knob("agents.custom", Kind::List, Tier::Advanced, "Agent 接入", "自定义 Agent（本机）", "[]"),
+    owned_by(knob("agents.custom", Kind::List, Tier::Advanced, "Agent 接入", "自定义 Agent（本机）", "[]"), "agents"),
     // 这里原本还有 `agents.autoVerify` / `agents.verifyInterval`（AgentHub 的
     // 「定时探活 + 接入后自动校验」）。本仓的接入是「用户点一下才握手」，没有
     // 后台巡检线程 —— 两个键都没有读取点，已删除；等价动作是接入页的「测试连接」。
@@ -286,8 +321,8 @@ static SCHEMA: &[Knob] = &[
     range(knob_d("auto.logKeepDays", Kind::Number, Tier::Internal, "自动化", "任务日志保留天数",
         "每天清理任务按它删掉过期的 llm_call / task_run 行；条数上限另见 logKeepCount", "30"), 1.0, 365.0),
     range(knob("auto.logKeepCount", Kind::Number, Tier::Internal, "自动化", "任务日志保留条数", "200"), 20.0, 2000.0),
-    knob_d("auto.tasks", Kind::Map, Tier::Advanced, "自动化", "任务开关与节奏",
-        "默认开：零/低消耗任务；耗 token 的任务默认关",
+    owned_by(knob_d("auto.tasks", Kind::Map, Tier::Advanced, "自动化", "任务开关与节奏",
+        "在「自动化」页逐任务开关，不需要在这里写 JSON",
         "{\"extract\":{\"enabled\":true,\"intervalMin\":30,\"batchSize\":20},\
           \"summarize\":{\"enabled\":false,\"intervalMin\":30,\"batchSize\":20},\
           \"tag\":{\"enabled\":false,\"intervalMin\":30,\"batchSize\":20},\
@@ -299,8 +334,7 @@ static SCHEMA: &[Knob] = &[
           \"profile\":{\"enabled\":false,\"weekly\":1,\"weeklyTime\":\"11:10\"},\
           \"index-scan\":{\"enabled\":true,\"intervalMin\":360},\
           \"cleanup\":{\"enabled\":true,\"daily\":\"11:20\"},\
-          \"ingest\":{\"enabled\":true,\"intervalMin\":30}}"),
-
+          \"ingest\":{\"enabled\":true,\"intervalMin\":30}}"), "auto"),
     // ===== 去重 =====
     //
     // ── 四级分工（2026-11-25 补齐 L3 / L4）────────────────────────
@@ -480,9 +514,14 @@ static SCHEMA: &[Knob] = &[
     // AgentHub 那套「模型来源排序 / 自定义供应商 / 用途标签集 / 失败重试次数」
     // 在本仓没有对应的解析器 —— 那几个键已删除，而不是留成灰掉的输入框。
     // 调用失败由自动化任务的下一轮重试，不在这里叠一层 `maxRetries`。
-    knob("models.models", Kind::List, Tier::Advanced, "模型与网关", "模型池", "[]"),
-    knob_d("models.routing", Kind::List, Tier::Internal, "模型与网关", "按标签降级链",
-        "每项 {\"task\":\"extract\",\"tags\":[\"light\"],\"model\":\"...\"}", "[]"),
+    // ── 模型池 / 路由表为什么不在配置页里手写（2026-11-25）────────
+    // `models.models` 与 `models.routing` 都是对象数组，配置页唯一能画的控件是
+    // 一个显示 `[]` 的 textarea —— 页面顶上那张截图里的「空白框」就是它。
+    // 它们各自已经有真正的界面：模型池在同步页上方的「按标签的路由」表里配
+    // （`RoutingTable` 直接读写这两个键），所以配置页只留一行指路。
+    inline(knob("models.models", Kind::List, Tier::Advanced, "模型与网关", "模型池", "[]")),
+    inline(knob_d("models.routing", Kind::List, Tier::Internal, "模型与网关", "按标签降级链",
+        "每项 {\"task\":\"extract\",\"tags\":[\"light\"],\"model\":\"...\"}", "[]")),
     range(knob("models.timeout", Kind::Number, Tier::Advanced, "模型与网关", "请求超时（秒）", "60"), 5.0, 600.0),
     knob_d("models.gatewayBase", Kind::Text, Tier::Internal, "模型与网关", "网关基址",
         "留空 = 自动探测本机端口（面板与网关分端口时也能找对）", "\"\""),
@@ -529,12 +568,15 @@ static SCHEMA: &[Knob] = &[
         "true"),
     range(knob_d("import.autoSinceDays", Kind::Number, Tier::Advanced, "导入", "首次自动入库回溯天数",
         "还没有水位时，只读最近 N 天改过的会话文件；之后按水位增量读", "7"), 1.0, 365.0),
-    knob_d("import.sources", Kind::List, Tier::Advanced, "导入", "导入来源清单",
-        "路径/格式/启用/优先级；Markdown 笔记目录默认关，选好路径再开", "[]"),
-    knob_d("import.overrides", Kind::Map, Tier::Internal, "导入", "来源路径覆盖",
-        "内置来源 id → 用户手填的路径；有值时优先于候选路径", "{}"),
-    knob_d("import.ignored", Kind::List, Tier::Internal, "导入", "已忽略的来源 id",
-        "用户主动关掉的内置来源；不在清单里 = 未被忽略", "[]"),
+    owned_by(knob_d("import.sources", Kind::List, Tier::Advanced, "导入", "导入来源清单",
+        "在「导入」页逐来源启用 / 停用 / 改路径", "[]"), "import"),
+    // 来源路径覆盖与忽略名单：两者都由「导入」页的启用 / 停用 / 改路径按钮
+    // 维护（`import_registry::enable / disable / set_path`）。手写这两份 JSON
+    // 的后果不是「麻烦」，而是与内置来源 id 对不上时静默不生效。
+    owned_by(knob_d("import.overrides", Kind::Map, Tier::Internal, "导入", "来源路径覆盖",
+        "内置来源 id → 用户手填的路径；在「导入」页改路径时自动写入", "{}"), "import"),
+    owned_by(knob_d("import.ignored", Kind::List, Tier::Internal, "导入", "已忽略的来源 id",
+        "在「导入」页停用某个来源时自动记入", "[]"), "import"),
 
     // ===== 隐私 =====
     knob_d("privacy.redact", Kind::Bool, Tier::Advanced, "隐私", "写入前脱敏",
@@ -554,26 +596,35 @@ static SCHEMA: &[Knob] = &[
     // 远端根目录）：本仓从来没实现过那四个模块的同步，那些目录名只用于界面展示，
     // 改了不会让任何东西开始传 —— 已连同界面上那四个输入框一起删除。记忆的远端
     // 目录只有 `sync.remoteDir` 一个键，不再有第二个投影。
-    knob("sync.enabled", Kind::Bool, Tier::Basic, "同步", "同步总开关", "true"),
-    opts(knob_d("sync.provider", Kind::Enum, Tier::Basic, "同步", "存储类型",
+    // ── 这一整组为什么都不在配置页画控件（2026-11-25）────────────
+    // 「同步」页已经有完整的一套：地址 / 账号 / 密码 / 远端目录 / 预设 /
+    // 显示名各有输入框（`memory-tab-sync.tsx` 的凭据卡，保存走
+    // `POST /api/memory/sync/setup`），自动同步开关与间隔在同一个页面显示。
+    // 配置页再抄一份，就成了「同一个值两处能改、两处各自的草稿互不相识」——
+    // 用户在配置页改了地址没点保存，去同步页看到的还是旧值。
+    //
+    // 所以这一组在配置页只留指路。键本身照旧参与校验与落盘（同步页写的就是
+    // 这些键），`every_knob_has_a_reader` 也仍然要求每个键都有读取点。
+    owned_by(knob("sync.enabled", Kind::Bool, Tier::Basic, "同步", "同步总开关", "true"), "sync"),
+    owned_by(opts(knob_d("sync.provider", Kind::Enum, Tier::Basic, "同步", "存储类型",
         "本仓只实现 WebDAV；S3 需要重写打包与列目录，尚未接入",
-        "\"webdav\""), &["webdav", "s3"]),
-    knob_d("sync.auto", Kind::Bool, Tier::Basic, "同步", "自动定时同步",
-        "开：后台线程按下面的「自动同步间隔」定期跑一次；关：只在点「立即同步」时传。手动同步不受这个开关影响",
-        "true"),
-    knob_d("sync.url", Kind::Text, Tier::Basic, "同步", "WebDAV 地址",
-        "留空 = 用默认地址（坚果云 dav.jianguoyun.com）；换别家网盘就填它给的地址", "\"\""),
-    knob_d("sync.username", Kind::Text, Tier::Basic, "同步", "WebDAV 用户名",
-        "留空 = 还没配好同步（同步页显示「未配置」）；少数自建服务允许匿名写时才可空", "\"\""),
-    knob_d("sync.password", Kind::Secret, Tier::Basic, "同步", "WebDAV 密码",
-        "经系统密钥加密后落 config.json，接口只回「已设置」；不进同步包", "\"\""),
-    knob_d("sync.deviceName", Kind::Text, Tier::Advanced, "同步", "本机显示名",
-        "留空 = 用系统电脑名（也读不到才退到设备 id）；随同步包上传，别的设备在设备列表里看到的就是它", "\"\""),
-    knob_d("sync.remoteDir", Kind::Text, Tier::Advanced, "同步", "远端目录名",
-        "同一账号下的多台设备共用这个目录", "\"agent2api-memory\""),
-    opts(knob_d("sync.preset", Kind::Enum, Tier::Advanced, "同步", "存储预设",
+        "\"webdav\""), &["webdav", "s3"]), "sync"),
+    owned_by(knob_d("sync.auto", Kind::Bool, Tier::Basic, "同步", "自动定时同步",
+        "开：后台线程按「自动同步间隔」定期跑一次；关：只在点「立即同步」时传。手动同步不受影响",
+        "true"), "sync"),
+    owned_by(knob_d("sync.url", Kind::Text, Tier::Basic, "同步", "WebDAV 地址",
+        "留空 = 用默认地址（坚果云 dav.jianguoyun.com）；换别家网盘就填它给的地址", "\"\""), "sync"),
+    owned_by(knob_d("sync.username", Kind::Text, Tier::Basic, "同步", "WebDAV 用户名",
+        "留空 = 还没配好同步（同步页显示「未配置」）；少数自建服务允许匿名写时才可空", "\"\""), "sync"),
+    owned_by(knob_d("sync.password", Kind::Secret, Tier::Basic, "同步", "WebDAV 密码",
+        "经系统密钥加密后落 config.json，接口只回「已设置」；不进同步包", "\"\""), "sync"),
+    owned_by(knob_d("sync.deviceName", Kind::Text, Tier::Advanced, "同步", "本机显示名",
+        "留空 = 用系统电脑名（也读不到才退到设备 id）；随同步包上传，别的设备在设备列表里看到的就是它", "\"\""), "sync"),
+    owned_by(knob_d("sync.remoteDir", Kind::Text, Tier::Advanced, "同步", "远端目录名",
+        "同一账号下的多台设备共用这个目录", "\"agent2api-memory\""), "sync"),
+    owned_by(opts(knob_d("sync.preset", Kind::Enum, Tier::Advanced, "同步", "存储预设",
         "仅备忘：帮你记住这台服务器是哪家的，不改变任何同步行为", "\"custom\""),
-        &["custom", "jianguoyun", "nextcloud", "synology", "fnos"]),
+        &["custom", "jianguoyun", "nextcloud", "synology", "fnos"]), "sync"),
     // 自动同步的节奏。默认 1440 分钟 = 24 小时。
     //
     // 为什么是 24 小时而不是更密：同步传的是**整包** tar.gz（记忆几百个文件几 MB），
@@ -583,8 +634,8 @@ static SCHEMA: &[Knob] = &[
     // 生效者是 `sync::spawn_auto` 那条巡检线程：每 60 秒看一次「距上次尝试是否
     // 已过 intervalMin」，到点跑一次 `run(false)`。改这里最多一分钟内生效。失败也
     // 按同一个间隔重试（不每分钟重连，免得网络故障期把日志刷满）。
-    range(knob_d("sync.intervalMin", Kind::Number, Tier::Advanced, "同步", "自动同步间隔（分钟）",
-        "默认 1440（24 小时）；后台线程每分钟校验一次是否到点", "1440"), 5.0, 1440.0),
+    owned_by(range(knob_d("sync.intervalMin", Kind::Number, Tier::Advanced, "同步", "自动同步间隔（分钟）",
+        "默认 1440（24 小时）；后台线程每分钟校验一次是否到点", "1440"), 5.0, 1440.0), "sync"),
     range(knob("sync.packSizeLimitMB", Kind::Number, Tier::Internal, "同步", "单包体积上限 (MB)", "50"), 1.0, 2048.0),
     knob_d("sync.excludeIndex", Kind::Bool, Tier::Internal, "同步", "索引库不入同步包",
         "索引可重建，且是二进制无法三方合并", "true"),
@@ -1239,6 +1290,9 @@ pub fn schema_json() -> Value {
                     "max": item.max,
                     "options": item.options,
                     "hot": item.hot,
+                    // 配置页要不要画控件：空串 = 画；"self" = 本页上方的表里改；
+                    // 其它值是页签键，配置页给一句「去 XX 页改」的指路。
+                    "owner": item.owner,
                     // 只有秘密字段有：库里有没有值。页面据此把占位符写成
                     // 「已保存口令，输入任意字符即进入修改」而不是「未设置」。
                     "set": if item.kind == Kind::Secret { Some(secret_set(item.key)) } else { None },
@@ -1553,5 +1607,54 @@ mod tests {
              留在表里而没人读，用户改了它不会有任何效果。",
             missing.join(", ")
         );
+    }
+
+    /// 「由谁维护」只能填这几个值。
+    ///
+    /// 拼错一个页签键（`"snyc"`）不会报错，只会让配置页渲染出一个点了没反应的
+    /// 「去 XX 页」按钮 —— 用户点两下就开始怀疑自己。所以这张表必须有闸门。
+    #[test]
+    fn owner_points_at_a_real_place() {
+        // 与 `memory-page.tsx` 的 `TABS` 一一对应（`self` 不是页签，是本页）。
+        const TABS: &[&str] = &[
+            "dashboard", "browse", "projects", "profile", "agents", "auto", "import", "sync", "settings",
+        ];
+        for item in schema() {
+            if item.owner.is_empty() || item.owner == "self" {
+                continue;
+            }
+            assert!(
+                TABS.contains(&item.owner),
+                "{} 的 owner 是 `{}`，不是已知页签（要么是 self，要么是 {} 之一）",
+                item.key,
+                item.owner,
+                TABS.join(" / ")
+            );
+        }
+    }
+
+    /// 配置页不能只剩指路：每一组都得有真的能调的键。
+    ///
+    /// 判据是「这一组有没有一个 owner 为空的键」。整组交给别的页签是合理的
+    /// （同步就是这么做的），但如果某组**既有**指路行**又**一个控件都没有，
+    /// 那一组在配置页里就只是一堆「去别的页改」—— 它不该出现在这页。
+    #[test]
+    fn no_group_is_only_a_signpost() {
+        let mut groups: Vec<&str> = Vec::new();
+        for item in schema() {
+            if !groups.contains(&item.group) {
+                groups.push(item.group);
+            }
+        }
+        for group in groups {
+            let has_control = schema()
+                .iter()
+                .any(|item| item.group == group && item.owner.is_empty());
+            assert!(
+                has_control,
+                "「{group}」这一组没有任何键在配置页画控件（owner 全被指定到别处）—— \
+                 要么留一个能调的键，要么把这组从 schema 里去掉"
+            );
+        }
     }
 }
