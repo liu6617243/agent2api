@@ -198,7 +198,6 @@ type SetupForm = {
   url: string
   username: string
   password: string
-  remoteDir: string
   deviceName: string
   preset: string
 }
@@ -218,7 +217,6 @@ function formOf(data: m.SyncStatus): SetupForm {
     url: data.url ?? '',
     username: data.username ?? '',
     password: '',
-    remoteDir: data.remoteDir ?? '',
     // 电脑名没填过就用系统电脑名预填：系统本来就知道这台机器叫什么，让用户手打
     // 一遍只会多出一个打错的机器名（多设备列表里就多出一台不存在的机器）。
     // 预填之后它就是一个**看得见、可改、保存即落盘**的值，而不是一个空框。
@@ -352,7 +350,15 @@ function Sync(): React.ReactElement {
       {/* ── WebDAV 服务器（凭据）──
           截图里这张卡自带账号 / 密码两个框和三个按钮。这里照做，但
           「测连接」测的是**当前输入框里的值**（后端 `post_sync_test` 接 body），
-          这样可以「先验再存」；密码框从不下发原文，占位符说明「已保存」与否。 */}
+          这样可以「先验再存」；密码框从不下发原文，占位符说明「已保存」与否。
+
+          ── 远端目录为什么从这张卡里撤掉了 ────────────────────────
+          它和地址 / 账号 / 密码看着像一类（都能改「连哪儿」），但改它的后果
+          完全不同：地址填错只是连不上，改一眼就看出来；远端目录改错会让两台
+          设备指向**两个互不相干的包**，各自同步都「成功」，却永远看不到对方
+          的数据 —— 这种错没有任何报错会提示。它的默认值（`agent2api-memory`）
+          对所有人都对，所以它从「怎么连」里拿出去，退回配置页「高级」那一栏，
+          要改的人自己会去找。这张卡只管三件事：连哪、用谁连、密码。 */}
       <section className='mm-cfg-card' ref={credentialCard}>
         <div className='mm-cfg-card-head'>
           <div className='mm-cfg-card-title'>{t('统一 WebDAV 服务器')}</div>
@@ -406,21 +412,6 @@ function Sync(): React.ReactElement {
           </label>
         </div>
 
-        {/* 远端目录必须在这一张卡里：它跟地址、账号、密码一样是「怎么连」的一部分
-            —— URL 的最后一段就是它，缺了它这张卡的三个输入框拼不出一个可用地址。 */}
-        <label className='mm-sync-field'>
-          <span className='mm-sync-field-label'>
-            {t('远端目录')}
-            <span className='mm-sync-field-aside'>{t('（记忆中枢在网盘上的根目录）')}</span>
-          </span>
-          <Input
-            value={current.remoteDir}
-            spellCheck={false}
-            placeholder='agent2api-memory'
-            onChange={event => put({ remoteDir: event.target.value })}
-          />
-        </label>
-
         <label className='mm-sync-field'>
           <span className='mm-sync-field-label'>
             {t('密码')}
@@ -457,7 +448,6 @@ function Sync(): React.ReactElement {
                   username: current.username,
                   // 空串 = 没动这一栏，交给后端沿用已保存的密码
                   password: current.password,
-                  remoteDir: current.remoteDir,
                 })
                 setTest({ ...result, from: 'setup' })
               })
@@ -477,7 +467,8 @@ function Sync(): React.ReactElement {
                   'sync.url': current.url,
                   'sync.username': current.username,
                   'sync.password': current.password,
-                  'sync.remoteDir': current.remoteDir,
+                  // `sync.remoteDir` 故意不发：这张卡不再管远端目录，不发 = 不改，
+                  // 已保存的值原样留在原地（配置页「高级」里才有它的入口）。
                   'sync.preset': current.preset,
                   'sync.deviceName': current.deviceName,
                 })
@@ -502,7 +493,7 @@ function Sync(): React.ReactElement {
         {confirmReset ? (
           <div className='mm-cfg-confirm'>
             <span>
-              {t('会清掉地址 / 账号 / 密码 / 目录这些同步配置（远端包与本机已同步的数据不动）。确定？')}
+              {t('会清掉地址 / 账号 / 密码这些同步配置（远端包与本机已同步的数据不动）。确定？')}
             </span>
             <div className='mm-inline-actions'>
               <Button

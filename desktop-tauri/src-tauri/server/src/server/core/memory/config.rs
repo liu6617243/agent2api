@@ -604,14 +604,24 @@ static SCHEMA: &[Knob] = &[
     // 改了不会让任何东西开始传 —— 已连同界面上那四个输入框一起删除。记忆的远端
     // 目录只有 `sync.remoteDir` 一个键，不再有第二个投影。
     // ── 这一整组为什么都不在配置页画控件（2026-11-25）────────────
-    // 「同步」页已经有完整的一套：地址 / 账号 / 密码 / 远端目录 / 预设 /
-    // 显示名各有输入框（`memory-tab-sync.tsx` 的凭据卡，保存走
-    // `POST /api/memory/sync/setup`），自动同步开关与间隔在同一个页面显示。
+    // 「同步」页已经有完整的一套：地址 / 账号 / 密码 / 预设 / 显示名各有输入框
+    // （`memory-tab-sync.tsx` 的凭据卡，保存走 `POST /api/memory/sync/setup`），
+    // 自动同步开关与间隔在同一个页面显示。
     // 配置页再抄一份，就成了「同一个值两处能改、两处各自的草稿互不相识」——
     // 用户在配置页改了地址没点保存，去同步页看到的还是旧值。
     //
     // 所以这一组在配置页只留指路。键本身照旧参与校验与落盘（同步页写的就是
     // 这些键），`every_knob_has_a_reader` 也仍然要求每个键都有读取点。
+    //
+    // ── `sync.remoteDir` 是唯一例外：它留在配置页（2026-11-25）───────
+    // 同步页的凭据卡只放「怎么连」的最小集合（连哪 / 用谁连 / 密码），远端目录
+    // 从那张卡里撤掉了：它看起来是同一个问题的一部分，后果却完全不同 —— 地址
+    // 填错只是连不上，一眼就能发现；目录改错会让两台设备各写一个互不相干的包，
+    // 两边都报「同步成功」却永远看不到对方的数据，且没有任何报错提示。
+    // 它的默认值 `agent2api-memory` 对所有人都对，所以不给它一个「顺手就能改」
+    // 的位置，只在这里留一个明确的入口，要改的人自己会来找。
+    // 注意这里**不能**再标 `owned_by(…, "sync")`：标了配置页就会把它藏起来并
+    // 指路到同步页，而同步页已经没有这个框了 —— 那就成了任何人都改不了。
     owned_by(knob("sync.enabled", Kind::Bool, Tier::Basic, "同步", "同步总开关", "true"), "sync"),
     owned_by(opts(knob_d("sync.provider", Kind::Enum, Tier::Basic, "同步", "存储类型",
         "本仓只实现 WebDAV；S3 需要重写打包与列目录，尚未接入",
@@ -627,8 +637,10 @@ static SCHEMA: &[Knob] = &[
         "经系统密钥加密后落 config.json，接口只回「已设置」；不进同步包", "\"\""), "sync"),
     owned_by(knob_d("sync.deviceName", Kind::Text, Tier::Advanced, "同步", "本机显示名",
         "留空 = 用系统电脑名（也读不到才退到设备 id）；随同步包上传，别的设备在设备列表里看到的就是它", "\"\""), "sync"),
-    owned_by(knob_d("sync.remoteDir", Kind::Text, Tier::Advanced, "同步", "远端目录名",
-        "同一账号下的多台设备共用这个目录", "\"agent2api-memory\""), "sync"),
+    // 远端目录的编辑入口**只在配置页**（上面已说明理由）：同步页的凭据卡撤掉了
+    // 这个框，所以这里不能标 `owned_by(…, "sync")`。
+    knob_d("sync.remoteDir", Kind::Text, Tier::Advanced, "同步", "远端目录名",
+        "同一账号下的多台设备必须一致：改它等于换一个远端包，两边都「成功」却看不到对方的数据", "\"agent2api-memory\""),
     owned_by(opts(knob_d("sync.preset", Kind::Enum, Tier::Advanced, "同步", "存储预设",
         "仅备忘：帮你记住这台服务器是哪家的，不改变任何同步行为", "\"custom\""),
         &["custom", "jianguoyun", "nextcloud", "synology", "fnos"]), "sync"),
