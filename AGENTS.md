@@ -23,8 +23,11 @@
 这一节写在这里而不是 `memory/` 里，是因为 **`AGENTS.md` 每轮都会进上下文，`memory/` 不会** —— 放在
 `memory/` 的规则等于没写（已因此重复踩坑三次）。凡「必须每次都生效」的规矩一律写进本文件。
 
-1. **「提交」= 本地 commit + `git push` 到 origin，一步做完。**
-   不要在 commit 后反问「要推吗 / 推哪个分支」。仍然受上面两条红线约束（版本号 / tag / Release 前必须确认）。
+1. **「提交」= 本地 commit + 推送 + **出 Windows 安装包**，一步做完。**
+   不要在 commit 后反问「要推吗 / 推哪个分支 / 要出包吗」，
+   也不要在只推完代码就收工 —— **推完没有包 = 没交付完**。
+   入口只有一条：`node scripts/deliver.mjs`（推代码 → 跑测试 → 等绿 → 出安装包）。
+   仍然受上面两条红线约束（版本号 / tag / Release 前必须确认）。
 2. **推送后不下载构建产物。** CI 绿了就是交付完成：**不要** `curl` exe / zip / 安装包到 `.workbuddy/dist/`
    或任何临时目录，也不要为了「校验」「验证一下」去下载。报「CI 绿 + run / artifact id」即可。
    只有用户**明确要产物文件**时才下。
@@ -50,13 +53,19 @@ node scripts/deliver.mjs --no-build   # 只跑测试与产物同源，不出包
 它做的整条链：
 
 ```
-git push HEAD:main-patched
+推 HEAD:main-patched（git push 走不通时自动改走 GitHub API 直推）
    ├─ 派发 rust-tests          ┐ 并行
    └─ 派发 frontend-artifacts  ┘
           ↓ 两个都绿才继续（任一失败 → 不派发出包，退出码 1）
      派发 build-windows → 打印安装包 artifact 文件名 / 大小 / id
 ```
 
+- **两条推送通道，闸门都挂着**：`git push` 走 `.githooks/pre-push` 钩子；
+  GitHub API 直推走 `scripts/push-local-commit.mjs` 自带的同名闸门。
+  放行词表统一：`A2A_DELIVER=1`（交付链路自己调）/ `A2A_SKIP_BUILD=1`（人明确说这次不出包）。
+  **不要绕过这两条通道自己写推送脚本** —— 2026-11-26 就是靠一条躺在
+  `.workbuddy/tmp/`（被 gitignore）里的脚本推的代码，绕过了全部闸门，
+  结果 CI 没跑、安装包没出。凡「推完代码忘了出包」，先查这条推送路径有没有闸门。
 - **为什么用派发而不是 push 触发**：三个工作流的 `push.branches` 写的是上游分支名
   `[main, beta]` / `[v3.3.0-beta.3]`，在本 fork（干活分支 `main-patched`）**从来不会因 push 自动跑**。
   治本是补触发面，但本机凭据是 classic PAT、scope 只有 `public_repo`，写 `.github/workflows/**`

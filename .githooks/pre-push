@@ -22,9 +22,21 @@
 # 而不是「安安静静推上去了，包没出」。
 #
 # ── 行为 ──────────────────────────────────────────────────────
-# · 推 main-patched 且未设 A2A_DELIVER=1 → 拦下，退出码 1，打印正确命令
+# · 推 main-patched 且未设 A2A_DELIVER=1 / A2A_SKIP_BUILD=1 → 拦下，退出码 1
 # · 由 deliver.mjs 发起（A2A_DELIVER=1）→ 放行
+# · 人明确说了这次不出包（A2A_SKIP_BUILD=1）→ 放行
 # · 其它分支 → 静默放行，不给日常推送添堵
+#
+# ── 两条推送通道，闸门要一起挂 ──────────────────────────────────
+# 2026-11-26 又漏了一次安装包，根因是**闸门只挂在一条通道上**：
+#
+#   通道 A：git push          → pre-push 钩子拦得住 ✓
+#   通道 B：GitHub API 直推   → 钩子根本不触发 ✗
+#
+# 本机到 github.com:443 经常整段不通，API 直推（scripts/push-local-commit.mjs）
+# 是唯一稳定的推代码通道，于是它成了绕过交付的暗道。
+# 现在通道 B 的脚本进了仓库，且**它自己**也带同一套闸门
+# （A2A_DELIVER=1 / A2A_SKIP_BUILD=1），两条通道词表一致。
 
 branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
 
@@ -36,6 +48,11 @@ esac
 
 # deliver.mjs 自己推的，放行
 if [ "${A2A_DELIVER:-}" = "1" ]; then
+  exit 0
+fi
+
+# 人明确说了这次不出包，放行
+if [ "${A2A_SKIP_BUILD:-}" = "1" ]; then
   exit 0
 fi
 
@@ -51,9 +68,12 @@ pre-push 拦下了这次推送。
     推代码 → 派发 rust-tests 与 frontend-artifacts → 等两个都绿
            → 派发 build-windows → 打印安装包 artifact 文件名与大小
 
+如果 git push 走不通（连不上 github.com:443），deliver.mjs 会自动改用
+GitHub API 直推，链路不断。
+
 只想推代码、确定不用出包（例如纯文档提交）时，可以显式放行：
 
-    A2A_DELIVER=1 git push origin HEAD:main-patched
+    A2A_SKIP_BUILD=1 git push origin HEAD:main-patched
 
 EOF
 exit 1

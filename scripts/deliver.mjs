@@ -250,10 +250,28 @@ function sha() {
   return execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
 }
 
-const SHA = sha()
-const SHORT = SHA.slice(0, 8)
+// ── 提交身份 ──────────────────────────────────────────────────────
+// SHA 必须是**可变的**：API 直推有一个副作用 —— GitHub 的 commit API 会剥掉
+// message 末尾的换行，本地 commit 与远端 commit 因此可能算出不同 sha，
+// 脚本会 `git reset --soft` 把本地对齐到远端那个 sha。此时「这次交付的提交」
+// 已经变了，后续所有按 head_sha 找 run 的逻辑必须用新的 sha，否则会一直
+// 找不到 run（判据：run 的 head_sha 必须等于本次真正推上远端的那个 commit）。
+let SHA = sha()
+let SHORT = SHA.slice(0, 8)
 
-function push() {
+/** 推送后重新读取本地 HEAD（API 直推对齐后 sha 会变）。 */
+function refreshSha() {
+  // 用户用 --sha 钉死了要交付的提交 → 不动它。
+  if (val('--sha', '')) return
+  const now = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+  if (now !== SHA) {
+    console.log(`  本地提交已对齐到远端 sha：${SHORT} → ${now.slice(0, 8)}`)
+    SHA = now
+    SHORT = now.slice(0, 8)
+  }
+}
+
+async function push() {
   const attempts = [
     ['origin'],
     ['https://ghfast.top/https://github.com/liu6617243/agent2api.git'],
@@ -280,7 +298,47 @@ function push() {
       console.log(`  失败：${msg.split('\n').slice(-3).join(' / ').slice(0, 200)}`)
     }
   }
-  return false
+
+  // ── 回退：GitHub REST API 直推 ────────────────────────────────
+  // 本机到 github.com:443 经常整段不通（Recv failure / CONNECT tunnel 502），
+  // 而 api.github.com 是通的 —— 所以 `git push` 不可用时，GitHub API 才是
+  // 本机唯一稳定的推代码通道。
+  //
+  // 关键：**这条回退必须留在交付链路内部**。历史上同一份脚本放在
+  // `.workbuddy/tmp/`（被 gitignore），于是它成了一条绕过交付的暗道 ——
+  // 推上去了，但 CI 没跑、安装包没出，2026-11-26 就这么漏过一次。
+  // 现在它进了仓库（scripts/push-local-commit.mjs），并且由本脚本调用，
+  // 推送成功后继续走闸门与出包，链路不会断。
+  console.log(`推送 ${SHORT} → ${REF}（GitHub API 直推）…`)
+  try {
+    const { pushViaApi } = await import('./push-local-commit.mjs')
+    // 推的是 HEAD（与上面 git push HEAD:REF 同一个东西）。
+    // SHA 可能被 --sha 钉成别的提交，那只影响「按哪个 head_sha 找 run」，
+    // 不影响「推哪个 commit」。
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const out = await pushViaApi({
+      token: TOKEN,
+      repo: REPO,
+      branch: REF,
+      localSha: head,
+      cwd: ROOT,
+      log: (m) => console.log(`  ${m}`),
+    })
+    if (!out.ok) {
+      console.log(`  失败（${out.reason}）：${out.message}`)
+      return false
+    }
+    if (out.alreadyUpToDate) {
+      console.log('  远端已是最新')
+      return true
+    }
+    console.log('  推送成功')
+    refreshSha()
+    return true
+  } catch (e) {
+    console.log(`  失败：${String(e?.message || e).slice(0, 300)}`)
+    return false
+  }
 }
 
 // ── 2. 派发 ─────────────────────────────────────────────────────────
@@ -603,7 +661,7 @@ async function main() {
   if (!NO_PUSH) await rustGate()
 
   if (!NO_PUSH) {
-    if (!push()) {
+    if (!(await push())) {
       console.error('推送失败，链路中止。')
       process.exit(1)
     }

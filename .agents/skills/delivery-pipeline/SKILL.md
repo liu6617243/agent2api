@@ -18,7 +18,7 @@ description: Agent2API（workbuddy）本 fork 的**交付流水线**规范 —�
 
 ```
 node scripts/deliver.mjs
-   ├─ git push HEAD:main-patched
+   ├─ 推 HEAD:main-patched（git push 走不通时自动改走 GitHub API 直推）
    ├─ 派发 rust-tests          服务端与插件联调（ubuntu / windows / macos 三平台）  ┐ 并行
    ├─ 派发 frontend-artifacts  入库前端产物必须与源码逐字节同源                    ┘
    │        ↓ 两个都绿才继续（任一失败 → 不派发出包，退出码 1）
@@ -31,6 +31,30 @@ node scripts/deliver.mjs
 - `build-windows` 是**出包**：Tauri `nsis` target，exe 直传（`archive:false`，下载下来就是 exe 本体）。
 - 顺序是**串行依赖**，不是并行 —— 出包必须等前两道绿。派发路径上这件事由 `deliver.mjs` 负责；
   触发面补丁上线后由 `build-windows` 的 `gate` job 负责（见 §2）。
+
+## 1.2 「提交」= 推代码 + 出安装包，一步做完（2026-11-26 血的教训）
+
+**只推代码、没出包 = 没交付完。** 入口只有 `node scripts/deliver.mjs`，不要自己拼推送 + 手动 dispatch。
+
+本机有**两条推送通道**，两条都必须带闸门（2026-11-26 就是漏了第二条）：
+
+| 通道 | 闸门在哪 | 放行词 |
+|---|---|---|
+| `git push` | `.githooks/pre-push` | `A2A_DELIVER=1`（交付链路）/ `A2A_SKIP_BUILD=1`（明确不出包） |
+| GitHub API 直推 | `scripts/push-local-commit.mjs` 自带 | 同上 |
+
+**为什么必须有第二条**：本机到 `github.com:443` 经常整段不通（`Recv failure: Connection was reset` /
+`CONNECT tunnel 502`），而 `api.github.com` 是通的。于是 `scripts/push-local-commit.mjs`
+（GitHub Git Data API，复刻 commit 全部元数据使两端 sha 一致）是本机唯一稳定的推代码通道。
+
+**那次是怎么漏的**：该脚本当时躺在 `.workbuddy/tmp/`（被 `.gitignore` 忽略、不受版本管理），
+绕过了 `pre-push` 钩子；推完只手动 dispatch 了 `frontend-artifacts`，没走完整链路，
+于是 `rust-tests` 与 `build-windows` 都没跑，安装包也没出。
+现在脚本进了仓库，闸门跟 `pre-push` **用同一套词表**。
+
+**规矩**：不要自己写推送脚本，更不要写在 `.workbuddy/tmp/` 里（那个目录不进版本管理 = 没有闸门）。
+要推就用 `node scripts/deliver.mjs`；确实只推代码不出包（纯文档提交）才用
+`A2A_SKIP_BUILD=1`，且必须是你明确知道自己在做什么。
 
 ## 1.5 为什么是「派发」而不是「push 触发」（2026-11-20 的现实约束）
 
