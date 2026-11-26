@@ -1,8 +1,8 @@
 import * as React from 'react'
-import { Badge, Button, SegmentedControl } from '@ui'
+import { Badge, Button } from '@ui'
 import { t } from '../i18n'
 import * as s from './skills-hub-api'
-import { Empty, HealthBadge, Panel, ago, toast, useLoad } from './skills-hub-shared'
+import { Empty, Panel, toast, useLoad } from './skills-hub-shared'
 
 /**
  * 技能仓库 · 技能库。
@@ -22,9 +22,11 @@ import { Empty, HealthBadge, Panel, ago, toast, useLoad } from './skills-hub-sha
  *   错误    —— 缺 SKILL.md / 缺 description（客户端不认）
  *   警告    —— 能跑但可能触发不出（缺 frontmatter / 描述超长）
  *
- * ── 为什么卡片上要显示 treeHash 前 8 位 ─────────────────────
- * 「这两个是不是同一份内容」是这一页最常被问的问题，而内容树哈希是唯一判据。
- * 全串 64 位太吵，前 8 位足以在几十个技能里肉眼比对（L1 合并时也是整串比对）。
+ * ── 版式为什么要「彩色圆点 + 单一状态徽标」──────────────────
+ * 早先把「已收纳 / 挂载 N / 失效 N / 指纹前 8 位 / 来源」五六枚标签全塞在卡片
+ * 底部，扫一眼读不出「这个技能现在到底能不能用」。现在把状态收到一处：左边一
+ * 枚圆点（绿=已挂载、蓝=待收纳、灰=未挂载、红=有硬伤），右上角一枚徽标写明，
+ * 其余细节（指纹、来源、时间）留给详情抽屉 —— 卡片只回答「受管到哪一步」。
  */
 
 type Filter = 'all' | 'mounted' | 'unmounted' | 'pending' | 'error' | 'warn'
@@ -38,6 +40,15 @@ const FILTERS: { key: Filter; label: string }[] = [
   { key: 'error', label: t('错误') },
   { key: 'warn', label: t('警告') },
 ]
+
+/** 每个筛选胶囊前面那枚小圆点用哪种颜色；`全部` 不画点。 */
+const FILTER_DOT: Record<Exclude<Filter, 'all'>, string> = {
+  mounted: 'sk-dot-ok',
+  unmounted: 'sk-dot-muted',
+  pending: 'sk-dot-pending',
+  error: 'sk-dot-bad',
+  warn: 'sk-dot-warn',
+}
 
 function match(row: s.LibraryRow, filter: Filter): boolean {
   const issues = row.health ?? []
@@ -60,14 +71,57 @@ function match(row: s.LibraryRow, filter: Filter): boolean {
   }
 }
 
+/**
+ * 一张卡片的状态：圆点配色 + 右上角徽标。
+ * 优先级：已挂载（有硬伤也标红点）> 未登记/自带 > 待收纳 > 未挂载。
+ */
+function cardStatus(row: s.LibraryRow): { dot: string; label: string; variant: 'success' | 'warning' | 'brand' | 'outline' } {
+  const mounts = row.mounts ?? []
+  const valid = mounts.filter(item => item.valid)
+  const hasBad = (row.health ?? []).some(item => item.level === 'bad')
+
+  if (valid.length > 0) {
+    return { dot: hasBad ? 'sk-dot-bad' : 'sk-dot-ok', label: t('已挂载'), variant: 'success' }
+  }
+  if (!row.inManifest) {
+    if (row.origin === 'hub-extra') return { dot: 'sk-dot-warn', label: t('中央未登记'), variant: 'warning' }
+    if (row.origin === 'system') return { dot: 'sk-dot-muted', label: t('客户端自带'), variant: 'outline' }
+    return { dot: hasBad ? 'sk-dot-bad' : 'sk-dot-pending', label: t('待收纳'), variant: 'brand' }
+  }
+  return { dot: hasBad ? 'sk-dot-bad' : 'sk-dot-muted', label: t('未挂载'), variant: 'outline' }
+}
+
+/** 卡片底部那排来源胶囊：优先用扫描到的来源工具，其次回落到台账号上的 tool。 */
+function sourceTools(row: s.LibraryRow): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const source of row.sources ?? []) {
+    if (source.tool && !seen.has(source.tool)) { seen.add(source.tool); out.push(source.tool) }
+  }
+  if (out.length === 0 && row.tool && !seen.has(row.tool)) out.push(row.tool)
+  return out
+}
+
+/** 「上次扫描」用的短时间：月-日 时:分，和参考图的 11-26 08:17 同形。 */
+function scanTime(timestamp: number | null | undefined): string {
+  if (!timestamp || timestamp <= 0) return ''
+  const date = new Date(timestamp)
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
 type Props = { onOpenSkill: (name: string) => void; onOpenSettings: () => void }
 
 function Library({ onOpenSkill, onOpenSettings }: Props): React.ReactElement {
   const library = useLoad(() => s.loadLibrary(), [], { refreshOnEnter: true })
+  const check = useLoad(() => s.loadDailyCheck(), [], { refreshOnEnter: true })
   const [filter, setFilter] = React.useState<Filter>('all')
   const [query, setQuery] = React.useState('')
+  const [refreshing, setRefreshing] = React.useState(false)
+  const [repairing, setRepairing] = React.useState(false)
 
   const items = library.data?.items ?? []
+  const last = check.data?.last ?? null
   const counts = {
     all: items.length,
     mounted: items.filter(row => match(row, 'mounted')).length,
@@ -89,27 +143,92 @@ function Library({ onOpenSkill, onOpenSettings }: Props): React.ReactElement {
       )
     })
 
+  // 「立即刷新」不只是重读缓存，而是真触发一次扫描（`runDailyCheck` 就是给
+  // 「上次扫描」时间戳供数的那条链路）；扫完把列表与状态一起重拉。
+  const refreshNow = (): void => {
+    setRefreshing(true)
+    void s.runDailyCheck(false)
+      .then(result => {
+        toast(result.summary, result.ok ? 'ok' : 'err')
+      })
+      .catch(error => toast(t('刷新失败：{error}', { error: String(error) }), 'err'))
+      .finally(() => {
+        setRefreshing(false)
+        library.reload()
+        check.reload()
+      })
+  }
+
+  const repair = (): void => {
+    setRepairing(true)
+    void s.repairMounts()
+      .then(result => {
+        toast(t('修复 {n} 处挂载', { n: result.repaired }), result.repaired > 0 ? 'ok' : undefined)
+        library.reload()
+        check.reload()
+      })
+      .catch(error => toast(t('修复失败：{error}', { error: String(error) }), 'err'))
+      .finally(() => setRepairing(false))
+  }
+
   return (
     <Panel loading={library.loading} error={library.error} onRetry={library.reload}>
       <div className='sk-lib'>
+        {/* ── 扫描状态行：上一轮扫描时间 + 两个动作 ── */}
+        <div className='sk-lib-status'>
+          <span className='sk-lib-status-text'>
+            <svg className='sk-lib-status-icon' viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round' aria-hidden='true'>
+              <circle cx='12' cy='12' r='9' />
+              <path d='M12 7v5l3 2' />
+            </svg>
+            {last
+              ? t('上次扫描 {time}', { time: scanTime(last.checkedAt) })
+              : t('尚未扫描')}
+          </span>
+          <span className='sk-lib-status-actions'>
+            <Button type='button' size='sm' variant='ghost' onClick={onOpenSettings}>
+              {t('配置渠道')}
+            </Button>
+            <Button type='button' size='sm' variant='outline' disabled={repairing} onClick={repair}>
+              {repairing ? t('修复中…') : t('修复挂载')}
+            </Button>
+            <Button type='button' size='sm' variant='default' disabled={refreshing} onClick={refreshNow}>
+              {refreshing ? t('扫描中…') : t('立即刷新')}
+            </Button>
+          </span>
+        </div>
+
+        {/* ── 工具栏：搜索在左、带色点计数的筛选胶囊在右 ── */}
         <div className='sk-lib-bar'>
-          <SegmentedControl
-            options={FILTERS.map(item => ({
-              value: item.key,
-              label: item.label,
-              count: counts[item.key],
-            }))}
-            value={filter}
-            onValueChange={value => setFilter(value as Filter)}
-            aria-label={t('技能状态筛选')}
-          />
-          <input
-            className='sk-search'
-            type='search'
-            value={query}
-            placeholder={t('搜技能名或描述…')}
-            onChange={event => setQuery(event.target.value)}
-          />
+          <label className='sk-search-wrap'>
+            <svg className='sk-search-icon' viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round' aria-hidden='true'>
+              <circle cx='11' cy='11' r='7' />
+              <path d='m20 20-3.2-3.2' />
+            </svg>
+            <input
+              className='sk-search'
+              type='search'
+              value={query}
+              placeholder={t('搜索技能名称或描述，例如 gsap、设计、部署')}
+              onChange={event => setQuery(event.target.value)}
+            />
+          </label>
+          <div className='sk-filter-pills' role='tablist' aria-label={t('技能状态筛选')}>
+            {FILTERS.map(item => (
+              <button
+                key={item.key}
+                type='button'
+                role='tab'
+                aria-selected={filter === item.key}
+                className={`sk-filter-pill${filter === item.key ? ' is-active' : ''}`}
+                onClick={() => setFilter(item.key)}
+              >
+                {item.key === 'all' ? null : <span className={`sk-dot ${FILTER_DOT[item.key]}`} />}
+                <span className='sk-filter-label'>{item.label}</span>
+                <span className='sk-filter-count'>{counts[item.key]}</span>
+              </button>
+            ))}
+          </div>
         </div>
 
         {visible.length === 0 ? (
@@ -121,9 +240,8 @@ function Library({ onOpenSkill, onOpenSettings }: Props): React.ReactElement {
         ) : (
           <div className='sk-skill-grid'>
             {visible.map(row => {
-              const mounts = row.mounts ?? []
-              const valid = mounts.filter(item => item.valid)
-              const bad = mounts.filter(item => !item.valid)
+              const status = cardStatus(row)
+              const chips = sourceTools(row)
               return (
                 <button
                   key={`${row.origin}-${row.tool ?? ''}-${row.name}`}
@@ -132,74 +250,24 @@ function Library({ onOpenSkill, onOpenSettings }: Props): React.ReactElement {
                   onClick={() => onOpenSkill(row.name)}
                 >
                   <div className='sk-skill-head'>
-                    <span className='sk-skill-name'>{row.skillName || row.name}</span>
-                    <HealthBadge issues={row.health} />
+                    <span className={`sk-dot sk-skill-dot ${status.dot}`} aria-hidden='true' />
+                    <span className='sk-skill-name' title={row.skillName || row.name}>{row.skillName || row.name}</span>
+                    <Badge className='sk-skill-badge' variant={status.variant} shape='tag'>{status.label}</Badge>
                   </div>
                   <div className='sk-skill-desc'>{row.description || t('（没有 description，Agent 触发不出这个技能）')}</div>
-                  <div className='sk-skill-foot'>
-                    <span className='sk-skill-tags'>
-                      {row.inManifest ? (
-                        <Badge variant='success' shape='tag'>{t('已收纳')}</Badge>
-                      ) : row.origin === 'hub-extra' ? (
-                        <Badge variant='warning' shape='tag'>{t('中央未登记')}</Badge>
-                      ) : row.origin === 'system' ? (
-                        <Badge variant='outline' shape='tag'>{t('客户端自带')}</Badge>
-                      ) : (
-                        <Badge variant='outline' shape='tag'>{t('待收纳')}</Badge>
-                      )}
-                      {valid.length > 0 ? (
-                        <Badge variant='brand' shape='tag'>{t('挂载 {n}', { n: valid.length })}</Badge>
-                      ) : null}
-                      {bad.length > 0 ? (
-                        <Badge variant='destructive' shape='tag'>{t('失效 {n}', { n: bad.length })}</Badge>
-                      ) : null}
-                    </span>
-                    <span className='sk-skill-hash' title={row.treeHash || ''}>
-                      {(row.treeHash ?? '').slice(0, 8) || '—'}
-                    </span>
-                  </div>
-                  {(row.sources ?? []).length > 0 ? (
+                  {chips.length > 0 ? (
                     <div className='sk-skill-sources'>
-                      {(row.sources ?? []).slice(0, 4).map((source, at) => (
-                        <span key={`${source.tool}-${at}`} className='sk-skill-source'>{source.tool}</span>
+                      {chips.slice(0, 4).map(tool => (
+                        <span key={tool} className='sk-skill-source'>{tool}</span>
                       ))}
-                      {(row.sources ?? []).length > 4 ? (
-                        <span className='sk-skill-source'>+{(row.sources ?? []).length - 4}</span>
-                      ) : null}
+                      {chips.length > 4 ? <span className='sk-skill-source'>+{chips.length - 4}</span> : null}
                     </div>
                   ) : null}
-                  {row.mtimeMs ? <div className='sk-skill-time'>{ago(row.mtimeMs)}</div> : null}
                 </button>
               )
             })}
           </div>
         )}
-
-        <div className='sk-lib-foot'>
-          <span className='sk-muted'>
-            {t('共 {n} 个技能；收纳后在渠道目录里只留指向中央的链接', { n: visible.length })}
-          </span>
-          <span className='sk-lib-foot-actions'>
-            <Button type='button' size='sm' variant='ghost' onClick={onOpenSettings}>
-              {t('配置渠道')}
-            </Button>
-            <Button
-              type='button'
-              size='sm'
-              variant='outline'
-              onClick={() => {
-                void s.repairMounts()
-                  .then(result => {
-                    toast(t('修复 {n} 处挂载', { n: result.repaired }), result.repaired > 0 ? 'ok' : undefined)
-                    library.reload()
-                  })
-                  .catch(error => toast(t('修复失败：{error}', { error: String(error) }), 'err'))
-              }}
-            >
-              {t('修复失效挂载')}
-            </Button>
-          </span>
-        </div>
       </div>
     </Panel>
   )

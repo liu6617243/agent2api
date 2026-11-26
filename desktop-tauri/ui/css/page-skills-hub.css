@@ -336,6 +336,31 @@
 
 /* ── 技能库 ── */
 .sk-lib { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+
+/* 扫描状态行：整条右对齐 —— [上次扫描时间 · 修复挂载 · 立即刷新]。与工具栏之间
+   不留分隔线，用留白区分层级 —— 参考图里这一条是「背景信息」，不该抢工具栏的视觉权重。 */
+.sk-lib-status {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+  flex: none;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.sk-lib-status-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+/* 状态文字与动作按钮同处一条右对齐的组（参考图即如此）：扫描时间是背景信息，
+   不该抢左侧工具栏的注意力。 */
+.sk-lib-status-icon { width: 13px; height: 13px; flex: none; opacity: .75; }
+.sk-lib-status-actions { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+/* 工具栏：搜索（左，撑开）+ 筛选胶囊组（右）。窄窗口时整行换行。 */
 .sk-lib-bar {
   display: flex;
   align-items: center;
@@ -344,32 +369,97 @@
   flex-wrap: wrap;
   flex: none;
 }
-.sk-search {
-  width: 260px;
-  max-width: 100%;
-  padding: 5px 10px;
+.sk-search-wrap {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1 1 260px;
+  min-width: 200px;
+  max-width: 420px;
+  padding: 0 11px;
+  height: 32px;
   border: 1px solid var(--border);
-  border-radius: var(--r-sm);
+  border-radius: var(--r-pill);
   background: var(--surface-inset);
+  transition: border-color 120ms ease;
+}
+.sk-search-wrap:focus-within { border-color: var(--primary-bd); }
+.sk-search-icon { width: 14px; height: 14px; flex: none; color: var(--text-3); }
+.sk-search {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
   color: var(--text);
   font-size: 12px;
   font-family: inherit;
+  outline: none;
 }
 .sk-search::placeholder { color: var(--text-3); }
-.sk-search:focus { outline: none; border-color: var(--primary-bd); }
 
-/* 卡片网格：最小 240px，窄窗口自动降列而不是挤成一条。 */
+/* 筛选胶囊：一枚枚圆角药丸，选中态用主色描边 + 柔底。 */
+.sk-filter-pills { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.sk-filter-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface-inset);
+  color: var(--text-2);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+.sk-filter-pill:hover { border-color: var(--border-strong); color: var(--text); }
+.sk-filter-pill.is-active {
+  border-color: var(--primary-bd);
+  background: var(--primary-soft);
+  color: var(--primary-fg);
+}
+.sk-filter-pill:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.sk-filter-label { line-height: 1; }
+.sk-filter-count {
+  min-width: 16px;
+  text-align: center;
+  font-size: 10.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
+.sk-filter-pill.is-active .sk-filter-count { color: var(--primary-fg); }
+
+/* 状态圆点：卡片头与筛选胶囊共用同一套配色。 */
+.sk-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.sk-dot-ok { background: var(--ok); }
+.sk-dot-pending { background: var(--primary); }
+.sk-dot-muted { background: var(--text-3); opacity: .55; }
+.sk-dot-warn { background: var(--warn); }
+.sk-dot-bad { background: var(--danger); }
+
+/* 卡片网格：固定三列宽卡。窄窗口按断点降为两列 / 单列，不挤成一条。 */
 .sk-skill-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
   min-width: 0;
+}
+@media (max-width: 1180px) {
+  .sk-skill-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 820px) {
+  .sk-skill-grid { grid-template-columns: minmax(0, 1fr); }
 }
 .sk-skill-card {
   display: flex;
   flex-direction: column;
-  gap: 7px;
-  padding: 11px 13px;
+  gap: 8px;
+  padding: 13px 15px;
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--surface);
@@ -388,10 +478,10 @@
 .sk-skill-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
   min-width: 0;
 }
+.sk-skill-dot { width: 8px; height: 8px; }
 .sk-skill-name {
   font-size: 12.5px;
   font-weight: 600;
@@ -400,8 +490,11 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+  flex: 1;
   font-family: var(--font-mono);
 }
+/* 卡片右上的状态徽标不参与收缩；名称先让位。 */
+.sk-skill-badge { flex: none; }
 /* 描述截两行：技能描述往往是一整句「把 X 转成 Y」，一行看不完，全展示又
    会把卡片高度撑得参差不齐。 */
 .sk-skill-desc {
@@ -413,51 +506,22 @@
   -webkit-box-orient: vertical;
   overflow: hidden;
   overflow-wrap: anywhere;
-}
-.sk-skill-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-top: auto;
-}
-.sk-skill-tags { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; min-width: 0; }
-.sk-skill-hash {
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  color: var(--text-3);
-  flex: none;
+  min-height: calc(1.6em * 2);
 }
 .sk-skill-sources {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
-  padding-top: 6px;
-  border-top: 1px solid var(--hairline);
+  margin-top: auto;
 }
 .sk-skill-source {
-  padding: 1px 6px;
+  padding: 1.5px 8px;
   border-radius: var(--r-pill);
+  border: 1px solid var(--hairline);
   background: var(--surface-inset);
   font-size: 10.5px;
   color: var(--text-3);
 }
-.sk-skill-time {
-  font-size: 10.5px;
-  color: var(--text-3);
-  font-variant-numeric: tabular-nums;
-}
-
-.sk-lib-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  flex-wrap: wrap;
-  padding-top: 2px;
-}
-.sk-lib-foot-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 
 .sk-muted { font-size: 11.5px; color: var(--text-3); }
 
@@ -685,10 +749,294 @@
 }
 
 /* ── 配置 ── */
-.sk-settings { display: flex; flex-direction: column; gap: 12px; }
+.sk-cfg { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 
-/* 一行开关：左侧「标签 + 说明」占弹性，右侧控件定宽右对齐。
-   说明文字必须能换行 —— 挂载模式的解释有好几行，截断就说不清后果了。 */
+/* 页头 */
+.sk-cfg-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  flex: none;
+}
+.sk-cfg-title { font-size: 14px; font-weight: 600; color: var(--text); }
+.sk-cfg-head-actions { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* 档位（同页内的分区切换） */
+.sk-cfg-tabs { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; flex: none; }
+.sk-cfg-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface-inset);
+  color: var(--text-2);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+.sk-cfg-tab:hover { border-color: var(--border-strong); color: var(--text); }
+.sk-cfg-tab.is-active { border-color: var(--primary-bd); background: var(--primary-soft); color: var(--primary-fg); }
+.sk-cfg-tab:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.sk-cfg-tab-count {
+  min-width: 16px;
+  padding: 0 4px;
+  text-align: center;
+  font-size: 10.5px;
+  font-weight: 600;
+  border-radius: var(--r-pill);
+  background: var(--surface-3, var(--surface-inset));
+  color: var(--text-3);
+}
+.sk-cfg-tab.is-active .sk-cfg-tab-count { background: var(--surface-2, var(--surface-inset)); color: var(--primary-fg); }
+
+/* 常用渠道推荐 */
+.sk-cfg-recommend {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 11px 13px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  flex: none;
+}
+.sk-cfg-recommend-title { font-size: 11.5px; color: var(--text-3); }
+.sk-cfg-recommend-chips { display: flex; flex-wrap: wrap; gap: 7px; }
+.sk-cfg-rec-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 28px;
+  padding: 0 10px 0 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface-inset);
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+.sk-cfg-rec-chip:hover { border-color: var(--border-strong); }
+.sk-cfg-rec-chip.is-ready { border-color: var(--ok-bd, var(--border)); }
+.sk-cfg-rec-chip:disabled { opacity: .5; cursor: default; }
+.sk-cfg-rec-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  flex: none;
+}
+.sk-cfg-rec-name { color: var(--text); }
+.sk-cfg-rec-state { font-size: 10.5px; color: var(--text-3); }
+.sk-cfg-rec-chip.is-ready .sk-cfg-rec-state { color: var(--ok); }
+
+/* 工具栏：筛选（左）+ 搜索 / 扫描 / 新增（右） */
+.sk-cfg-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: none;
+}
+.sk-cfg-filters { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-right: auto; }
+.sk-cfg-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.sk-cfg-filter:hover { background: var(--surface-inset); color: var(--text); }
+.sk-cfg-filter.is-active { background: var(--primary-soft); color: var(--primary-fg); }
+.sk-cfg-filter-count { font-size: 10.5px; font-weight: 600; font-variant-numeric: tabular-nums; opacity: .85; }
+.sk-cfg-searchbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  max-width: 240px;
+  flex: 1 1 180px;
+}
+.sk-cfg-searchbox:focus-within { border-color: var(--primary-bd); }
+.sk-cfg-search-icon { width: 13px; height: 13px; flex: none; color: var(--text-3); }
+.sk-cfg-search {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 11.5px;
+  font-family: inherit;
+  outline: none;
+}
+.sk-cfg-search::placeholder { color: var(--text-3); }
+
+/* 渠道卡片网格：三列。 */
+.sk-cfg-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+@media (max-width: 1180px) {
+  .sk-cfg-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 820px) {
+  .sk-cfg-grid { grid-template-columns: minmax(0, 1fr); }
+}
+.sk-cfg-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  min-width: 0;
+  transition: border-color 120ms ease;
+}
+.sk-cfg-card:hover { border-color: var(--border-strong); }
+.sk-cfg-card.is-off { opacity: .62; }
+.sk-cfg-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--r-sm);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 700;
+  flex: none;
+}
+.sk-cfg-card-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.sk-cfg-card-top { display: flex; align-items: center; gap: 7px; min-width: 0; flex-wrap: wrap; }
+.sk-cfg-card-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sk-cfg-card-id {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sk-cfg-card-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--warn);
+  min-width: 0;
+  overflow: hidden;
+}
+.sk-cfg-card-status.is-hit { color: var(--text-3); }
+.sk-cfg-warn { flex: none; }
+.sk-cfg-check { color: var(--ok); flex: none; }
+.sk-cfg-path {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sk-cfg-card-control { display: inline-flex; align-items: center; gap: 8px; flex: none; align-self: center; }
+.sk-cfg-path-pill {
+  padding: 2px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-pill);
+  background: var(--surface-inset);
+  font-size: 10.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+/* 自定义目录 */
+.sk-cfg-custom {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 2px;
+  padding: 12px 13px;
+  border: 1px dashed var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+.sk-cfg-custom-title { font-size: 12px; font-weight: 600; color: var(--text); }
+.sk-cfg-custom-hint { font-size: 11.5px; line-height: 1.6; color: var(--text-3); }
+.sk-cfg-custom-list { display: flex; flex-direction: column; gap: 4px; }
+.sk-cfg-custom-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 9px;
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  min-width: 0;
+}
+.sk-cfg-custom-item > code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sk-cfg-add-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sk-cfg-add-row > .sk-input { flex: 1 1 240px; }
+
+/* 检测 / 回收站面板（复用 .sk-field） */
+.sk-cfg-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 14px 15px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface);
+}
+.sk-cfg-panel-title { font-size: 12.5px; font-weight: 600; color: var(--text); }
+.sk-cfg-panel-hint { font-size: 11.5px; line-height: 1.6; color: var(--text-3); margin-bottom: 6px; }
+.sk-cfg-trash-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+
+/* 一行开关：左侧「标签 + 说明」占弹性，右侧控件定宽右对齐。 */
 .sk-field {
   display: flex;
   align-items: flex-start;
@@ -729,68 +1077,6 @@
 .sk-input:focus { outline: none; border-color: var(--primary-bd); }
 /* 数字输入框固定窄宽：留宽了会让人以为能填路径 */
 .sk-input-num { width: 84px; text-align: right; font-variant-numeric: tabular-nums; }
-
-.sk-add-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  padding-top: 8px;
-}
-.sk-add-row > .sk-input { flex: 1 1 240px; }
-
-.sk-custom-dirs { display: flex; flex-direction: column; gap: 4px; padding-top: 8px; }
-.sk-custom-dir {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 5px 8px;
-  border-radius: var(--r-sm);
-  background: var(--surface-inset);
-  min-width: 0;
-}
-.sk-custom-dir > code {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-2);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
-
-/* 探测建议：只给建议、不自动加，所以整块用虚线框 —— 视觉上就是「还没生效」 */
-.sk-suggest {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 10px;
-  padding: 10px 12px;
-  border: 1px dashed var(--border);
-  border-radius: var(--r-sm);
-  background: var(--surface-inset);
-}
-.sk-suggest-list { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.sk-suggest-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  padding: 4px 0;
-  min-width: 0;
-}
-.sk-suggest-name { font-size: 11.5px; color: var(--text-2); }
-.sk-suggest-dir {
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  color: var(--text-3);
-  flex: 1 1 200px;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 
 /* ── 键值对（详情 / 差异链接 / 配置-位置）────────────────────
    两列 grid：「键」固定 72px、「值」弹性并在需要时换行（路径很长）。 */
