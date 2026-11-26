@@ -116,7 +116,8 @@ pub fn overview() -> Value {
         .map(|row| {
             let id = row.get("id").and_then(Value::as_str).unwrap_or("");
             let dir = row.get("dir").and_then(Value::as_str).unwrap_or("");
-            let skill_count = if dir.is_empty() { 0 } else { scan::count_skill_dirs(std::path::Path::new(dir)) };
+            let skill_count =
+                if dir.is_empty() { 0 } else { scan::count_channel_skills(std::path::Path::new(dir)) };
             let mounts = planned
                 .get("mountHealth")
                 .and_then(Value::as_array)
@@ -141,6 +142,22 @@ pub fn overview() -> Value {
         .collect();
 
     let manifest_map = store::manifest_names(&manifest);
+    // 页头「N 个技能」要回答的是「本机到底有几个技能」（= 技能库列表的「全部」）：
+    // 本轮扫到的（含链接挂进来的）与台账里的取并集。中央真身目录里的数量仍按
+    // `skillCount` 单独报，两者不是一回事。
+    let mut visible: Vec<String> = Vec::new();
+    for item in planned.get("scanned").and_then(Value::as_array).into_iter().flatten() {
+        let name = text(item, "name");
+        if !name.is_empty() && !visible.contains(&name) {
+            visible.push(name);
+        }
+    }
+    for name in manifest_map.keys() {
+        if !visible.contains(name) {
+            visible.push(name.clone());
+        }
+    }
+    let visible_count = visible.len();
     let source_count: usize = manifest_map
         .values()
         .map(|entry| {
@@ -175,6 +192,7 @@ pub fn overview() -> Value {
         "skillsDir": skills_root.to_string_lossy(),
         "manifestCount": manifest_map.len(),
         "skillCount": store::skill_names().len(),
+        "visibleSkills": visible_count,
         "sourceCount": source_count,
         "l1Merged": dedupe_merged,
         "brokenMounts": broken,
@@ -254,6 +272,13 @@ pub fn library() -> Value {
     for skill in &scanned {
         let name = text(skill, "name");
         let dir = text(skill, "dir");
+        // 扫描层的 origin 只有三种：system（客户端自带）/ link（别的中枢挂进来
+        // 的链接，真身不归本机管）/ 其余按 channel 显示。
+        let origin = match text(skill, "origin").as_str() {
+            "system" => "system",
+            "link" => "link",
+            _ => "channel",
+        };
         let existing = rows.iter_mut().find(|row| text(row, "name") == name);
         if let Some(row) = existing {
             row["description"] = skill.get("description").cloned().unwrap_or(json!(""));
@@ -261,9 +286,10 @@ pub fn library() -> Value {
             row["treeHash"] = skill.get("treeHash").cloned().unwrap_or(json!(""));
             row["health"] = skill.get("health").cloned().unwrap_or(json!([]));
             row["mtimeMs"] = skill.get("mtimeMs").cloned().unwrap_or(json!(0));
-            row["origin"] = json!(if text(skill, "origin") == "system" { "system" } else { "channel" });
+            row["origin"] = json!(origin);
             row["tool"] = skill.get("tool").cloned().unwrap_or(Value::Null);
             row["dir"] = json!(dir);
+            row["linkTarget"] = skill.get("linkTarget").cloned().unwrap_or(json!(""));
             continue;
         }
         rows.push(json!({
@@ -273,7 +299,8 @@ pub fn library() -> Value {
                 .and_then(Value::as_object)
                 .map(|map| map.contains_key(&name))
                 .unwrap_or(false),
-            "origin": if text(skill, "origin") == "system" { "system" } else { "channel" },
+            "origin": origin,
+            "linkTarget": skill.get("linkTarget").cloned().unwrap_or(json!("")),
             "skillName": skill.get("skillName").cloned().unwrap_or(Value::Null),
             "description": skill.get("description").cloned().unwrap_or(json!("")),
             "version": skill.get("version").cloned().unwrap_or(json!("")),
@@ -574,12 +601,22 @@ pub fn run_daily_check(auto_mount: bool) -> Value {
     let orphans = planned.get("orphans").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
     let hub_extra = planned.get("hubExtra").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
 
-    let ok = broken == 0 && conflicts == 0 && orphans == 0 && hub_extra == 0;
+    // 「巡检失败」只认硬故障：失效挂载与待裁决冲突。
+    //
+    // 孤儿与中央未登记是「有东西可以纳管」的提示，不该把整轮结果染成失败 ——
+    // 渠道里永远可能有别人放进去的技能，判失败的话用户每次点刷新都吃一条红字，
+    // 几轮之后就学会无视这个信号。
+    let ok = broken == 0 && conflicts == 0;
+    let pending = if orphans == 0 && hub_extra == 0 {
+        String::new()
+    } else {
+        format!("，另可纳管 孤儿 {orphans} / 中央未登记 {hub_extra}")
+    };
     let summary = if ok {
-        format!("{tools_hit}/{tools_total} 个渠道连通，没有失效挂载与待裁决项")
+        format!("{tools_hit}/{tools_total} 个渠道连通，没有失效挂载与待裁决项{pending}")
     } else {
         format!(
-            "{tools_hit}/{tools_total} 个渠道连通 · 失效挂载 {broken} 处 · 待裁决 {conflicts} · 孤儿 {orphans} · 中央未登记 {hub_extra}"
+            "{tools_hit}/{tools_total} 个渠道连通 · 失效挂载 {broken} 处 · 待裁决 {conflicts}{pending}"
         )
     };
     let payload = json!({

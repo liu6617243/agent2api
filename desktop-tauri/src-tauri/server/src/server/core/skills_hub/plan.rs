@@ -315,10 +315,12 @@ fn survey(config: &Value) -> Survey {
 
     let manifest = store::load_manifest();
 
-    // 系统自带技能不参与去重收纳（不进中央、不挂载），墓碑里的技能也不再回来
+    // 系统自带技能不参与去重收纳（不进中央、不挂载），墓碑里的技能也不再回来；
+    // 指向别处的链接技能同样排除 —— 那是别人中枢挂进来的（见 `scan::scan_channel`），
+    // 把它们纳入去重会把上百个技能整批复制进本机中央库，等于劫持别人的真身。
     let dedupe_input: Vec<Value> = skills
         .iter()
-        .filter(|skill| text_of(skill, "origin") != "system")
+        .filter(|skill| !matches!(text_of(skill, "origin").as_str(), "system" | "link"))
         .filter(|skill| !store::is_deleted(&manifest, &text_of(skill, "name")))
         .cloned()
         .collect();
@@ -329,7 +331,11 @@ fn survey(config: &Value) -> Survey {
         config.get("l3Threshold").and_then(Value::as_f64).unwrap_or(0.85),
     );
 
-    // 孤儿：既不是台账里的技能，也不是任何已记录的来源名 / 挂载名
+    // 孤儿：既不是台账里的技能，也不是任何已记录的来源名 / 挂载名。
+    //
+    // 链接技能不算孤儿：它们本来就不归本机台账管（真身在别的技能中枢），
+    // 算成孤儿会让巡检永远红着，而「孤儿」这个词要提示的是「刚拷进来、还没
+    // 纳管的新技能」，两者不是一件事。
     let mut known: Vec<String> = Vec::new();
     if let Some(map) = manifest.get("skills").and_then(Value::as_object) {
         for (name, entry) in map {
@@ -348,7 +354,7 @@ fn survey(config: &Value) -> Survey {
     }
     let orphans: Vec<Value> = skills
         .iter()
-        .filter(|skill| text_of(skill, "origin") != "system")
+        .filter(|skill| !matches!(text_of(skill, "origin").as_str(), "system" | "link"))
         .filter(|skill| !known.iter().any(|item| item == &text_of(skill, "name")))
         .map(|skill| {
             json!({

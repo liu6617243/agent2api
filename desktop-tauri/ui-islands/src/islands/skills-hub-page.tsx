@@ -104,7 +104,7 @@ function SkillsHubPage(): React.ReactElement {
     try {
       const data = await s.loadOverview()
       setBadge({
-        skills: data.skillCount,
+        skills: data.visibleSkills,
         todo: data.pendingConflicts.length + data.orphans.length + data.hubExtra.length + data.brokenMounts,
       })
       setError('')

@@ -67,6 +67,8 @@ export type Overview = {
   manifestCount: number
   /** 中央真身目录里有几个（含未登记的） */
   skillCount: number
+  /** 本机可见的技能总数（扫描到的含链接挂载 + 台账），页头「N 个技能」用它 */
+  visibleSkills: number
   /** 累计来源条数：这个数字与 `skillCount` 的差就是「份消除」 */
   sourceCount: number
   /** 本轮扫描里被 L1 合并掉的冗余副本数 */
@@ -98,7 +100,7 @@ export type LibraryRow = {
   name: string
   /** 台账里有没有这一条 */
   inManifest: boolean
-  /** `channel` 扫描到待收纳 / `hub` 已收纳 / `hub-extra` 中央未登记 / `system` 客户端自带 */
+  /** `channel` 扫描到待收纳 / `hub` 已收纳 / `hub-extra` 中央未登记 / `system` 客户端自带 / `link` 外部链接技能 */
   origin: string
   skillName?: string | null
   description?: string
@@ -111,6 +113,8 @@ export type LibraryRow = {
   sources?: SkillSource[]
   mounts?: MountRecord[]
   isLink?: boolean
+  /** `origin === 'link'` 时，链接指向的真身目录 */
+  linkTarget?: string
 }
 
 export type Library = {

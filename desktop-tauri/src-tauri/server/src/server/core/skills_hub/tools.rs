@@ -434,7 +434,7 @@ pub fn probe_agents(config: &Value) -> Vec<Value> {
             "suggestId": agent.suggest_id,
             "name": agent.name,
             "hitDirs": hits.iter().map(|path| path.to_string_lossy().to_string()).collect::<Vec<String>>(),
-            "skillCount": super::scan::count_skill_dirs(&hits[0]),
+            "skillCount": super::scan::count_channel_skills(&hits[0]),
             "firstDir": first,
         }));
     }

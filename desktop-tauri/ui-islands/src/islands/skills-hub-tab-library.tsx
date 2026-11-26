@@ -55,13 +55,16 @@ function match(row: s.LibraryRow, filter: Filter): boolean {
   const mounts = row.mounts ?? []
   switch (filter) {
     case 'mounted':
-      return mounts.some(item => item.valid)
+      // 外部链接技能也是「客户端里真的能用」：它的链接就挂在渠道目录里。
+      return row.origin === 'link' || mounts.some(item => item.valid)
     case 'unmounted':
       // 「未挂载」只对已经收进中央的技能有意义：待收纳的天生没有挂载记录，
       // 把它们也算进来会让这一档变成「全部」的同义词。
       return row.inManifest && !mounts.some(item => item.valid)
     case 'pending':
-      return !row.inManifest && row.origin !== 'hub-extra' && row.origin !== 'system'
+      // 外部链接技能（别的技能中枢挂进来的）不算「待收纳」：它们的真身不归本机
+      // 台账管，收进来等于把别人的目录整批复制一份。
+      return !row.inManifest && row.origin !== 'hub-extra' && row.origin !== 'system' && row.origin !== 'link'
     case 'error':
       return issues.some(item => item.level === 'bad')
     case 'warn':
@@ -86,6 +89,8 @@ function cardStatus(row: s.LibraryRow): { dot: string; label: string; variant: '
   if (!row.inManifest) {
     if (row.origin === 'hub-extra') return { dot: 'sk-dot-warn', label: t('中央未登记'), variant: 'warning' }
     if (row.origin === 'system') return { dot: 'sk-dot-muted', label: t('客户端自带'), variant: 'outline' }
+    // 别人中枢挂进来的链接：客户端能用（绿点），但真身不归本机台账管，故标注来路
+    if (row.origin === 'link') return { dot: 'sk-dot-ok', label: t('外部链接'), variant: 'outline' }
     return { dot: hasBad ? 'sk-dot-bad' : 'sk-dot-pending', label: t('待收纳'), variant: 'brand' }
   }
   return { dot: hasBad ? 'sk-dot-bad' : 'sk-dot-muted', label: t('未挂载'), variant: 'outline' }

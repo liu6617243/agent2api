@@ -302,9 +302,34 @@ fn is_system_dir(dir: &Path) -> bool {
     false
 }
 
+/// 解析链接的真实落点：相对目标要按链接所在目录还原。
+///
+/// Windows 的 junction / `mklink` 一般写绝对路径，但 Git Bash 里手工
+/// `ln -s ../x` 会留下相对目标 —— 那样 `Path::new(target).exists()` 会按
+/// 当前工作目录解析，一律判成断链。
+fn resolve_link_target(link: &Path) -> PathBuf {
+    match fs::read_link(link) {
+        Ok(value) if value.is_absolute() => value,
+        Ok(value) => match link.parent() {
+            Some(parent) => parent.join(value),
+            None => value,
+        },
+        Err(_) => PathBuf::new(),
+    }
+}
+
+/// 链接是否指向一个真技能（目标目录里有 SKILL.md）。
+fn link_is_skill(link: &Path) -> bool {
+    let resolved = resolve_link_target(link);
+    !resolved.as_os_str().is_empty() && resolved.join("SKILL.md").is_file()
+}
+
 /// 把一个技能目录压成界面要的那一行。
+///
+/// 对链接行（`origin == "link"`）要跟到目标取时间：`symlink_metadata` 拿到的是
+/// 链接自身的时间（创建那一刻），跟技能内容改没改无关。
 fn build_entry(dir: &Path, tool: &str, origin: &str) -> Value {
-    let meta = fs::symlink_metadata(dir).ok();
+    let meta = if origin == "link" { fs::metadata(dir).ok() } else { fs::symlink_metadata(dir).ok() };
     let mtime_ms = meta
         .as_ref()
         .and_then(|value| value.modified().ok())
@@ -323,11 +348,17 @@ fn build_entry(dir: &Path, tool: &str, origin: &str) -> Value {
         }
         Err(_) => (name.clone(), String::new(), String::new()),
     };
+    let link_target = if origin == "link" {
+        resolve_link_target(dir).to_string_lossy().to_string()
+    } else {
+        String::new()
+    };
     json!({
         "name": name,
         "dir": dir.to_string_lossy(),
         "tool": tool,
         "origin": origin,
+        "linkTarget": link_target,
         "skillName": skill_name,
         "description": description,
         "version": version,
@@ -340,11 +371,18 @@ fn build_entry(dir: &Path, tool: &str, origin: &str) -> Value {
 
 /// 扫一个渠道目录。
 ///
-/// 返回 `(skills, mounts, broken)`：
-/// * `skills` 普通技能与系统技能（`origin` 区分）；
-/// * `mounts` 目录里的符号链接 / junction（指向中央库 = 正常挂载，指向别处 =
+/// 返回 `(skills, mounts)`：
+/// * `skills` 普通技能、系统技能、以及**指向真技能的链接**（`origin` 区分：
+///   `user` / `system` / `link`）；
+/// * `mounts` 目录里所有符号链接 / junction（指向中央库 = 正常挂载，指向别处 =
 ///   用户自己的链接，都记下来 —— 不记就等于让它隐身，排障时找不到）；
-/// * `broken` 链接目标不存在的条数（仪表盘「失效挂载」的一项来源）。
+///
+/// ── 链接为什么也要产出技能行 ────────────────────────────────
+/// 技能中枢（本机或别的客户端）是靠链接把真身挂进各渠道目录的。只把链接记成
+/// 「挂载」而不产出技能行，界面就会「磁盘上有 106 个技能，列表里只有 1 个」——
+/// 因为只有那个没被链接的真实目录才算技能。链接目标有 SKILL.md 就是客户端
+/// 真能用的技能，必须让用户看见；这类链接**不参与**去重收纳（见 `plan` 里
+/// `origin == "link"` 的排除），免得把别人中枢管的技能整批搬进本机中央库。
 pub fn scan_channel(dir: &Path, tool: &str) -> (Vec<Value>, Vec<Value>) {
     let mut skills: Vec<Value> = Vec::new();
     let mut mounts: Vec<Value> = Vec::new();
@@ -360,8 +398,12 @@ pub fn scan_channel(dir: &Path, tool: &str) -> (Vec<Value>, Vec<Value>) {
             Err(_) => continue,
         };
         if meta.file_type().is_symlink() {
+            let resolved = resolve_link_target(&abs);
             let target = fs::read_link(&abs).map(|value| normalize_link_target(&value)).unwrap_or_default();
-            let valid = !target.is_empty() && Path::new(&target).exists();
+            let valid = !resolved.as_os_str().is_empty() && resolved.exists();
+            if valid && resolved.join("SKILL.md").is_file() {
+                skills.push(build_entry(&abs, tool, "link"));
+            }
             mounts.push(json!({
                 "tool": tool,
                 "name": abs.file_name().map(|value| value.to_string_lossy().to_string()).unwrap_or_default(),
@@ -443,6 +485,52 @@ pub fn count_skill_dirs(dir: &Path) -> usize {
                 .unwrap_or(false)
         })
         .count()
+}
+
+/// 渠道目录里「客户端看得见」的技能数：真实目录 + 指向真技能的链接。
+///
+/// 与 `count_skill_dirs` 的区别：后者只数真实目录（中央库 / 台账统计用，链接
+/// 在那里算重复）；渠道矩阵要报的是「这个客户端到底能用几个技能」，链接挂进来
+/// 的必须一起数，否则显示的数字和用户在客户端里看到的对不上。
+pub fn count_channel_skills(dir: &Path) -> usize {
+    let entries = match fs::read_dir(dir) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let mut total = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            if link_is_skill(&path) {
+                total += 1;
+            }
+            continue;
+        }
+        if !file_type.is_dir() {
+            continue;
+        }
+        if is_system_dir(&path) {
+            if let Ok(items) = fs::read_dir(&path) {
+                for item in items.flatten() {
+                    let sub = item.path();
+                    if fs::symlink_metadata(&sub)
+                        .map(|meta| meta.file_type().is_dir() && !meta.file_type().is_symlink())
+                        .unwrap_or(false)
+                    {
+                        total += 1;
+                    }
+                }
+            }
+            continue;
+        }
+        total += 1;
+    }
+    total
 }
 
 /// 目录第一层的子项名（技能详情页的文件树用；不进递归，避免把大目录读爆）。
