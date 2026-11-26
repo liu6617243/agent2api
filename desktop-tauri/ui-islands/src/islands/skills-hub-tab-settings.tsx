@@ -71,6 +71,8 @@ function Settings({ onChanged }: Props): React.ReactElement {
   const [busy, setBusy] = React.useState('')
   const [customPath, setCustomPath] = React.useState('')
   const addInputRef = React.useRef<HTMLInputElement | null>(null)
+  const [draft, setDraft] = React.useState<s.HubConfig | null>(null)
+  const [pending, setPending] = React.useState(false)
 
   const values = config.data?.values
   const dirRows = tools.data?.items ?? []
@@ -79,25 +81,66 @@ function Settings({ onChanged }: Props): React.ReactElement {
 
   const hubPath = hubDir(trash.data?.dir)
 
-  const save = async (patch: Partial<s.HubConfig>) => {
+  // 界面读草稿（草稿只在用户改过之后存在，否则就是服务端值）。
+  const cfg = draft ?? values
+  // 自定义目录是「立刻生效」的动作（加/删各自独立打盘），不走草稿。
+  const customDirs = values?.customDirs ?? []
+
+  // 开关与输入框改的是**草稿**，点「保存配置」才落盘 —— 这是参考页的交互：
+  // 一次改三个渠道再统一保存，不至于点一下开关就打一次盘、顺手触发一次全量扫描。
+  // 有未保存改动时不要被后台重载覆盖掉（`pending` 为真就保持草稿）。
+  React.useEffect(() => {
+    if (values && !pending) setDraft({ ...values })
+  }, [values, pending])
+
+  // 「有没有未保存改动」要真比对，不能只记「点过」——
+  // 开关点开再点回去（或改了数字又改回原值）就不该再提示保存。
+  const savedShape = (value: s.HubConfig | null | undefined): string => {
+    if (!value) return ''
+    return JSON.stringify([value.mountMode, value.trashDays, value.l3Enabled, value.l3Threshold, value.tools])
+  }
+  const dirty = draft !== null && savedShape(draft) !== savedShape(values)
+
+  const edit = (patch: Partial<s.HubConfig>) => {
+    const base = draft ?? values
+    if (!base) return
+    const next = { ...base, ...patch }
+    setDraft(next)
+    // 改回原值就把 pending 放开，让后台重载能重新同步（否则草稿会一直挂着）
+    setPending(savedShape(next) !== savedShape(values))
+  }
+
+  // 渠道开关只改草稿；真正落盘在页头「保存配置」。原来点一下开关就打一次盘，
+  // 打盘会顺手触发一次全量扫描 —— 连开三个渠道就扫三次，还容易被后到的响应覆盖。
+  const toggleTool = (id: string, enabled: boolean) => {
+    const base = draft ?? values
+    if (!base) return
+    const nextTools = { ...base.tools }
+    nextTools[id] = { ...(nextTools[id] ?? {}), enabled }
+    edit({ tools: nextTools })
+  }
+
+  const saveDraft = async () => {
+    if (!draft) return
     setBusy('save')
     try {
-      await s.saveConfig(patch)
+      await s.saveConfig({
+        mountMode: draft.mountMode,
+        trashDays: draft.trashDays,
+        l3Enabled: draft.l3Enabled,
+        l3Threshold: draft.l3Threshold,
+        tools: draft.tools,
+      })
+      setPending(false)
       config.reload()
       tools.reload()
       onChanged()
+      toast(t('配置已保存'), 'ok')
     } catch (error) {
       toast(t('保存失败：{error}', { error: String(error instanceof Error ? error.message : error) }), 'err')
     } finally {
       setBusy('')
     }
-  }
-
-  const toggleTool = async (id: string, enabled: boolean) => {
-    if (!values) return
-    const nextTools = { ...values.tools }
-    nextTools[id] = { ...(nextTools[id] ?? {}), enabled }
-    await save({ tools: nextTools })
   }
 
   const addCustom = async (raw?: string) => {
@@ -153,18 +196,21 @@ function Settings({ onChanged }: Props): React.ReactElement {
     addInputRef.current?.focus()
   }
 
+  // 开关的显示值也要读草稿：否则点完开关、服务端还没存，`row.enabled` 一刷新就弹回原样。
+  const toolEnabled = (row: s.ToolRow): boolean => cfg?.tools?.[row.id]?.enabled ?? row.enabled
+
   // 渠道档的三个计数与筛选。
   const toolCounts = {
     all: dirRows.length,
     connected: dirRows.filter(row => row.dir !== null).length,
-    enabled: dirRows.filter(row => row.enabled).length,
+    enabled: dirRows.filter(row => toolEnabled(row)).length,
     unconfigured: dirRows.filter(row => row.dir === null).length,
   }
   const visibleTools = dirRows
     .filter(row => {
       switch (toolFilter) {
         case 'connected': return row.dir !== null
-        case 'enabled': return row.enabled
+        case 'enabled': return toolEnabled(row)
         case 'unconfigured': return row.dir === null
         default: return true
       }
@@ -184,9 +230,9 @@ function Settings({ onChanged }: Props): React.ReactElement {
 
   return (
     <Panel loading={config.loading} error={config.error} onRetry={config.reload}>
-      {!values ? <Empty>{t('还没读到配置')}</Empty> : (
+      {!cfg ? <Empty>{t('还没读到配置')}</Empty> : (
         <div className='sk-cfg'>
-          {/* ── 页头：标题 + 两个动作 ── */}
+          {/* ── 页头：标题 + 中央仓库路径 + 保存配置（改完统一落盘） ── */}
           <div className='sk-cfg-head'>
             <div className='sk-cfg-title'>{t('配置 · 技能仓库')}</div>
             <div className='sk-cfg-head-actions'>
@@ -197,16 +243,10 @@ function Settings({ onChanged }: Props): React.ReactElement {
                 type='button'
                 size='sm'
                 variant='default'
-                disabled={busy === 'scan'}
-                onClick={() => {
-                  setBusy('scan')
-                  void s.runDailyCheck(false)
-                    .then(result => { toast(result.summary, result.ok ? 'ok' : 'err'); tools.reload(); probe.reload() })
-                    .catch(error => toast(t('检测失败：{error}', { error: String(error) }), 'err'))
-                    .finally(() => setBusy(''))
-                }}
+                disabled={!dirty || busy === 'save'}
+                onClick={() => void saveDraft()}
               >
-                {t('立即检测')}
+                {busy === 'save' ? t('保存中…') : dirty ? t('保存配置') : t('已保存')}
               </Button>
             </div>
           </div>
@@ -226,7 +266,7 @@ function Settings({ onChanged }: Props): React.ReactElement {
               className={`sk-cfg-tab${section === 'auto' ? ' is-active' : ''}`}
               onClick={() => setSection('auto')}
             >
-              {t('检测与调度')}
+              {t('全自动检测与调度')}
             </button>
             <button
               type='button' role='tab' aria-selected={section === 'trash'}
@@ -246,7 +286,7 @@ function Settings({ onChanged }: Props): React.ReactElement {
                 <div className='sk-cfg-recommend-title'>{t('常用 Agent 渠道推荐')}</div>
                 <div className='sk-cfg-recommend-chips'>
                   {dirRows.map(row => {
-                    const ready = row.enabled && row.dir !== null
+                    const ready = toolEnabled(row) && row.dir !== null
                     return (
                       <button
                         key={`rec-${row.id}`}
@@ -280,7 +320,7 @@ function Settings({ onChanged }: Props): React.ReactElement {
                         {iconLetter(row.name)}
                       </span>
                       <span className='sk-cfg-rec-name'>{row.name}</span>
-                      <span className='sk-cfg-rec-state'>{t('+ 启用')}</span>
+                      <span className='sk-cfg-rec-state'>{t('+ 应用')}</span>
                     </button>
                   ))}
                 </div>
@@ -313,6 +353,19 @@ function Settings({ onChanged }: Props): React.ReactElement {
                     onChange={event => setToolQuery(event.target.value)}
                   />
                 </div>
+                <Button
+                  type='button' size='sm' variant='ghost'
+                  disabled={busy === 'scan'}
+                  onClick={() => {
+                    setBusy('scan')
+                    void s.runDailyCheck(false)
+                      .then(result => { toast(result.summary, result.ok ? 'ok' : 'err'); tools.reload(); probe.reload() })
+                      .catch(error => toast(t('检测失败：{error}', { error: String(error) }), 'err'))
+                      .finally(() => setBusy(''))
+                  }}
+                >
+                  {busy === 'scan' ? t('检测中…') : t('立即检测')}
+                </Button>
                 <Button type='button' size='sm' variant='ghost' onClick={scanNow}>
                   {t('扫描电脑发现')}
                 </Button>
@@ -329,8 +382,11 @@ function Settings({ onChanged }: Props): React.ReactElement {
                   {visibleTools.map(row => {
                     const hit = row.dir !== null
                     const paths = row.candidatePaths ?? []
+                    const enabled = toolEnabled(row)
+                    // 改过但没保存的卡片描一圈，让人一眼看到「这几张还没落盘」
+                    const edited = enabled !== row.enabled
                     return (
-                      <div key={row.id} className={`sk-cfg-card${row.enabled ? '' : ' is-off'}`}>
+                      <div key={row.id} className={`sk-cfg-card${enabled ? '' : ' is-off'}${edited ? ' is-edited' : ''}`}>
                         <span className='sk-cfg-icon' style={{ background: iconColor(row.name) }}>
                           {iconLetter(row.name)}
                         </span>
@@ -349,7 +405,7 @@ function Settings({ onChanged }: Props): React.ReactElement {
                           </div>
                         </div>
                         <div className='sk-cfg-card-control'>
-                          <Switch checked={row.enabled} onCheckedChange={next => void toggleTool(row.id, next)} />
+                          <Switch checked={enabled} onCheckedChange={next => toggleTool(row.id, next)} />
                           <span className='sk-cfg-path-pill' title={paths.join('\n')}>
                             {t('{n} 路径', { n: paths.length })}
                           </span>
@@ -366,9 +422,9 @@ function Settings({ onChanged }: Props): React.ReactElement {
                 <div className='sk-cfg-custom-hint'>
                   {t('没有自带目录的独立技能库，或想额外扫一个私有的 skills/ 都在这里加。')}
                 </div>
-                {(values.customDirs ?? []).length > 0 ? (
+                {customDirs.length > 0 ? (
                   <div className='sk-cfg-custom-list'>
-                    {values.customDirs.map(path => (
+                    {customDirs.map(path => (
                       <div key={path} className='sk-cfg-custom-item'>
                         <code>{path}</code>
                         <Button
@@ -415,10 +471,10 @@ function Settings({ onChanged }: Props): React.ReactElement {
                 </div>
                 <div className='sk-field-control'>
                   <Switch
-                    checked={values.mountMode === 'copy'}
-                    onCheckedChange={next => void save({ mountMode: next ? 'copy' : 'junction' })}
+                    checked={cfg.mountMode === 'copy'}
+                    onCheckedChange={next => edit({ mountMode: next ? 'copy' : 'junction' })}
                   />
-                  <span className='sk-field-value'>{values.mountMode === 'copy' ? t('复制副本') : t('目录链接')}</span>
+                  <span className='sk-field-value'>{cfg.mountMode === 'copy' ? t('复制副本') : t('目录链接')}</span>
                 </div>
               </div>
 
@@ -431,17 +487,17 @@ function Settings({ onChanged }: Props): React.ReactElement {
                 </div>
                 <div className='sk-field-control'>
                   <Switch
-                    checked={values.l3Enabled}
-                    onCheckedChange={next => void save({ l3Enabled: next })}
+                    checked={cfg.l3Enabled}
+                    onCheckedChange={next => edit({ l3Enabled: next })}
                   />
-                  {values.l3Enabled ? (
+                  {cfg.l3Enabled ? (
                     <input
                       className='sk-input sk-input-num'
                       type='number' min={0.3} max={0.99} step={0.01}
-                      defaultValue={values.l3Threshold}
+                      defaultValue={cfg.l3Threshold}
                       onBlur={event => {
                         const next = Number(event.target.value)
-                        if (Number.isFinite(next)) void save({ l3Threshold: next })
+                        if (Number.isFinite(next)) edit({ l3Threshold: next })
                       }}
                     />
                   ) : null}
@@ -467,10 +523,10 @@ function Settings({ onChanged }: Props): React.ReactElement {
                   <input
                     className='sk-input sk-input-num'
                     type='number' min={0} max={3650}
-                    defaultValue={values.trashDays}
+                    defaultValue={cfg.trashDays}
                     onBlur={event => {
                       const next = Number(event.target.value)
-                      if (Number.isFinite(next)) void save({ trashDays: Math.max(0, Math.floor(next)) })
+                      if (Number.isFinite(next)) edit({ trashDays: Math.max(0, Math.floor(next)) })
                     }}
                   />
                   <span className='sk-field-value'>{t('天')}</span>

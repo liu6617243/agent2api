@@ -1203,5 +1203,9 @@
   "还没读到任何渠道": "No channels detected yet",
   "配置 · 技能仓库": "Settings · Skill repository",
   "配置分区": "Settings sections",
-  "外部链接": "External link"
+  "外部链接": "External link",
+  "保存配置": "Save configuration",
+  "全自动检测与调度": "Automated detection & scheduling",
+  "配置已保存": "Configuration saved",
+  "+ 应用": "+ Apply"
 }

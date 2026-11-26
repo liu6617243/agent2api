@@ -14,13 +14,13 @@ import { Empty, Panel, toast, useLoad } from './skills-hub-shared'
  *
  * ── 为什么筛选是六个而不是「搜索 + 排序」──────────────────
  * 这一页的用途不是「找某个技能」（那是搜索框的事），而是「看哪些没在受管状态」。
- * 六个筛选正好对应六种处置状态：
+ * 六个档位正好对应六种处置状态，且**互斥**（数字相加 = 全部）：
  *   全部    —— 有多少东西
- *   已挂载  —— 真的在所有客户端里都能用了
- *   未挂载  —— 收进中央了，但没有任何客户端指向它（白收）
- *   待收纳  —— 还在渠道目录里，没进中央
+ *   已就绪  —— 真的在所有客户端里都能用了（含外部链接挂进来的）
+ *   未就绪  —— 收进中央了，但没有任何客户端指向它（白收）
  *   错误    —— 缺 SKILL.md / 缺 description（客户端不认）
  *   警告    —— 能跑但可能触发不出（缺 frontmatter / 描述超长）
+ *   待收纳  —— 还在渠道目录里，没进中央
  *
  * ── 版式为什么要「彩色圆点 + 单一状态徽标」──────────────────
  * 早先把「已收纳 / 挂载 N / 失效 N / 指纹前 8 位 / 来源」五六枚标签全塞在卡片
@@ -29,16 +29,16 @@ import { Empty, Panel, toast, useLoad } from './skills-hub-shared'
  * 其余细节（指纹、来源、时间）留给详情抽屉 —— 卡片只回答「受管到哪一步」。
  */
 
-type Filter = 'all' | 'mounted' | 'unmounted' | 'pending' | 'error' | 'warn'
+type Filter = 'all' | 'mounted' | 'unmounted' | 'error' | 'warn' | 'pending'
 
 /** 六个筛选。label 在模块加载期取译文 —— 渲染时 `t(item.label)` 扫描器认不出键。 */
 const FILTERS: { key: Filter; label: string }[] = [
   { key: 'all', label: t('全部') },
-  { key: 'mounted', label: t('已挂载') },
-  { key: 'unmounted', label: t('未挂载') },
-  { key: 'pending', label: t('待收纳') },
+  { key: 'mounted', label: t('已就绪') },
+  { key: 'unmounted', label: t('未就绪') },
   { key: 'error', label: t('错误') },
   { key: 'warn', label: t('警告') },
+  { key: 'pending', label: t('待收纳') },
 ]
 
 /** 每个筛选胶囊前面那枚小圆点用哪种颜色；`全部` 不画点。 */
@@ -50,28 +50,25 @@ const FILTER_DOT: Record<Exclude<Filter, 'all'>, string> = {
   warn: 'sk-dot-warn',
 }
 
-function match(row: s.LibraryRow, filter: Filter): boolean {
+/**
+ * 一行只属于一个状态档 —— 六个胶囊是**分区**，不是可重叠的筛选条件。
+ *
+ * 早先每个胶囊各算一套条件（「已挂载」看 mounts、「警告」看 health），同一个技能
+ * 会同时落在好几档里，各档数字相加比「全部」还大。参考页的计数是相加等于全部的，
+ * 所以这里定死优先级：硬伤 > 警告 > 已挂载 > 待收纳 > 未就绪。
+ */
+function statusKey(row: s.LibraryRow): Exclude<Filter, 'all'> {
   const issues = row.health ?? []
-  const mounts = row.mounts ?? []
-  switch (filter) {
-    case 'mounted':
-      // 外部链接技能也是「客户端里真的能用」：它的链接就挂在渠道目录里。
-      return row.origin === 'link' || mounts.some(item => item.valid)
-    case 'unmounted':
-      // 「未挂载」只对已经收进中央的技能有意义：待收纳的天生没有挂载记录，
-      // 把它们也算进来会让这一档变成「全部」的同义词。
-      return row.inManifest && !mounts.some(item => item.valid)
-    case 'pending':
-      // 外部链接技能（别的技能中枢挂进来的）不算「待收纳」：它们的真身不归本机
-      // 台账管，收进来等于把别人的目录整批复制一份。
-      return !row.inManifest && row.origin !== 'hub-extra' && row.origin !== 'system' && row.origin !== 'link'
-    case 'error':
-      return issues.some(item => item.level === 'bad')
-    case 'warn':
-      return issues.length > 0 && !issues.some(item => item.level === 'bad')
-    default:
-      return true
-  }
+  if (issues.some(item => item.level === 'bad')) return 'error'
+  if (issues.length > 0) return 'warn'
+  // 外部链接技能也是「客户端里真的能用」：链接就挂在渠道目录里
+  if (row.origin === 'link' || (row.mounts ?? []).some(item => item.valid)) return 'mounted'
+  if (!row.inManifest && row.origin !== 'hub-extra' && row.origin !== 'system') return 'pending'
+  return 'unmounted'
+}
+
+function match(row: s.LibraryRow, filter: Filter): boolean {
+  return filter === 'all' || statusKey(row) === filter
 }
 
 /**
