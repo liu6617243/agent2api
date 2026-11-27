@@ -184,10 +184,15 @@ function Dashboard({ onGo, onOpenSkill, onChanged }: Props): React.ReactElement 
   const channelSkills = data.tools.reduce((sum, row) => sum + row.skillCount, 0)
   const brokenMounts = data.mountHealth.filter(item => !item.valid).length
   const todoTotal = data.pendingConflicts.length + data.orphans.length + data.hubExtra.length + brokenMounts
-  // 「份消除」= 累计来源条数 − 中央真身条数（`Overview::sourceCount` 的注释就是这么
-  // 定义的）。不用 `l1Merged`：那是「本轮扫描」的数字，一天没扫就归零，和左边
-  // 「105 个技能 / 来自 121 个来源副本」对不上，读起来像去重没起作用。
-  const deduped = Math.max(0, data.sourceCount - data.skillCount)
+  // 「份消除」= 来源副本数 − 去重后的技能数，两个数字必须是同一轮扫描的两个
+  // 视角（`Overview::sourceCount` / `Overview::visibleSkills`）。
+  //
+  // 不要用 `skillCount`（中央真身目录里的条目数）：那和「本机有几个技能」不是
+  // 一回事 —— 没收纳过任何技能时它是 0，卡片就会写「0 个技能 / 来自 0 个来源
+  // 副本」，而同一页的速览网格列着一百多个，用户第一眼就问「为什么是 0」。
+  // 也不要用 `l1Merged`：那是「本轮扫描」的数字，一天没扫就归零。
+  const uniqueSkills = data.visibleSkills
+  const deduped = Math.max(0, data.sourceCount - uniqueSkills)
 
   const items = library.data?.items ?? []
   const needle = query.trim().toLowerCase()
@@ -295,7 +300,7 @@ function Dashboard({ onGo, onOpenSkill, onChanged }: Props): React.ReactElement 
               </span>
             </div>
             <div className='sk-stat-value'>
-              <b>{num(data.skillCount)}</b>
+              <b>{num(uniqueSkills)}</b>
               <span>{t('个技能')}</span>
             </div>
             <div className='sk-stat-sub'>{t('来自 {n} 个来源副本', { n: num(data.sourceCount) })}</div>

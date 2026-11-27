@@ -65,11 +65,11 @@ export type Overview = {
   skillsDir: string
   /** 台账里登记了几个技能 */
   manifestCount: number
-  /** 中央真身目录里有几个（含未登记的） */
+  /** 中央真身目录里有几个（只数 `skills/` 下的真实目录，不含链接；没收纳过就是 0） */
   skillCount: number
   /** 本机可见的技能总数（扫描到的含链接挂载 + 台账），页头「N 个技能」用它 */
   visibleSkills: number
-  /** 累计来源条数：这个数字与 `skillCount` 的差就是「份消除」 */
+  /** 来源副本总数（同一轮扫描的另一个视角）：与 `visibleSkills` 的差 = 「份消除」 */
   sourceCount: number
   /** 本轮扫描里被 L1 合并掉的冗余副本数 */
   l1Merged: number

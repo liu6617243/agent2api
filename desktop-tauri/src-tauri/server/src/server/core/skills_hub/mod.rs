@@ -166,8 +166,13 @@ pub fn overview() -> Value {
     // 页头「N 个技能」要回答的是「本机到底有几个技能」（= 技能库列表的「全部」）：
     // 本轮扫到的（含链接挂进来的）与台账里的取并集。中央真身目录里的数量仍按
     // `skillCount` 单独报，两者不是一回事。
+    let scanned_rows: Vec<Value> = planned
+        .get("scanned")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let mut visible: Vec<String> = Vec::new();
-    for item in planned.get("scanned").and_then(Value::as_array).into_iter().flatten() {
+    for item in &scanned_rows {
         let name = text(item, "name");
         if !name.is_empty() && !visible.contains(&name) {
             visible.push(name);
@@ -179,16 +184,32 @@ pub fn overview() -> Value {
         }
     }
     let visible_count = visible.len();
-    let source_count: usize = manifest_map
-        .values()
-        .map(|entry| {
-            entry
-                .get("sources")
-                .and_then(Value::as_array)
-                .map(|list| list.len())
-                .unwrap_or(0)
-        })
-        .sum();
+    // 来源副本数：本轮扫到的**每一行**就是一份副本（同名技能来自两个渠道 = 2 份），
+    // 已收纳、但本轮扫不到的技能（工具目录只剩链接）按台账登记的 `sources` 计，
+    // 至少算 1 份。
+    //
+    // 只读台账是错的：新装 / 还没收纳过任何技能时台账为空，这里恒为 0，
+    // 界面上就成了「0 个技能 / 来自 0 个来源副本」，而同一页的速览网格明明
+    // 列着一百多个技能 —— 左右自相矛盾。`visibleSkills` 与 `sourceCount`
+    // 必须是同一轮扫描的两个视角，才能算出有意义的「份消除」。
+    let mut source_count: usize = 0;
+    for item in &scanned_rows {
+        if !text(item, "name").is_empty() {
+            source_count += 1;
+        }
+    }
+    for (name, entry) in &manifest_map {
+        // 本轮扫到的，已经在上面按行数过一遍了（一行 = 一份副本）
+        if scanned_rows.iter().any(|item| text(item, "name") == *name) {
+            continue;
+        }
+        let registered = entry
+            .get("sources")
+            .and_then(Value::as_array)
+            .map(|list| list.len())
+            .unwrap_or(0);
+        source_count += registered.max(1);
+    }
 
     let dedupe_merged = planned
         .get("duplicates")
