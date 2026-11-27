@@ -46,6 +46,21 @@ use serde_json::{json, Value};
 pub use plan::{normalize_name, plan as sync_plan};
 pub use tools::{default_config, KV_KEY};
 
+/// 磁盘或配置被改过之后，把两层缓存一起作废。
+///
+/// ── 为什么必须成对清 ────────────────────────────────────────
+/// 这里有两层缓存，寿命不同：
+/// * `scan` 的内容事实（哈希 / 描述 / 体检），按技能真实路径存；
+/// * `plan` 的规划结论（待收纳 / 冲突 / 孤儿 / 挂载健康），2 秒窗口。
+///
+/// 写操作后只清前者的话，紧接着的列表请求会命中后者 —— 界面上就是「刚同步完，
+/// 待收纳数还是老的」。这类不一致最难查（数据其实已经对了，只是被旧结论盖住），
+/// 所以两层的失效一律走这一个入口，不在调用点各写一遍。
+fn invalidate() {
+    scan::clear_cache();
+    plan::clear_plan_cache();
+}
+
 /// 配置读取（整份生效值：默认 + 覆盖 + 派生字段）。
 pub fn config() -> Value {
     tools::load_config()
@@ -55,7 +70,11 @@ pub fn config() -> Value {
 pub fn save_config(patch: &Value) -> Result<Value, String> {
     let current = tools::load_config();
     let next = merge(&current, patch);
-    tools::save_config(&next)
+    let out = tools::save_config(&next);
+    // `hubDir` / `customDirs` / `l3*` 都会改变「扫哪些目录、怎么去重」，
+    // 缓存里的内容事实还是对的，但整份规划结论已经过期 —— 两层一起清。
+    invalidate();
+    out
 }
 
 /// 恢复默认（只重置传进来的键；`None` = 全量重置）。
@@ -79,7 +98,9 @@ pub fn reset_config(keys: Option<&[String]>) -> Result<Value, String> {
         }
         _ => defaults,
     };
-    tools::save_config(&next)
+    let out = tools::save_config(&next);
+    invalidate();
+    out
 }
 
 /// 一层浅合并（本模块的配置没有嵌套多层的键，`tools` / `customDirs` 都是整体替换）。
@@ -507,7 +528,9 @@ pub fn conflicts() -> Value {
 /// 裁决一条冲突（`plan::resolve` 的门面）。
 pub fn resolve(id: &str, choice: &str) -> Result<Value, String> {
     let config = tools::load_config();
-    plan::resolve(id, choice, &config)
+    let out = plan::resolve(id, choice, &config);
+    invalidate();
+    out
 }
 
 // ─── 同步 ────────────────────────────────────────────────────
@@ -521,7 +544,11 @@ pub fn preview() -> Value {
 /// 执行一次同步（重新规划后重放）。
 pub fn sync_now() -> Value {
     let config = tools::load_config();
-    plan::execute(&config)
+    let out = plan::execute(&config);
+    // 同步会建/摘链接、搬真身，磁盘已经变了 —— 缓存必须立刻失效，
+    // 否则紧接着的列表请求会拿旧指纹比对（同一次请求内 mtime 精度不够）。
+    invalidate();
+    out
 }
 
 /// 同步报告内容。
@@ -538,24 +565,32 @@ pub fn reports(limit: usize) -> Vec<Value> {
 
 /// 纳管：中央目录里有、台账没记的，只补台账不动文件。
 pub fn adopt(name: &str) -> Result<Value, String> {
-    plan::adopt(name)
+    let out = plan::adopt(name);
+    invalidate();
+    out
 }
 
 /// 删除一个技能（真身进回收站、挂载摘掉、立墓碑）。
 pub fn remove(name: &str) -> Result<Value, String> {
-    plan::remove(name)
+    let out = plan::remove(name);
+    invalidate();
+    out
 }
 
 /// 切换一处挂载的启用状态。
 pub fn toggle_mount(name: &str, tool: &str, enabled: bool) -> Result<Value, String> {
     let config = tools::load_config();
-    plan::toggle_mount(name, tool, enabled, &config)
+    let out = plan::toggle_mount(name, tool, enabled, &config);
+    invalidate();
+    out
 }
 
 /// 一键修复失效挂载。
 pub fn repair() -> Value {
     let config = tools::load_config();
-    plan::repair(&config)
+    let out = plan::repair(&config);
+    invalidate();
+    out
 }
 
 // ─── 每日检测 ────────────────────────────────────────────────
@@ -577,17 +612,26 @@ pub fn daily_check_status() -> Value {
 /// 看到「尚未运行检测」，等于这个功能不存在。所以结果整份存一个保留键。
 pub fn run_daily_check(auto_mount: bool) -> Value {
     let config = tools::load_config();
-    let planned = sync_plan(&config);
+    // 巡检是用户点「立即刷新」触发的，必须看现场 —— 绕开 2 秒规划缓存，
+    // 否则刚在磁盘上改完（还没经过本模块写操作）的技能要等缓存过期才出现。
+    // 自动修复要排在规划**之前**：`repair` 会建/摘链接，先规划再修复的话，
+    // 下面统计用的 `planned` 是修复前的现场 —— 巡检结论会永远显示「还有 N 处
+    // 失效挂载」，而实际上刚刚已经修好了。
     let mut repaired = 0usize;
     if auto_mount {
         let result = plan::repair(&config);
         repaired = result.get("repaired").and_then(Value::as_u64).unwrap_or(0) as usize;
+        invalidate();
     }
-    let tools_hit = tools::list_tools(&config)
-        .into_iter()
+    let planned = plan::plan_fresh(&config);
+    // 只探一次：`list_tools` 每个渠道都要 stat 一遍候选目录，重复调用等于把
+    // 同一批 stat 做两遍（14 个渠道 × 若干候选路径）。
+    let tool_rows = tools::list_tools(&config);
+    let tools_total = tool_rows.len();
+    let tools_hit = tool_rows
+        .iter()
         .filter(|row| row.get("dir").and_then(Value::as_str).map(|text| !text.is_empty()).unwrap_or(false))
         .count();
-    let tools_total = tools::list_tools(&config).len();
     let broken = planned
         .get("mountHealth")
         .and_then(Value::as_array)
@@ -650,13 +694,16 @@ pub fn trash() -> Value {
 }
 
 pub fn restore(file: &str) -> Result<Value, String> {
-    store::restore_trash(file)
+    let out = store::restore_trash(file);
+    invalidate();
+    out
 }
 
 pub fn purge_trash() -> Value {
     let config = tools::load_config();
     let days = config.get("trashDays").and_then(Value::as_i64).unwrap_or(7);
     let removed = store::purge_trash(days);
+    invalidate();
     json!({ "removed": removed })
 }
 
@@ -698,7 +745,9 @@ pub fn add_custom_dir(path: &str) -> Result<Value, String> {
     }
     dirs.push(json!(spec));
     config["customDirs"] = Value::Array(dirs);
-    tools::save_config(&config)
+    let out = tools::save_config(&config);
+    invalidate();
+    out
 }
 
 /// 删一条自定义目录。
@@ -713,7 +762,9 @@ pub fn remove_custom_dir(path: &str) -> Result<Value, String> {
         .filter(|item| item.as_str().map(|text| text != path).unwrap_or(false))
         .collect();
     config["customDirs"] = Value::Array(dirs);
-    tools::save_config(&config)
+    let out = tools::save_config(&config);
+    invalidate();
+    out
 }
 
 fn text(value: &Value, key: &str) -> String {

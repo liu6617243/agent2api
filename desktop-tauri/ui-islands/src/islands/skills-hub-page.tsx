@@ -96,6 +96,25 @@ function SkillsHubPage(): React.ReactElement {
   const [reloadAt, setReloadAt] = React.useState(0)
 
   /**
+   * 已经打开过的页签。
+   *
+   * ── 为什么要保活，而不是条件渲染 ──────────────────────────
+   * 原来是 `{tab === 'library' ? <Library/> : null}`：切走即卸载，切回来重新
+   * 挂载，`useLoad` 从零开始跑 —— 每切一次页签就重新发 2~4 个请求，而服务端
+   * 每个请求都要扫一遍磁盘。用户来回点两下，等于把同一批文件读十几遍。
+   *
+   * 现在改成「首次访问才挂载，之后只隐藏」：组件状态（已拉到的数据、筛选、
+   * 搜索词）都留着，切回来是瞬时的。隐藏用 `hidden` 属性而不是不渲染 ——
+   * 它同时把子树移出无障碍树与 tab 序列，不会出现「看不见但能 Tab 到」。
+   *
+   * 代价是五个页签的数据都常驻内存，但它们是同一份扫描结果的切片，本来就不大。
+   */
+  const [visited, setVisited] = React.useState<Set<Tab>>(() => new Set<Tab>([activeTab]))
+  React.useEffect(() => {
+    setVisited(prev => (prev.has(tab) ? prev : new Set(prev).add(tab)))
+  }, [tab])
+
+  /**
    * 首屏只拉一次 overview：它同时给出技能数、待处理数与渠道矩阵，是这一页
    * 唯一「一眼看全」的数据源。其余页签各自的 `useLoad` 会在被渲染时才请求 ——
    * 五个页签全在首屏拉一遍，等于用户打开这一页就要扫五次磁盘。
@@ -202,20 +221,30 @@ function SkillsHubPage(): React.ReactElement {
         </div>
       ) : (
         <div className='sk-body'>
-          {tab === 'dashboard' ? (
-            <Dashboard onGo={goto} onOpenSkill={openSkill} onChanged={() => setReloadAt(value => value + 1)} />
+          {visited.has('dashboard') ? (
+            <div className='sk-pane' hidden={tab !== 'dashboard'}>
+              <Dashboard onGo={goto} onOpenSkill={openSkill} onChanged={() => setReloadAt(value => value + 1)} />
+            </div>
           ) : null}
-          {tab === 'library' ? (
-            <Library onOpenSkill={openSkill} onOpenSettings={() => goto('settings')} />
+          {visited.has('library') ? (
+            <div className='sk-pane' hidden={tab !== 'library'}>
+              <Library onOpenSkill={openSkill} onOpenSettings={() => goto('settings')} />
+            </div>
           ) : null}
-          {tab === 'sync' ? (
-            <SyncTab onChanged={() => setReloadAt(value => value + 1)} />
+          {visited.has('sync') ? (
+            <div className='sk-pane' hidden={tab !== 'sync'}>
+              <SyncTab onChanged={() => setReloadAt(value => value + 1)} />
+            </div>
           ) : null}
-          {tab === 'dedup' ? (
-            <Dedup onChanged={() => setReloadAt(value => value + 1)} onOpenSkill={openSkill} />
+          {visited.has('dedup') ? (
+            <div className='sk-pane' hidden={tab !== 'dedup'}>
+              <Dedup onChanged={() => setReloadAt(value => value + 1)} onOpenSkill={openSkill} />
+            </div>
           ) : null}
-          {tab === 'settings' ? (
-            <Settings onChanged={() => setReloadAt(value => value + 1)} />
+          {visited.has('settings') ? (
+            <div className='sk-pane' hidden={tab !== 'settings'}>
+              <Settings onChanged={() => setReloadAt(value => value + 1)} />
+            </div>
           ) : null}
         </div>
       )}

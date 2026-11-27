@@ -267,7 +267,8 @@ pub fn import_skill(entry: &Value) -> Result<Value, String> {
     }
 
     copy_dir_all(&source_dir, &dest)?;
-    let real_hash = scan::tree_hash(&dest);
+    // 写入后立刻读：必须绕过缓存（写入前刚比对过两边哈希）。
+    let real_hash = scan::tree_hash_fresh(&dest);
     let sources: Vec<Value> = entry
         .get("sources")
         .and_then(Value::as_array)
@@ -538,7 +539,8 @@ pub fn restore_trash(file: &str) -> Result<Value, String> {
             remove_dir_all(&source)?;
         }
     }
-    let hash = scan::tree_hash(&dest);
+    // 刚从回收站搬回来：绕过缓存，现场读一遍。
+    let hash = scan::tree_hash_fresh(&dest);
     let parsed = scan::parse_skill_md(&dest).ok();
     let mut manifest = load_manifest();
     let record = json!({

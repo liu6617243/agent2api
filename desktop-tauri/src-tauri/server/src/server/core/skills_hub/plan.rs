@@ -748,6 +748,72 @@ fn plan_actions(config: &Value) -> Planned {
 
 /// 预览：把规划压成界面要的形状。不改任何文件。
 pub fn plan(config: &Value) -> Value {
+    plan_with(config, false)
+}
+
+/// 规划结果缓存：一个页签同时发多个请求时共用同一份规划。
+///
+/// ── 为什么按「请求批」缓存而不是按数据版本 ──────────────────
+/// 打开一个页签会并发发 2~4 个请求（`overview` + `daily-check`，或
+/// `library` + `daily-check`），每个都在内部跑一遍完整规划。规划本身要扫全部
+/// 渠道目录、算内容树哈希、做 L1/L2/L3 去重 —— 本机一次 1s 上下。四个请求
+/// 就是四遍，而它们要的其实是同一份结论。
+///
+/// 所以这里按 `PLAN_TTL` 短窗口复用：窗口内同一份配置直接返回上次结果。
+/// 写操作（收纳 / 挂载 / 同步 / 改配置）都会 `clear_plan_cache()`，所以
+/// 「改完立刻看」不会拿到旧结论；用户点「立即刷新」时传 `fresh = true`
+/// 绕过缓存，那是他明确要求重扫的信号。
+const PLAN_TTL: std::time::Duration = std::time::Duration::from_millis(2000);
+
+struct CachedPlan {
+    key: String,
+    at: std::time::Instant,
+    value: Value,
+}
+
+fn plan_cache() -> &'static std::sync::Mutex<Option<CachedPlan>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedPlan>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 丢掉规划缓存（写操作后调用）。
+pub fn clear_plan_cache() {
+    if let Ok(mut slot) = plan_cache().lock() {
+        *slot = None;
+    }
+}
+
+fn plan_with(config: &Value, fresh: bool) -> Value {
+    let key = config.to_string();
+    // `fresh` 的语义是「别用我之前算的」，不是「别用别人正在算的」：先作废旧结果，
+    // 再走下面那条串行路径 —— 并发进来的第二个 fresh 请求就能复用第一个刚算出的
+    // 结果，而不是陪着再扫一遍磁盘。
+    if fresh {
+        clear_plan_cache();
+    }
+    // 规划期间持锁：`fresh` 请求（巡检、立即刷新）在页签切换时可能同时进来
+    // 两三个，不串行的话它们会各自跑一遍完整扫描 —— 那正是要消掉的浪费。
+    let mut slot = match plan_cache().lock() {
+        Ok(value) => value,
+        // 锁中毒（别的线程 panic 过）时不阻塞功能，退化成不缓存。
+        Err(_) => return plan_uncached(config),
+    };
+    if let Some(hit) = slot.as_ref() {
+        if hit.key == key && hit.at.elapsed() < PLAN_TTL {
+            return hit.value.clone();
+        }
+    }
+    let value = plan_uncached(config);
+    *slot = Some(CachedPlan { key, at: std::time::Instant::now(), value: value.clone() });
+    value
+}
+
+/// 绕过缓存重新规划（用户点「立即刷新」/ 巡检要真实现场时用）。
+pub fn plan_fresh(config: &Value) -> Value {
+    plan_with(config, true)
+}
+
+fn plan_uncached(config: &Value) -> Value {
     let planned = plan_actions(config);
     let mode = mount_mode(config);
     let count = |kind: &str, replace: Option<bool>| -> usize {
@@ -1206,9 +1272,10 @@ pub fn resolve(id: &str, choice: &str, config: &Value) -> Result<Value, String> 
                 store::to_trash(&central, &format!("{skill}-central"))?;
             }
             store::copy_dir_all(&tool_copy, &central)?;
+            // 覆盖完立刻读：必须绕过缓存，否则拿到的是被覆盖掉的旧中央哈希。
             let hash = {
-                let real = scan::tree_hash(&central);
-                if real.is_empty() { scan::tree_hash(&tool_copy) } else { real }
+                let real = scan::tree_hash_fresh(&central);
+                if real.is_empty() { scan::tree_hash_fresh(&tool_copy) } else { real }
             };
             let parsed = scan::parse_skill_md(&central).ok();
             let mut manifest = store::load_manifest();
@@ -1255,7 +1322,7 @@ pub fn resolve(id: &str, choice: &str, config: &Value) -> Result<Value, String> 
                         "skillName": skill,
                         "description": parsed.as_ref().map(|item| item.description.clone()).unwrap_or_default(),
                         "version": parsed.as_ref().map(|item| item.version.clone()).unwrap_or_default(),
-                        "treeHash": scan::tree_hash(&dest),
+                        "treeHash": scan::tree_hash_fresh(&dest),
                         "sources": [{ "tool": tool, "originalName": skill, "firstSeen": store::now_iso() }],
                         "mounts": [],
                         "mergeHistory": [{ "at": store::now_iso(), "action": "conflict", "detail": format!("双保留改名自 {tool}:{skill}") }],

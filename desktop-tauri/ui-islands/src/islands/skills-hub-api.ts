@@ -285,12 +285,37 @@ export type ProbeRow = {
 
 const BASE = '/api/skills-hub'
 
+/**
+ * 同一接口的并发请求合并成一次。
+ *
+ * ── 为什么要这一层 ──────────────────────────────────────────
+ * 打开一页会同时发生几件事：壳侧拉 `overview` 算徽标、页签自己拉 `library`、
+ * 两者又都要 `daily-check`。它们发出的时刻几乎相同，而服务端每个请求都要扫
+ * 一遍磁盘 —— 同一份数据被算两三遍。
+ *
+ * 所以这里按「请求路径」把**进行中**的请求合并：后来的调用直接复用前一个
+ * 的 Promise。请求一落地就把条目删掉，不会把结果缓存成「过时数据」—— 那是
+ * 服务端缓存该管的事，前端只管「同时在飞的别重复发」。
+ *
+ * 键只用路径、不带方法，是因为这里只包装 GET（写请求绝不能合并，见下面
+ * `loadConfig` 处的说明）。
+ */
+const inflight = new Map<string, Promise<unknown>>()
+
+function once<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const hit = inflight.get(key)
+  if (hit) return hit as Promise<T>
+  const task = run().finally(() => { inflight.delete(key) })
+  inflight.set(key, task)
+  return task
+}
+
 export function loadOverview(): Promise<Overview> {
-  return api('GET', `${BASE}/overview`)
+  return once(`${BASE}/overview`, () => api('GET', `${BASE}/overview`))
 }
 
 export function loadLibrary(): Promise<Library> {
-  return api('GET', `${BASE}/library`)
+  return once(`${BASE}/library`, () => api('GET', `${BASE}/library`))
 }
 
 export function loadSkill(name: string): Promise<SkillDetail> {
@@ -298,11 +323,11 @@ export function loadSkill(name: string): Promise<SkillDetail> {
 }
 
 export function loadConflicts(): Promise<ConflictView> {
-  return api('GET', `${BASE}/conflicts`)
+  return once(`${BASE}/conflicts`, () => api('GET', `${BASE}/conflicts`))
 }
 
 export function loadPreview(): Promise<Plan> {
-  return api('GET', `${BASE}/preview`)
+  return once(`${BASE}/preview`, () => api('GET', `${BASE}/preview`))
 }
 
 export function runSync(): Promise<SyncResult> {
@@ -313,6 +338,15 @@ export function resolveConflict(id: string, choice: string): Promise<{ resolved:
   return api('POST', `${BASE}/resolve`, { id, choice })
 }
 
+/**
+ * 只对**真正重且纯读**的接口去重，判断标准是「服务端要不要扫一遍磁盘」。
+ *
+ * 走 `plan()` 的四个（overview / library / conflicts / preview）每次都是一次
+ * 全量扫描，页签切换时命中最狠，所以合并。而 `config` / `daily-check` /
+ * `trash` / `tools` 这些是读 kv 与 `read_dir`，本来就便宜，更重要的是它们
+ * **与写操作耦合**（保存后立刻 reload）：若写之前发出的那个 GET 还在飞，
+ * 去重会把写前的旧值直接喂给写后的 reload —— 便宜的接口不值得换这个风险。
+ */
 export function loadConfig(): Promise<{ values: HubConfig }> {
   return api('GET', `${BASE}/config`)
 }
