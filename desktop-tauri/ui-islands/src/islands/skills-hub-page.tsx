@@ -94,6 +94,17 @@ function SkillsHubPage(): React.ReactElement {
   const [booted, setBooted] = React.useState(false)
   const [error, setError] = React.useState('')
   const [reloadAt, setReloadAt] = React.useState(0)
+  // 进入某个页签的次数。保活后 `useLoad` 的 `refreshOnEnter` 只认「整页重进 /
+  // 手动刷新」，内部切 tab 不会变信号 —— 处理页第一次挂载后数据就定格，仪表盘
+  // 的待处理数字却是每次 `loadShell` 的最新值，于是出现「仪表盘有 4 项、点进去
+  // 是空的」。每次切入计数 +1，喂给 Dashboard / Dedup 当重拉信号。
+  const [enterCounts, setEnterCounts] = React.useState<Record<Tab, number>>({
+    dashboard: 1,
+    library: 0,
+    sync: 0,
+    dedup: 0,
+    settings: 0,
+  })
 
   /**
    * 已经打开过的页签。
@@ -110,8 +121,15 @@ function SkillsHubPage(): React.ReactElement {
    * 代价是五个页签的数据都常驻内存，但它们是同一份扫描结果的切片，本来就不大。
    */
   const [visited, setVisited] = React.useState<Set<Tab>>(() => new Set<Tab>([activeTab]))
+  // 首挂载的那一签不 bump：enterKey 初始值就是给它的，再 +1 会让首次进入多扫一遍盘。
+  const firstTabSeen = React.useRef(false)
   React.useEffect(() => {
     setVisited(prev => (prev.has(tab) ? prev : new Set(prev).add(tab)))
+    if (!firstTabSeen.current) {
+      firstTabSeen.current = true
+      return
+    }
+    setEnterCounts(prev => ({ ...prev, [tab]: (prev[tab] ?? 0) + 1 }))
   }, [tab])
 
   /**
@@ -223,7 +241,7 @@ function SkillsHubPage(): React.ReactElement {
         <div className='sk-body'>
           {visited.has('dashboard') ? (
             <div className='sk-pane' hidden={tab !== 'dashboard'}>
-              <Dashboard onGo={goto} onOpenSkill={openSkill} onChanged={() => setReloadAt(value => value + 1)} />
+              <Dashboard onGo={goto} onOpenSkill={openSkill} onChanged={() => setReloadAt(value => value + 1)} enterKey={enterCounts.dashboard} />
             </div>
           ) : null}
           {visited.has('library') ? (
@@ -238,7 +256,7 @@ function SkillsHubPage(): React.ReactElement {
           ) : null}
           {visited.has('dedup') ? (
             <div className='sk-pane' hidden={tab !== 'dedup'}>
-              <Dedup onChanged={() => setReloadAt(value => value + 1)} onOpenSkill={openSkill} />
+              <Dedup onChanged={() => setReloadAt(value => value + 1)} onOpenSkill={openSkill} enterKey={enterCounts.dedup} />
             </div>
           ) : null}
           {visited.has('settings') ? (

@@ -35,6 +35,8 @@ type Props = {
   onGo: (tab: 'library' | 'sync' | 'dedup' | 'settings') => void
   onOpenSkill: (name: string) => void
   onChanged: () => void
+  /** 每次切入仪表盘 +1。保活后切 tab 不会卸载组件，靠它当重拉信号。 */
+  enterKey: number
 }
 
 /** 一份同步报告里读出来的结论。 */
@@ -96,12 +98,14 @@ function reportStamp(file: string): string {
 /** 一条待办：裁决 / 孤儿 / 中央未登记，统一成「标题 + 一句说明 + 查看」。 */
 type TodoRow = { key: string; title: string; sub: string; skill: string }
 
-function Dashboard({ onGo, onOpenSkill, onChanged }: Props): React.ReactElement {
+function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.ReactElement {
   // 仪表盘是全套里唯一「一眼看全现在」的一页，切回来还显示几分钟前的数字等于
-  // 这一页白设 —— 显式开启「进页面重拉」。
-  const overview = useLoad(() => s.loadOverview(), [], { refreshOnEnter: true })
-  const library = useLoad(() => s.loadLibrary(), [], { refreshOnEnter: true })
-  const check = useLoad(() => s.loadDailyCheck(), [], { refreshOnEnter: true })
+  // 这一页白设 —— 显式开启「进页面重拉」。`enterKey` 补上「Skills Hub 内部切
+  // tab」这个信号：`refreshOnEnter` 只认整页重进 / 手动刷新，保活后切 tab
+  // 不卸载组件，`enterKey` 变了才把 deps 里的 effect 再跑一遍。
+  const overview = useLoad(() => s.loadOverview(), [enterKey], { refreshOnEnter: true })
+  const library = useLoad(() => s.loadLibrary(), [enterKey], { refreshOnEnter: true })
+  const check = useLoad(() => s.loadDailyCheck(), [enterKey], { refreshOnEnter: true })
   const [checking, setChecking] = React.useState(false)
   const [query, setQuery] = React.useState('')
   const [reports, setReports] = React.useState<Record<string, ReportMeta>>({})
@@ -182,7 +186,11 @@ function Dashboard({ onGo, onOpenSkill, onChanged }: Props): React.ReactElement 
   // 同一份过滤结果既喂卡片、也喂上面「已连接渠道」那格，别再写第二遍。
   const liveTools = data.tools.filter(row => row.dir)
   const channelSkills = data.tools.reduce((sum, row) => sum + row.skillCount, 0)
-  const brokenMounts = data.mountHealth.filter(item => !item.valid).length
+  // 失效挂载是「待处理」的第四类来源。之前它只进了 `todoTotal`、没进副标题，
+  // 于是出现「4 项」配「冲突 0 · 孤儿 0 · 未登记 0」—— 四个数各自都对，加起来
+  // 却对不上总数，用户只能猜第 4 项是什么。现在四类同进同出，总数 = 副标题之和。
+  const brokenList = data.mountHealth.filter(item => !item.valid)
+  const brokenMounts = brokenList.length
   const todoTotal = data.pendingConflicts.length + data.orphans.length + data.hubExtra.length + brokenMounts
   // 「份消除」= 来源副本数 − 去重后的技能数，两个数字必须是同一轮扫描的两个
   // 视角（`Overview::sourceCount` / `Overview::visibleSkills`）。
@@ -207,26 +215,45 @@ function Dashboard({ onGo, onOpenSkill, onChanged }: Props): React.ReactElement 
     })
     .slice(0, 12)
 
-  const todo: TodoRow[] = [
-    ...data.pendingConflicts.slice(0, 2).map(item => ({
+  // 四类问题**轮流**取，先各取第一条再取第二条。
+  //
+  // 不能像原来那样先拼成一个大数组再 `slice(0, 3)`：挂载失效排在最后，只要前三类
+  // 里有一条，它就被整类切掉。而用户遇到的情况正是「右上角写 4 项、副标题三个 0」——
+  // 那 4 项全是挂载失效，列表里一条都看不见，点「去裁决」进去也是空的。
+  const buckets: TodoRow[][] = [
+    data.pendingConflicts.map(item => ({
       key: `c-${item.id}`,
       title: t('待裁决 · {title}', { title: item.title }),
       sub: item.detail,
       skill: item.skill ?? '',
     })),
-    ...data.orphans.slice(0, 2).map(item => ({
+    data.orphans.map(item => ({
       key: `o-${item.tool}-${item.name}`,
       title: t('孤儿目录 · {name}', { name: item.name }),
       sub: t('存在于 {tool}，待收纳', { tool: item.tool }),
       skill: item.name,
     })),
-    ...data.hubExtra.slice(0, 2).map(item => ({
+    data.hubExtra.map(item => ({
       key: `h-${item.name}`,
       title: t('中央未登记 · {name}', { name: item.name }),
       sub: item.isLink ? t('悬空链接，指向的真身已不在') : t('中央有目录，台账里没有记录'),
       skill: item.name,
     })),
-  ].slice(0, 3)
+    brokenList.map(item => ({
+      key: `m-${item.tool}-${item.name}`,
+      title: t('挂载失效 · {name}', { name: item.name }),
+      sub: t('{tool} 里的链接指不到中央真身', { tool: item.tool }),
+      skill: item.name,
+    })),
+  ]
+  const todo: TodoRow[] = []
+  for (let round = 0; round < 2 && todo.length < 3; round += 1) {
+    for (const bucket of buckets) {
+      if (todo.length >= 3) break
+      const row = bucket[round]
+      if (row) todo.push(row)
+    }
+  }
 
   const checkState = last
     ? last.ok
@@ -378,10 +405,11 @@ function Dashboard({ onGo, onOpenSkill, onChanged }: Props): React.ReactElement 
               <span>{t('项')}</span>
             </div>
             <div className={`sk-stat-sub${todoTotal > 0 ? ' is-warn' : ' is-ok'}`}>
-              {t('冲突 {c} · 孤儿 {o} · 未登记 {h}', {
+              {t('冲突 {c} · 孤儿 {o} · 未登记 {h} · 挂载 {m}', {
                 c: num(data.pendingConflicts.length),
                 o: num(data.orphans.length),
                 h: num(data.hubExtra.length),
+                m: num(brokenMounts),
               })}
             </div>
             <div className='sk-stat-foot'>
