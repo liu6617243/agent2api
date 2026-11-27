@@ -671,6 +671,8 @@ fn plan_actions(config: &Value) -> Planned {
                 {
                     // 别的中枢在管的健康外链：不生成 diff-link 冲突。否则用户
                     // 点同步，处理页又冒出「链接指向异常」，两个软件抢同一条路径。
+                    // `tool` 要 move 进结构体，note 先备好（同上）。
+                    let note = format!("{tool} 是外部技能链接，不接管");
                     actions.push(Action {
                         kind: "skip",
                         skill: name.clone(),
@@ -678,7 +680,7 @@ fn plan_actions(config: &Value) -> Planned {
                         dir: tool_dir.clone(),
                         mount_name: name.clone(),
                         replace_real: false,
-                        note: format!("{tool} 是外部技能链接，不接管"),
+                        note,
                         sources: Vec::new(),
                         entry: None,
                     });
