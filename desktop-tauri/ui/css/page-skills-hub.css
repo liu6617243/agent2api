@@ -433,7 +433,8 @@
   color: var(--text-2);
 }
 .sk-channel-glyph.is-ok { color: var(--ok); border-color: var(--ok); }
-.sk-channel-glyph.is-off { color: var(--text-3); opacity: .65; }
+/* 曾经的 `.is-off`（未连接的灰态）随「渠道区只画已连接」一起去掉了：
+   仪表盘不再渲染未连接的渠道，那条规则没有使用者。 */
 .sk-channel-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1 1 auto; }
 .sk-channel-name {
   display: flex;

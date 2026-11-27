@@ -1245,5 +1245,7 @@
   "报告": "Report",
   "待办决策与孤儿": "Pending decisions & orphans",
   "没有待处理项，仓库是干净的": "Nothing pending — the hub is clean",
-  "中央": "Hub"
+  "中央": "Hub",
+  "还没有已连接的渠道，去配置页检查目录": "No channels connected yet — check the directories on the settings page.",
+  "只显示已连接的渠道": "Only connected channels are shown."
 }

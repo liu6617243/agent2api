@@ -176,7 +176,11 @@ function Dashboard({ onGo, onOpenSkill, onChanged }: Props): React.ReactElement 
     )
   }
 
-  const hitTools = data.tools.filter(row => row.dir).length
+  // 渠道区只画「目录真的找到了」的渠道 —— 未找到目录 / 已停用的完整配置在配置页
+  // 已经有（含候选路径、启用开关），仪表盘重复一遍只会把已连接的挤到下面。
+  // 卡片里的状态徽标因此恒为「已连接」，不再需要三态分支。
+  // 同一份过滤结果既喂卡片、也喂上面「已连接渠道」那格，别再写第二遍。
+  const liveTools = data.tools.filter(row => row.dir)
   const channelSkills = data.tools.reduce((sum, row) => sum + row.skillCount, 0)
   const brokenMounts = data.mountHealth.filter(item => !item.valid).length
   const todoTotal = data.pendingConflicts.length + data.orphans.length + data.hubExtra.length + brokenMounts
@@ -314,7 +318,7 @@ function Dashboard({ onGo, onOpenSkill, onChanged }: Props): React.ReactElement 
               </span>
             </div>
             <div className='sk-stat-value'>
-              <b>{num(hitTools)}</b>
+              <b>{num(liveTools.length)}</b>
               <span className='sk-stat-slash'>/</span>
               <b>{num(data.tools.length)}</b>
               <span>{t('个渠道')}</span>
@@ -395,6 +399,7 @@ function Dashboard({ onGo, onOpenSkill, onChanged }: Props): React.ReactElement 
                 </svg>
               </span>
               {t('渠道工具连接矩阵')}
+              <span className='sk-block-count' title={t('只显示已连接的渠道')}>{num(liveTools.length)}</span>
             </span>
             <div className='sk-block-action'>
               <Button type='button' size='sm' variant='ghost' onClick={() => onGo('settings')}>
@@ -402,29 +407,27 @@ function Dashboard({ onGo, onOpenSkill, onChanged }: Props): React.ReactElement 
               </Button>
             </div>
           </div>
-          {data.tools.length === 0 ? (
-            <Empty>{t('没有可用的渠道，先去配置页加一个目录')}</Empty>
+          {liveTools.length === 0 ? (
+            <Empty>
+              {data.tools.length === 0
+                ? t('没有可用的渠道，先去配置页加一个目录')
+                : t('还没有已连接的渠道，去配置页检查目录')}
+            </Empty>
           ) : (
             <div className='sk-channels'>
-              {data.tools.map(row => (
+              {liveTools.map(row => (
                 <div key={row.id} className='sk-channel'>
-                  <span className={`sk-channel-glyph${row.dir ? ' is-ok' : ' is-off'}`} aria-hidden='true'>
+                  <span className='sk-channel-glyph is-ok' aria-hidden='true'>
                     {(row.name || '?').trim().charAt(0).toUpperCase()}
                   </span>
                   <div className='sk-channel-body'>
                     <div className='sk-channel-name'>
                       <span title={row.name}>{row.name}</span>
                       {row.builtin ? null : <Badge variant='outline' shape='tag'>{t('自定义')}</Badge>}
-                      {row.dir ? (
-                        <Badge variant='success' shape='tag'>{t('已连接')}</Badge>
-                      ) : row.enabled ? (
-                        <Badge variant='outline' shape='tag'>{t('未找到目录')}</Badge>
-                      ) : (
-                        <Badge variant='ghost' shape='tag'>{t('已停用')}</Badge>
-                      )}
+                      <Badge variant='success' shape='tag'>{t('已连接')}</Badge>
                     </div>
-                    <code className='sk-channel-path' title={row.dir ?? row.candidatePaths.join('\n')}>
-                      {row.dir ?? t('未找到（候选：{list}）', { list: row.candidatePaths.join(' / ') || t('无') })}
+                    <code className='sk-channel-path' title={row.dir ?? ''}>
+                      {row.dir}
                     </code>
                   </div>
                   <div className='sk-channel-meta'>
