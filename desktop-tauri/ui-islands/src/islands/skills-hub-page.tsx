@@ -404,7 +404,9 @@ function SkillDrawer({
                     <span className='sk-cell-tool'>{row.tool}</span>
                     <code className='sk-cell-note' title={row.path}>{row.path}</code>
                     <span>
-                      {row.valid ? (
+                      {row.external ? (
+                        <Badge variant='outline' shape='tag'>{t('外部链接')}</Badge>
+                      ) : row.valid ? (
                         <Badge variant='success' shape='tag'>{t('有效')}</Badge>
                       ) : (
                         <Badge variant='destructive' shape='tag'>{t('失效')}</Badge>
@@ -413,7 +415,9 @@ function SkillDrawer({
                     <span>
                       <Switch
                         checked={row.enabled}
-                        disabled={busy === `mount-${row.tool}`}
+                        // 外链是别的中枢在管的：关掉开关会摘掉那条链接，
+                        // 会被对方抢回来，还会把对方的功能弄断。
+                        disabled={busy === `mount-${row.tool}` || row.external === true}
                         onCheckedChange={next => void toggle(row.tool, next)}
                       />
                     </span>

@@ -666,6 +666,22 @@ fn plan_actions(config: &Value) -> Planned {
                         sources: Vec::new(),
                         entry: None,
                     });
+                } else if mount::is_link(&link_path)
+                    && Path::new(&mount::link_target(&link_path)).join("SKILL.md").is_file()
+                {
+                    // 别的中枢在管的健康外链：不生成 diff-link 冲突。否则用户
+                    // 点同步，处理页又冒出「链接指向异常」，两个软件抢同一条路径。
+                    actions.push(Action {
+                        kind: "skip",
+                        skill: name.clone(),
+                        tool,
+                        dir: tool_dir.clone(),
+                        mount_name: name.clone(),
+                        replace_real: false,
+                        note: format!("{tool} 是外部技能链接，不接管"),
+                        sources: Vec::new(),
+                        entry: None,
+                    });
                 } else {
                     let got = mount::link_target(&link_path);
                     let shown = if got.is_empty() { "（读不出）".to_string() } else { got };
@@ -1473,9 +1489,48 @@ pub fn toggle_mount(name: &str, tool: &str, enabled: bool, config: &Value) -> Re
 }
 
 /// 一键修复失效挂载。
+///
+/// 「失效」只算本程序该管的：链接丢了 / 指错且目标不是活技能目录。指向别的
+/// 中枢的健康外链不在这里抢（见 `mount::repair` 里的 external 分支）。
 pub fn repair(config: &Value) -> Value {
     let manifest = store::load_manifest();
     mount::repair(&manifest, &mount_mode(config))
+}
+
+/// 解除登记：只删台账记录，不动磁盘上的链接。
+///
+/// 用于「这个位置的链接是别的中枢在管的」—— 摘掉重挂会被抢回去，两个软件
+/// 抢同一条路径。解除后 Agent2API 不再把它算作自己的挂载，也不再报失效。
+pub fn unregister(name: &str, tool: &str) -> Result<Value, String> {
+    let name = name.trim();
+    let tool = tool.trim();
+    if name.is_empty() || tool.is_empty() {
+        return Err("缺少技能名或渠道".to_string());
+    }
+    let manifest = store::load_manifest();
+    let mounts = manifest
+        .get("skills")
+        .and_then(Value::as_object)
+        .and_then(|map| map.get(name))
+        .and_then(|entry| entry.get("mounts"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let record = mounts
+        .iter()
+        .find(|item| item.get("tool").and_then(Value::as_str) == Some(tool))
+        .cloned()
+        .ok_or_else(|| format!("「{name}」没有登记到 {tool} 的挂载记录"))?;
+    let path = PathBuf::from(record.get("path").and_then(Value::as_str).unwrap_or(""));
+    // 只删台账；链接本身是别的中枢的资产，不动。
+    store::drop_mount(name, tool, &path)?;
+    Ok(json!({
+        "ok": true,
+        "name": name,
+        "tool": tool,
+        "path": path.to_string_lossy(),
+        "message": format!("已解除 {name} 在 {tool} 的挂载登记（磁盘链接未动）"),
+    }))
 }
 
 // ─── 日报 ────────────────────────────────────────────────────

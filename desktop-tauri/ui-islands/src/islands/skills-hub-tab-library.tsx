@@ -97,7 +97,12 @@ function Library({ onOpenSkill, onOpenSettings }: Props): React.ReactElement {
     setRepairing(true)
     void s.repairMounts()
       .then(result => {
-        toast(t('修复 {n} 处挂载', { n: result.repaired }), result.repaired > 0 ? 'ok' : undefined)
+        const failed = result.failed ?? []
+        if (failed.length > 0) {
+          toast(t('部分失败：{n} 处未修复', { n: failed.length }), 'err')
+        } else {
+          toast(t('修复 {n} 处挂载', { n: result.repaired }), result.repaired > 0 ? 'ok' : undefined)
+        }
         library.reload()
         check.reload()
       })

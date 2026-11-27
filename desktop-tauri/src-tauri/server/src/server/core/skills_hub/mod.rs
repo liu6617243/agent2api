@@ -224,9 +224,15 @@ pub fn overview() -> Value {
     let orphans = planned.get("orphans").and_then(Value::as_array).cloned().unwrap_or_default();
     let hub_extra = planned.get("hubExtra").and_then(Value::as_array).cloned().unwrap_or_default();
     let mount_health = planned.get("mountHealth").and_then(Value::as_array).cloned().unwrap_or_default();
+    // 「失效」= 不是有效挂载，也**不是外部链接**。外链是别的中枢在管的健康
+    // 链接（链接在、目标是活技能目录、只是不指本机中央），算进失效会让
+    // 一键修复去抢那个中枢的路径，修完又被抢回来。
     let broken = mount_health
         .iter()
-        .filter(|item| item.get("valid").and_then(Value::as_bool) != Some(true))
+        .filter(|item| {
+            item.get("valid").and_then(Value::as_bool) != Some(true)
+                && item.get("external").and_then(Value::as_bool) != Some(true)
+        })
         .count();
 
     json!({
@@ -264,8 +270,9 @@ pub fn library() -> Value {
     let planned = sync_plan(&config);
     let manifest = store::load_manifest();
 
-    // 「名称\0路径」→ 挂载是否有效（前端要分开「已启用但链接失效」与「真有效」）
-    let health: Vec<(String, bool)> = planned
+    // 「名称\0路径」→ (是否有效, 是否外部链接)。前端要分开
+    // 「已启用但链接失效」「真有效」「别的中枢在管的外链」三种。
+    let health: Vec<(String, bool, bool)> = planned
         .get("mountHealth")
         .and_then(Value::as_array)
         .map(|list| {
@@ -274,6 +281,7 @@ pub fn library() -> Value {
                     (
                         format!("{}\u{0}{}", text(item, "skill"), text(item, "path")),
                         item.get("valid").and_then(Value::as_bool).unwrap_or(false),
+                        item.get("external").and_then(Value::as_bool).unwrap_or(false),
                     )
                 })
                 .collect()
@@ -281,7 +289,11 @@ pub fn library() -> Value {
         .unwrap_or_default();
     let is_valid = |skill: &str, path: &str| -> bool {
         let key = format!("{skill}\u{0}{path}");
-        health.iter().any(|(item, ok)| *item == key && *ok)
+        health.iter().any(|(item, ok, _)| *item == key && *ok)
+    };
+    let is_external = |skill: &str, path: &str| -> bool {
+        let key = format!("{skill}\u{0}{path}");
+        health.iter().any(|(item, _, ext)| *item == key && *ext)
     };
 
     let mut rows: Vec<Value> = Vec::new();
@@ -372,9 +384,9 @@ pub fn library() -> Value {
                 .into_iter()
                 .map(|item| {
                     let path = text(&item, "path");
-                    let valid = is_valid(name, &path);
                     let mut next = item;
-                    next["valid"] = json!(valid);
+                    next["valid"] = json!(is_valid(name, &path));
+                    next["external"] = json!(is_external(name, &path));
                     next
                 })
                 .collect();
@@ -606,6 +618,13 @@ pub fn toggle_mount(name: &str, tool: &str, enabled: bool) -> Result<Value, Stri
     out
 }
 
+/// 解除登记：只删台账记录，不动磁盘链接（用于其他中枢管理的链接位）。
+pub fn unregister_mount(name: &str, tool: &str) -> Result<Value, String> {
+    let out = plan::unregister(name, tool);
+    invalidate();
+    out
+}
+
 /// 一键修复失效挂载。
 pub fn repair() -> Value {
     let config = tools::load_config();
@@ -658,7 +677,10 @@ pub fn run_daily_check(auto_mount: bool) -> Value {
         .and_then(Value::as_array)
         .map(|list| {
             list.iter()
-                .filter(|item| item.get("valid").and_then(Value::as_bool) != Some(true))
+                .filter(|item| {
+                    item.get("valid").and_then(Value::as_bool) != Some(true)
+                        && item.get("external").and_then(Value::as_bool) != Some(true)
+                })
                 .count()
         })
         .unwrap_or(0);

@@ -243,7 +243,16 @@ pub fn unmount(link_path: &Path) -> Result<(), String> {
     }
 }
 
-/// 校验一条挂载记录：链接还在、指向中央真身、目标还能进去。
+/// 校验一条挂载记录。
+///
+/// ── 为什么「指向别处的健康链接」不算失效 ────────────────────
+/// 台账里可能残留别的中枢（AgentHub / WorkBuddy 自己的技能库）登记的挂载：
+/// 链接存在、目标是个活着的技能目录，只是不指向本机中央真身。以前这种一律
+/// 判「失效」，一键修复就会去摘掉它、重建成本程序中央的链接 —— 然后被那个
+/// 中枢抢回去，用户看到的就是「点了全部重建、失效项还在」，两个软件在抢
+/// 同一条路径。现在这种链接标 `external: true`：
+/// `valid` 仍指「本程序的有效挂载」（不算 true），但失效统计与一键修复都会
+/// 跳过它；要接管得在详情页 / 处理页显式解除登记。
 pub fn verify(mount_record: &Value) -> Value {
     let path = PathBuf::from(mount_record.get("path").and_then(Value::as_str).unwrap_or(""));
     let skill = mount_record.get("name").and_then(Value::as_str).unwrap_or("");
@@ -251,8 +260,17 @@ pub fn verify(mount_record: &Value) -> Value {
     let link_exists = is_link(&path);
     let target = link_target(&path);
     let points_ok = !target.is_empty() && scan::path_key(Path::new(&target)) == scan::path_key(&central);
+    // 目标本身是个活技能目录（有 SKILL.md）。比较键不解析 `..`，所以不能用
+    // `path_key(target) == path_key(central)` 判「指到中央」之后再谈外部 ——
+    // 得先确认这条链接**没有**指到中央，再看目标是否健康。
+    let target_is_live_skill = !target.is_empty()
+        && Path::new(&target).join("SKILL.md").is_file();
+    let external = link_exists && !points_ok && target_is_live_skill;
     let mut row = mount_record.clone();
+    // `valid` 仍指「本程序的有效挂载」（链接指向中央真身）。外链不算 valid，
+    // 也不算失效 —— 用 `external` 单独标记，失效统计要排除它。
     row["valid"] = json!(link_exists && points_ok && central.is_dir());
+    row["external"] = json!(external);
     row["linkExists"] = json!(link_exists);
     row["pointsCentral"] = json!(points_ok);
     row["centralExists"] = json!(central.is_dir());
@@ -308,7 +326,19 @@ pub fn repair(manifest: &Value, mode: &str) -> Value {
             if path.as_os_str().is_empty() {
                 continue;
             }
-            if verify(item).get("valid").and_then(Value::as_bool) == Some(true) {
+            let checked = verify(item);
+            if checked.get("valid").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            // 外链是别的中枢在管的健康链接：摘了会被抢回去，两个软件抢同一条
+            // 路径只会让「全部重建」永远修不完。不碰文件，提示用户去解除登记。
+            if checked.get("external").and_then(Value::as_bool) == Some(true) {
+                failed.push(json!({
+                    "skill": name,
+                    "tool": item.get("tool").cloned().unwrap_or(Value::Null),
+                    "path": path.to_string_lossy(),
+                    "message": "外部技能链接（其他中枢维护），未接管；可在处理页解除登记",
+                }));
                 continue;
             }
             let tool_dir = match path.parent() {

@@ -33,6 +33,8 @@ export type MountRecord = {
   enabled: boolean
   /** 链接存在 且 指向中央真身 且 中央真身还在 */
   valid?: boolean
+  /** 链接存在、目标是活技能目录、但不指向本机中央 —— 别的中枢在管，本程序不接管 */
+  external?: boolean
   linkExists?: boolean
   pointsCentral?: boolean
   centralExists?: boolean
@@ -384,7 +386,7 @@ export function runDailyCheck(autoMount: boolean): Promise<DailyCheck> {
   return api('POST', `${BASE}/daily-check/run${autoMount ? '?autoMount=1' : ''}`, {})
 }
 
-export function repairMounts(): Promise<{ repaired: number; failed: unknown[] }> {
+export function repairMounts(): Promise<{ repaired: number; failed: RepairFailure[] }> {
   return api('POST', `${BASE}/repair`, {})
 }
 
@@ -410,6 +412,19 @@ export function removeSkill(name: string): Promise<{ name: string; trash: string
 
 export function toggleMount(name: string, tool: string, enabled: boolean): Promise<{ ok: boolean; enabled: boolean }> {
   return api('POST', `${BASE}/mount/toggle`, { name, tool, enabled })
+}
+
+/** 一条修复失败明细（`mount::repair` 的 failed 数组）。 */
+export type RepairFailure = {
+  skill: string
+  path: string
+  message: string
+  tool?: string
+}
+
+/** 解除登记：只删台账记录，不动磁盘链接（用于其他中枢管理的链接位）。 */
+export function unregisterMount(name: string, tool: string): Promise<{ ok: boolean; name: string; tool: string; message: string }> {
+  return api('POST', `${BASE}/mount/unregister`, { name, tool })
 }
 
 export function loadReports(limit = 20): Promise<{ items: ReportRow[] }> {

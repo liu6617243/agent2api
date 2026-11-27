@@ -96,15 +96,41 @@ function Dedup({ onChanged, onOpenSkill, enterKey }: Props): React.ReactElement 
 
   // 修复挂载只有全量接口（`mount::repair_all`），没有「修这一条」。所以这一区
   // 只给一个按钮，不假装能逐行点 —— 界面上放一排点了没用的按钮比没有按钮更糟。
+  // 失败明细必须展示：只 toast 修好的条数，外链没被接管 / 真实目录没被摘
+  // 这些「为什么还剩」的原因就全被吞掉了。
+  const [repairNote, setRepairNote] = React.useState('')
   const repair = async () => {
     setBusy('repair')
     try {
       const result = await s.repairMounts()
-      toast(t('重建完成：修复 {n} 处', { n: num(result.repaired) }), 'ok')
+      const failed = result.failed ?? []
+      if (failed.length > 0) {
+        setRepairNote(failed.map(item => `${item.skill} @ ${item.tool}：${item.message}`).join('\n'))
+        toast(t('部分失败：{n} 处未修复', { n: num(failed.length) }), 'err')
+      } else {
+        setRepairNote('')
+        toast(t('重建完成：修复 {n} 处', { n: num(result.repaired) }), 'ok')
+      }
       overview.reload()
       onChanged()
     } catch (error) {
       toast(t('重建失败：{error}', { error: errorText(error) }), 'err')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  // 解除登记：只删台账，不动磁盘链接。用于别的中枢在管的链接位 ——
+  // 摘掉重挂会被抢回去，两个软件抢同一条路径。
+  const unregister = async (name: string, tool: string) => {
+    setBusy(`unregister:${tool}:${name}`)
+    try {
+      const result = await s.unregisterMount(name, tool)
+      toast(t('已解除 {name} 在 {tool} 的挂载登记', { name, tool }), 'ok')
+      overview.reload()
+      onChanged()
+    } catch (error) {
+      toast(t('解除失败：{error}', { error: errorText(error) }), 'err')
     } finally {
       setBusy('')
     }
@@ -130,7 +156,10 @@ function Dedup({ onChanged, onOpenSkill, enterKey }: Props): React.ReactElement 
   const duplicates = conflicts.data?.duplicates ?? []
   const hints = conflicts.data?.hints ?? []
 
-  const broken = (overview.data?.mountHealth ?? []).filter(item => !item.valid)
+  // 失效 = 不是有效挂载、也不是外部链接。外链是别的中枢在管的健康链接，
+  // 放进「失效」会让用户点「全部重建」，然后看它修完又回来。
+  const broken = (overview.data?.mountHealth ?? []).filter(item => !item.valid && !item.external)
+  const externals = (overview.data?.mountHealth ?? []).filter(item => item.external)
   const extras = overview.data?.hubExtra ?? []
   const orphans = overview.data?.orphans ?? []
   const clean =
@@ -257,7 +286,7 @@ function Dedup({ onChanged, onOpenSkill, enterKey }: Props): React.ReactElement 
           </Section>
         ) : null}
 
-        {broken.length > 0 ? (
+        {broken.length > 0 || repairNote ? (
           <Section
             title={t('挂载失效')}
             hint={t('{n} 处。客户端目录里的链接指不到中央真身 —— 重建只改链接，不动内容。', { n: num(broken.length) })}
@@ -267,6 +296,45 @@ function Dedup({ onChanged, onOpenSkill, enterKey }: Props): React.ReactElement 
               </Button>
             )}
           >
+            {repairNote ? (
+              <div className='sk-conflict-detail' style={{ whiteSpace: 'pre-line' }}>
+                <b>{t('失败明细')}</b>
+                {repairNote}
+              </div>
+            ) : null}
+            {broken.length > 0 ? (
+              <div className='sk-table'>
+                <div className='sk-table-head'>
+                  <span>{t('技能')}</span>
+                  <span>{t('渠道')}</span>
+                  <span>{t('链接路径')}</span>
+                  <span>{t('操作')}</span>
+                </div>
+                {broken.map(item => (
+                  <div key={`${item.skill}-${item.tool}-${item.path}`} className='sk-table-row'>
+                    <span className='sk-cell-name'>{item.skill}</span>
+                    <span><Badge variant='outline' shape='tag'>{item.tool}</Badge></span>
+                    <span className='sk-cell-note'>
+                      <code>{item.path}</code>
+                      {item.centralExists === false ? <span className='sk-muted'> {t('中央真身也不在了')}</span> : null}
+                    </span>
+                    <span className='sk-row-actions'>
+                      <Button type='button' size='sm' variant='ghost' onClick={() => onOpenSkill(item.skill)}>
+                        {t('看详情')}
+                      </Button>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </Section>
+        ) : null}
+
+        {externals.length > 0 ? (
+          <Section
+            title={t('外部链接')}
+            hint={t('这是其他软件维护的健康链接，本程序不接管。')}
+          >
             <div className='sk-table'>
               <div className='sk-table-head'>
                 <span>{t('技能')}</span>
@@ -274,15 +342,21 @@ function Dedup({ onChanged, onOpenSkill, enterKey }: Props): React.ReactElement 
                 <span>{t('链接路径')}</span>
                 <span>{t('操作')}</span>
               </div>
-              {broken.map(item => (
+              {externals.map(item => (
                 <div key={`${item.skill}-${item.tool}-${item.path}`} className='sk-table-row'>
                   <span className='sk-cell-name'>{item.skill}</span>
                   <span><Badge variant='outline' shape='tag'>{item.tool}</Badge></span>
-                  <span className='sk-cell-note'>
-                    <code>{item.path}</code>
-                    {item.centralExists === false ? <span className='sk-muted'> {t('中央真身也不在了')}</span> : null}
-                  </span>
+                  <span className='sk-cell-note'><code>{item.path}</code></span>
                   <span className='sk-row-actions'>
+                    <Button
+                      type='button'
+                      size='sm'
+                      variant='ghost'
+                      disabled={busy === `unregister:${item.tool}:${item.skill}`}
+                      onClick={() => void unregister(item.skill, item.tool)}
+                    >
+                      {t('解除登记')}
+                    </Button>
                     <Button type='button' size='sm' variant='ghost' onClick={() => onOpenSkill(item.skill)}>
                       {t('看详情')}
                     </Button>

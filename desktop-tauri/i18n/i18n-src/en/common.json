@@ -1278,5 +1278,11 @@
   "冲突 {c} · 孤儿 {o} · 未登记 {h} · 挂载 {m}": "Conflicts {c} · Orphans {o} · Unregistered {h} · Mounts {m}",
   "自定义": "Custom",
   "读取中…": "Loading…",
-  "查看": "View"
+  "查看": "View",
+  "这是其他软件维护的健康链接，本程序不接管。": "Healthy links managed by other software; this app does not take over.",
+  "解除登记": "Unregister",
+  "已解除 {name} 在 {tool} 的挂载登记": "Unregistered {name} from {tool}",
+  "解除失败：{error}": "Unregister failed: {error}",
+  "部分失败：{n} 处未修复": "Partial failure: {n} not repaired",
+  "失败明细": "Failure details"
 }

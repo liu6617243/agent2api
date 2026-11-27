@@ -26,6 +26,7 @@
 //! POST /api/skills-hub/adopt          纳管中央目录里未登记的技能（{name}）
 //! POST /api/skills-hub/remove         删除技能（{name}）
 //! POST /api/skills-hub/mount/toggle   切换一处挂载（{name, tool, enabled}）
+//! POST /api/skills-hub/mount/unregister 解除登记（{name, tool}），不动磁盘链接
 //! ```
 //!
 //! ── 为什么全部挂 protected ──────────────────────────────────
@@ -333,6 +334,27 @@ pub async fn post_mount_toggle(State(_state): State<ServerState>, body: Bytes) -
         .and_then(Value::as_bool)
         .unwrap_or(true);
     match skills_hub::toggle_mount(&name, &tool, enabled) {
+        Ok(value) => ok_json(value),
+        Err(message) => errors::management_error(400, message),
+    }
+}
+
+/// 解除登记：只删台账记录，不动磁盘链接。用于其他中枢管理的链接位 ——
+/// 摘掉重挂会被抢回去，两个软件抢同一条路径。
+pub async fn post_mount_unregister(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = match body_or_bad_request(&body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let name = match field(&payload, "name") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let tool = match field(&payload, "tool") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match skills_hub::unregister_mount(&name, &tool) {
         Ok(value) => ok_json(value),
         Err(message) => errors::management_error(400, message),
     }

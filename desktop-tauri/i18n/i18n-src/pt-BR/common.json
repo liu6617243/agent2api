@@ -1267,5 +1267,11 @@
   "冲突 {c} · 孤儿 {o} · 未登记 {h} · 挂载 {m}": "Conflitos {c} · Órfãos {o} · Não registrados {h} · Montagens {m}",
   "自定义": "Personalizado",
   "读取中…": "Carregando…",
-  "查看": "Ver"
+  "查看": "Ver",
+  "这是其他软件维护的健康链接，本程序不接管。": "Links saudáveis gerenciados por outro software; este app não assume.",
+  "解除登记": "Desregistrar",
+  "已解除 {name} 在 {tool} 的挂载登记": "Desregistrado {name} de {tool}",
+  "解除失败：{error}": "Falha ao desregistrar: {error}",
+  "部分失败：{n} 处未修复": "Falha parcial: {n} não reparados",
+  "失败明细": "Detalhes da falha"
 }
