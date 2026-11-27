@@ -20,7 +20,7 @@
    ── 为什么表格用 grid 而不是 <table> ──────────────────────────
    这些「表」的每列宽度是按内容语义定的（渠道名窄、路径弹性、状态固定宽），
    `<table>` 的自动列宽会让长路径把整表撑出横向滚动，而路径本来就是该截断
-   的东西。所有 .sk-table / .sk-matrix 都是 grid 行，列宽写死在
+   的东西。所有 .sk-table 都是 grid 行，列宽写死在
    grid-template-columns 里，单元格自己 overflow 处理。
    ───────────────────────────────────────────── */
 
@@ -178,50 +178,9 @@
 }
 .sk-section-action { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 
-/* ── 仪表盘 ── */
-.sk-dash { display: flex; flex-direction: column; gap: 12px; }
-.sk-dash-cols {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-  gap: 12px;
-  align-items: start;
-}
-
-/* hero：中央仓库路径 + 上次检测 + 三个动作 */
-.sk-hero {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 14px;
-  flex-wrap: wrap;
-  padding: 12px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--surface-2, var(--surface-inset));
-  flex: 0 0 auto;
-}
-.sk-hero-main { display: flex; flex-direction: column; gap: 8px; min-width: 0; flex: 1 1 320px; }
-.sk-hero-path { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-.sk-hero-label {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  color: var(--text-3);
-}
-.sk-hero-path code {
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  color: var(--text-2);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.sk-hero-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.sk-mode { font-size: 11.5px; color: var(--text-3); }
-.sk-hero-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-
 /* 统计卡下的第二行说明。组件库的 MetricCard 只管大数字，这行字随接口
-   一起变（「来源 N 处 → 真身 M 份」），所以由页面自己画。 */
+   一起变（「来源 N 处 → 真身 M 份」），所以由页面自己画。
+   ⚠️ 同步页（skills-hub-tab-sync）还在用，删之前先 grep。 */
 .sk-metric-sub {
   margin-top: 2px;
   font-size: 11.5px;
@@ -229,79 +188,395 @@
   color: var(--text-3);
 }
 
-/* ── 渠道矩阵 ────────────────────────────────────────────────
-   五列：渠道（含「自定义」徽标）/ 目录（弹性、可截断）/ 技能数 / 挂载数 / 状态。
-   数字列用 .sk-num 右对齐，一眼就能纵向比大小。 */
-.sk-matrix { display: flex; flex-direction: column; min-width: 0; }
-.sk-matrix-head,
-.sk-matrix-row {
+/* ── 仪表盘 ──────────────────────────────────────────────────
+   结构：页头 → 检测条 → 四宫格统计 → 渠道卡片 → 技能速览 → 最近同步 + 待办。
+   每一块都是独立卡片（.sk-block），块内不再嵌套卡片 —— 卡片套卡片会让边界
+   变成两层阴影，读起来分不清层级。 */
+.sk-dash { display: flex; flex-direction: column; gap: 12px; }
+
+/* 底部两栏：同步记录更宽（每行有时间 + 结论 + 文件名），待办窄一档 */
+.sk-dash-cols {
   display: grid;
-  grid-template-columns: minmax(120px, 0.9fr) minmax(180px, 2fr) 56px 56px 96px;
-  gap: 10px;
-  align-items: center;
-  padding: 7px 0;
-  font-size: 12px;
-  min-width: 0;
+  grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
 }
-.sk-matrix-head {
-  padding: 4px 0;
+@media (max-width: 1080px) {
+  .sk-dash-cols { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* 页头：标题 + 中央路径 + 三个动作 */
+.sk-dash-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+}
+.sk-dash-head-copy { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.sk-dash-title { font-size: 15px; font-weight: 600; color: var(--text); }
+.sk-dash-sub {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
   font-size: 11.5px;
   color: var(--text-3);
-  border-bottom: 1px solid var(--border);
 }
-.sk-matrix-row { border-bottom: 1px solid var(--hairline); }
-.sk-matrix-row:last-child { border-bottom: 0; }
-.sk-matrix-name {
+.sk-dash-sub code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sk-dash-head-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+/* 每日检测条：一条横向状态带，不是卡片 —— 它只说「上次检测结论」 */
+.sk-check-bar {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+  flex: 0 0 auto;
+}
+.sk-check-main { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
+.sk-check-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-3);
+}
+.sk-check-glyph svg { width: 12px; height: 12px; }
+.sk-check-glyph.is-ok { color: var(--ok); border-color: var(--ok); background: var(--ok-soft); }
+.sk-check-glyph.is-warn { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
+.sk-check-title { font-size: 12.5px; font-weight: 600; color: var(--text); }
+.sk-check-state { font-size: 11.5px; color: var(--text-3); }
+.sk-check-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+/* 图标按钮（检测条右侧的「重读」）：与 Button 的 ghost 尺寸对齐 */
+.sk-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+.sk-icon-btn svg { width: 13px; height: 13px; }
+.sk-icon-btn:hover { background: var(--control-hover); color: var(--text); }
+.sk-icon-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+/* ── 四宫格统计 ──────────────────────────────────────────────
+   数字是这一屏的「主结论」，所以单独放大（26px）且带单位；标签在上、说明在
+   下、入口在右下 —— 视线从「多少」往下走一步就落到「下一步做什么」。 */
+.sk-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+@media (max-width: 940px) {
+  .sk-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 620px) {
+  .sk-stats { grid-template-columns: minmax(0, 1fr); }
+}
+.sk-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 11px 13px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  min-width: 0;
+}
+.sk-stat-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.sk-stat-label { font-size: 11.5px; color: var(--text-3); }
+.sk-stat-glyph { display: inline-flex; color: var(--text-3); opacity: .7; flex: none; }
+.sk-stat-glyph svg { width: 13px; height: 13px; }
+.sk-stat-value {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+.sk-stat-value b {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+.sk-stat-value span { font-size: 11.5px; color: var(--text-3); }
+.sk-stat-slash { color: var(--text-3); }
+.sk-stat-sub {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+.sk-stat-sub.is-ok { color: var(--ok); }
+.sk-stat-sub.is-warn { color: var(--warn); }
+.sk-stat-foot { display: flex; justify-content: flex-end; margin-top: auto; }
+.sk-stat-link {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font-family: inherit;
+  font-size: 11.5px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.sk-stat-link:hover { color: var(--primary); }
+.sk-stat-link:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-radius: var(--r-sm); }
+
+/* ── 内容块（渠道 / 速览 / 同步 / 待办）──────────────────────
+   与 .sk-section 同款卡片，但标题行只在左，右侧放这一块自己的动作。 */
+.sk-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 13px 15px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  flex: 0 0 auto;
+  min-width: 0;
+}
+.sk-block-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.sk-block-title {
+  display: inline-flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
-  color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-2);
 }
-.sk-matrix-dir {
-  font-family: var(--font-mono);
-  font-size: 11px;
+.sk-block-glyph { display: inline-flex; color: var(--text-3); flex: none; }
+.sk-block-glyph svg { width: 13px; height: 13px; }
+.sk-block-count {
+  padding: 0 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface-inset);
+  font-size: 10.5px;
+  font-weight: 500;
   color: var(--text-3);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
+  font-variant-numeric: tabular-nums;
 }
-.sk-num { text-align: right; font-variant-numeric: tabular-nums; }
+.sk-block-action { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; flex: none; min-width: 0; }
+/* 区块头里的搜索框不许抢宽：`flex: 1 1 260px` 会让它吃掉整行，把旁边的
+   「全部技能库」挤到第二行。这里改成可收缩的定档，并与 Button sm（26px）同高。
+   `min-width` 必须一起压下来 —— 基础规则的 200px 会让整组宽到 288px，
+   按钮照样被挤到第二行。 */
+.sk-block-action .sk-search-wrap { flex: 0 1 240px; width: 240px; min-width: 110px; max-width: 240px; height: 26px; padding: 0 9px; }
+.sk-block-action .sk-search { font-size: 11.5px; }
 
-/* ── 迷你清单（待裁决 / 孤儿 / 最近同步）─────────────────── */
-.sk-mini-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+/* ── 渠道卡片 ────────────────────────────────────────────────
+   一行一个渠道（窄窗口两行），图标 + 名字/目录 + 右侧「技能/挂载/状态」。 */
+.sk-channels {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 8px;
   min-width: 0;
 }
-.sk-mini-list > li {
+.sk-channel {
   display: flex;
-  flex-direction: column;
-  gap: 1px;
-  padding: 7px 10px;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
   border: 1px solid var(--hairline);
   border-radius: var(--r-sm);
   background: var(--surface-inset);
   min-width: 0;
 }
-.sk-mini-title {
+.sk-channel-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.sk-channel-glyph.is-ok { color: var(--ok); border-color: var(--ok); }
+.sk-channel-glyph.is-off { color: var(--text-3); opacity: .65; }
+.sk-channel-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1 1 auto; }
+.sk-channel-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text);
+}
+/* 名字让位、徽标不收缩：目录名往往很长，先截名字再加徽标才不会把徽标挤出卡片 */
+.sk-channel-name > span:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sk-channel-path {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sk-channel-name > span:not(:first-child) { flex: none; }
+.sk-channel-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ── 速览网格 ────────────────────────────────────────────────
+   比技能库密：一屏尽量多放几行，卡片高度压到「名字 + 两行描述 + 一行页脚」。
+
+   ⚠️ 选择器必须写成 `.sk-skill-grid.sk-quick-grid`（两个类）：基础网格在本文
+   件更靠后的位置定义，同特异度时后写的赢 —— 只用单类 `.sk-quick-grid` 会被
+   后面那条 `repeat(3, …)` 整个盖掉，这里就还是三列（已踩过）。 */
+.sk-skill-grid.sk-quick-grid {
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 8px;
+}
+.sk-skill-card.is-compact { gap: 5px; padding: 9px 10px; }
+.sk-skill-card.is-compact .sk-skill-name { font-size: 11.5px; }
+.sk-skill-card.is-compact .sk-skill-desc {
+  font-size: 10.5px;
+  line-height: 1.5;
+  min-height: calc(1.5em * 2);
+}
+.sk-skill-foot {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: auto;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.sk-skill-tool {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sk-skill-mounts { margin-left: auto; flex: none; font-variant-numeric: tabular-nums; }
+
+/* ── 最近同步 ────────────────────────────────────────────────
+   三列：时间 / 结论 + 文件名 / 报告入口。时间用等宽数字，纵向对齐才好扫。 */
+.sk-sync-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.sk-sync-list > li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px;
+  border-radius: var(--r-sm);
+  min-width: 0;
+}
+.sk-sync-list > li:hover { background: var(--surface-inset); }
+.sk-sync-time {
+  flex: none;
+  width: 74px;
+  font-size: 11.5px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.sk-sync-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1 1 auto; }
+.sk-sync-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.sk-sync-note { font-size: 10.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.sk-sync-file {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 待办 ────────────────────────────────────────────────────
+   每条待办左侧一枚警示图标、中间标题与出处，右侧「查看」直接开技能抽屉。 */
+.sk-todo-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.sk-todo-list > li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px;
+  border-radius: var(--r-sm);
+  min-width: 0;
+}
+.sk-todo-list > li:hover { background: var(--surface-inset); }
+.sk-todo-glyph { display: inline-flex; color: var(--warn); flex: none; }
+.sk-todo-glyph svg { width: 15px; height: 15px; }
+.sk-todo-copy { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1 1 auto; }
+.sk-todo-title {
   font-size: 12px;
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.sk-mini-sub {
-  font-size: 11px;
-  line-height: 1.55;
+.sk-todo-sub {
+  font-size: 10.5px;
+  line-height: 1.5;
   color: var(--text-3);
   overflow-wrap: anywhere;
 }
@@ -1263,12 +1538,10 @@
 .sk-child-size { font-size: 10px; color: var(--text-3); font-variant-numeric: tabular-nums; }
 
 /* ── 窄窗口 ──────────────────────────────────────────────────
-   渠道矩阵与四列表在 720px 以下会挤：把目录列降到等宽并把「技能 / 挂载」
-   两列压窄。不做横向滚动 —— 这几张表的用途是「扫一眼有没有缺口」，
-   要横向拖动就失去意义了。 */
+   四列表在 720px 以下会挤：把目录列降到等宽并把「技能 / 挂载」两列压窄。
+   不做横向滚动 —— 这张表的用途是「扫一眼有没有缺口」，要横向拖动就失去
+   意义了。（原渠道矩阵的规则随仪表盘改版一起删掉了。） */
 @media (max-width: 720px) {
-  .sk-matrix-head,
-  .sk-matrix-row { grid-template-columns: minmax(96px, 1fr) minmax(120px, 1.4fr) 44px 44px 84px; }
   .sk-table-head,
   .sk-table-row { grid-template-columns: 72px minmax(96px, 1fr) minmax(80px, 1fr); }
   .sk-table-head > span:nth-child(4),

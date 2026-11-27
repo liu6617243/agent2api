@@ -1,8 +1,8 @@
 import * as React from 'react'
-import { Badge, Button } from '@ui'
+import { Button } from '@ui'
 import { t } from '../i18n'
 import * as s from './skills-hub-api'
-import { Empty, Panel, toast, useLoad } from './skills-hub-shared'
+import { Empty, FILTER_DOT, Panel, SkillCardGrid, matchFilter, scanTime, toast, useLoad } from './skills-hub-shared'
 
 /**
  * 技能仓库 · 技能库。
@@ -29,7 +29,7 @@ import { Empty, Panel, toast, useLoad } from './skills-hub-shared'
  * 其余细节（指纹、来源、时间）留给详情抽屉 —— 卡片只回答「受管到哪一步」。
  */
 
-type Filter = 'all' | 'mounted' | 'unmounted' | 'error' | 'warn' | 'pending'
+type Filter = import('./skills-hub-shared').FilterKey
 
 /** 六个筛选。label 在模块加载期取译文 —— 渲染时 `t(item.label)` 扫描器认不出键。 */
 const FILTERS: { key: Filter; label: string }[] = [
@@ -41,76 +41,8 @@ const FILTERS: { key: Filter; label: string }[] = [
   { key: 'pending', label: t('待收纳') },
 ]
 
-/** 每个筛选胶囊前面那枚小圆点用哪种颜色；`全部` 不画点。 */
-const FILTER_DOT: Record<Exclude<Filter, 'all'>, string> = {
-  mounted: 'sk-dot-ok',
-  unmounted: 'sk-dot-muted',
-  pending: 'sk-dot-pending',
-  error: 'sk-dot-bad',
-  warn: 'sk-dot-warn',
-}
-
-/**
- * 一行只属于一个状态档 —— 六个胶囊是**分区**，不是可重叠的筛选条件。
- *
- * 早先每个胶囊各算一套条件（「已挂载」看 mounts、「警告」看 health），同一个技能
- * 会同时落在好几档里，各档数字相加比「全部」还大。参考页的计数是相加等于全部的，
- * 所以这里定死优先级：硬伤 > 警告 > 已挂载 > 待收纳 > 未就绪。
- */
-function statusKey(row: s.LibraryRow): Exclude<Filter, 'all'> {
-  const issues = row.health ?? []
-  if (issues.some(item => item.level === 'bad')) return 'error'
-  if (issues.length > 0) return 'warn'
-  // 外部链接技能也是「客户端里真的能用」：链接就挂在渠道目录里
-  if (row.origin === 'link' || (row.mounts ?? []).some(item => item.valid)) return 'mounted'
-  if (!row.inManifest && row.origin !== 'hub-extra' && row.origin !== 'system') return 'pending'
-  return 'unmounted'
-}
-
-function match(row: s.LibraryRow, filter: Filter): boolean {
-  return filter === 'all' || statusKey(row) === filter
-}
-
-/**
- * 一张卡片的状态：圆点配色 + 右上角徽标。
- * 优先级：已挂载（有硬伤也标红点）> 未登记/自带 > 待收纳 > 未挂载。
- */
-function cardStatus(row: s.LibraryRow): { dot: string; label: string; variant: 'success' | 'warning' | 'brand' | 'outline' } {
-  const mounts = row.mounts ?? []
-  const valid = mounts.filter(item => item.valid)
-  const hasBad = (row.health ?? []).some(item => item.level === 'bad')
-
-  if (valid.length > 0) {
-    return { dot: hasBad ? 'sk-dot-bad' : 'sk-dot-ok', label: t('已挂载'), variant: 'success' }
-  }
-  if (!row.inManifest) {
-    if (row.origin === 'hub-extra') return { dot: 'sk-dot-warn', label: t('中央未登记'), variant: 'warning' }
-    if (row.origin === 'system') return { dot: 'sk-dot-muted', label: t('客户端自带'), variant: 'outline' }
-    // 别人中枢挂进来的链接：客户端能用（绿点），但真身不归本机台账管，故标注来路
-    if (row.origin === 'link') return { dot: 'sk-dot-ok', label: t('外部链接'), variant: 'outline' }
-    return { dot: hasBad ? 'sk-dot-bad' : 'sk-dot-pending', label: t('待收纳'), variant: 'brand' }
-  }
-  return { dot: hasBad ? 'sk-dot-bad' : 'sk-dot-muted', label: t('未挂载'), variant: 'outline' }
-}
-
-/** 卡片底部那排来源胶囊：优先用扫描到的来源工具，其次回落到台账号上的 tool。 */
-function sourceTools(row: s.LibraryRow): string[] {
-  const seen = new Set<string>()
-  const out: string[] = []
-  for (const source of row.sources ?? []) {
-    if (source.tool && !seen.has(source.tool)) { seen.add(source.tool); out.push(source.tool) }
-  }
-  if (out.length === 0 && row.tool && !seen.has(row.tool)) out.push(row.tool)
-  return out
-}
-
-/** 「上次扫描」用的短时间：月-日 时:分，和参考图的 11-26 08:17 同形。 */
-function scanTime(timestamp: number | null | undefined): string {
-  if (!timestamp || timestamp <= 0) return ''
-  const date = new Date(timestamp)
-  const pad = (value: number): string => String(value).padStart(2, '0')
-  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
-}
+// 状态判定与筛选逻辑在 `skills-hub-shared`（仪表盘的技能速览网格共用同一份）。
+const match = matchFilter
 
 type Props = { onOpenSkill: (name: string) => void; onOpenSettings: () => void }
 
@@ -240,35 +172,7 @@ function Library({ onOpenSkill, onOpenSettings }: Props): React.ReactElement {
               : t('没有符合筛选的技能')}
           </Empty>
         ) : (
-          <div className='sk-skill-grid'>
-            {visible.map(row => {
-              const status = cardStatus(row)
-              const chips = sourceTools(row)
-              return (
-                <button
-                  key={`${row.origin}-${row.tool ?? ''}-${row.name}`}
-                  type='button'
-                  className='sk-skill-card'
-                  onClick={() => onOpenSkill(row.name)}
-                >
-                  <div className='sk-skill-head'>
-                    <span className={`sk-dot sk-skill-dot ${status.dot}`} aria-hidden='true' />
-                    <span className='sk-skill-name' title={row.skillName || row.name}>{row.skillName || row.name}</span>
-                    <Badge className='sk-skill-badge' variant={status.variant} shape='tag'>{status.label}</Badge>
-                  </div>
-                  <div className='sk-skill-desc'>{row.description || t('（没有 description，Agent 触发不出这个技能）')}</div>
-                  {chips.length > 0 ? (
-                    <div className='sk-skill-sources'>
-                      {chips.slice(0, 4).map(tool => (
-                        <span key={tool} className='sk-skill-source'>{tool}</span>
-                      ))}
-                      {chips.length > 4 ? <span className='sk-skill-source'>+{chips.length - 4}</span> : null}
-                    </div>
-                  ) : null}
-                </button>
-              )
-            })}
-          </div>
+          <SkillCardGrid rows={visible} onOpen={onOpenSkill} />
         )}
       </div>
     </Panel>
