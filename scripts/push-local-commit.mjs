@@ -93,8 +93,17 @@ async function call(token, method, path, body) {
  * @returns {Promise<{ok: boolean, sha?: string, alreadyUpToDate?: boolean, reason?: string, message?: string}>}
  */
 export async function pushViaApi({ token, repo, branch, localSha, cwd = process.cwd(), log = () => {} }) {
+  // `-c core.quotepath=false` 不能少：默认 `quotepath=true` 会把非 ASCII 路径
+  // 转义成 `".workbuddy/\344\270\212\346\270\272..."` 这种带引号的八进制串。
+  // 拿去当 tree 条目发出去，远端建出来的 tree 必然和本地对不上 ——
+  // 表现为「本地是 X、远端是 Y」然后中止。2026-11-27 改中文名的
+  // `.workbuddy/修改清单.md` 时踩到，之前几次改动恰好都是纯 ASCII 路径。
   const git = (...args) =>
-    execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).trim()
+    execFileSync('git', ['-c', 'core.quotepath=false', ...args], {
+      cwd,
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    }).trim()
 
   // ── 1. 本地 commit 的元数据 ─────────────────────────────────────
   const raw = git('cat-file', '-p', localSha)
