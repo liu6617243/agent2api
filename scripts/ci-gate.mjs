@@ -52,7 +52,7 @@
 // 不下载任何产物，不改任何文件，只读 API 并输出判定结果。
 // 产物一律不落盘（仓库纪律）。
 
-import { jobVerdict, describeVerdict } from './lib/run-verdict.mjs'
+import { jobVerdict, describeVerdict, ignoredJob } from './lib/run-verdict.mjs'
 
 const TOKEN = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || ''
 const REPO = process.env.GITHUB_REPOSITORY || ''
@@ -64,6 +64,24 @@ if (!SHA) { console.error('缺少 GITHUB_SHA'); process.exit(2) }
 
 const TIMEOUT = Number(process.env.CI_GATE_TIMEOUT || 3600)
 const POLL = Number(process.env.CI_GATE_POLL || 20000)
+
+// ── 要跳过哪些平台 ──────────────────────────────────────────────────
+// 本 fork 只交付 Windows（§62），macOS job 没有产物去处，却常在排队半小时
+// 以上、或分到 runner 后 0 个步骤被判 cancelled —— 于是 run 永远不了结，
+// 出包闸门永远不派发。
+//
+// `deliver.mjs` 早就认这个约定（`A2A_SKIP_OS`，默认 `macos`），但本脚本
+// 原先没读，于是同一件事在两个地方有两种口径：交付脚本放行了，
+// 闸门脚本还在按「macOS 也要绿」判。两边必须一致，否则就是「谁先跑谁说了算」。
+//
+// 用法：`A2A_SKIP_OS= node scripts/ci-gate.mjs`（空串 = 不跳过，三平台都判）。
+const SKIP_OS = (process.env.A2A_SKIP_OS ?? 'macos')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+// job 名形如「服务端与插件联调 (macos-latest)」，用 `(macos` 当匹配串就够，
+// 不必猜 runner 的具体版本号（macos-14 / macos-15 都命中）。
+const SKIP_PATTERNS = SKIP_OS.map((os) => `(${os}`)
 
 const API = `https://api.github.com/repos/${REPO}`
 const H = {
@@ -169,12 +187,35 @@ async function classify(runs) {
   if (last.status !== 'completed') return { state: 'pending', why: `run 进行中（${last.status}）` }
   switch (last.conclusion) {
     case 'success': return { state: 'passed', why: `run ${last.id} success` }
-    case 'cancelled': return { state: 'superseded', why: `run ${last.id} 被更新的提交顶掉` }
+    case 'cancelled': {
+      // 「cancelled」有两种含义，结论完全相反：
+      //   ① 这个提交被更新的提交顶掉（concurrency cancel-in-progress）→ 提交作废，不该出包；
+      //   ② run 里的某个平台 job 被人/被脚本取消，其余 job 全绿 → 提交没问题，只是那个平台没结论。
+      // 本 fork 只交付 Windows，`deliver.mjs` 会主动取消还在排队的 macOS job（§62），
+      // 那种情况下整个 run 的结论就是 cancelled —— 若一律判 superseded，
+      // 闸门会拦住一个完全健康的提交。
+      // 判据：下钻到 job 级，看「需要判定的 job」（排除跳过平台）是否已经全绿。
+      const jobsData = await json(`${API}/actions/runs/${last.id}/jobs?per_page=100`)
+      const verdict = jobVerdict(jobsData.jobs ?? [], { ignore: SKIP_PATTERNS })
+      if (verdict.state === 'ok') {
+        const skipped = (jobsData.jobs ?? []).filter((job) => ignoredJob(job, SKIP_PATTERNS))
+        return {
+          state: 'passed',
+          why: `run ${last.id} cancelled，但需要判定的 job 全绿（被取消的是 ${
+            skipped.map((j) => j.name).join('、') || '某个平台'
+          }）`,
+        }
+      }
+      if (verdict.state === 'code') {
+        return { state: 'failed', why: `run ${last.id} cancelled —— ${describeVerdict(verdict)}` }
+      }
+      return { state: 'superseded', why: `run ${last.id} 被更新的提交顶掉` }
+    }
     case 'skipped': return { state: 'not-applicable', why: `run ${last.id} skipped` }
     case 'failure':
     case 'timed_out': {
       const jobsData = await json(`${API}/actions/runs/${last.id}/jobs?per_page=100`)
-      const verdict = jobVerdict(jobsData.jobs ?? [])
+      const verdict = jobVerdict(jobsData.jobs ?? [], { ignore: SKIP_PATTERNS })
       if (verdict.state === 'code') {
         return { state: 'failed', why: `run ${last.id} ${last.conclusion} —— ${describeVerdict(verdict)}` }
       }
