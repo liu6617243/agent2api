@@ -473,6 +473,7 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/skills-hub/config/reset", post(api::skills_hub::post_config_reset))
         .route("/api/skills-hub/tools", get(api::skills_hub::get_tools))
         .route("/api/skills-hub/probe", get(api::skills_hub::get_probe))
+        .route("/api/skills-hub/repos", get(api::skills_hub::get_repos))
         .route("/api/skills-hub/custom-dir", post(api::skills_hub::post_custom_dir).delete(api::skills_hub::delete_custom_dir))
         .route("/api/skills-hub/daily-check", get(api::skills_hub::get_daily_check))
         .route("/api/skills-hub/daily-check/run", post(api::skills_hub::post_daily_check_run))

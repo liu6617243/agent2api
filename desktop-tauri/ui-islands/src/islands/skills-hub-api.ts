@@ -308,6 +308,18 @@ export type ProbeRow = {
   firstDir: string
 }
 
+/** 本机现成的技能仓库（带 `manifest.json` 的那种），供「共用真身」一键填入。 */
+export type RepoRow = {
+  /** 路径比较键（去重用，不显示） */
+  key: string
+  /** 仓库根目录（`manifest.json` 所在层） */
+  path: string
+  /** 真身目录（`<path>/skills`），直接填进 `skillsDir` */
+  skillsDir: string
+  /** 真身目录里的技能数 */
+  count: number
+}
+
 /* ─── 调用 ──────────────────────────────────────────────────── */
 
 const BASE = '/api/skills-hub'
@@ -393,6 +405,11 @@ export function loadTools(): Promise<{ items: ToolRow[] }> {
 
 export function loadProbe(): Promise<{ items: ProbeRow[] }> {
   return api('GET', `${BASE}/probe`)
+}
+
+/** 本机现成的技能仓库（带台账），配置页「一键填入真身目录」用。 */
+export function loadRepos(): Promise<{ items: RepoRow[] }> {
+  return api('GET', `${BASE}/repos`)
 }
 
 export function addCustomDir(path: string): Promise<{ values: HubConfig }> {

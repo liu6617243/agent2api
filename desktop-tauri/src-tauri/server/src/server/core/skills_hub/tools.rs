@@ -312,6 +312,84 @@ pub fn is_known_tool_id(id: &str) -> bool {
     TOOLS.iter().any(|tool| tool.id == id)
 }
 
+/// 本机现成的技能仓库候选（用户想「共用真身」时不用手打路径）。
+///
+/// ── 为什么只认这几处 ────────────────────────────────────────
+/// 判据不是「哪个目录里有 skills」，而是「哪个目录里有**带台账的技能仓库**」：
+/// 有 `manifest.json` 说明它被某个中枢（AgentHub / 别的客户端）真正管着，指过去
+/// 才有意义 —— 只有一个空 `skills/` 目录指过去等于把中央库换成空的。所以候选
+/// 必须同时满足「`<dir>/skills` 存在」+「`<dir>/manifest.json` 存在」。
+///
+/// 返回 `[{ path, skills, count }]`，按技能数降序，供配置页一键填入。
+pub fn shared_repo_candidates() -> Vec<Value> {
+    let home = home_dir();
+    let mut roots: Vec<PathBuf> = vec![
+        // AgentHub 的默认中枢（本程序要复刻/替代的那个）
+        home.join(".agent_skills"),
+        // 少数版本把它放在数据目录下
+        home.join(".agenthub").join("skills-hub"),
+        home.join(".agent2api").join("agenthub"),
+    ];
+    // 用户已配的 skillsDir 也当候选（方便切回去）
+    let config = load_config();
+    let configured = config.get("skillsDir").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if !configured.is_empty() {
+        roots.push(expand_path(&configured));
+    }
+
+    let mut out: Vec<Value> = Vec::new();
+    for root in roots {
+        // 允许用户填的是 skills 那一层
+        let repo = if root.file_name().map(|n| n.to_string_lossy().eq_ignore_ascii_case("skills")).unwrap_or(false)
+            && root.join("manifest.json").is_file()
+        {
+            root.parent().map(|p| p.to_path_buf()).unwrap_or(root.clone())
+        } else {
+            root
+        };
+        let skills = repo.join("skills");
+        if !skills.is_dir() || !repo.join("manifest.json").is_file() {
+            continue;
+        }
+        let key = scan_path_key(&repo);
+        if out.iter().any(|row| row.get("key").and_then(Value::as_str) == Some(key.as_str())) {
+            continue;
+        }
+        let count = fs::read_dir(&skills)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| {
+                        let path = entry.path();
+                        fs::symlink_metadata(&path)
+                            .map(|meta| meta.is_dir() && !super::scan::is_link_entry(&path, &meta))
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        out.push(json!({
+            "key": key,
+            "path": repo.to_string_lossy(),
+            "skillsDir": skills.to_string_lossy(),
+            "count": count,
+        }));
+    }
+    out.sort_by(|a, b| {
+        b.get("count").and_then(Value::as_u64).unwrap_or(0)
+            .cmp(&a.get("count").and_then(Value::as_u64).unwrap_or(0))
+    });
+    out
+}
+
+/// 路径比较键（与 `scan::path_key` 同口径，这里只为少一层依赖）。
+fn scan_path_key(path: &Path) -> String {
+    let text = fs::canonicalize(path)
+        .map(|real| real.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string_lossy().to_string());
+    if cfg!(windows) { text.to_lowercase() } else { text }
+}
+
 /// 写配置（整份替换：配置是整体读写单元，拆字段会让一次保存变成多次写）。
 pub fn save_config(next: &Value) -> Result<Value, String> {
     if !next.is_object() {

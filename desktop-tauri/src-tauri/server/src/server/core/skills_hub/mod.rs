@@ -872,6 +872,11 @@ pub fn probe() -> Vec<Value> {
     tools::probe_agents(&config)
 }
 
+/// 本机现成的技能仓库（带台账），供配置页一键填入 `skillsDir`。
+pub fn shared_repos() -> Vec<Value> {
+    tools::shared_repo_candidates()
+}
+
 /// 加一条自定义目录。
 pub fn add_custom_dir(path: &str) -> Result<Value, String> {
     let spec = path.trim();

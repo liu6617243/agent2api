@@ -901,8 +901,9 @@ pub fn copy_dir_all(source: &Path, dest: &Path) -> Result<(), String> {
             Ok(value) => value,
             Err(_) => continue,
         };
-        if meta.file_type().is_symlink() {
-            // 链接不复制：目标内容由中央真身负责，抄一份链接只会指回原处
+        if scan::is_link_entry(&from, &meta) {
+            // 链接不复制：目标内容由中央真身负责，抄一份链接只会指回原处。
+            // 用 `is_link` 而不是 `file_type().is_symlink()` —— junction 认不出来。
             continue;
         }
         if meta.is_dir() {
@@ -924,8 +925,9 @@ pub fn skill_names() -> Vec<String> {
     let mut names: Vec<String> = entries
         .flatten()
         .filter(|entry| {
-            fs::symlink_metadata(entry.path())
-                .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+            let path = entry.path();
+            fs::symlink_metadata(&path)
+                .map(|meta| meta.is_dir() && !scan::is_link_entry(&path, &meta))
                 .unwrap_or(false)
         })
         .map(|entry| entry.file_name().to_string_lossy().to_string())

@@ -182,6 +182,22 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|byte| *byte == 0)
 }
 
+/// 这个条目是不是链接（符号链接 / Windows junction 都算）。
+///
+/// ── 为什么不能只用 `file_type().is_symlink()` ──────────────────
+/// Windows 的 junction 是**目录型 reparse point**，`std` 对它报
+/// `is_symlink() == false`、`is_dir() == true`。而技能中枢正是用 junction 把真身
+/// 挂进渠道目录的（`mklink /J`，理由见 `mount::make_link`）。只判 `is_symlink()`
+/// 的后果是 2026-11-28 用户报的那一幕：108 个挂载全被当成「渠道里的真实技能目录」
+/// —— `origin` 标成 user、`linkTarget` 为空、`mounts` 为空，界面显示
+/// 「待收纳 / 未挂载」，可磁盘上它们个个都是指向中央真身的链接。
+///
+/// 判据与 `mount::is_link` 完全一致：`is_symlink()` 为真，或 `read_link()` 成功
+/// （junction 能读出目标）。两处必须同源，否则「挂载校验」和「扫描」会各说各话。
+pub fn is_link_entry(path: &Path, meta: &fs::Metadata) -> bool {
+    meta.file_type().is_symlink() || fs::read_link(path).is_ok()
+}
+
 /// 收集目录下的普通文件（不跟随符号链接），按相对路径排序。
 fn collect_files(root: &Path) -> Vec<(String, PathBuf)> {
     let mut out: Vec<(String, PathBuf)> = Vec::new();
@@ -204,8 +220,9 @@ fn collect_files(root: &Path) -> Vec<(String, PathBuf)> {
                 Err(_) => continue,
             };
             let file_type = meta.file_type();
-            if file_type.is_symlink() {
-                // 挂载产物不进哈希：跟进去会把自己指向的那份内容算成「另一份」
+            // 挂载产物不进哈希：跟进去会把自己指向的那份内容算成「另一份」。
+            // junction 也要在这里挡住（`is_symlink()` 认不出它）。
+            if is_link_entry(&abs, &meta) {
                 continue;
             }
             if file_type.is_dir() {
@@ -595,7 +612,8 @@ pub fn scan_channel(dir: &Path, tool: &str) -> (Vec<Value>, Vec<Value>) {
             Ok(value) => value,
             Err(_) => continue,
         };
-        if meta.file_type().is_symlink() {
+        // junction 也走链接分支 —— 它才是挂载的主要形态（见 `is_link_entry`）
+        if is_link_entry(&abs, &meta) {
             let resolved = resolve_link_target(&abs);
             let target = fs::read_link(&abs).map(|value| normalize_link_target(&value)).unwrap_or_default();
             let valid = !resolved.as_os_str().is_empty() && resolved.exists();
@@ -623,7 +641,7 @@ pub fn scan_channel(dir: &Path, tool: &str) -> (Vec<Value>, Vec<Value>) {
                         Ok(value) => value,
                         Err(_) => continue,
                     };
-                    if sub_meta.file_type().is_symlink() || !sub_meta.file_type().is_dir() {
+                    if is_link_entry(&sub, &sub_meta) || !sub_meta.file_type().is_dir() {
                         continue;
                     }
                     skills.push(build_entry(&sub, tool, "system"));
@@ -678,8 +696,9 @@ pub fn count_skill_dirs(dir: &Path) -> usize {
     entries
         .flatten()
         .filter(|entry| {
-            fs::symlink_metadata(entry.path())
-                .map(|meta| meta.file_type().is_dir() && !meta.file_type().is_symlink())
+            let path = entry.path();
+            fs::symlink_metadata(&path)
+                .map(|meta| meta.file_type().is_dir() && !is_link_entry(&path, &meta))
                 .unwrap_or(false)
         })
         .count()
@@ -703,7 +722,7 @@ pub fn count_channel_skills(dir: &Path) -> usize {
             Err(_) => continue,
         };
         let file_type = meta.file_type();
-        if file_type.is_symlink() {
+        if is_link_entry(&path, &meta) {
             if link_is_skill(&path) {
                 total += 1;
             }
@@ -717,7 +736,7 @@ pub fn count_channel_skills(dir: &Path) -> usize {
                 for item in items.flatten() {
                     let sub = item.path();
                     if fs::symlink_metadata(&sub)
-                        .map(|meta| meta.file_type().is_dir() && !meta.file_type().is_symlink())
+                        .map(|meta| meta.file_type().is_dir() && !is_link_entry(&sub, &meta))
                         .unwrap_or(false)
                     {
                         total += 1;
@@ -745,7 +764,7 @@ pub fn list_children(dir: &Path) -> Vec<Value> {
             Err(_) => continue,
         };
         let file_type = meta.file_type();
-        let kind = if file_type.is_symlink() {
+        let kind = if is_link_entry(&path, &meta) {
             "link"
         } else if file_type.is_dir() {
             "dir"

@@ -78,7 +78,8 @@ function Settings({ onChanged }: Props): React.ReactElement {
   const tools = useLoad(() => s.loadTools(), [])
   const trash = useLoad(() => s.loadTrash(), [])
   const probe = useLoad(() => s.loadProbe(), [])
-  // 巡检状态条要显示「上次巡检的时间与结论」，不读它这块只能画个空壳。
+  // 本机现成的技能仓库（带台账）：真身目录那一栏不用手打路径。
+  const repos = useLoad(() => s.loadRepos(), [])  // 巡检状态条要显示「上次巡检的时间与结论」，不读它这块只能画个空壳。
   const check = useLoad(() => s.loadDailyCheck(), [])
 
   const [section, setSection] = React.useState<Section>('tools')
@@ -94,6 +95,7 @@ function Settings({ onChanged }: Props): React.ReactElement {
   const dirRows = tools.data?.items ?? []
   const trashItems = trash.data?.items ?? []
   const suggestions = probe.data?.items ?? []
+  const repoRows = repos.data?.items ?? []
 
   const hubPath = hubDir(trash.data?.dir)
   // 真身目录留空时的默认值，只用于输入框占位提示（真正解析在后端 `store::skills_dir`）。
@@ -677,6 +679,35 @@ function Settings({ onChanged }: Props): React.ReactElement {
                     placeholder={defaultSkillsDir ? t('留空 = {path}', { path: defaultSkillsDir }) : ''}
                     onChange={event => edit({ skillsDir: event.target.value })}
                   />
+                  {/* 探测到的现成仓库：一键填入，不用手打路径。
+                      只列「有 manifest.json 的仓库」—— 空 skills 目录指过去等于把中央换成空的。 */}
+                  {repoRows.length > 0 ? (
+                    <div className='sk-path-row'>
+                      <select
+                        className='sk-input'
+                        value=''
+                        onChange={event => {
+                          const picked = repoRows.find(row => row.key === event.target.value)
+                          if (picked) edit({ skillsDir: picked.skillsDir })
+                        }}
+                      >
+                        <option value=''>{t('从本机现成仓库填入…')}</option>
+                        {repoRows.map(row => (
+                          <option key={row.key} value={row.key}>
+                            {`${row.path}（${row.count} 个技能）`}
+                          </option>
+                        ))}
+                      </select>
+                      {cfg?.skillsDir ? (
+                        <Button
+                          type='button' size='sm' variant='ghost'
+                          onClick={() => edit({ skillsDir: '' })}
+                        >
+                          {t('恢复默认')}
+                        </Button>
+                      ) : null}
+                    </div>
+                  ) : null}
                   <div className='sk-field-hint'>
                     {t('可指向现成仓库（例如 AgentHub 的 .agent_skills\\skills），两边共用同一批技能；在这里新增技能也会写进去。两边的台账仍各存一份。')}
                   </div>

@@ -160,6 +160,11 @@ pub async fn get_probe(State(_state): State<ServerState>) -> Response {
     ok_json(json!({ "items": skills_hub::probe() }))
 }
 
+/// 本机现成的技能仓库（含台账），供「共用真身目录」一键填入。
+pub async fn get_repos(State(_state): State<ServerState>) -> Response {
+    ok_json(json!({ "items": skills_hub::shared_repos() }))
+}
+
 pub async fn get_daily_check(State(_state): State<ServerState>) -> Response {
     ok_json(json!({ "last": skills_hub::daily_check_status() }))
 }
