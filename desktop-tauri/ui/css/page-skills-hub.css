@@ -648,6 +648,31 @@
   overflow-wrap: anywhere;
 }
 
+/* ── 待办区里的「非待办」小组 ─────────────────────────────────
+   外链登记不属于「待处理优化」（它没有需要修的缺陷），但用户需要一个解除
+   登记的入口。放在待办列表下面用一条虚线隔开，标题直接写「不计入待办」，
+   这样「卡片上的数字」和「上面那串待办行」始终一一对应，不会又出现
+   「写 4 项、点进去 0 项」。 */
+.sk-todo-aside {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--hairline);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.sk-todo-aside-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 0 8px;
+}
+.sk-todo-aside-title { font-size: 11px; font-weight: 600; color: var(--text-2); }
+.sk-todo-aside-hint { font-size: 10.5px; color: var(--text-3); }
+.sk-todo-aside .sk-todo-glyph { color: var(--text-3); }
+
 /* ── chips（失效挂载 / L3 相似度）────────────────────────────
    chip 是可点的：点开就是那个技能的详情抽屉。所以 cursor:pointer 且悬停
    有反馈 —— 不做成纯装饰的圆角标签。 */

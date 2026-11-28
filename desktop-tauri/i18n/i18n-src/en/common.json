@@ -1394,5 +1394,8 @@
   "{tool} 里由其他软件维护，磁盘链接不动": "Maintained by another app in {tool}; the on-disk link is untouched",
   "外部链接登记 · {name}": "External link entry · {name}",
   "裁决": "Resolve",
-  "还有 {n} 项待处理，去对应页面逐条看完。": "{n} more pending — review them on their own pages."
+  "还有 {n} 项待处理，去对应页面逐条看完。": "{n} more pending — review them on their own pages.",
+  "其他中枢在管的登记（{n}）": "Registered by other hubs ({n})",
+  "磁盘链接由别的软件维护，不计入待办": "Disk links maintained by other software — not counted as to-do",
+  "逐条纳管": "Adopt one by one"
 }

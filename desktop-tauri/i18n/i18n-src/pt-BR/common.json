@@ -1383,5 +1383,8 @@
   "{tool} 里由其他软件维护，磁盘链接不动": "Mantido por outro app em {tool}; o link no disco não é alterado",
   "外部链接登记 · {name}": "Registro de link externo · {name}",
   "裁决": "Resolver",
-  "还有 {n} 项待处理，去对应页面逐条看完。": "Mais {n} pendentes — revise nas páginas correspondentes."
+  "还有 {n} 项待处理，去对应页面逐条看完。": "Mais {n} pendentes — revise nas páginas correspondentes.",
+  "其他中枢在管的登记（{n}）": "Registrados por outros hubs ({n})",
+  "磁盘链接由别的软件维护，不计入待办": "Links em disco mantidos por outro software — não contam como pendência",
+  "逐条纳管": "Adotar um a um"
 }

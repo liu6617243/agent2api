@@ -12,7 +12,8 @@ import { Empty, Panel, SkillCardGrid, ago, errorText, num, scanTime, toast, useL
  *   2. 各渠道通没通？目录在哪？
  *   3. 每个技能受管到哪一步？（下面那张速览网格，和技能库同一套状态判定）
  *   4. 上次同步是什么时候、成功没有？
- *   5. 有什么要人处理的？（待裁决 / 孤儿 / 中央未登记 / 失效挂载）
+ *   5. 有什么要人处理的？（待裁决 / 孤儿 / 中央未登记 —— 这个数字点进去必须
+ *      真的能逐条办掉；外链只说明、失效挂载在「挂载与去重」卡上）
  *
  * ── 为什么速览网格直接嵌在仪表盘里 ──────────────────────────
  * 「有 105 个技能」是个抽象数字，用户下一步一定是「让我看看是哪些」。把网格嵌
@@ -96,20 +97,22 @@ function reportStamp(file: string): string {
 }
 
 /**
- * 一条待办：裁决 / 孤儿 / 中央未登记 / 外部链接 / 失效挂载。
+ * 一条待办：裁决 / 孤儿 / 中央未登记 —— 只有这三类（= AgentHub 的 `x()`）。
  *
  * 统一成「图标 + 标题 + 一句说明 + 一个动作」。`action` 决定那颗按钮做什么 ——
  * AgentHub 就是这么分工的：冲突给「裁决」跳去重页，孤儿给「查看」跳同步页，
  * 中央未登记给「纳管」直接改台账。把它摊平成一个无脑的「查看」会让用户多点
  * 两层才办得成事，也让仪表盘失去「把不用动脑的事办完」的站位。
+ *
+ * 外链与失效挂载**不是**这个类型：前者在下方「其他中枢在管的登记」小组里，
+ * 后者在「挂载与去重」卡上（一键修复）。它们进不来，是因为它们不在这个数字里。
  */
 type TodoRow = {
   key: string
   title: string
   sub: string
   skill: string
-  action: 'dedup' | 'sync' | 'adopt' | 'unregister' | 'open'
-  tool?: string
+  action: 'dedup' | 'sync' | 'adopt' | 'open'
 }
 
 function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.ReactElement {
@@ -124,6 +127,8 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
   const [query, setQuery] = React.useState('')
   /** 渠道卡片点出来的筛选；空串 = 全部。同一时刻只选一个渠道（AgentHub 同款）。 */
   const [toolFilter, setToolFilter] = React.useState('')
+  /** 待办区锚点：三类全是「中央未登记」时，入口只能滚到本页那几条行内纳管。 */
+  const todoRef = React.useRef<HTMLElement | null>(null)
   const [reports, setReports] = React.useState<Record<string, ReportMeta>>({})
 
   const data = overview.data
@@ -270,22 +275,26 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
   // 列表里，两边对不上；§69 全部重建修完也压不掉这个数字，就是这个原因。
   const brokenList = data.mountHealth.filter(item => !item.valid && !item.external)
   const brokenMounts = brokenList.length
-  // 另外四类同样先算好：仪表盘是它们的处理入口（裁决页只留冲突）。
+  // 另外两类先算好：外链只作「登记说明」展示，孤儿是待办。
   const externals = data.mountHealth.filter(item => item.external)
   const extras = data.hubExtra ?? []
   const orphans = data.orphans ?? []
   const conflicts = data.pendingConflicts
 
   /**
-   * 「待处理优化」总数 = 五类之和。
+   * 「待处理优化」= 冲突 + 孤儿 + 中央未登记 —— 就是 AgentHub 的 `x()`。
    *
-   * AgentHub 的 `x()` 是「冲突 + 孤儿 + 中央未登记」；本机多两类（其他软件维护的
-   * 外部链接、失效挂载）。之前只把失效挂载算进来、外链漏在外面，于是卡片写
-   * 「0 项」、下面列表却挂着 4 行「外部链接登记」—— 同一页两个数互相打脸。
-   * 现在总数与列表行数同源，副标题把每一类都点出来。
+   * ── 为什么不能把外链 / 失效挂载也加进来（2026-11-28 第二次报同一个 bug）──
+   * 上一版把五类合成一个数，于是用户看到「4 项：0 冲突 + 2 孤儿 + 0 未登记 +
+   * 2 其他」，点「去裁决」进裁决页 —— 那里只有冲突，0 条，空的。数字没错，
+   * 错在**这个数字承诺的事，入口那边办不了**：
+   *   * 失效挂载的处理入口在「挂载与去重」那张卡上（`一键修复`），已经闭环；
+   *   * 外部链接是「别的中枢在管」的**登记状态**，不是缺陷，处置动作只有
+   *     「解除登记」这种可选项 —— AgentHub 的仪表盘压根不列它。
+   * 三类之外的这两类留在本页展示（外链单独一小组、失效挂载在卡上），但不进
+   * 这个数字。判据只有一条：**卡片上的数字，必须等于点进去能逐条办掉的事**。
    */
-  const todoTotal = conflicts.length + orphans.length + extras.length + externals.length + brokenMounts
-  const others = externals.length + brokenMounts
+  const todoTotal = conflicts.length + orphans.length + extras.length
 
   // 「份消除」= 本轮扫描里**真的被 L1 合并掉**的冗余副本对数。
   //
@@ -320,11 +329,14 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
     })
     .slice(0, 18)
 
-  // 五类问题**轮流**取，先各取第一条再取第二条。
+  // 三类问题**轮流**取，先各取第一条再取第二条。
   //
-  // 不能先拼成一个大数组再 `slice(0, 3)`：失效挂载排在最后，只要前面几类里有
+  // 不能先拼成一个大数组再 `slice(0, 3)`：未登记排在最后，只要前面两类里有
   // 一条，它就被整类切掉 —— 而用户遇到的情况正是「右上角写 4 项、列表一条都
   // 看不见」。轮流取保证每一类都有机会露头。
+  //
+  // 只放「待处理优化」计数的三类（= AgentHub 的 `x()`）。外链不在这里 ——
+  // 它不是缺陷而是登记状态，混进来会让「待办 N 项」点进去永远是空的。
   const buckets: TodoRow[][] = [
     conflicts.map(item => ({
       key: `c-${item.id}`,
@@ -347,30 +359,31 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
       skill: item.name,
       action: item.isLink ? 'open' : 'adopt',
     })),
-    externals.map(item => ({
-      key: `x-${item.tool}-${item.skill}`,
-      title: t('外部链接登记 · {name}', { name: item.skill }),
-      sub: t('{tool} 里由其他软件维护，磁盘链接不动', { tool: item.tool }),
-      skill: item.skill,
-      tool: item.tool,
-      action: 'unregister',
-    })),
-    brokenList.map(item => ({
-      key: `m-${item.tool}-${item.skill}`,
-      title: t('挂载失效 · {name}', { name: item.skill }),
-      sub: t('{tool} 里的链接指不到中央真身', { tool: item.tool }),
-      skill: item.skill,
-      action: 'open',
-    })),
   ]
   const todo: TodoRow[] = []
-  for (let round = 0; round < 2 && todo.length < 6; round += 1) {
+  for (let round = 0; round < 3 && todo.length < 6; round += 1) {
     for (const bucket of buckets) {
       if (todo.length >= 6) break
       const row = bucket[round]
       if (row) todo.push(row)
     }
   }
+
+  /**
+   * 「这个数字点进去会到哪」—— 按组成分派，不写死跳裁决页。
+   *
+   * AgentHub 自己也栽在这儿：它的卡片脚注是一颗写死的「去裁决」，只要
+   * `orphans > 0` 而 `conflicts === 0`，点下去就是一张空页（它的 `x()` 把
+   * 三类算在一起，入口却只认冲突）。照抄这个写法等于把这个洞一起继承，
+   * 所以这里按「先冲突、再孤儿、最后未登记」分派到**真能办掉它**的地方。
+   */
+  const nextStep = todoTotal === 0
+    ? null
+    : conflicts.length > 0
+      ? { label: t('去裁决'), arrow: '→', run: () => onGo('dedup') }
+      : orphans.length > 0
+        ? { label: t('去同步'), arrow: '→', run: () => onGo('sync') }
+        : { label: t('逐条纳管'), arrow: '↓', run: () => todoRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
 
   // AgentHub 的胶囊文案是「· {时间} 已自动完成」/「· 尚未运行检测」，两态都
   // 只陈述事实、不做评价。本机保留「有 N 项待处理」这一句，因为巡检失败时
@@ -554,12 +567,11 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
                 o: num(orphans.length),
                 h: num(extras.length),
               })}
-              {others > 0 ? t(' + {n} 其他', { n: num(others) }) : null}
             </div>
             <div className='sk-stat-foot'>
-              {todoTotal > 0 ? (
-                <button type='button' className='sk-stat-link' onClick={() => onGo('dedup')}>
-                  {t('去裁决')} <span aria-hidden='true'>→</span>
+              {nextStep ? (
+                <button type='button' className='sk-stat-link' onClick={nextStep.run}>
+                  {nextStep.label} <span aria-hidden='true'>{nextStep.arrow}</span>
                 </button>
               ) : (
                 <span className='sk-stat-ok'>{t('✓ 已就绪')}</span>
@@ -734,13 +746,13 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
             )}
           </section>
 
-          <section className='sk-block'>
+          <section className='sk-block' ref={todoRef}>
             <div className='sk-block-head'>
               <span className='sk-block-title'>{t('待办决策与孤儿')}</span>
               <div className='sk-block-action'>
-                {todoTotal > 0 ? (
-                  <Button type='button' size='sm' variant='ghost' onClick={() => onGo('dedup')}>
-                    {t('去裁决')}
+                {nextStep ? (
+                  <Button type='button' size='sm' variant='ghost' onClick={nextStep.run}>
+                    {nextStep.label}
                   </Button>
                 ) : null}
               </div>
@@ -790,16 +802,6 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
                         >
                           {t('纳管')}
                         </Button>
-                      ) : row.action === 'unregister' ? (
-                        <Button
-                          type='button'
-                          size='sm'
-                          variant='ghost'
-                          disabled={busy === `unregister:${row.tool}:${row.skill}`}
-                          onClick={() => void unregister(row.skill, row.tool ?? '')}
-                        >
-                          {t('解除登记')}
-                        </Button>
                       ) : (
                         <Button
                           type='button'
@@ -817,9 +819,11 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
                 {todoTotal > todo.length ? (
                   <div className='sk-dedup-summary'>
                     <span>{t('还有 {n} 项待处理，去对应页面逐条看完。', { n: num(todoTotal - todo.length) })}</span>
-                    <Button type='button' size='sm' variant='ghost' onClick={() => onGo('dedup')}>
-                      {t('去裁决')}
-                    </Button>
+                    {nextStep ? (
+                      <Button type='button' size='sm' variant='ghost' onClick={nextStep.run}>
+                        {nextStep.label}
+                      </Button>
+                    ) : null}
                   </div>
                 ) : null}
                 {note ? (
@@ -830,6 +834,45 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
                 ) : null}
               </>
             )}
+            {/* ── 外链：只说明，不算待办 ──
+                AgentHub 的仪表盘完全不列外链，本机留着是因为它是唯一能给「解除
+                登记」的入口（外链指向别处时，那个链接不是缺陷）。但它**不进**
+                上面那个数字：把它算成待办，用户点「去处理」永远落空 —— 这正是
+                2026-11-28 第二次报同一个 bug 的直接原因。所以单独一小组，标题
+                就写明「不计入待办」。 */}
+            {externals.length > 0 ? (
+              <div className='sk-todo-aside'>
+                <div className='sk-todo-aside-head'>
+                  <span className='sk-todo-aside-title'>{t('其他中枢在管的登记（{n}）', { n: num(externals.length) })}</span>
+                  <span className='sk-todo-aside-hint'>{t('磁盘链接由别的软件维护，不计入待办')}</span>
+                </div>
+                <ul className='sk-todo-list'>
+                  {externals.map(item => (
+                    <li key={`x-${item.tool}-${item.skill}`}>
+                      <span className='sk-todo-glyph' aria-hidden='true'>
+                        <svg viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round'>
+                          <path d='M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.2 1.2' />
+                          <path d='M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.2-1.2' />
+                        </svg>
+                      </span>
+                      <span className='sk-todo-copy'>
+                        <span className='sk-todo-title' title={item.skill}>{t('外部链接登记 · {name}', { name: item.skill })}</span>
+                        <span className='sk-todo-sub'>{t('{tool} 里由其他软件维护，磁盘链接不动', { tool: item.tool })}</span>
+                      </span>
+                      <Button
+                        type='button'
+                        size='sm'
+                        variant='ghost'
+                        disabled={busy === `unregister:${item.tool}:${item.skill}`}
+                        onClick={() => void unregister(item.skill, item.tool)}
+                      >
+                        {t('解除登记')}
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
           </section>
         </div>
 
