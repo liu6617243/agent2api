@@ -1227,7 +1227,7 @@ pub fn resolve(id: &str, choice: &str, config: &Value) -> Result<Value, String> 
         let existing = mount::link_target(&tool_copy);
         if choice == "rebuildLink" {
             if !central.is_dir() {
-                return Err("中央真身不存在，先同步一次再重建".to_string());
+                return Err("中央真身不存在，先收纳一次再重建".to_string());
             }
             if mount::is_link(&tool_copy) {
                 mount::unmount(&tool_copy)?;
@@ -1632,7 +1632,7 @@ fn render_report(
 ) -> String {
     let num = |key: &str| summary.get(key).and_then(Value::as_i64).unwrap_or(0);
     let mut out = String::new();
-    out.push_str("# 技能仓库 · 同步报告\n\n");
+    out.push_str("# 技能仓库 · 收纳报告\n\n");
     out.push_str(&format!("- 时间：{}\n", store::now_iso()));
     out.push_str(&format!("- 中央仓库：{}\n", store::hub_dir().display()));
     out.push_str(&format!(

@@ -173,7 +173,7 @@ function Library({ onOpenSkill, onOpenSettings }: Props): React.ReactElement {
         {visible.length === 0 ? (
           <Empty>
             {items.length === 0
-              ? t('技能库里还没有任何技能。去配置页接上客户端的技能目录，然后同步一次。')
+              ? t('技能库里还没有任何技能。去配置页接上客户端的技能目录，然后收纳一次。')
               : t('没有符合筛选的技能')}
           </Empty>
         ) : (

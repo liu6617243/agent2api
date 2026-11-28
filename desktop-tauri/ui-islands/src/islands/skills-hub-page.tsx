@@ -27,11 +27,19 @@ import { Empty, notifyEnter, notifyRefresh, sizeText, toast } from './skills-hub
  * 走另建一条 WebDAV 通道会在同一份配置里出现两套远端语义 —— 一期不做，需要时
  * 按 cloud sync 的口径接进来，而不是照抄一个并行实现。
  *
+ * ── 为什么本项目的第二个页签叫「收纳」而不是 AgentHub 的「同步」──────
+ * 这页不是双向同步：它是以中央仓库为唯一真身、把各客户端目录往中央收敛
+ * （收进中央 → 原位换成链接 → 分发到该有它的客户端）。而「同步」在本应用里
+ * 已经被记忆中枢占用，且那边是**真双向**（WebDAV 整包 + manifest 三方合并 +
+ * 冲突裁决）。两个模块同叫「同步」，用户在两个页面之间必然串味。
+ * 另外本页内部早就在用「收进中央 / 已收纳 / 待收纳」，页签跟着叫「收纳」，
+ * 一处词贯穿到底，用户不用在两套说法之间翻译。
+ *
  * 剩下的五个是**这条链路的必经站点**，且顺序就是用户的心路：
  *
  *   dashboard 仪表盘 —— 现在什么状态、有什么要处理
  *   library   技能库 —— 每个技能受管到什么程度
- *   sync      同步    —— 这次会做什么（预览 → 确认 → 结果）
+ *   sync      收纳    —— 这次会做什么（预览 → 确认 → 结果）
  *   dedup     去重    —— 同名异容、链接异常这些只有人能决定的事
  *   settings  配置    —— 扫哪些渠道、怎么挂、删了能救多久
  *
@@ -46,7 +54,7 @@ import { Empty, notifyEnter, notifyRefresh, sizeText, toast } from './skills-hub
  * ── 顶栏徽标为什么只留一个 ──────────────────────────────────
  * 早先想同时显示「N 个技能」「N 项待处理」「N 处失效挂载」。三个徽标并排的
  * 结果是用户读不出哪个是当下该管的 —— 而待处理数是唯一**会随用户动作变化**
- * 的数字（技能数只在同步时变）。所以顶栏只留在处理数，其余数字都在仪表盘上。
+ * 的数字（技能数只在收纳时变）。所以顶栏只留在处理数，其余数字都在仪表盘上。
  */
 
 /**
@@ -60,7 +68,7 @@ import { Empty, notifyEnter, notifyRefresh, sizeText, toast } from './skills-hub
 const TABS = [
   { key: 'dashboard', label: t('仪表盘') },
   { key: 'library', label: t('技能库') },
-  { key: 'sync', label: t('同步') },
+  { key: 'sync', label: t('收纳') },
   { key: 'dedup', label: t('去重') },
   { key: 'settings', label: t('仓库配置') },
 ] as const
@@ -383,7 +391,7 @@ function SkillDrawer({
                 <><span>{t('文件数')}</span><code>{data.fileCount}</code></>
               ) : null}
               {data.manifest ? (
-                <><span>{t('最后同步')}</span><code>{lastHistory(data.manifest)}</code></>
+                <><span>{t('最后收纳')}</span><code>{lastHistory(data.manifest)}</code></>
               ) : null}
             </div>
 
@@ -505,7 +513,7 @@ function mount(): void {
 }
 
 // 页面重新成为当前页时，让各页签的 useLoad 静默重拉（磁盘是别的东西在改的，
-// 用户切走再回来看到旧快照会以为同步没生效）。
+// 用户切走再回来看到旧快照会以为收纳没生效）。
 window.addEventListener('wb:page', event => {
   const detail = (event as CustomEvent<{ page?: string }>).detail
   if (detail?.page === 'skills-hub') notifyEnter()

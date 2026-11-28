@@ -107,6 +107,18 @@
     // 记住什么」，技能管「Agent 能用什么」（各客户端 `skills/` 里的同名副本收敛
     // 成一份中央真身）。所以放同一组，顺序按「先攒、后用」。
     { key: 'skills-hub', label: wbI18n.t('技能仓库'), icon: 'skills' },
+    // WebDAV 同步：同样归「资源库」组，排在技能仓库下面。
+    //
+    // 它原本是记忆中枢的第八个页签（`memory-tab-sync.tsx`）。提升成一级页面的
+    // 理由是「读者不同」：记忆中枢那八个页签都是「看 / 改本机这份记忆」，唯独
+    // 同步是「和另一台机器对账」—— 有自己的服务器、账号、节奏、冲突队列、
+    // 设备清单和失败模式。压在记忆页签栏里，侧边栏看不到同步入口，用户会以为
+    // 本产品不支持多设备。
+    //
+    // 这一项同步的是**记忆库**（general / projects / profile 目录），名字直接
+    // 说清通道与动作：WebDAV 协议 + 同步动作。设置页「数据同步」传的是应用数据
+    // （账号 / 网关配置 / 提供商 / 代理池 / 签到记录），两处各写各的包，互不影响。
+    { key: 'webdav-sync', label: wbI18n.t('WebDAV 同步'), icon: 'refresh' },
     // 提供商插件：各家 provider 的转发与账号实现都在插件包里，这一页是装插件的
     // 唯一入口。排在「设置」上面 —— 它是「让软件能用起来」的前置步骤，与设置同级
     // 但更靠前（没装插件时账号页与模型页都是空的）。
@@ -255,10 +267,12 @@
           items: ['routing', 'gateway', 'agent', 'tools', 'proxies', 'keys', 'docs'] },
         { id: 'g-diag', label: '诊断', custom: false, hidden: false,
           items: ['requests', 'logs', 'tasks'] },
-        // 记忆中枢的家。老用户布局里没有这一组，由 `normalizeLayout` 里的
-        // 「资源库迁移」一次性建组并把 memory 搬进来（见那里的注释）。
+        // 记忆中枢与技能仓库的家，WebDAV 同步也在这里（三者都是「本机攒下来的资料」）。
+        // 老用户布局里没有这一组，由 `normalizeLayout` 里的「资源库迁移」一次性
+        // 建组并把 memory 搬进来（见那里的注释）；WebDAV 同步与技能仓库是后加的，
+        // 走「新菜单补位」自动落到这里。
         { id: 'g-res', label: '资源库', custom: false, hidden: false,
-          items: ['memory', 'skills-hub'] },
+          items: ['memory', 'skills-hub', 'webdav-sync'] },
         { id: 'g-system', label: '系统', custom: false, hidden: false,
           items: ['plugins', 'settings'] },
       ],

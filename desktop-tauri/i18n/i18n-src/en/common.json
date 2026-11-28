@@ -1397,5 +1397,21 @@
   "还有 {n} 项待处理，去对应页面逐条看完。": "{n} more pending — review them on their own pages.",
   "其他中枢在管的登记（{n}）": "Registered by other hubs ({n})",
   "磁盘链接由别的软件维护，不计入待办": "Disk links maintained by other software — not counted as to-do",
-  "逐条纳管": "Adopt one by one"
+  "逐条纳管": "Adopt one by one",
+  "去收纳": "Go to Adopt",
+  "去收纳中心": "Open Adopt Center",
+  "最近收纳记录": "Recent adoptions",
+  "收纳完成": "Adoption complete",
+  "还没收纳过": "Nothing adopted yet",
+  "收纳一次": "adopt once",
+  "收纳中…": "Adopting…",
+  "收纳失败：{error}": "Adoption failed: {error}",
+  "收纳报告（{n} 份）": "Adoption reports ({n})",
+  "本次收纳结果": "Result of this adoption",
+  "这次收纳会做什么": "What this adoption will do",
+  "确认执行收纳": "Run adoption",
+  "确认执行收纳吗？\n收进中央 {i} 个 · 挂载变更 {m} 处 · {c} 条冲突进入人工裁决。\n所有覆盖/删除先进入回收站，可还原。": "Run adoption?\n{i} to central · {m} mount changes · {c} conflicts go to manual review.\nEvery overwrite/deletion goes to Trash first and can be restored.",
+  "最后收纳": "Last adoption",
+  "调整仅影响之后的收纳与挂载动作": "Changes only affect subsequent adoption and mount actions",
+  "WebDAV 同步": "WebDAV sync"
 }

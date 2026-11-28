@@ -109,11 +109,14 @@ pub struct Knob {
     /// 取值：
     ///   · `""`      —— 配置页自己画控件（绝大多数键）；
     ///   · `"self"`  —— 就在配置页上方那张表里改（路由表）；
-    ///   · 页签键    —— `"sync"` / `"auto"` / `"import"` / `"agents"`，配置页给一句
-    ///                  「去 XX 页改」的指路，点了直接切过去。
+    ///   · 页签键    —— `"auto"` / `"import"` / `"agents"`，配置页给一句
+    ///                  「去 XX 页改」的指路，点了直接切到那个页签；
+    ///   · 页面键    —— `"webdav-sync"`，指路到侧边栏的一级页面（换整页，不是
+    ///                  换页签）。同步页原本是记忆中枢的页签，2026-11-28 提升成
+    ///                  一级页面「WebDAV 同步」，owner 随之从 `"sync"` 改成它。
     ///
     /// 约束由单测 `owner_points_at_a_real_place` 兜着：页签键必须是真实存在的
-    /// 页签，否则指路按钮会跳到一个不存在的地方。
+    /// 页签、页面键必须是真实存在的菜单项，否则指路按钮会跳到一个不存在的地方。
     pub owner: &'static str,
 }
 
@@ -608,42 +611,42 @@ static SCHEMA: &[Knob] = &[
     // （`memory-tab-sync.tsx` 的凭据卡，保存走 `POST /api/memory/sync/setup`），
     // 自动同步开关与间隔在同一个页面显示。
     // 配置页再抄一份，就成了「同一个值两处能改、两处各自的草稿互不相识」——
-    // 用户在配置页改了地址没点保存，去同步页看到的还是旧值。
+    // 用户在配置页改了地址没点保存，去 WebDAV 同步页看到的还是旧值。
     //
-    // 所以这一组在配置页只留指路。键本身照旧参与校验与落盘（同步页写的就是
+    // 所以这一组在配置页只留指路。键本身照旧参与校验与落盘（WebDAV 同步页写的就是
     // 这些键），`every_knob_has_a_reader` 也仍然要求每个键都有读取点。
     //
     // ── `sync.remoteDir` 是唯一例外：它留在配置页（2026-11-25）───────
-    // 同步页的凭据卡只放「怎么连」的最小集合（连哪 / 用谁连 / 密码），远端目录
+    // WebDAV 同步页的凭据卡只放「怎么连」的最小集合（连哪 / 用谁连 / 密码），远端目录
     // 从那张卡里撤掉了：它看起来是同一个问题的一部分，后果却完全不同 —— 地址
     // 填错只是连不上，一眼就能发现；目录改错会让两台设备各写一个互不相干的包，
     // 两边都报「同步成功」却永远看不到对方的数据，且没有任何报错提示。
     // 它的默认值 `agent2api-memory` 对所有人都对，所以不给它一个「顺手就能改」
     // 的位置，只在这里留一个明确的入口，要改的人自己会来找。
-    // 注意这里**不能**再标 `owned_by(…, "sync")`：标了配置页就会把它藏起来并
-    // 指路到同步页，而同步页已经没有这个框了 —— 那就成了任何人都改不了。
-    owned_by(knob("sync.enabled", Kind::Bool, Tier::Basic, "同步", "同步总开关", "true"), "sync"),
+    // 注意这里**不能**再标 `owned_by(…, "webdav-sync")`：标了配置页就会把它藏起来并
+    // 指路到 WebDAV 同步页，而它已经没有这个框了 —— 那就成了任何人都改不了。
+    owned_by(knob("sync.enabled", Kind::Bool, Tier::Basic, "同步", "同步总开关", "true"), "webdav-sync"),
     owned_by(opts(knob_d("sync.provider", Kind::Enum, Tier::Basic, "同步", "存储类型",
         "本仓只实现 WebDAV；S3 需要重写打包与列目录，尚未接入",
-        "\"webdav\""), &["webdav", "s3"]), "sync"),
+        "\"webdav\""), &["webdav", "s3"]), "webdav-sync"),
     owned_by(knob_d("sync.auto", Kind::Bool, Tier::Basic, "同步", "自动定时同步",
         "开：后台线程按「自动同步间隔」定期跑一次；关：只在点「立即同步」时传。手动同步不受影响",
-        "true"), "sync"),
+        "true"), "webdav-sync"),
     owned_by(knob_d("sync.url", Kind::Text, Tier::Basic, "同步", "WebDAV 地址",
-        "留空 = 用默认地址（坚果云 dav.jianguoyun.com）；换别家网盘就填它给的地址", "\"\""), "sync"),
+        "留空 = 用默认地址（坚果云 dav.jianguoyun.com）；换别家网盘就填它给的地址", "\"\""), "webdav-sync"),
     owned_by(knob_d("sync.username", Kind::Text, Tier::Basic, "同步", "WebDAV 用户名",
-        "留空 = 还没配好同步（同步页显示「未配置」）；少数自建服务允许匿名写时才可空", "\"\""), "sync"),
+        "留空 = 还没配好同步（同步页显示「未配置」）；少数自建服务允许匿名写时才可空", "\"\""), "webdav-sync"),
     owned_by(knob_d("sync.password", Kind::Secret, Tier::Basic, "同步", "WebDAV 密码",
-        "经系统密钥加密后落 config.json，接口只回「已设置」；不进同步包", "\"\""), "sync"),
+        "经系统密钥加密后落 config.json，接口只回「已设置」；不进同步包", "\"\""), "webdav-sync"),
     owned_by(knob_d("sync.deviceName", Kind::Text, Tier::Advanced, "同步", "本机显示名",
-        "留空 = 用系统电脑名（也读不到才退到设备 id）；随同步包上传，别的设备在设备列表里看到的就是它", "\"\""), "sync"),
+        "留空 = 用系统电脑名（也读不到才退到设备 id）；随同步包上传，别的设备在设备列表里看到的就是它", "\"\""), "webdav-sync"),
     // 远端目录的编辑入口**只在配置页**（上面已说明理由）：同步页的凭据卡撤掉了
-    // 这个框，所以这里不能标 `owned_by(…, "sync")`。
+    // 这个框，所以这里不能标 `owned_by(…, "webdav-sync")`。
     knob_d("sync.remoteDir", Kind::Text, Tier::Advanced, "同步", "远端目录名",
         "同一账号下的多台设备必须一致：改它等于换一个远端包，两边都「成功」却看不到对方的数据", "\"agent2api-memory\""),
     owned_by(opts(knob_d("sync.preset", Kind::Enum, Tier::Advanced, "同步", "存储预设",
         "仅备忘：帮你记住这台服务器是哪家的，不改变任何同步行为", "\"custom\""),
-        &["custom", "jianguoyun", "nextcloud", "synology", "fnos"]), "sync"),
+        &["custom", "jianguoyun", "nextcloud", "synology", "fnos"]), "webdav-sync"),
     // 自动同步的节奏。默认 1440 分钟 = 24 小时。
     //
     // 为什么是 24 小时而不是更密：同步传的是**整包** tar.gz（记忆几百个文件几 MB），
@@ -654,7 +657,7 @@ static SCHEMA: &[Knob] = &[
     // 已过 intervalMin」，到点跑一次 `run(false)`。改这里最多一分钟内生效。失败也
     // 按同一个间隔重试（不每分钟重连，免得网络故障期把日志刷满）。
     owned_by(range(knob_d("sync.intervalMin", Kind::Number, Tier::Advanced, "同步", "自动同步间隔（分钟）",
-        "默认 1440（24 小时）；后台线程每分钟校验一次是否到点", "1440"), 5.0, 1440.0), "sync"),
+        "默认 1440（24 小时）；后台线程每分钟校验一次是否到点", "1440"), 5.0, 1440.0), "webdav-sync"),
     range(knob("sync.packSizeLimitMB", Kind::Number, Tier::Internal, "同步", "单包体积上限 (MB)", "50"), 1.0, 2048.0),
     knob_d("sync.excludeIndex", Kind::Bool, Tier::Internal, "同步", "索引库不入同步包",
         "索引可重建，且是二进制无法三方合并", "true"),
@@ -668,11 +671,11 @@ static SCHEMA: &[Knob] = &[
     range(knob_d("ui.pageSize", Kind::Number, Tier::Basic, "界面", "列表每页条数",
         "浏览页每页条数；后端在 `limit` 缺省时也用这个值", "50"), 10.0, 500.0),
     opts(knob("ui.defaultTab", Kind::Enum, Tier::Advanced, "界面", "默认页签", "\"dashboard\""),
-        &["dashboard", "browse", "projects", "profile", "agents", "auto", "import", "sync", "settings"]),
+        &["dashboard", "browse", "projects", "profile", "agents", "auto", "import", "settings"]),
     opts(knob_d("ui.tabs", Kind::Multi, Tier::Advanced, "界面", "显示的页签",
         "只控制顶栏显示哪些页签；「配置」始终可见 —— 否则关掉它就再也改不回来",
-        "[\"dashboard\",\"browse\",\"projects\",\"profile\",\"agents\",\"auto\",\"import\",\"sync\"]"),
-        &["dashboard", "browse", "projects", "profile", "agents", "auto", "import", "sync", "settings"]),
+        "[\"dashboard\",\"browse\",\"projects\",\"profile\",\"agents\",\"auto\",\"import\"]"),
+        &["dashboard", "browse", "projects", "profile", "agents", "auto", "import", "settings"]),
 ];
 
 pub fn schema() -> &'static [Knob] {
@@ -1632,22 +1635,33 @@ mod tests {
     ///
     /// 拼错一个页签键（`"snyc"`）不会报错，只会让配置页渲染出一个点了没反应的
     /// 「去 XX 页」按钮 —— 用户点两下就开始怀疑自己。所以这张表必须有闸门。
+    ///
+    /// ── 为什么分成「页签」和「页面」两张表（2026-11-28）────────────
+    /// 同步页从记忆中枢的页签提升成了一级页面「云同步」，`sync.*` 那批键的
+    /// owner 也跟着从 `"sync"` 变成 `"webdav-sync"`。两者的区别不只是名字：
+    /// 页签走 `mm:tab` 事件在页内切，页面走 `wbApp.showPage` 换整页。合成一张
+    /// 表的话，闸门就分不清「这个 owner 该出现在页签栏里还是侧边栏里」——
+    /// 而那正是拼错之后最难查的部分（按钮画出来了，点下去毫无反应）。
     #[test]
     fn owner_points_at_a_real_place() {
         // 与 `memory-page.tsx` 的 `TABS` 一一对应（`self` 不是页签，是本页）。
         const TABS: &[&str] = &[
-            "dashboard", "browse", "projects", "profile", "agents", "auto", "import", "sync", "settings",
+            "dashboard", "browse", "projects", "profile", "agents", "auto", "import", "settings",
         ];
+        // 一级页面：owner 指向侧边栏菜单项而不是页签。与 `ui/sidebar-layout.js`
+        // 的 `MENUS` 里的 key 逐字一致。
+        const PAGES: &[&str] = &["webdav-sync"];
         for item in schema() {
             if item.owner.is_empty() || item.owner == "self" {
                 continue;
             }
             assert!(
-                TABS.contains(&item.owner),
-                "{} 的 owner 是 `{}`，不是已知页签（要么是 self，要么是 {} 之一）",
+                TABS.contains(&item.owner) || PAGES.contains(&item.owner),
+                "{} 的 owner 是 `{}`，不是已知页签（{}）也不是已知页面（{}）",
                 item.key,
                 item.owner,
-                TABS.join(" / ")
+                TABS.join(" / "),
+                PAGES.join(" / ")
             );
         }
     }

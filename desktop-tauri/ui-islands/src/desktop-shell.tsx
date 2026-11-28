@@ -121,11 +121,12 @@ function Frame() {
         {/* 页面挂载点：**这份数组就是「有哪些页」的事实来源**，与
             `sidebar-layout.js` 的 MENUS、`app.js` 的 PAGES 必须逐字一致
             （三处都少一个，页签就点出一个空 section —— 岛找不到挂载点会静默
-            不渲染，界面上看起来「点了没反应」）。`memory` / `skills-hub` 排在
-            `routing` 前只是沿用初版位置：两者都已经不走转发链路（记忆只暴露
-            `/mcp/memory`，技能仓库只读写本机 `skills/` 目录），这个顺序没有
-            数据流含义，别照它去推断处理顺序。 */}
-        {['assistant', 'overview', 'accounts', 'checkin', 'memory', 'skills-hub', 'routing', 'gateway', 'agent', 'tools', 'proxies', 'keys', 'docs', 'logs', 'tasks', 'requests', 'plugins', 'settings'].map(key =>
+            不渲染，界面上看起来「点了没反应」）。`memory` / `skills-hub` /
+            `webdav-sync` 排在 `routing` 前只是沿用初版位置：三者都已经不走转发
+            链路（记忆只暴露 `/mcp/memory`，技能仓库只读写本机 `skills/` 目录，
+            WebDAV 同步只跟远端对账），这个顺序没有数据流含义，别照它去推断
+            处理顺序。 */}
+        {['assistant', 'overview', 'accounts', 'checkin', 'memory', 'skills-hub', 'webdav-sync', 'routing', 'gateway', 'agent', 'tools', 'proxies', 'keys', 'docs', 'logs', 'tasks', 'requests', 'plugins', 'settings'].map(key =>
           <section key={key} className={`page${page === key ? ' active' : ''}`} data-page={key} />)}
         <section className={`page${page.startsWith('plugin:') ? ' active' : ''}`} data-page='__plugin__' id='plugin-page-host' />
       </div></div>

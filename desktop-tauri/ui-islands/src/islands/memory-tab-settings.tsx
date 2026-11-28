@@ -120,17 +120,31 @@ const GROUP_ICONS: Record<string, string> = {
 type RouteRow = { task: string; tags: string[]; model: string }
 
 /**
- * owner → 页签名。**与 `memory-page.tsx` 的 `TABS` 逐字对齐**（后端那条
- * `owner_points_at_a_real_place` 单测校验 owner 只能是这些键之一）。
+ * owner → 显示名。**页签键与 `memory-page.tsx` 的 `TABS` 逐字对齐**（后端那条
+ * `owner_points_at_a_real_place` 单测校验 owner 只能是已知页签或已知页面之一）。
  *
- * 这张表只为了把 `owner="sync"` 翻译成「去同步页」—— 配置页不 import 页面壳，
+ * 这张表只为了把 `owner="auto"` 翻译成「去自动化页」—— 配置页不 import 页面壳，
  * 否则 `memory-page` ↔ `memory-tab-settings` 会互相 import。
+ *
+ * ── 为什么 `sync` 不见了，换成了 `webdav-sync` ────────────────
+ * 同步页从记忆中枢的页签提升成了一级页面「WebDAV 同步」（`webdav-sync-page.tsx`），
+ * 所以 `sync.*` 那些键的 owner 也跟着从「页签」变成「页面」。两者的跳转方式
+ * 不同：页签走 `mm:tab` 事件，页面走 `wbApp.showPage` —— 见下面的 `goOwner`。
  */
 const OWNER_TABS: Record<string, string> = {
   agents: '接入',
   auto: '自动化',
   import: '导入',
-  sync: '同步',
+}
+
+/**
+ * owner → 一级页面键。与 `OWNER_TABS` 分开，因为跳转方式不一样。
+ *
+ * 后端 `owner_points_at_a_real_place` 单测里有一份同名清单（`PAGES`），
+ * 两边必须同时改 —— 那边是闸门，这边是落地。
+ */
+const OWNER_PAGES: Record<string, string> = {
+  'webdav-sync': 'WebDAV 同步',
 }
 
 /**
@@ -144,6 +158,12 @@ const OWNER_TABS: Record<string, string> = {
  */
 function goTab(tab: string): void {
   window.dispatchEvent(new CustomEvent('mm:tab', { detail: { tab } }))
+}
+
+/** 切到一级页面（跨页面，不是跨页签）。 */
+function goPage(page: string): void {
+  (window as unknown as { wbApp?: { showPage?: (name: string) => void } })
+    .wbApp?.showPage?.(page)
 }
 
 /** 「请求级注入」那一组。下面要把预览卡片挂到这一组下面。 */
@@ -573,14 +593,20 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
             指路条放在控件**上方**：用户点进这一组就是想找那几个键，先告诉他
             它们在哪，比让他滚到底部才发现要快一步。 */}
         {signposts.map(({ owner, knobs }) => {
+          // 目标可能是一个页签（`agents` / `auto` / `import`），也可能是一个
+          // 一级页面（`webdav-sync`）。两者的显示名与跳转方式都不同，所以先
+          // 分别查两张表，再决定画哪种按钮 —— 而不是在一张表里混着放，
+          // 然后靠 `owner` 里有没有连字符去猜。
           const tab = OWNER_TABS[owner]
+          const page = OWNER_PAGES[owner]
+          const name = tab ?? page ?? owner
           return (
             <div key={owner} className='mm-cfg-owned'>
               <div className='mm-cfg-owned-main'>
                 <div className='mm-cfg-owned-title'>
                   {owner === 'self'
                     ? t('有 {n} 项在本页上方的表里改', { n: knobs.length })
-                    : t('有 {n} 项在「{tab}」页改', { n: knobs.length, tab: tab ?? owner })}
+                    : t('有 {n} 项在「{tab}」页改', { n: knobs.length, tab: name })}
                 </div>
                 <div className='mm-cfg-owned-keys'>
                   {knobs.map(knob => t(knob.label)).join(' · ')}
@@ -599,8 +625,12 @@ function Settings({ onChanged }: { onChanged: () => void }): React.ReactElement 
                   {t('回到上方 ›')}
                 </button>
               ) : (
-                <button type='button' className='mm-cfg-pageonly-go' onClick={() => goTab(owner)}>
-                  {t('去{tab}页 ›', { tab: tab ?? owner })}
+                <button
+                  type='button'
+                  className='mm-cfg-pageonly-go'
+                  onClick={() => (page ? goPage(page) : goTab(owner))}
+                >
+                  {t('去{tab}页 ›', { tab: name })}
                 </button>
               )}
             </div>

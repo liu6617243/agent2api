@@ -1,11 +1,41 @@
 import * as React from 'react'
+import { createRoot } from 'react-dom/client'
 import { Button, Input, SegmentedControl, Switch } from '@ui'
+import { mountOnPage } from '../island-lazy'
 import { t } from '../i18n'
 import * as m from './memory-api'
-import { Empty, Panel, StateBadge, fullTime, timeText, useLoad } from './memory-shared'
+import { Empty, Panel, StateBadge, fullTime, timeText } from './memory-shared'
+import { notifyEnter, useLoad } from './webdav-sync-shared'
 
 /**
- * 同步页：WebDAV 状态 + 冲突裁决 + 设备列表 + 同步日志。
+ * WebDAV 同步（一级页面）：WebDAV 状态 + 冲突裁决 + 设备列表 + 同步日志。
+ *
+ * ── 为什么从记忆中枢的页签提升成独立菜单项 ──────────────────
+ * 它原来是记忆中枢的第八个页签。问题是：这一页做的事**不是记忆的一种视图**，
+ * 而是一条独立的跨设备链路 —— 连哪台服务器、账号密码、自动同步节奏、冲突
+ * 裁决队列、设备清单、同步日志。把它压在记忆页签栏里，代价是三重的：
+ *
+ *   · 发现成本：侧边栏里看不到同步入口，用户以为本产品不支持多设备。
+ *     真机反馈就是「换台电脑要怎么把记忆带过去」找不到入口。
+ *   · 语义污染：记忆中枢其余七个页签都是「看 / 改本机这份数据」，这一页却是
+ *     「和另一台机器对账」。混在一条页签栏里，用户分不清哪些操作会改远端。
+ *   · 页签栏膨胀：记忆页原本已有九项，再加「配置 / 导入 / 自动化」这类长尾，
+ *     一条平铺页签栏塞到十几个，横向扫读的成本已经超过它的便利。
+ *
+ * 提升成一级页面之后，它和「记忆中枢」「技能仓库」并列在侧边栏的「资源库」
+ * 组里 —— 三者都是「本机攒下来的资料」的不同面向：记忆管 Agent 该记住什么、
+ * 技能管 Agent 能用什么、WebDAV 同步管这份资料怎么跟着人走。
+ *
+ * ── 名字为什么是「WebDAV 同步」──────────────────────────────
+ * 这一页只实现 WebDAV 一条通道（S3 尚未接入），名字直接把协议和动作说清楚：
+ * 什么时候、往哪台服务器、怎么对账。传的对象是**记忆库**（general / projects /
+ * profile 目录），配置面在「设置 → 数据」里，两处各写各的包、互不覆盖。
+ *
+ * ── 数据层为什么还留在 `memory-api` ─────────────────────────
+ * 这一页调的全是 `/api/memory/sync/*`：同步的**对象**是记忆目录，后端实现
+ * 也在 `core/memory/sync.rs`。页面搬了家，接口没有搬 —— 所以 `import * as m
+ * from './memory-api'` 保持不变。给 WebDAV 同步单开一份 api 文件只会把同一批类型
+ * 声明抄两遍，然后两份慢慢漂开。
  *
  * ── 为什么同步是「整包 tar.gz + manifest」而不是逐文件同步 ────
  * 逐文件同步要为每个文件算增量、处理远端不支持 MOVE/COPY 的服务器、还要在
@@ -225,7 +255,15 @@ function formOf(data: m.SyncStatus): SetupForm {
   }
 }
 
-function Sync(): React.ReactElement {
+/**
+ * WebDAV 同步页根组件。
+ *
+ * 从 `memory-tab-sync.tsx` 搬过来时**组件体一行没改**（除了 import 的 `useLoad`
+ * 换了来源）—— 它本来就是自成一页的布局（`mm-sync` 是个纵向 flex 容器，
+ * 内部自己滚动），当初挂在记忆页签里也只是被套进一个 `TabBoundary` 而已。
+ * 所以搬家不需要重写渲染，只需要换外面那层壳。
+ */
+function WebdavSync(): React.ReactElement {
   const { data, loading, error, reload } = useLoad(() => m.loadSync(), [])
   const conflicts = useLoad(() => m.loadSyncConflicts(), [])
   const log = useLoad(() => m.loadSyncLog(50), [])
@@ -1059,4 +1097,113 @@ function Sync(): React.ReactElement {
   )
 }
 
-export { Sync }
+/* ─── 页面壳 ───────────────────────────────── */
+
+/**
+ * 页面根。
+ *
+ * ── 这一层为什么必须存在 ────────────────────────────────────
+ * 内容组件（`WebdavSync`）从页签搬过来时是「页签内容」：它假设外面已经有一个
+ * 撑满高度、自己滚动的容器（记忆页的 `.mm-body-area` 就是那个）。作为一级页面，
+ * 外面换成 `.page.active`（`display:block` + `overflow-y:auto`），两者的高度
+ * 语义不一样 —— 直接塞进去，内容里的 `overflow:auto` 会算不出高度，滚动条
+ * 要么消失要么跑到页面外。
+ *
+ * 所以补一层 `.mm-page`（`flex column` + `height:100%` + `min-height:0`）。
+ * 这是记忆页同款的壳，`.mm-sync` 当初就是它的子节点，高度链完全一致 ——
+ * 搬家后视觉不需要重新调。
+ *
+ * ── 为什么这里没有页签栏、也没有页面标题 ────────────────────
+ * 页签栏是「同一份数据的多个视图」才需要的东西，这一页只有一份内容。
+ * 标题也不必画：顶栏面包屑已经写着「WebDAV 同步」（`PAGE_LABELS`），页内再写一遍
+ * 是重复信息 —— 和技能仓库 / 记忆中枢的处理一致，它们的页内也没有大标题。
+ */
+function WebdavSyncPage(): React.ReactElement {
+  /**
+   * 重新进入这一页就静默重拉。
+   *
+   * ── 两条触发路径，与记忆页同一口径 ──────────────────────────
+   * 1. `wb:page`：用户点左侧导航切到本页，detail 就是 `webdav-sync`。
+   * 2. `visibilitychange`：窗口被切走又切回来（`wb:page` 不派发，只看第一路会漏）。
+   *
+   * ── 为什么首屏那一次要跳过 ──────────────────────────────────
+   * `index.tsx` 在模块求值末尾会为「上次停留的页面」先派发一次 `wb:page`。
+   * 上次正好停在 WebDAV 同步页时，这一发会在组件刚挂载、`useLoad` 已经发出请求之后
+   * 到达 —— 不拦就是首屏同一批接口各请求两次。`booted` 用一个微任务把「首屏
+   * 那一发」让过去：挂载同步完成后立刻置真，之后的才是真·切页。
+   *
+   * ── 为什么不做定时轮询 ──────────────────────────────────────
+   * 同步状态的变化都是「用户刚才做了什么」（点了立即同步、改了凭据、别的设备
+   * 传了包）引起的。定时拉只会让静止的页面每 N 秒闪一次 loading。别的设备上传
+   * 这件事本机本来也不知道，轮询也补不上。
+   */
+  const booted = React.useRef(false)
+  React.useEffect(() => {
+    booted.current = true
+  }, [])
+
+  React.useEffect(() => {
+    const onPage = (event: Event) => {
+      if ((event as CustomEvent<unknown>).detail !== 'webdav-sync') return
+      if (!booted.current) return
+      notifyEnter()
+    }
+    const onVisible = () => {
+      if (document.hidden) return
+      const current = (window as unknown as { wbApp?: { currentPage?: string } }).wbApp?.currentPage
+      // `currentPage` 缺失（老外壳没有这个字段）时按「就在这一页」处理：
+      // 宁可多刷一次，也不要因为读不到字段就退化成「永不刷新」。
+      if (current && current !== 'webdav-sync') return
+      if (!booted.current) return
+      notifyEnter()
+    }
+    window.addEventListener('wb:page', onPage)
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      window.removeEventListener('wb:page', onPage)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [])
+
+  return (
+    <div className='mm-page'>
+      <WebdavSync />
+    </div>
+  )
+}
+
+/* ─── 挂载 ─────────────────────────────────── */
+
+const PAGE_SELECTOR = '.page[data-page="webdav-sync"]'
+
+let mounted = false
+
+function mount(): void {
+  if (mounted) return
+  const section = document.querySelector<HTMLElement>(PAGE_SELECTOR)
+  if (!section) return
+  mounted = true
+  section.replaceChildren()
+  createRoot(section).render(<WebdavSyncPage />)
+}
+
+mountOnPage('webdav-sync', PAGE_SELECTOR, mount)
+
+declare global {
+  interface Window {
+    /** WebDAV 同步（壳侧接口，与 `wbMemory` / `wbSkillsHub` 同一套约定）。 */
+    wbWebdavSync?: {
+      load(): Promise<void>
+      /** 从别处跳过来（目前只有记忆中枢仪表盘的「去裁决」与「同步设置」用）。 */
+      open(): void
+    }
+  }
+}
+
+window.wbWebdavSync = {
+  load: async () => { /* 页面自己首屏拉数据，这里只保留接口形状 */ },
+  open: () => {
+    (window as unknown as { wbApp?: { showPage?: (name: string) => void } })
+      .wbApp?.showPage?.('webdav-sync')
+  },
+}

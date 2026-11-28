@@ -5,10 +5,10 @@ import * as s from './skills-hub-api'
 import { Empty, Panel, Section, ago, num, sizeText, toast, useLoad } from './skills-hub-shared'
 
 /**
- * 技能仓库 · 同步。
+ * 技能仓库 · 收纳。
  *
- * ── 这一页的形态是「预览 → 确认 → 结果」而不是一个「同步」按钮 ──
- * 同步会改用户的磁盘：把渠道目录里的副本收进中央、把目录原位换成指向中央的
+ * ── 这一页的形态是「预览 → 确认 → 结果」而不是一个「收纳」按钮 ──
+ * 收纳会改用户的磁盘：把渠道目录里的副本收进中央、把目录原位换成指向中央的
  * 链接、把旧副本备份进回收站。一个按钮点下去就动几十个目录，用户连它要做什么
  * 都不知道 —— 这种「点一下看看」的代价太高。所以拆成两步：先给出**这一轮会做
  * 什么**的完整清单（一行不动），用户看清楚了再确认。
@@ -19,13 +19,13 @@ import { Empty, Panel, Section, ago, num, sizeText, toast, useLoad } from './ski
  * 和自己的目录结构对一遍。统计卡只用来判断「要不要往下看」。
  *
  * ── 为什么报告要能翻历史 ────────────────────────────────────
- * 同步是**可回看**的操作：出错时第一个问题是「上一次同步到底动了什么」。
- * 每次同步都落一份 Markdown（`reports/sync-<ts>.md`），这一页给最近几条入口。
+ * 收纳是**可回看**的操作：出错时第一个问题是「上一次收纳到底动了什么」。
+ * 每次收纳都落一份 Markdown（`reports/sync-<ts>.md`，文件名沿用旧格式以免读不到历史），这一页给最近几条入口。
  */
 
 type Props = { onChanged: () => void; onGo: (tab: 'dedup') => void }
 
-/** 同步中心表格的一行（动作行或冲突行）。 */
+/** 收纳中心表格的一行（动作行或冲突行）。 */
 type SyncRow = {
   key: string
   skill: string
@@ -46,16 +46,16 @@ function SyncTab({ onChanged, onGo }: Props): React.ReactElement {
   const run = async () => {
     // 执行前必须先说清影响面。AgentHub 用 confirm 列出「收进中央 N 个 ·
     // 挂载变更 M 处 · K 条冲突进入人工裁决」并声明「所有覆盖/删除先进入
-    // 回收站，可还原」—— 同步会动几十个目录，用户不该在完全不知情的
+    // 回收站，可还原」—— 收纳会动几十个目录，用户不该在完全不知情的
     // 情况下点一下就交出磁盘。
     const planCounts = preview.data?.counts ?? {}
     const confirmed = await confirmDialog(
-      t('确认执行同步吗？\n收进中央 {i} 个 · 挂载变更 {m} 处 · {c} 条冲突进入人工裁决。\n所有覆盖/删除先进入回收站，可还原。', {
+      t('确认执行收纳吗？\n收进中央 {i} 个 · 挂载变更 {m} 处 · {c} 条冲突进入人工裁决。\n所有覆盖/删除先进入回收站，可还原。', {
         i: planCounts.import ?? 0,
         m: (planCounts.replace ?? 0) + (planCounts.publish ?? 0),
         c: planCounts.conflict ?? 0,
       }),
-      { title: t('确认执行同步'), confirmText: t('确认执行') },
+      { title: t('确认执行收纳'), confirmText: t('确认执行') },
     )
     if (!confirmed) return
     setRunning(true)
@@ -76,7 +76,7 @@ function SyncTab({ onChanged, onGo }: Props): React.ReactElement {
       reports.reload()
       onChanged()
     } catch (error) {
-      toast(t('同步失败：{error}', { error: String(error instanceof Error ? error.message : error) }), 'err')
+      toast(t('收纳失败：{error}', { error: String(error instanceof Error ? error.message : error) }), 'err')
     } finally {
       setRunning(false)
     }
@@ -96,7 +96,7 @@ function SyncTab({ onChanged, onGo }: Props): React.ReactElement {
 
   const plan = preview.data
   const counts = plan?.counts ?? {}
-  // 「两边已经一致」的技能数。AgentHub 同步中心会在统计卡下面显式说
+  // 「两边已经一致」的技能数。AgentHub 的同步中心会在统计卡下面显式说
   // 「另有 N 个技能两边已经一致，无需处理。」—— 这一句的作用是把「没有
   // 动作」和「页面坏了」区分开：214 个技能一致是正常的稳态，不是没东西可做。
   // 后端 `counts.skip` 就是这个数（plan 里 skip 动作 = 挂载已指向中央真身）。
@@ -171,7 +171,7 @@ function SyncTab({ onChanged, onGo }: Props): React.ReactElement {
         </MetricGrid>
 
         {/* ── 「两边已经一致」的显式说明 ──
-            没有这一句时，「这次同步会做什么」下面是空的，用户分不清是稳态
+            没有这一句时，「这次收纳会做什么」下面是空的，用户分不清是稳态
             还是页面没加载出来。AgentHub 也有这一句（`另有 N 个技能两边已经
             一致，无需处理。`），数字来自同一份 plan 的 skip 计数。 */}
         {skippedCount > 0 ? (
@@ -179,7 +179,7 @@ function SyncTab({ onChanged, onGo }: Props): React.ReactElement {
         ) : null}
 
         <Section
-          title={t('这次同步会做什么')}
+          title={t('这次收纳会做什么')}
           hint={t('（{mode}）确认执行前不会改任何文件。', {
             mode: plan?.mode === 'copy' ? t('复制模式') : t('Junction 共用模式'),
           })}
@@ -189,7 +189,7 @@ function SyncTab({ onChanged, onGo }: Props): React.ReactElement {
                 {t('重新扫描')}
               </Button>
               <Button type='button' size='sm' variant='default' disabled={running} onClick={() => void run()}>
-                {running ? t('同步中…') : t('确认执行')}
+                {running ? t('收纳中…') : t('确认执行')}
               </Button>
             </span>
           }
@@ -257,7 +257,7 @@ function SyncTab({ onChanged, onGo }: Props): React.ReactElement {
 
         {result ? (
           <Section
-            title={t('本次同步结果')}
+            title={t('本次收纳结果')}
             hint={resolvedReportHint(result)}
             action={
               result.reportFile ? (
@@ -275,17 +275,17 @@ function SyncTab({ onChanged, onGo }: Props): React.ReactElement {
           </Section>
         ) : null}
 
-        {/* ── 同步报告（对齐 AgentHub：折叠在页面底部，标题带份数）────────
-            AgentHub 的同步中心把报告收成一行「同步报告（N 份）」的折叠项，
+        {/* ── 收纳报告（对齐 AgentHub：折叠在页面底部，标题带份数）────────
+            AgentHub 把报告收成一行「同步报告（N 份）」的折叠项（本项目叫「收纳报告」），
             默认收起 —— 报告是回看用的，不该在「要做什么」旁边占一屏。 */}
         <details className='sk-report-fold' open={Boolean(reportBody)}>
           <summary>
-            <span>{t('同步报告（{n} 份）', { n: num(reports.data?.items?.length ?? 0) })}</span>
+            <span>{t('收纳报告（{n} 份）', { n: num(reports.data?.items?.length ?? 0) })}</span>
           </summary>
           {reports.loading && !reports.data ? (
             <Empty>{t('正在读取…')}</Empty>
           ) : (reports.data?.items ?? []).length === 0 ? (
-            <Empty>{t('还没同步过')}</Empty>
+            <Empty>{t('还没收纳过')}</Empty>
           ) : (
             <ul className='sk-report-list'>
               {(reports.data?.items ?? []).map(row => (

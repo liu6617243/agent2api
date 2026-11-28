@@ -577,7 +577,7 @@ function Settings({ onChanged }: Props): React.ReactElement {
                   开关只能表示「是不是 A」，说不清「B 是什么、什么时候该用 B」。 */}
               <div className='sk-cfg-panel'>
                 <div className='sk-cfg-panel-title'>{t('挂载模式与生命周期')}</div>
-                <div className='sk-cfg-panel-hint'>{t('调整仅影响之后的同步与挂载动作')}</div>
+                <div className='sk-cfg-panel-hint'>{t('调整仅影响之后的收纳与挂载动作')}</div>
 
                 <div className='sk-field sk-field-block'>
                   <div className='sk-field-label'>{t('挂载模式')}</div>
@@ -617,7 +617,7 @@ function Settings({ onChanged }: Props): React.ReactElement {
                 </div>
 
                 {/* 保留天数归「生命周期」不归「回收站」：它约束的是所有移除动作
-                    多久之后自动过期，由同步流程顺手清理（AgentHub 同）。 */}
+                    多久之后自动过期，由收纳流程顺手清理（AgentHub 同）。 */}
                 <div className='sk-field'>
                   <div className='sk-field-copy'>
                     <div className='sk-field-label'>{t('回收站保留天数')}</div>

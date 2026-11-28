@@ -44,7 +44,7 @@ import { Empty, Panel, Section, StateBadge, num, timeText, useLoad } from './mem
 
 type DashboardProps = {
   status: m.MemoryStatus | null
-  onGo: (tab: 'browse' | 'profile' | 'auto' | 'sync' | 'agents') => void
+  onGo: (tab: 'browse' | 'profile' | 'auto' | 'agents') => void
   /**
    * 「去裁决」的专用出口：跳浏览页**并直接落在「待确认」那一段**。
    *
@@ -57,9 +57,21 @@ type DashboardProps = {
   onOpenEntry?: (id: string) => void
   /** 重建索引会改条数，重建完让外层刷新一次 status。 */
   onChanged?: () => void
+  /**
+   * 去「云同步」页。
+   *
+   * 同步页原来是本页签栏里的第八项，`onGo('sync')` 就能过去。它提升成一级
+   * 页面后跨的是**页面**而不是页签，`switchTab` 到不了 —— 所以单独给一个出口，
+   * 由页面壳实现成 `wbApp.showPage('webdav-sync')`。
+   *
+   * 为什么不在本组件里直接调 `showPage`：仪表盘不该知道自己挂在哪个外壳里
+   * （它现在被记忆页复用，将来也可能被别处引用）。跳转意图往上传，由壳决定
+   * 怎么落地，和 `onReview` / `onOpenEntry` 同一取向。
+   */
+  onWebdavSync?: () => void
 }
 
-function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: DashboardProps): React.ReactElement {
+function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged, onWebdavSync }: DashboardProps): React.ReactElement {
   // 这一页三份数据都显式开启「重新进入就重拉」：状态页是全套里唯一需要「一眼看全
   // 现在」的一页，切回来还显示几分钟前的数字等于这一页白设。
   const auto = useLoad(() => m.loadAuto(), [], { refreshOnEnter: true })
@@ -300,7 +312,7 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
                 state='bad'
                 title={t('同步冲突')}
                 detail={t('{n} 个文件两边都改过，需要选一边', { n: conflicts })}
-                action={{ label: t('去裁决'), run: () => onGo('sync') }}
+                action={{ label: t('去裁决'), run: () => { onWebdavSync?.() } }}
               />
             ) : null}
             {drift ? (
@@ -392,7 +404,7 @@ function Dashboard({ status, onGo, onReview, onOpenEntry, onChanged }: Dashboard
             </code>
           </div>
           <div className='mm-inline-actions'>
-            <Button type='button' size='sm' variant='ghost' onClick={() => onGo('sync')}>{t('同步设置')}</Button>
+            <Button type='button' size='sm' variant='ghost' onClick={() => { onWebdavSync?.() }}>{t('同步设置')}</Button>
             <Button type='button' size='sm' variant='ghost' onClick={() => onGo('agents')}>{t('Agent 接入')}</Button>
             <Button type='button' size='sm' variant='ghost' onClick={() => onGo('profile')}>{t('画像')}</Button>
           </div>

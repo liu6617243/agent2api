@@ -11,7 +11,6 @@ import { Profile } from './memory-tab-profile'
 import { Agents } from './memory-tab-agents'
 import { Auto } from './memory-tab-auto'
 import { Import } from './memory-tab-import'
-import { Sync } from './memory-tab-sync'
 import { Settings } from './memory-tab-settings'
 import { TabBoundary, notifyMemoryEnter, notifyMemoryRefresh } from './memory-shared'
 
@@ -24,7 +23,7 @@ import { TabBoundary, notifyMemoryEnter, notifyMemoryRefresh } from './memory-sh
  * 而「记忆」的后端（存储 + 检索 + MCP 工具）本来就只能由网关提供 —— 插件连
  * 端点都加不了。所以页面归网关，插件不参与本功能。
  *
- * ── 为什么是九个页签 ────────────────────────────────────────
+ * ── 为什么是八个页签 ────────────────────────────────────────
  * 对齐 AgentHub 的记忆中枢之后，这一页承载的不再只是「看记忆」：
  *
  *   dashboard 仪表盘  —— 现在什么状态、有什么要处理
@@ -34,8 +33,18 @@ import { TabBoundary, notifyMemoryEnter, notifyMemoryRefresh } from './memory-sh
  *   agents    接入    —— 11 个客户端装没装、真的调过没
  *   auto      自动化  —— 11 个后台任务的节奏与消耗
  *   import    导入    —— 把别处的历史会话搬进来
- *   sync      同步    —— WebDAV 多设备，冲突裁决
  *   settings  配置    —— 一百多个旋钮，schema 驱动
+ *
+ * ── 原来的第九个「同步」页签去哪了 ──────────────────────────
+ * 它提升成了**一级页面「WebDAV 同步」**（`webdav-sync-page.tsx`，侧边栏「资源库」组）。
+ * 判据是「这一页的读者是谁」：其余八项都是「看 / 改本机这份记忆」的不同视图，
+ * 唯独同步是「和另一台机器对账」—— 它有自己的服务器、账号、节奏、冲突队列、
+ * 设备清单，甚至有自己的失败模式（连不上 / 密码过期 / 远端被别的设备写坏）。
+ * 塞在记忆页签栏里的代价是发现不了它（侧边栏里看不到「同步」两个字，用户以为
+ * 本产品不支持多设备）＋ 分不清哪些操作会改远端。
+ *
+ * 搬家时后端一行没改：接口仍是 `/api/memory/sync/*`，同步的对象仍是记忆目录。
+ * 搬的只是「这一页挂在哪个菜单下」。
  *
  * ── 原来的第十个「索引」页去哪了 ────────────────────────────
  * 那一页原本放四样排障工具：重建索引、体检清单（已删，见 memory/mod.rs）、检索调试、清理回收站。
@@ -43,7 +52,7 @@ import { TabBoundary, notifyMemoryEnter, notifyMemoryRefresh } from './memory-sh
  * 检索与回收站浏览页都有，剩下「重建索引」一个动作撑不起一整页 ——
  * 于是把它挪到仪表盘「索引一致性」那一行的按钮上，页签删掉。
  *
- * 九项平铺在一条页签栏里而不是收进二级菜单：记忆的日常动作横跨这九项（看一条 →
+ * 八项平铺在一条页签栏里而不是收进二级菜单：记忆的日常动作横跨这八项（看一条 →
  * 发现过时 → 去改配置 → 回来验证），藏进二级菜单会让人忘了它的存在。
  *
  * ── 为什么没有「核心记忆」这个独立页签了 ────────────────────
@@ -65,7 +74,6 @@ const TABS = [
   { key: 'agents', label: '接入' },
   { key: 'auto', label: '自动化' },
   { key: 'import', label: '导入' },
-  { key: 'sync', label: '同步' },
   { key: 'settings', label: '配置' },
 ] as const
 
@@ -272,7 +280,7 @@ function MemoryPage(): React.ReactElement {
    * - `projects` → 壳这一层的 state（项目页、浏览页的项目下拉）；
    * - `notifyMemoryEnter()` → 当前页签内部自己 `useLoad` 的那些数据，壳够不着。
    *
-   * 第三类只发一次信号，九个页签各自决定要不要跟（详见 `memory-shared.tsx`
+   * 第三类只发一次信号，八个页签各自决定要不要跟（详见 `memory-shared.tsx`
    * 里 `notifyMemoryEnter` / `useLoad` 的说明）。
    */
   const refreshOnEnter = React.useCallback(() => {
@@ -391,6 +399,21 @@ function MemoryPage(): React.ReactElement {
     switchTab('browse')
   }
 
+  /**
+   * 去「WebDAV 同步」页（跨页面跳转）。
+   *
+   * 同步原来是本页的第八个页签，`switchTab('sync')` 就够。它提升成一级页面后
+   * 跨的是**页面**，`switchTab` 到不了 —— 走 `wbApp.showPage`，这是全应用统一
+   * 的切页入口（路由页、模型页、账号页的跨页按钮都走它）。
+   *
+   * 为什么用 `?.` 兜一层：`wbApp` 由 `app.js` 挂上，理论上早于所有岛，但
+   * 「点了没反应」比「抛异常炸掉整个仪表盘」更难排查 —— 这里宁可静默失败。
+   */
+  const openWebdavSync = () => {
+    (window as unknown as { wbApp?: { showPage?: (name: string) => void } })
+      .wbApp?.showPage?.('webdav-sync')
+  }
+
   return (
     <div className='mm-page'>
       <div className='mm-head'>
@@ -462,6 +485,7 @@ function MemoryPage(): React.ReactElement {
                 onReview={openReview}
                 onOpenEntry={openEntryFromProject}
                 onChanged={afterChange}
+                onWebdavSync={openWebdavSync}
               />
             </TabBoundary>
           ) : null}
@@ -506,7 +530,6 @@ function MemoryPage(): React.ReactElement {
             </TabBoundary>
           ) : null}
           {tab === 'import' ? <TabBoundary name='导入'><Import /></TabBoundary> : null}
-          {tab === 'sync' ? <TabBoundary name='同步'><Sync /></TabBoundary> : null}
           {tab === 'settings' ? (
             <TabBoundary name='配置'>
               <Settings onChanged={afterChange} />

@@ -1386,5 +1386,21 @@
   "还有 {n} 项待处理，去对应页面逐条看完。": "Mais {n} pendentes — revise nas páginas correspondentes.",
   "其他中枢在管的登记（{n}）": "Registrados por outros hubs ({n})",
   "磁盘链接由别的软件维护，不计入待办": "Links em disco mantidos por outro software — não contam como pendência",
-  "逐条纳管": "Adotar um a um"
+  "逐条纳管": "Adotar um a um",
+  "去收纳": "Ir para Adotar",
+  "去收纳中心": "Abrir Central de Adoção",
+  "最近收纳记录": "Adoções recentes",
+  "收纳完成": "Adoção concluída",
+  "还没收纳过": "Nada adotado ainda",
+  "收纳一次": "adotar uma vez",
+  "收纳中…": "Adotando…",
+  "收纳失败：{error}": "Falha na adoção: {error}",
+  "收纳报告（{n} 份）": "Relatórios de adoção ({n})",
+  "本次收纳结果": "Resultado desta adoção",
+  "这次收纳会做什么": "O que esta adoção fará",
+  "确认执行收纳": "Executar adoção",
+  "确认执行收纳吗？\n收进中央 {i} 个 · 挂载变更 {m} 处 · {c} 条冲突进入人工裁决。\n所有覆盖/删除先进入回收站，可还原。": "Executar a adoção?\n{i} para o central · {m} alterações de montagem · {c} conflitos vão para revisão manual.\nToda sobrescrita/exclusão vai primeiro para a Lixeira e pode ser restaurada.",
+  "最后收纳": "Última adoção",
+  "调整仅影响之后的收纳与挂载动作": "As alterações afetam apenas adoções e montagens futuras",
+  "WebDAV 同步": "Sincronização WebDAV"
 }

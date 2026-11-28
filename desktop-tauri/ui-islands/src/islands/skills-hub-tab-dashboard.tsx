@@ -11,7 +11,7 @@ import { Empty, Panel, SkillCardGrid, ago, errorText, num, scanTime, toast, useL
  *   1. 收敛到什么程度？（真实目录份数 / 真身条数 —— 实际被合并的对数才是「份消除」）
  *   2. 各渠道通没通？目录在哪？
  *   3. 每个技能受管到哪一步？（下面那张速览网格，和技能库同一套状态判定）
- *   4. 上次同步是什么时候、成功没有？
+ *   4. 上次收纳是什么时候、成功没有？
  *   5. 有什么要人处理的？（待裁决 / 孤儿 / 中央未登记 —— 这个数字点进去必须
  *      真的能逐条办掉；外链只说明、失效挂载在「挂载与去重」卡上）
  *
@@ -20,7 +20,7 @@ import { Empty, Panel, SkillCardGrid, ago, errorText, num, scanTime, toast, useL
  * 进来以后，首屏就能从数字走到具体条目，不用先去技能库再回来。网格与技能库
  * 共用 `SkillCardGrid`，所以两处对「已挂载 / 待收纳 / 有硬伤」的判定不可能打架。
  *
- * ── 为什么同步记录要逐份读报告正文 ──────────────────────────
+ * ── 为什么收纳记录要逐份读报告正文 ──────────────────────────
  * 文件名只带时间，判断不了这一轮成功没有。`overview` 里给的是「最近几份报告」
  * 的元信息，状态只能从正文首行的统计行解析（`render_report` 的固定格式）：
  * 冲突数为 0 且没有「失败」字样才算完成。只读最近三条 —— 每条都是一次小文件
@@ -40,7 +40,7 @@ type Props = {
   enterKey: number
 }
 
-/** 一份同步报告里读出来的结论。 */
+/** 一份收纳报告里读出来的结论。 */
 type ReportMeta = {
   ok: boolean
   imported: number
@@ -51,7 +51,7 @@ type ReportMeta = {
 }
 
 /**
- * 解析同步报告正文。
+ * 解析收纳报告正文。
  *
  * 概要行是唯一的统计来源，但**它的标签改过名**，两种都在磁盘上：
  *   现在：`- 收进中央 3 · 挂载变更 2 · 合并重复 1 · 跳过 0 · 冲突 0 · 清理回收站 0`
@@ -100,7 +100,7 @@ function reportStamp(file: string): string {
  * 一条待办：裁决 / 孤儿 / 中央未登记 —— 只有这三类（= AgentHub 的 `x()`）。
  *
  * 统一成「图标 + 标题 + 一句说明 + 一个动作」。`action` 决定那颗按钮做什么 ——
- * AgentHub 就是这么分工的：冲突给「裁决」跳去重页，孤儿给「查看」跳同步页，
+ * AgentHub 就是这么分工的：冲突给「裁决」跳去重页，孤儿给「查看」跳收纳页，
  * 中央未登记给「纳管」直接改台账。把它摊平成一个无脑的「查看」会让用户多点
  * 两层才办得成事，也让仪表盘失去「把不用动脑的事办完」的站位。
  *
@@ -196,7 +196,7 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
   // ─── 机械类事项的处理动作（参考 AgentHub：动作挂在仪表盘，不占裁决页）──
   //
   // AgentHub 的分工：失效挂载那张卡上挂「一键修复」，「中央未登记」行挂
-  // 「纳管」，「陌生目录（孤儿）」行只给「查看」跳同步页，需要人对着两份内容
+  // 「纳管」，「陌生目录（孤儿）」行只给「查看」跳收纳页，需要人对着两份内容
   // 做判断的冲突才进去重页逐条裁决。这里照同一套分工。
   //
   // 特意不再保留跨类的「一键处理」总按钮：它会让用户以为冲突也能一键办掉，
@@ -382,7 +382,7 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
     : conflicts.length > 0
       ? { label: t('去裁决'), arrow: '→', run: () => onGo('dedup') }
       : orphans.length > 0
-        ? { label: t('去同步'), arrow: '→', run: () => onGo('sync') }
+        ? { label: t('去收纳'), arrow: '→', run: () => onGo('sync') }
         : { label: t('逐条纳管'), arrow: '↓', run: () => todoRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
 
   // AgentHub 的胶囊文案是「· {时间} 已自动完成」/「· 尚未运行检测」，两态都
@@ -419,7 +419,7 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
           </div>
           <div className='sk-dash-head-actions'>
             <Button type='button' size='sm' variant='outline' onClick={() => onGo('sync')}>
-              {t('去同步中心')}
+              {t('去收纳中心')}
             </Button>
             <Button type='button' size='sm' variant='ghost' onClick={() => onGo('settings')}>
               {t('配置渠道')}
@@ -687,7 +687,7 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
           {quick.length === 0 ? (
             <Empty>
               {items.length === 0
-                ? t('技能库里还没有任何技能。去配置页接上客户端的技能目录，然后同步一次。')
+                ? t('技能库里还没有任何技能。去配置页接上客户端的技能目录，然后收纳一次。')
                 : t('没有找到符合条件的技能')}
             </Empty>
           ) : (
@@ -695,19 +695,19 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
           )}
         </section>
 
-        {/* ── 最近同步 + 待办 ── */}
+        {/* ── 最近收纳 + 待办 ── */}
         <div className='sk-dash-cols'>
           <section className='sk-block'>
             <div className='sk-block-head'>
-              <span className='sk-block-title'>{t('最近同步记录')}</span>
+              <span className='sk-block-title'>{t('最近收纳记录')}</span>
               <div className='sk-block-action'>
                 <Button type='button' size='sm' variant='ghost' onClick={() => onGo('sync')}>
-                  {t('去同步')}
+                  {t('去收纳')}
                 </Button>
               </div>
             </div>
             {data.recentReports.length === 0 ? (
-              <Empty>{t('还没同步过')}</Empty>
+              <Empty>{t('还没收纳过')}</Empty>
             ) : (
               <ul className='sk-sync-list'>
                 {recent.map(row => {
@@ -719,7 +719,7 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
                         <span className='sk-sync-line'>
                           {meta ? (
                             <Badge variant={meta.ok ? 'success' : 'warning'} shape='tag'>
-                              {meta.ok ? t('同步完成') : t('有 {n} 项冲突', { n: num(meta.conflicts) })}
+                              {meta.ok ? t('收纳完成') : t('有 {n} 项冲突', { n: num(meta.conflicts) })}
                             </Badge>
                           ) : (
                             <Badge variant='outline' shape='tag'>{t('读取中…')}</Badge>
