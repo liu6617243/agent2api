@@ -5,25 +5,32 @@ import * as s from './skills-hub-api'
 import { Empty, Panel, Section, errorText, num, toast, useLoad } from './skills-hub-shared'
 
 /**
- * 技能仓库 · 去重与冲突（处理页）。
+ * 技能仓库 · 去重与冲突（裁决页）。
  *
- * ── 这一页必须覆盖「待处理」那格的全部四类来源 ──────────────
- * 仪表盘「待处理优化」的 N = 冲突 + 孤儿 + 未登记 + 挂载失效。原来这页只渲染
- * 冲突 / 已合并 / 相似度，后三类一条都不显示 —— 于是仪表盘写「4 项」、副标题
- * 三个 0、点「去裁决」进来是空白页。用户没法判断是「真的没问题」还是「页面坏了」。
+ * ── 这一页只做一件事：裁决冲突 ──────────────────────────────
  *
- * 现在的对应关系（每类都有真实接口，不是只列出来）：
+ * 参考 AgentHub（`SkillsDedupView`）的站位：它的「去重与冲突」页从上到下只有
+ * 三块 —— 一行漏斗图标的汇总（「本轮扫描自动合并了 N 组重复副本；剩下 M 条
+ * 疑似冲突需要你逐条确认」）、一个「需要你决定的冲突（M）」列表、以及一个
+ * 「没有待裁决的冲突」空状态。**没有**挂载失效、没有外部链接、没有中央未登记、
+ * 没有孤儿目录。
  *
- * | 类别 | 接口 | 动作粒度 |
+ * 原因是这些事需要的动作性质完全不同，混在一页会同时压垮两件事：
+ *   * 冲突要人对着两份内容做判断，必须一次只看一条；
+ *   * 挂载失效 / 未登记 / 外部链接是机械动作，丢进同一个列表会让人以为
+ *     「裁决」按钮也能顺手把这些办了。
+ *
+ * 所以 Agent2API 也照这个分工拆（2026-11-28，用户报「去重界面和 AgentHub
+ * 不一样」）：
+ *
+ * | 事项 | 归属页面 | 形态 |
  * |---|---|---|
- * | 冲突（同名异容 / 链接异常 / 疑似同一） | `resolveConflict(id, choice)` | 逐条 |
- * | 挂载失效（链接指不到中央真身） | `repairMounts()` | **全量**，无单条修复接口 |
- * | 中央未登记（中央有目录、台账无记录） | `adoptSkill(name)` | 逐条 |
- * | 孤儿目录（工具里有、中央没有） | 无收纳接口，跳技能详情 | 逐条 |
+ * | 冲突（同名异容 / 链接异常 / 疑似同一） | 本页 | 逐条裁决 |
+ * | 已合并 / 相似度提示 | 本页 | 只读展示（证明「机器做了什么」） |
+ * | 挂载失效、外部链接、中央未登记、孤儿目录 | 仪表盘「待办」区 | 行内动作 + 一键处理 |
  *
- * 孤儿为什么不做「一键收纳」：收纳 = 把工具目录的内容搬进中央并登记，
- * 是同步（`runSync`）的职责，单个孤儿走同步会把整批一起收进来。这里只负责
- * 让人看见它、并能跳到技能详情去处理，避免造一个语义含糊的按钮。
+ * 仪表盘那边已经具备全部动作入口（`一键处理` 聚合接口 + 逐条纳管 / 解除登记），
+ * 所以这里删掉这些区块不会让任何事项失去处理路径。
  *
  * ── 三类冲突的处置动作完全不同 ──────────────────────────────
  * * **content**（同名不同内容）：必须选一边。四个动作：保留中央版 / 保留工具版 /
@@ -73,9 +80,6 @@ function Dedup({ onChanged, onOpenSkill, enterKey }: Props): React.ReactElement 
   // `refreshOnEnter` 又只认整页重进 —— 不加这个信号，「仪表盘有 4 项、
   // 点进来是空的」会重现（切进来看到的是上一次的旧快照）。
   const conflicts = useLoad(() => s.loadConflicts(), [enterKey], { refreshOnEnter: true })
-  // 后三类问题只在 `overview` 里 —— 冲突接口不返回它们。两个请求并行，各自独立
-  // 报错：overview 挂了不该把冲突列表也一起拖成错误页。
-  const overview = useLoad(() => s.loadOverview(), [enterKey], { refreshOnEnter: true })
   const [busy, setBusy] = React.useState('')
   const [expanded, setExpanded] = React.useState('')
 
@@ -85,7 +89,6 @@ function Dedup({ onChanged, onOpenSkill, enterKey }: Props): React.ReactElement 
       const result = await s.resolveConflict(id, choice)
       toast(result.message, 'ok')
       conflicts.reload()
-      overview.reload()
       onChanged()
     } catch (error) {
       toast(t('裁决失败：{error}', { error: errorText(error) }), 'err')
@@ -94,139 +97,42 @@ function Dedup({ onChanged, onOpenSkill, enterKey }: Props): React.ReactElement 
     }
   }
 
-  // 解除登记：只删台账，不动磁盘链接。用于别的中枢在管的链接位 ——
-  // 摘掉重挂会被抢回去，两个软件抢同一条路径。
-  const unregister = async (name: string, tool: string) => {
-    setBusy(`unregister:${tool}:${name}`)
-    try {
-      const result = await s.unregisterMount(name, tool)
-      toast(t('已解除 {name} 在 {tool} 的挂载登记', { name, tool }), 'ok')
-      overview.reload()
-      onChanged()
-    } catch (error) {
-      toast(t('解除失败：{error}', { error: errorText(error) }), 'err')
-    } finally {
-      setBusy('')
-    }
-  }
-
-  // `adopt` 只对「中央已有真实目录、但台账里没登记」的条目有效（后端会拒绝链接与
-  // 不存在的目录），正好就是 `hubExtra` 这一类，所以只在这里给按钮。
-  const adopt = async (name: string) => {
-    setBusy(`adopt:${name}`)
-    try {
-      await s.adoptSkill(name)
-      toast(t('已纳入台账：{name}', { name }), 'ok')
-      overview.reload()
-      onChanged()
-    } catch (error) {
-      toast(t('纳入失败：{error}', { error: errorText(error) }), 'err')
-    } finally {
-      setBusy('')
-    }
-  }
-
-  // ─── 一键处理（参考 AgentHub：一个按钮、自动决策、事后汇总）──────────
-  // 用户不关心内部分了几类：按钮替他决定 —— 解除外部登记 → 重建真失效
-  // 挂载 → 纳管中央未登记，顺序执行。冲突要人选一边、孤儿归同步确认执行，
-  // 都不在此列，弹窗里说明。失败明细在汇总区展示，不静默吞掉。
-  const [note, setNote] = React.useState('')
-  const resolveAll = async () => {
-    setBusy('resolve-all')
-    try {
-      const result = await s.resolveAll()
-      const failed = result.repair.failed ?? []
-      const skipped = result.adopt.skipped ?? []
-      const lines: string[] = []
-      if (failed.length > 0) {
-        lines.push(t('重建失败 {n} 处：', { n: num(failed.length) }))
-        lines.push(...failed.map(item => `${item.skill} @ ${item.tool}：${item.message}`))
-      }
-      if (skipped.length > 0) {
-        lines.push(t('纳入跳过 {n} 个：', { n: num(skipped.length) }))
-        lines.push(...skipped.map(item => `${item.name}：${item.reason}`))
-      }
-      setNote(lines.join('\n'))
-      toast(result.message, failed.length + skipped.length > 0 ? 'err' : 'ok')
-      overview.reload()
-      conflicts.reload()
-      onChanged()
-    } catch (error) {
-      toast(t('处理失败：{error}', { error: errorText(error) }), 'err')
-    } finally {
-      setBusy('')
-    }
-  }
-
-  const askResolveAll = async () => {
-    const ask = (window as unknown as { wbConfirm?: { ask?: (options: Record<string, unknown>) => Promise<boolean> } }).wbConfirm?.ask
-    const parts: string[] = []
-    if (externals.length > 0) {
-      parts.push(t('解除 {n} 条外部链接登记（磁盘链接不动）', { n: num(externals.length) }))
-    }
-    if (broken.length > 0) {
-      parts.push(t('重建 {n} 处失效挂载', { n: num(broken.length) }))
-    }
-    const adoptables = extras.filter(item => !item.isLink)
-    if (adoptables.length > 0) {
-      parts.push(t('纳管 {n} 个中央未登记技能', { n: num(adoptables.length) }))
-    }
-    const nothing = parts.length === 0
-    const body = nothing
-      ? t('当前没有可自动处理的事项。冲突与孤儿目录不在此列：冲突需要你选一边，孤儿由同步确认执行收纳。')
-      : [t('将自动执行：'), ...parts.map(part => `• ${part}`), '', t('冲突与孤儿目录不在此列：冲突需要你选一边，孤儿由同步确认执行收纳。')].join('\n')
-    const ok = await Promise.resolve(ask?.({
-      title: t('一键处理'),
-      text: body,
-      okText: t('立即执行'),
-    }) ?? true)
-    if (!ok) return
-    await resolveAll()
-  }
-
   const items = conflicts.data?.items ?? []
   const duplicates = conflicts.data?.duplicates ?? []
   const hints = conflicts.data?.hints ?? []
 
-  // 失效 = 不是有效挂载、也不是外部链接。外链是别的中枢在管的健康链接，
-  // 放进「失效」会让用户点「全部重建」，然后看它修完又回来。
-  const broken = (overview.data?.mountHealth ?? []).filter(item => !item.valid && !item.external)
-  const externals = (overview.data?.mountHealth ?? []).filter(item => item.external)
-  const extras = overview.data?.hubExtra ?? []
-  const orphans = overview.data?.orphans ?? []
-  const clean =
-    items.length === 0 && duplicates.length === 0 && hints.length === 0
-    && broken.length === 0 && extras.length === 0 && orphans.length === 0
-
   return (
     <Panel loading={conflicts.loading} error={conflicts.error} onRetry={conflicts.reload}>
       <div className='sk-dedup'>
-        {clean ? (
-          <Empty>{t('没有待处理项。同名异容、链接异常、挂载失效、孤儿目录都会出现在这里。')}</Empty>
-        ) : (
-          // ── 页顶统一入口（参考 AgentHub）：一个按钮替用户把不需要裁决的
-          // 事项全部做完。放在页首而不是某个区块里 —— 它本来就是跨区块动作。
-          <div className='sk-dedup-toolbar'>
-            <span className='sk-muted'>
-              {t('冲突需要你裁决，其余事项可以一键处理。')}
-            </span>
-            <Button
-              type='button'
-              size='sm'
-              variant='default'
-              disabled={busy === 'resolve-all'}
-              onClick={() => void askResolveAll()}
-            >
-              {busy === 'resolve-all' ? t('处理中…') : t('一键处理')}
-            </Button>
-          </div>
-        )}
+        {/* ── 汇总条（对齐 AgentHub：一行说清「机器做了什么、还剩多少要人拦」）──
+            没有这一行时，用户看到空列表无法区分「真的合并了 0 份」与「页面没加载」。
+            数字直接来自同一份 `resolveConflict` 快照（duplicates / items），
+            不做任何二次推算。 */}
+        <div className='sk-dedup-summary'>
+          <span className='sk-dedup-summary-glyph' aria-hidden='true'>
+            <svg viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round'>
+              <path d='M3 5h18l-7 8v6l-4 2v-8z' />
+            </svg>
+          </span>
+          <span>
+            {t('本轮扫描自动合并了 {n} 组重复副本；剩下 {m} 条疑似冲突需要你逐条确认。', {
+              n: num(duplicates.length),
+              m: num(items.length),
+            })}
+          </span>
+        </div>
 
-        {items.length > 0 ? (
-          <Section
-            title={t('待裁决的冲突')}
-            hint={t('{n} 条。同名异容必须选一边，链接异常只需重建链接，疑似同一只是提示。', { n: num(items.length) })}
-          >
+        <Section
+          title={t('需要你决定的冲突（{n}）', { n: num(items.length) })}
+          action={
+            <Button type='button' size='sm' variant='ghost' disabled={conflicts.loading} onClick={conflicts.reload}>
+              {t('重新检测')}
+            </Button>
+          }
+        >
+          {items.length === 0 ? (
+            <Empty>{t('没有待裁决的冲突')}</Empty>
+          ) : (
             <div className='sk-conflict-list'>
               {items.map(item => {
                 const open = expanded === item.id
@@ -249,7 +155,7 @@ function Dedup({ onChanged, onOpenSkill, enterKey }: Props): React.ReactElement 
                           variant='ghost'
                           onClick={() => setExpanded(open ? '' : item.id)}
                         >
-                          {open ? t('收起') : t('展开')}
+                          {open ? t('收起') : t('查看 / 裁决')}
                         </Button>
                       </span>
                     </div>
@@ -332,157 +238,8 @@ function Dedup({ onChanged, onOpenSkill, enterKey }: Props): React.ReactElement 
                 )
               })}
             </div>
-          </Section>
-        ) : null}
-
-        {broken.length > 0 || note ? (
-          <Section
-            title={t('挂载失效')}
-            hint={t('{n} 处。客户端目录里的链接指不到中央真身 —— 重建只改链接，不动内容。', { n: num(broken.length) })}
-          >
-            {note ? (
-              <div className='sk-conflict-detail' style={{ whiteSpace: 'pre-line' }}>
-                <b>{t('失败明细')}</b>
-                {note}
-              </div>
-            ) : null}
-            {broken.length > 0 ? (
-              <div className='sk-table'>
-                <div className='sk-table-head'>
-                  <span>{t('技能')}</span>
-                  <span>{t('渠道')}</span>
-                  <span>{t('链接路径')}</span>
-                  <span>{t('操作')}</span>
-                </div>
-                {broken.map(item => (
-                  <div key={`${item.skill}-${item.tool}-${item.path}`} className='sk-table-row'>
-                    <span className='sk-cell-name'>{item.skill}</span>
-                    <span><Badge variant='outline' shape='tag'>{item.tool}</Badge></span>
-                    <span className='sk-cell-note'>
-                      <code>{item.path}</code>
-                      {item.centralExists === false ? <span className='sk-muted'> {t('中央真身也不在了')}</span> : null}
-                    </span>
-                    <span className='sk-row-actions'>
-                      <Button type='button' size='sm' variant='ghost' onClick={() => onOpenSkill(item.skill)}>
-                        {t('看详情')}
-                      </Button>
-                    </span>
-                  </div>
-                ))}
-              </div>
-            ) : null}
-          </Section>
-        ) : null}
-
-        {externals.length > 0 ? (
-          <Section
-            title={t('外部链接')}
-            hint={t('这是其他软件维护的健康链接，本程序不接管。')}
-          >
-            <div className='sk-table'>
-              <div className='sk-table-head'>
-                <span>{t('技能')}</span>
-                <span>{t('渠道')}</span>
-                <span>{t('链接路径')}</span>
-                <span>{t('操作')}</span>
-              </div>
-              {externals.map(item => (
-                <div key={`${item.skill}-${item.tool}-${item.path}`} className='sk-table-row'>
-                  <span className='sk-cell-name'>{item.skill}</span>
-                  <span><Badge variant='outline' shape='tag'>{item.tool}</Badge></span>
-                  <span className='sk-cell-note'><code>{item.path}</code></span>
-                  <span className='sk-row-actions'>
-                    <Button
-                      type='button'
-                      size='sm'
-                      variant='ghost'
-                      disabled={busy === `unregister:${item.tool}:${item.skill}`}
-                      onClick={() => void unregister(item.skill, item.tool)}
-                    >
-                      {t('解除登记')}
-                    </Button>
-                    <Button type='button' size='sm' variant='ghost' onClick={() => onOpenSkill(item.skill)}>
-                      {t('看详情')}
-                    </Button>
-                  </span>
-                </div>
-              ))}
-            </div>
-          </Section>
-        ) : null}
-
-        {extras.length > 0 ? (
-          <Section
-            title={t('中央未登记')}
-            hint={t('{n} 个。中央有目录，台账里没有记录 —— 不纳入就永远不参与同步与去重。', { n: num(extras.length) })}
-          >
-            <div className='sk-table'>
-              <div className='sk-table-head'>
-                <span>{t('技能')}</span>
-                <span>{t('路径')}</span>
-                <span>{t('类型')}</span>
-                <span>{t('操作')}</span>
-              </div>
-              {extras.map(item => (
-                <div key={item.name} className='sk-table-row'>
-                  <span className='sk-cell-name'>{item.name}</span>
-                  <span className='sk-cell-note'><code>{item.path}</code></span>
-                  <span>
-                    {item.isLink
-                      ? <Badge variant='warning' shape='tag'>{t('悬空链接')}</Badge>
-                      : <Badge variant='outline' shape='tag'>{t('真实目录')}</Badge>}
-                  </span>
-                  <span className='sk-row-actions'>
-                    {item.isLink ? (
-                      // 链接不是真身，后端会直接拒绝纳管；给按钮等于给一个必然失败的按钮
-                      <Button type='button' size='sm' variant='ghost' onClick={() => onOpenSkill(item.name)}>
-                        {t('看详情')}
-                      </Button>
-                    ) : (
-                      <Button
-                        type='button'
-                        size='sm'
-                        variant='outline'
-                        disabled={busy === `adopt:${item.name}`}
-                        onClick={() => void adopt(item.name)}
-                      >
-                        {t('纳入台账')}
-                      </Button>
-                    )}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </Section>
-        ) : null}
-
-        {orphans.length > 0 ? (
-          <Section
-            title={t('孤儿目录')}
-            hint={t('{n} 个。只存在于客户端目录、中央还没有 —— 收纳由同步统一完成，这里只能看。', { n: num(orphans.length) })}
-          >
-            <div className='sk-table'>
-              <div className='sk-table-head'>
-                <span>{t('技能')}</span>
-                <span>{t('渠道')}</span>
-                <span>{t('目录')}</span>
-                <span>{t('操作')}</span>
-              </div>
-              {orphans.map(item => (
-                <div key={`${item.tool}-${item.name}`} className='sk-table-row'>
-                  <span className='sk-cell-name'>{item.name}</span>
-                  <span><Badge variant='outline' shape='tag'>{item.tool}</Badge></span>
-                  <span className='sk-cell-note'><code>{item.dir}</code></span>
-                  <span className='sk-row-actions'>
-                    <Button type='button' size='sm' variant='ghost' onClick={() => onOpenSkill(item.name)}>
-                      {t('看详情')}
-                    </Button>
-                  </span>
-                </div>
-              ))}
-            </div>
-          </Section>
-        ) : null}
+          )}
+        </Section>
 
         {duplicates.length > 0 ? (
           <Section

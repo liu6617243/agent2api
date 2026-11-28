@@ -1286,5 +1286,19 @@
   "冲突与孤儿目录不在此列：冲突需要你选一边，孤儿由同步确认执行收纳。": "Conflitos e pastas órfãs ficam de fora: conflitos exigem sua escolha, órfãos são coletados na confirmação de sincronização.",
   "处理失败：{error}": "Falha ao resolver: {error}",
   "重建失败 {n} 处：": "{n} montagens não reconstruídas:",
-  "纳入跳过 {n} 个：": "{n} adoções ignoradas:"
+  "纳入跳过 {n} 个：": "{n} adoções ignoradas:",
+  "需要你决定的冲突（{n}）": "Conflitos que precisam da sua decisão ({n})",
+  "本轮扫描自动合并了 {n} 组重复副本；剩下 {m} 条疑似冲突需要你逐条确认。": "Esta varredura mesclou automaticamente {n} cópias duplicadas; restam {m} conflitos suspeitos para você revisar um a um.",
+  "需要处理": "Precisa de atenção",
+  "重新检测": "Verificar de novo",
+  "查看 / 裁决": "Ver / resolver",
+  "挂载全部有效，中央目录也都登记过了": "Todos os mounts são válidos e todas as pastas centrais estão registradas.",
+  "事项": "Item",
+  "位置": "Local",
+  "纳管": "Adotar",
+  "外部链接登记（其他软件维护，磁盘链接不动）": "Registro de link externo (mantido por outro app; o link no disco não é alterado)",
+  "挂载失效（链接指不到中央真身）": "Mount quebrado (o link não alcança a cópia central)",
+  "中央未登记（悬空链接，指向的真身已不在）": "Não registrado no central (link pendurado; o alvo sumiu)",
+  "中央未登记（中央有目录，台账无记录）": "Não registrado no central (pasta existe no central, mas não no registro)",
+  "另有 {n} 个孤儿目录（渠道里有、中央还没有）。收纳由同步统一完成，去同步页确认执行即可。": "Restam {n} pastas órfãs (existem no canal, ainda não no central). A coleta é feita pela sincronização — vá à página de sincronização e confirme."
 }

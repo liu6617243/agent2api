@@ -2,7 +2,7 @@ import * as React from 'react'
 import { Badge, Button } from '@ui'
 import { t } from '../i18n'
 import * as s from './skills-hub-api'
-import { Empty, Panel, SkillCardGrid, ago, num, toast, useLoad } from './skills-hub-shared'
+import { Empty, Panel, Section, SkillCardGrid, ago, errorText, num, toast, useLoad } from './skills-hub-shared'
 
 /**
  * 技能仓库 · 仪表盘。
@@ -172,6 +172,97 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
     }
   }
 
+  // ─── 机械类事项的处理动作（参考 AgentHub：动作挂在仪表盘，不占裁决页）──
+  //
+  // AgentHub 的仪表盘就是这么分工的：失效挂载那张卡上直接挂「一键修复」，
+  // 「中央未登记」每行挂「纳管」，「陌生目录（孤儿）」行只给「查看」跳同步页。
+  // 需要人对着两份内容做判断的冲突，才进「去重与冲突」页逐条裁决。
+  //
+  // 所以这里把 `resolve-all` 的入口从裁决页搬回仪表盘：它本来就是跨区块的机械
+  // 动作，摆在裁决页会让用户以为「裁决」能顺手把这些办了，也会在无可裁决冲突
+  // 时把整个按钮藏掉（旧实现：`clean` 分支下压根不渲染 toolbar）。
+  const [busy, setBusy] = React.useState('')
+  const [note, setNote] = React.useState('')
+
+  const resolveAll = async () => {
+    setBusy('resolve-all')
+    try {
+      const result = await s.resolveAll()
+      const failed = result.repair.failed ?? []
+      const skipped = result.adopt.skipped ?? []
+      const lines: string[] = []
+      if (failed.length > 0) {
+        lines.push(t('重建失败 {n} 处：', { n: num(failed.length) }))
+        lines.push(...failed.map(item => `${item.skill} @ ${item.tool}：${item.message}`))
+      }
+      if (skipped.length > 0) {
+        lines.push(t('纳入跳过 {n} 个：', { n: num(skipped.length) }))
+        lines.push(...skipped.map(item => `${item.name}：${item.reason}`))
+      }
+      setNote(lines.join('\n'))
+      toast(result.message, failed.length + skipped.length > 0 ? 'err' : 'ok')
+      refreshNow()
+    } catch (error) {
+      toast(t('处理失败：{error}', { error: errorText(error) }), 'err')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const askResolveAll = async () => {
+    const ask = (window as unknown as { wbConfirm?: { ask?: (options: Record<string, unknown>) => Promise<boolean> } }).wbConfirm?.ask
+    const parts: string[] = []
+    if (externals.length > 0) {
+      parts.push(t('解除 {n} 条外部链接登记（磁盘链接不动）', { n: num(externals.length) }))
+    }
+    if (brokenMounts > 0) {
+      parts.push(t('重建 {n} 处失效挂载', { n: num(brokenMounts) }))
+    }
+    const adoptables = extras.filter(item => !item.isLink)
+    if (adoptables.length > 0) {
+      parts.push(t('纳管 {n} 个中央未登记技能', { n: num(adoptables.length) }))
+    }
+    const nothing = parts.length === 0
+    const body = nothing
+      ? t('当前没有可自动处理的事项。冲突需要你选一边，孤儿目录由同步确认执行收纳。')
+      : [t('将自动执行：'), ...parts.map(part => `• ${part}`), '', t('冲突需要你选一边，孤儿目录由同步确认执行收纳。')].join('\n')
+    const ok = await Promise.resolve(ask?.({
+      title: t('一键处理'),
+      text: body,
+      okText: t('立即执行'),
+    }) ?? true)
+    if (!ok) return
+    await resolveAll()
+  }
+
+  const unregister = async (name: string, tool: string) => {
+    setBusy(`unregister:${tool}:${name}`)
+    try {
+      await s.unregisterMount(name, tool)
+      toast(t('已解除 {name} 在 {tool} 的挂载登记', { name, tool }), 'ok')
+      refreshNow()
+    } catch (error) {
+      toast(t('解除失败：{error}', { error: errorText(error) }), 'err')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  // `adopt` 只对「中央已有真实目录、但台账里没登记」的条目有效（后端会拒绝链接与
+  // 不存在的目录），正好就是 `hubExtra` 里非链接的那一类。
+  const adopt = async (name: string) => {
+    setBusy(`adopt:${name}`)
+    try {
+      await s.adoptSkill(name)
+      toast(t('已纳入台账：{name}', { name }), 'ok')
+      refreshNow()
+    } catch (error) {
+      toast(t('纳入失败：{error}', { error: errorText(error) }), 'err')
+    } finally {
+      setBusy('')
+    }
+  }
+
   if (!data) {
     return (
       <Panel loading={overview.loading} error={overview.error} onRetry={overview.reload}>
@@ -194,6 +285,16 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
   // 两边对不上；§69 全部重建修完也压不掉这个数字，就是这个原因。
   const brokenList = data.mountHealth.filter(item => !item.valid && !item.external)
   const brokenMounts = brokenList.length
+  // 另外三类同样在这里先算好：仪表盘现在是它们的唯一处理入口（裁决页只留冲突），
+  // 所以「有没有东西要处理」「一键处理会做几件事」都靠这三个数组。
+  const externals = data.mountHealth.filter(item => item.external)
+  const extras = data.hubExtra ?? []
+  const orphans = data.orphans ?? []
+  // 两个数必须分开：`listed` 是表格实际会画出的行数（决定显不显示空状态），
+  // `autoFixable` 是「一键处理」真能办掉的件数（悬空链接后端会拒绝纳管，
+  // 所以不算）。混用会出现「表里有 1 行、却显示空状态」或反之。
+  const listed = externals.length + brokenMounts + extras.length
+  const autoFixable = externals.length + brokenMounts + extras.filter(item => !item.isLink).length
   const todoTotal = data.pendingConflicts.length + data.orphans.length + data.hubExtra.length + brokenMounts
   // 「份消除」= 本轮扫描里**真的被 L1 合并掉**的冗余副本对数。
   //
@@ -615,6 +716,135 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
             )}
           </section>
         </div>
+
+        {/* ── 需要处理（机械动作区）─────────────────────────────────
+            对齐 AgentHub 的站位：仪表盘才是「把不用动脑的事办完」的地方。
+            AgentHub 在「挂载与去重」那张卡上直接挂「一键修复」，未登记行挂
+            「纳管」，陌生目录行跳同步 —— 裁决页只管冲突。
+
+            这里把四类机械事项按「能不能自动做」分成两段：上半是自动段（外链
+            登记 / 失效挂载 / 未登记），一个按钮全处理；下半是孤儿，只给「去同步」，
+            因为收纳是同步的职责，造个按钮等于绕开同步直接改台账。 */}
+        <section className='sk-block'>
+          <div className='sk-block-head'>
+            <span className='sk-block-title'>
+              <span className='sk-block-glyph' aria-hidden='true'>
+                <svg viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round'>
+                  <path d='M14.7 6.3a5 5 0 0 0 6.9 6.9l-8.3 8.3a2.5 2.5 0 0 1-3.5-3.5z' />
+                  <path d='M3 21l3-3' />
+                </svg>
+              </span>
+              {t('需要处理')}
+              <span className='sk-block-count'>{num(listed)}</span>
+            </span>
+            <div className='sk-block-action'>
+              <Button
+                type='button'
+                size='sm'
+                variant='ghost'
+                disabled={busy === 'resolve-all' || autoFixable === 0}
+                onClick={() => void askResolveAll()}
+              >
+                {busy === 'resolve-all' ? t('处理中…') : t('一键处理')}
+              </Button>
+            </div>
+          </div>
+
+          {listed === 0 ? (
+            <Empty>{t('挂载全部有效，中央目录也都登记过了')}</Empty>
+          ) : (
+            <div className='sk-table'>
+              <div className='sk-table-head'>
+                <span>{t('事项')}</span>
+                <span>{t('技能')}</span>
+                <span>{t('位置')}</span>
+                <span>{t('操作')}</span>
+              </div>
+
+              {externals.map(item => (
+                <div key={`x-${item.tool}-${item.skill}`} className='sk-table-row'>
+                  <span className='sk-cell-note'>{t('外部链接登记（其他软件维护，磁盘链接不动）')}</span>
+                  <span className='sk-cell-name'>{item.skill}</span>
+                  <span className='sk-cell-note'><code>{item.path}</code></span>
+                  <span className='sk-row-actions'>
+                    <Button
+                      type='button'
+                      size='sm'
+                      variant='ghost'
+                      disabled={busy === `unregister:${item.tool}:${item.skill}`}
+                      onClick={() => void unregister(item.skill, item.tool)}
+                    >
+                      {t('解除登记')}
+                    </Button>
+                  </span>
+                </div>
+              ))}
+
+              {brokenList.map(item => (
+                <div key={`m-${item.tool}-${item.skill}`} className='sk-table-row'>
+                  <span className='sk-cell-note'>
+                    {t('挂载失效（链接指不到中央真身）')}
+                    {item.centralExists === false ? <span className='sk-muted'> · {t('中央真身也不在了')}</span> : null}
+                  </span>
+                  <span className='sk-cell-name'>{item.skill}</span>
+                  <span className='sk-cell-note'><code>{item.path}</code></span>
+                  <span className='sk-row-actions'>
+                    <Button type='button' size='sm' variant='ghost' onClick={() => onOpenSkill(item.skill)}>
+                      {t('看详情')}
+                    </Button>
+                  </span>
+                </div>
+              ))}
+
+              {extras.map(item => (
+                <div key={`h-${item.name}`} className='sk-table-row'>
+                  <span className='sk-cell-note'>
+                    {item.isLink ? t('中央未登记（悬空链接，指向的真身已不在）') : t('中央未登记（中央有目录，台账无记录）')}
+                  </span>
+                  <span className='sk-cell-name'>{item.name}</span>
+                  <span className='sk-cell-note'><code>{item.path}</code></span>
+                  <span className='sk-row-actions'>
+                    {item.isLink ? (
+                      <Button type='button' size='sm' variant='ghost' onClick={() => onOpenSkill(item.name)}>
+                        {t('看详情')}
+                      </Button>
+                    ) : (
+                      <Button
+                        type='button'
+                        size='sm'
+                        variant='outline'
+                        disabled={busy === `adopt:${item.name}`}
+                        onClick={() => void adopt(item.name)}
+                      >
+                        {t('纳管')}
+                      </Button>
+                    )}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {note ? (
+            <div className='sk-conflict-detail' style={{ whiteSpace: 'pre-line' }}>
+              <b>{t('失败明细')}</b>
+              {note}
+            </div>
+          ) : null}
+
+          {orphans.length > 0 ? (
+            <div className='sk-dedup-summary'>
+              <span>
+                {t('另有 {n} 个孤儿目录（渠道里有、中央还没有）。收纳由同步统一完成，去同步页确认执行即可。', {
+                  n: num(orphans.length),
+                })}
+              </span>
+              <Button type='button' size='sm' variant='ghost' onClick={() => onGo('sync')}>
+                {t('去同步')}
+              </Button>
+            </div>
+          ) : null}
+        </section>
       </div>
     </Panel>
   )

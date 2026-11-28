@@ -945,6 +945,21 @@
   border-radius: var(--r-sm);
   background: var(--surface);
 }
+/* 汇总条（对齐 AgentHub 的去重页首行）：一行说清「机器合并了几份、还剩几条要人拦」。
+   用 info 色而不是 warn —— 这一行正常状态下也是常驻的，不是告警。 */
+.sk-dedup-summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-2, var(--surface));
+  color: var(--text-2, var(--text));
+  line-height: 1.55;
+}
+.sk-dedup-summary-glyph { flex: none; color: var(--info); display: inline-flex; }
+.sk-dedup-summary-glyph svg { width: 16px; height: 16px; margin-top: 2px; }
 .sk-conflict-list { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .sk-conflict {
   /* 左侧 3px 竖条是「这条要你动手」的标记，用 warn（不是 danger）：
