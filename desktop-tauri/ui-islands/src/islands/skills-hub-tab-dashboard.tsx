@@ -8,7 +8,7 @@ import { Empty, Panel, SkillCardGrid, ago, num, toast, useLoad } from './skills-
  * 技能仓库 · 仪表盘。
  *
  * ── 这一页要回答的五个问题 ──────────────────────────────────
- *   1. 收敛到什么程度？（来源条数 / 真身条数 —— 两者的差就是「份消除」）
+ *   1. 收敛到什么程度？（真实目录份数 / 真身条数 —— 实际被合并的对数才是「份消除」）
  *   2. 各渠道通没通？目录在哪？
  *   3. 每个技能受管到哪一步？（下面那张速览网格，和技能库同一套状态判定）
  *   4. 上次同步是什么时候、成功没有？
@@ -195,15 +195,18 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
   const brokenList = data.mountHealth.filter(item => !item.valid && !item.external)
   const brokenMounts = brokenList.length
   const todoTotal = data.pendingConflicts.length + data.orphans.length + data.hubExtra.length + brokenMounts
-  // 「份消除」= 来源副本数 − 去重后的技能数，两个数字必须是同一轮扫描的两个
-  // 视角（`Overview::sourceCount` / `Overview::visibleSkills`）。
+  // 「份消除」= 本轮扫描里**真的被 L1 合并掉**的冗余副本对数。
   //
-  // 不要用 `skillCount`（中央真身目录里的条目数）：那和「本机有几个技能」不是
-  // 一回事 —— 没收纳过任何技能时它是 0，卡片就会写「0 个技能 / 来自 0 个来源
-  // 副本」，而同一页的速览网格列着一百多个，用户第一眼就问「为什么是 0」。
-  // 也不要用 `l1Merged`：那是「本轮扫描」的数字，一天没扫就归零。
+  // 不要用 `sourceCount − visibleSkills`（2026-11-28 用户报的 bug）：
+  // `sourceCount` 里没有 junction 了（后端已与 AgentHub 对齐），但
+  // `visibleSkills` 是「扫描 ∪ 台账」的并集，两者相减还混进了「链接技能」
+  // 这类本来就不参与收纳的条目 —— 107 个链路技能会算出「份消除 107」，
+  // 和中央技能库一模一样，看着像有 107 份冗余其实一份都没有。
+  //
+  // AgentHub 的仪表盘卡片读的就是 `survey.dedup.duplicates.length`
+  // （`l1Merged`），即真实合并对数。这里照做，数字才有意义。
   const uniqueSkills = data.visibleSkills
-  const deduped = Math.max(0, data.sourceCount - uniqueSkills)
+  const deduped = data.l1Merged
 
   const items = library.data?.items ?? []
   const needle = query.trim().toLowerCase()

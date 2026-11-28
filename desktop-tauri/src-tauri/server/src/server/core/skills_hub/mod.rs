@@ -184,23 +184,39 @@ pub fn overview() -> Value {
         }
     }
     let visible_count = visible.len();
-    // 来源副本数：本轮扫到的**每一行**就是一份副本（同名技能来自两个渠道 = 2 份），
-    // 已收纳、但本轮扫不到的技能（工具目录只剩链接）按台账登记的 `sources` 计，
-    // 至少算 1 份。
+    // ── 来源副本数：只数「参与去重收纳的真实目录」──────────────────
     //
-    // 只读台账是错的：新装 / 还没收纳过任何技能时台账为空，这里恒为 0，
-    // 界面上就成了「0 个技能 / 来自 0 个来源副本」，而同一页的速览网格明明
-    // 列着一百多个技能 —— 左右自相矛盾。`visibleSkills` 与 `sourceCount`
-    // 必须是同一轮扫描的两个视角，才能算出有意义的「份消除」。
+    // 教训（2026-11-28，用户报「挂载去重显示 107，和中央技能库一样」）：
+    // 这里原来数的是 `scanned` 的**每一行**，而 `scan_channel` 为了让用户看见
+    // 链路技能，会把 junction 也产出一行（`origin == "link"`）。于是 107 个
+    // 链接在 `.workbuddy` 与 `.agents` 两个渠道各算一份 = 214 份「来源副本」，
+    // `deduped = 214 − 107 = 107` 恰好等于技能数 —— 这个「份消除 107」纯属
+    // 公式被 link 行污染，磁盘上根本没有任何副本被合并（真实目录 0 个、
+    // 中央真身 2 个、duplicates 为空）。
+    //
+    // 对齐 AgentHub（`syncer.survey`）：它的 `scanDir` 遇到 junction 只往
+    // `mounts` 塞、`continue` 掉，所以 `sourceCount = scanned.skills.length`
+    // 天然不含链接；`l1Merged = dedup.duplicates.length` 是真实合并对数。
+    // 两个数字必须同源同口径，否则「份消除」这个数永远不可信。
+    //
+    // 排除口径与 `plan()` 的 `dedupe_input` 完全一致（system / link 都不参与
+    // 去重收纳），这样 `sourceCount − 真身数` 才是真正的「消除了几份」。
+    let is_dedup_source = |item: &Value| {
+        let name = text(item, "name");
+        !name.is_empty() && !matches!(text(item, "origin").as_str(), "system" | "link")
+    };
     let mut source_count: usize = 0;
     for item in &scanned_rows {
-        if !text(item, "name").is_empty() {
+        if is_dedup_source(item) {
             source_count += 1;
         }
     }
     for (name, entry) in &manifest_map {
-        // 本轮扫到的，已经在上面按行数过一遍了（一行 = 一份副本）
-        if scanned_rows.iter().any(|item| text(item, "name") == *name) {
+        // 本轮扫到真实目录的，已经在上面按行数过一遍了（一行 = 一份副本）
+        if scanned_rows
+            .iter()
+            .any(|item| is_dedup_source(item) && text(item, "name") == *name)
+        {
             continue;
         }
         let registered = entry

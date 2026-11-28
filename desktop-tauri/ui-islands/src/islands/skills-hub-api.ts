@@ -71,9 +71,12 @@ export type Overview = {
   skillCount: number
   /** 本机可见的技能总数（扫描到的含链接挂载 + 台账），页头「N 个技能」用它 */
   visibleSkills: number
-  /** 来源副本总数（同一轮扫描的另一个视角）：与 `visibleSkills` 的差 = 「份消除」 */
+  /**
+   * 参与去重收纳的**真实目录**份数（不含 system / link 行）。
+   * 与 AgentHub 的 `scanned.skills.length` 同口径 —— junction 只算挂载，不算副本。
+   */
   sourceCount: number
-  /** 本轮扫描里被 L1 合并掉的冗余副本数 */
+  /** 本轮扫描里被 L1 合并掉的冗余副本对数（= AgentHub 的 `l1Merged`） */
   l1Merged: number
   brokenMounts: number
   mountHealth: (MountRecord & { skill: string })[]
