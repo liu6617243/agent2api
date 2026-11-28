@@ -257,6 +257,15 @@ export type HubConfig = {
    * 两边共用同一批真身，谁都能往里新增技能，只有台账各管各的。
    */
   skillsDir: string
+  /**
+   * 实际生效的真身目录（只读，后端算出来的）。
+   *
+   * `skillsDir` 留空时后端会自动采用本机现成的带台账仓库，所以这个字段才是
+   * 「现在到底在用哪一份」的答案 —— 输入框空白不代表没生效。
+   */
+  effectiveSkillsDir?: string
+  /** 真身是否来自外部共用仓库（只读）。 */
+  sharedDir?: boolean
   /** 只存用户改过的覆盖：`{ [toolId]: { enabled?, name?, paths?[] } }` */
   tools: Record<string, { enabled?: boolean; name?: string; paths?: string[] }>
   customDirs: string[]

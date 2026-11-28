@@ -711,6 +711,16 @@ function Settings({ onChanged }: Props): React.ReactElement {
                   <div className='sk-field-hint'>
                     {t('可指向现成仓库（例如 AgentHub 的 .agent_skills\\skills），两边共用同一批技能；在这里新增技能也会写进去。两边的台账仍各存一份。')}
                   </div>
+                  {/* 当前实际在用哪一份：输入框留空时后端会自动采用本机现成仓库，
+                      此时框里是空的但真身并非空 —— 不写出来用户就会以为「没生效」，
+                      这正是上一轮「还是显示未挂载」的直接成因。 */}
+                  {cfg?.effectiveSkillsDir ? (
+                    <div className='sk-field-hint'>
+                      {cfg.sharedDir
+                        ? t('当前生效：{path}（与现有仓库共用真身，未复制）', { path: cfg.effectiveSkillsDir })
+                        : t('当前生效：{path}', { path: cfg.effectiveSkillsDir })}
+                    </div>
+                  ) : null}
                 </div>
 
                 <div className='sk-field'>

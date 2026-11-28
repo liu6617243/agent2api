@@ -1408,5 +1408,7 @@
   "可指向现成仓库（例如 AgentHub 的 .agent_skills\\skills），两边共用同一批技能；在这里新增技能也会写进去。两边的台账仍各存一份。": "Pode apontar para um repositório existente (ex.: .agent_skills\\skills do AgentHub) para compartilhar as mesmas habilidades; habilidades adicionadas aqui também são gravadas nele. Cada lado mantém seu próprio registro.",
   "已从本机台账移除（真身在共用仓库，未删除）": "Removido apenas deste registro (a habilidade continua no repositório compartilhado)",
   "从本机现成仓库填入…": "Preencher de um repositório local…",
-  "恢复默认": "Restaurar padrão"
+  "恢复默认": "Restaurar padrão",
+  "当前生效：{path}（与现有仓库共用真身，未复制）": "Em uso: {path} (compartilha os arquivos reais com o repositório existente, sem cópia)",
+  "当前生效：{path}": "Em uso: {path}"
 }

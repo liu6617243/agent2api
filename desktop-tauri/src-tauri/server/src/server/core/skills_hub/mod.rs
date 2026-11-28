@@ -61,11 +61,25 @@ pub use tools::{default_config, KV_KEY};
 fn invalidate() {
     scan::clear_cache();
     plan::clear_plan_cache();
+    // 改了 skillsDir / hubDir 之后，自动采用的探测结论必须立刻重算，
+    // 否则用户保存完配置还得等 TTL 过期才看到新路径。
+    store::clear_adopt_cache();
 }
 
 /// 配置读取（整份生效值：默认 + 覆盖 + 派生字段）。
 pub fn config() -> Value {
-    tools::load_config()
+    let mut value = tools::load_config();
+    // 「实际生效的真身目录」与「是否在共用别人的仓库」是只读事实，配置里存不下来
+    // （它由 skillsDir 为空时的自动探测决定）。前端要显示当前到底用的哪一份，
+    // 否则用户看着输入框空白、以为没生效 —— 这正是上一轮「还是显示未挂载」的成因之一。
+    if let Some(map) = value.as_object_mut() {
+        map.insert(
+            "effectiveSkillsDir".to_string(),
+            json!(store::skills_dir().to_string_lossy()),
+        );
+        map.insert("sharedDir".to_string(), json!(store::is_shared_dir()));
+    }
+    value
 }
 
 /// 保存配置（部分更新，返回整份生效值）。

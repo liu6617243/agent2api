@@ -27,7 +27,8 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
@@ -36,6 +37,16 @@ use super::tools;
 
 /// 台账版本号。改了结构（不是新增可选字段）才 +1，供将来迁移判断。
 const MANIFEST_VERSION: i64 = 1;
+
+/// 自动采用仓库的探测缓存（进程级快照，见 `adoptable_repo`）。
+static ADOPT_CACHE: Mutex<Option<(Instant, Option<PathBuf>)>> = Mutex::new(None);
+const ADOPT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 清掉自动采用的探测缓存（改了配置 / 新建了仓库后要立刻重算）。
+pub fn clear_adopt_cache() {
+    let mut cache = ADOPT_CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    *cache = None;
+}
 
 /// 中央仓库根目录。默认落在网关数据目录下，可被配置的 `hubDir` 改走
 /// （换盘 / 放进同步盘的人不少）。
@@ -58,10 +69,22 @@ pub fn hub_dir() -> PathBuf {
 /// 两种填法都接受：填到 skills 那一层（`…\.agent_skills\skills`）直接用；填到仓库
 /// 那一层（`…\.agent_skills`）自动补一层 `skills`。判据是「下面有没有 skills 子目录」，
 /// 这样用户复制粘贴哪个路径都不会挂到空目录上。
+///
+/// ── 没配的时候为什么不是「空仓库」 ──────────────────────────
+/// 用户从 AgentHub 迁过来时，本机已经有一份 108 个技能、带台账的现成仓库。
+/// 若默认从空的 `<hub>/skills` 起步，他看到的会是「108 个未登记 + 全部未挂载」，
+/// 然后被要求去配置页手填一个路径 —— 这条路实测走不通（配置页那个输入框在折叠
+/// 档位里，用户找不到，`skillsHubConfig` 一次都没落库）。
+/// 所以未配置时先探一遍本机现成仓库，有就直接采用：开箱即「已挂载」，
+/// 不复制、不搬家、不动 AgentHub。用户想换回来，配置页填 `hubDir` 或显式
+/// 设 `skillsDir` 即可。
 pub fn skills_dir() -> PathBuf {
     let config = tools::load_config();
     let custom = config.get("skillsDir").and_then(Value::as_str).unwrap_or("").trim();
     if custom.is_empty() {
+        if let Some(repo) = adoptable_repo() {
+            return repo;
+        }
         return hub_dir().join("skills");
     }
     let path = tools::expand_path(custom);
@@ -79,6 +102,85 @@ pub fn skills_dir() -> PathBuf {
 
 pub fn trash_dir() -> PathBuf {
     hub_dir().join(".trash")
+}
+
+/// 未配置 `skillsDir` 时，本机有没有一份「值得直接采用」的现成仓库。
+///
+/// ── 采用条件（缺一不可，宁可不采用也不能抢数据）──────────────
+/// 1. 候选仓库有 `manifest.json`（被某个中枢真正管着，不是空壳）；
+/// 2. 候选仓库的 `skills/` 里有真实技能目录（不算链接）；
+/// 3. **本机默认仓库里的技能，候选仓库里都有**。
+///
+/// 第 3 条是最关键的一条，也是「本机为空才采用」这个粗糙判据的反面：
+/// 本机默认库往往不是空的 —— 用户先用过一阵子，库里有几个自己收进来的技能。
+/// 但那些技能很可能**本来就在候选仓库里**（渠道里的链接全指向 `.agent_skills`，
+/// 收纳时真身落在那儿，本机只是多留了一份）。这种情况下不采用，等于把 108 个
+/// 已挂载的技能全判成「未登记」；而采用它一个都不会丢 —— 两边是同一批文件。
+///
+/// 反过来，只要本机库里有**候选仓库没有的**技能，就不采用：那才是用户真正
+/// 独有的数据，换库等于让它凭空消失。
+fn adoptable_repo() -> Option<PathBuf> {
+    // `skills_dir()` 是所有页面每次刷新都要调的热路径，探测要 readdir 好几个仓库，
+    // 不能每次重算。用进程级快照 + 30 秒 TTL：目录刚建出来时最多晚半分钟被看见，
+    // 但不会让一次页面刷新扫几十个目录。写配置（save_config）会显式清掉它。
+    {
+        let cache = ADOPT_CACHE.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((stamp, value)) = cache.as_ref() {
+            if stamp.elapsed() < ADOPT_TTL {
+                return value.clone();
+            }
+        }
+    }
+    let found = probe_adoptable_repo();
+    let mut cache = ADOPT_CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    *cache = Some((Instant::now(), found.clone()));
+    found
+}
+
+/// 探测本身（无缓存）。
+fn probe_adoptable_repo() -> Option<PathBuf> {
+    let own = hub_dir().join("skills");
+    let own_names = real_skill_names(&own);
+
+    let mut best: Option<(usize, PathBuf)> = None;
+    for row in tools::shared_repo_candidates() {
+        let skills = row.get("skillsDir").and_then(Value::as_str).unwrap_or("");
+        let count = row.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
+        if skills.is_empty() || count == 0 {
+            continue;
+        }
+        let path = PathBuf::from(skills);
+        // 候选就是本机默认仓库本身时无需「采用」（等同默认分支）
+        if same_file(&path, &own) {
+            continue;
+        }
+        // 本机独有的技能一条都不能丢：候选里缺任何一个就放弃这个候选
+        if own_names.iter().any(|name| !path.join(name).is_dir()) {
+            continue;
+        }
+        if best.as_ref().map(|(top, _)| count > *top).unwrap_or(true) {
+            best = Some((count, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// 目录下的真实技能名（不算链接、必须有 `SKILL.md`）。
+fn real_skill_names(root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else { return out };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let real = fs::symlink_metadata(&path)
+            .map(|meta| meta.is_dir() && !scan::is_link_entry(&path, &meta) && path.join("SKILL.md").is_file())
+            .unwrap_or(false);
+        if real {
+            if let Some(name) = path.file_name().map(|value| value.to_string_lossy().to_string()) {
+                out.push(name);
+            }
+        }
+    }
+    out
 }
 
 /// 真身目录是否来自**外部共用仓库**（`skillsDir` 指向别处，如 AgentHub 的

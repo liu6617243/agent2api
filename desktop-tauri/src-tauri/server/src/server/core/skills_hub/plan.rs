@@ -1446,11 +1446,22 @@ pub fn remove(name: &str) -> Result<Value, String> {
     let manifest = store::load_manifest();
     let entry = store::manifest_skill(&manifest, name).clone();
     let mut removed_mounts = 0usize;
-    if let Some(items) = entry.get("mounts").and_then(Value::as_array) {
-        for item in items {
-            let path = PathBuf::from(item.get("path").and_then(Value::as_str).unwrap_or(""));
-            if mount::is_link(&path) && mount::unmount(&path).is_ok() {
-                removed_mounts += 1;
+    // ── 共用真身时不摘链接 ────────────────────────────────────
+    // 渠道目录里的链接指向的是**共享真身**（`.agent_skills/skills/<name>`），
+    // 也就是说 AgentHub 自己也靠这些链接工作。本机在这里把链接摘掉，AgentHub
+    // 那边对应的技能就直接消失了 —— 用户的原话是「不想动已有资源」。
+    //
+    // 所以共享模式下的「删除」只收敛本机这一侧：删本机台账条目，链接与真身
+    // 都原地不动。删完之后下一轮扫描仍会看到这些链接，但它们以 `origin=link`
+    // 的身份出现（不进「中央未登记」、不进去重输入），本机只是不再"管"它，
+    // 这正是「解除本机登记」该有的语义。
+    if !shared {
+        if let Some(items) = entry.get("mounts").and_then(Value::as_array) {
+            for item in items {
+                let path = PathBuf::from(item.get("path").and_then(Value::as_str).unwrap_or(""));
+                if mount::is_link(&path) && mount::unmount(&path).is_ok() {
+                    removed_mounts += 1;
+                }
             }
         }
     }

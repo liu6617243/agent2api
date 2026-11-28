@@ -1419,5 +1419,7 @@
   "可指向现成仓库（例如 AgentHub 的 .agent_skills\\skills），两边共用同一批技能；在这里新增技能也会写进去。两边的台账仍各存一份。": "Can point at an existing repository (e.g. AgentHub's .agent_skills\\skills) so both sides share one copy of every skill; skills added here are written into it too. Each side keeps its own ledger.",
   "已从本机台账移除（真身在共用仓库，未删除）": "Removed from this ledger only (the skill stays in the shared repository)",
   "从本机现成仓库填入…": "Fill from an existing local repository…",
-  "恢复默认": "Reset to default"
+  "恢复默认": "Reset to default",
+  "当前生效：{path}（与现有仓库共用真身，未复制）": "Active: {path} (shares the real files with the existing repo, nothing copied)",
+  "当前生效：{path}": "Active: {path}"
 }
