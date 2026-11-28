@@ -202,6 +202,8 @@ export type PlanAction = {
   note: string
   mountName: string
   dir: string
+  /** 原位转挂载（true）还是发布到工具（false）。仅 kind === 'mount' 时有意义。 */
+  replaceReal?: boolean
   sources: string[]
 }
 

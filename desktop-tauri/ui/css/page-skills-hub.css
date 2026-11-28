@@ -187,6 +187,37 @@
   line-height: 1.55;
   color: var(--text-3);
 }
+/* 冲突数 > 0 时用 warn（不是 danger）：有待裁决不是出错，
+   是两种都合理的选择摆在一起等人拍板。
+   选择器用 data-slot：MetricValue 组件不挂 .sk-metric-value 类名。 */
+[data-slot='metric-value'].is-warn { color: var(--warn); }
+
+/* 指标卡标题旁的 ⓘ 说明（对齐 AgentHub 的 stat-label + tooltip）。
+   问号用 muted 色，不抢主标签的视觉权重。 */
+.sk-metric-label-with-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.sk-metric-hint {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  color: var(--text-3);
+  font-size: 9.5px;
+  line-height: 1;
+  cursor: help;
+  user-select: none;
+}
+.sk-metric-hint:hover {
+  color: var(--text-2);
+  border-color: var(--text-3);
+}
+.sk-metric-hint:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 
 /* ── 仪表盘 ──────────────────────────────────────────────────
    结构：页头 → 检测条 → 四宫格统计 → 渠道卡片 → 技能速览 → 最近同步 + 待办。
@@ -864,6 +895,91 @@
 
 /* ── 同步 ── */
 .sk-sync { display: flex; flex-direction: column; gap: 12px; }
+
+/* 「另有 N 个技能两边已经一致」——
+   AgentHub 用的是一段普通正文（不是带边框的提示盒）：这句话的作用是
+   解释「为什么下面没东西」，不是一条需要被当成警示的独立信息块。
+   做成盒子会让人误以为这是个待处理项。 */
+.sk-sync-skip {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.55;
+}
+
+/* 同步表格是三列：技能（名 + 副标题）/ 将做什么（徽章）/ 操作（去裁决）。
+   与默认四列表格不同，列宽必须单独给：徽章列窄、操作列更窄，
+   剩下的宽度全给技能名和它的说明。 */
+.sk-table-sync .sk-table-head,
+.sk-table-sync .sk-table-row {
+  grid-template-columns: minmax(160px, 1.5fr) 96px 72px;
+  align-items: start;
+}
+.sk-table-sync .sk-table-head { align-items: center; }
+
+/* 技能单元格：名字一行、说明一行。
+   AgentHub 也是这个结构（`skill` + `detail` 两行），说明文字用更小的
+   灰色，让「这条要动什么」一眼能扫到。 */
+.sk-cell-skill {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.sk-cell-detail {
+  font-size: 11px;
+  color: var(--text-3);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 空状态：一个大圆形勾 + 一句话。
+   和「列表是空的但那是个问题」要能区分开 —— 这是「一切就绪」的信号，
+   所以用居中大图标而不是灰色小字。 */
+.sk-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 56px 20px;
+  color: var(--text-3);
+  text-align: center;
+}
+.sk-empty-state-glyph { display: inline-flex; color: var(--primary); }
+.sk-empty-state-glyph svg { width: 40px; height: 40px; }
+.sk-empty-state-title { font-size: 14px; font-weight: 600; color: var(--text-2); }
+
+/* 同步报告折叠区：默认收起。报告是回看用的，不该在「要做什么」旁边
+   占一屏 —— 只在真的打开了一份报告时才展开。 */
+.sk-report-fold {
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  padding: 0 12px;
+}
+.sk-report-fold > summary {
+  cursor: pointer;
+  padding: 9px 0;
+  font-size: 12px;
+  color: var(--text-2);
+  list-style: none;
+  user-select: none;
+}
+.sk-report-fold > summary::-webkit-details-marker { display: none; }
+.sk-report-fold > summary::before {
+  content: '▸';
+  display: inline-block;
+  margin-right: 7px;
+  color: var(--text-3);
+  transition: transform 0.15s ease;
+}
+.sk-report-fold[open] > summary::before { transform: rotate(90deg); }
+.sk-report-fold > summary:hover { color: var(--text); }
+.sk-report-fold > summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.sk-report-fold > .sk-report-list { padding-bottom: 10px; }
+
 .sk-diff {
   margin: 0;
   padding: 10px 12px;
@@ -1573,5 +1689,9 @@
   .sk-table-row { grid-template-columns: 72px minmax(96px, 1fr) minmax(80px, 1fr); }
   .sk-table-head > span:nth-child(4),
   .sk-table-row > span:nth-child(4) { display: none; }
+  /* 同步表本来就是三列，上面那条通用规则会把第 4 列隐藏掉（无害），
+     但列宽配比要按三列重新给：徽章列 80px、操作列 64px、技能列吃掉剩余。 */
+  .sk-table-sync .sk-table-head,
+  .sk-table-sync .sk-table-row { grid-template-columns: minmax(110px, 1fr) 80px 64px; }
   .sk-search { width: 100%; }
 }

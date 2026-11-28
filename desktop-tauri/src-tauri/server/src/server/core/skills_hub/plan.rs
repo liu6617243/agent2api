@@ -503,6 +503,11 @@ impl Action {
             "note": self.note,
             "mountName": self.mount_name,
             "dir": self.dir.to_string_lossy(),
+            // `replace_real = true` → 原位转挂载（AgentHub 的「改为共用」）
+            // `replace_real = false` → 工具目录里没有，发布一份（「分发到工具」）
+            // 两者后端 kind 都是 "mount"，前端要靠这个字段才能给出正确文案，
+            // 口径与 AgentHub 的 `replaceReal ? "mount" : "publish"` 一致。
+            "replaceReal": self.replace_real,
             "sources": self.sources.iter()
                 .map(|source| format!(
                     "{}:{}",

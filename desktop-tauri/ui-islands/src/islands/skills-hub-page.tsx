@@ -251,7 +251,7 @@ function SkillsHubPage(): React.ReactElement {
           ) : null}
           {visited.has('sync') ? (
             <div className='sk-pane' hidden={tab !== 'sync'}>
-              <SyncTab onChanged={() => setReloadAt(value => value + 1)} />
+              <SyncTab onChanged={() => setReloadAt(value => value + 1)} onGo={goto} />
             </div>
           ) : null}
           {visited.has('dedup') ? (
