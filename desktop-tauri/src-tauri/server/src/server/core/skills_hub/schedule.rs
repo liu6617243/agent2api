@@ -17,7 +17,9 @@
 //! 60 秒轮询最坏晚一分钟，但每次都能看到最新配置。巡检本身是几十毫秒的
 //! 磁盘 stat，一分钟一次的开销可以忽略。
 
-use serde_json::{json, Value};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 
 use super::{invalidate, run_daily_check, tools};
 
@@ -66,7 +68,7 @@ pub fn is_valid_clock(text: &str) -> bool {
 /// 仅测试用（`next_daily_is_strictly_after` 验它不会原地打转）。
 #[cfg(test)]
 fn next_daily_after(base: i64, hour: u32, minute: u32) -> i64 {
-    use chrono::{Datelike, Local, NaiveTime, TimeZone};
+    use chrono::{Local, NaiveTime, TimeZone};
     let moment = match Local.timestamp_millis_opt(base).single() {
         Some(value) => value,
         None => return base + 24 * 3600 * 1000,
@@ -113,7 +115,7 @@ fn next_daily_after(base: i64, hour: u32, minute: u32) -> i64 {
 /// 夏令时空档（`and_local_timezone` 回 Ambiguous/None）时退回 `now`，
 /// 效果是「这一轮不跑、下一分钟再看」，宁可晚一分钟也不要算错日期。
 fn today_at(now: i64, hour: u32, minute: u32) -> i64 {
-    use chrono::{Datelike, Local, NaiveTime, TimeZone};
+    use chrono::{Local, NaiveTime, TimeZone};
     let moment = match Local.timestamp_millis_opt(now).single() {
         Some(value) => value,
         None => return now,
@@ -184,7 +186,6 @@ pub fn tick_once(config: &Value, now: i64) -> Option<Value> {
 /// 起调度线程。重复调用只跑一轮（桌面壳重启后端时 `start` 可能被再次调用）。
 pub fn spawn() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
 
     static STARTED: AtomicBool = AtomicBool::new(false);
     // 用 `Once` 语义：第二次调用直接返回，不叠加第二条轮询线程。
@@ -194,14 +195,13 @@ pub fn spawn() {
         return;
     }
 
-    let alive: Arc<AtomicBool> = Arc::new(true);
+    // 这条线程没有停止条件：后端进程活着它就该在跑，进程退出线程随之消失。
+    // 不做「可以外部关掉」的开关 —— 那是配置里 `schedule.dailyCheck` 的职责，
+    // 在循环里每轮重读即可，不需要再引一层生命周期管理。
     crate::spawn_task(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(TICK_SECS));
         loop {
             ticker.tick().await;
-            if !alive.load(Ordering::SeqCst) {
-                break;
-            }
             // 每轮重读配置：用户在面板上改时刻 / 关开关，下一分钟就生效，
             // 不需要重启后端。
             let config = tools::load_config();
@@ -243,7 +243,7 @@ mod tests {
     /// 今天这个点还没到 → 不跑。
     #[test]
     fn not_due_yet() {
-        use chrono::{Datelike, Local, TimeZone};
+        use chrono::{Local, TimeZone};
         let today = Local::now().date_naive();
         let at_0800 = Local
             .from_local_datetime(&today.and_hms_opt(8, 0, 0).unwrap())
@@ -260,7 +260,7 @@ mod tests {
     /// 今天这个点已过、从没跑过 → 跑（白天开机补跑昨夜/今早那次）。
     #[test]
     fn due_and_never_ran() {
-        use chrono::{Datelike, Local, TimeZone};
+        use chrono::{Local, TimeZone};
         let today = Local::now().date_naive();
         let at_1000 = Local
             .from_local_datetime(&today.and_hms_opt(10, 0, 0).unwrap())
@@ -277,7 +277,7 @@ mod tests {
     /// 今天这个点已过，但今天已经跑过 → 不重复跑（幂等）。
     #[test]
     fn due_but_already_ran_today() {
-        use chrono::{Datelike, Local, TimeZone};
+        use chrono::{Local, TimeZone};
         let today = Local::now().date_naive();
         let at_0930 = Local
             .from_local_datetime(&today.and_hms_opt(9, 30, 0).unwrap())
@@ -315,7 +315,7 @@ mod tests {
     /// `today_at` 必须落在「与 now 同一天」的 HH:MM 上。
     #[test]
     fn today_at_is_same_day() {
-        use chrono::{Datelike, Local, TimeZone};
+        use chrono::{Local, TimeZone};
         let now = 1_700_000_000_000;
         let at = today_at(now, 9, 0);
         let now_dt = Local.timestamp_millis_opt(now).unwrap();
