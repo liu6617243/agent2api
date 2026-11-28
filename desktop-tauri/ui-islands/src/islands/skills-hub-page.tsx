@@ -321,7 +321,13 @@ function SkillDrawer({
         toast(t('已纳入台账（没有移动任何文件）'), 'ok')
       } else {
         const result = await s.removeSkill(skillName)
-        toast(t('已删除，真身在回收站 {file}', { file: result.trash || '—' }), 'ok')
+        // 共用真身时不搬磁盘：真身还在共用仓库里，对方照样能用。
+        toast(
+          result.shared
+            ? t('已从本机台账移除（真身在共用仓库，未删除）')
+            : t('已删除，真身在回收站 {file}', { file: result.trash || '—' }),
+          'ok',
+        )
         onClose()
       }
       await load()

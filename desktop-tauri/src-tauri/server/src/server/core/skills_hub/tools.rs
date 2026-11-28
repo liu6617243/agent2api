@@ -174,6 +174,11 @@ pub fn default_config() -> Value {
         "l3Threshold": 0.85,
         "tools": {},
         "customDirs": [],
+        // 仓库位置覆盖：空串 = 用默认（`<数据目录>/skills-hub`）。
+        // `skillsDir` 可指到现成仓库（如 AgentHub 的 `~/.agent_skills/skills`），
+        // 真身两边共用、都能往里写，只有台账各管各的。
+        "hubDir": "",
+        "skillsDir": "",
         // 每日自动巡检三项（对齐参考实现的配置页）。
         // `dailyCheck` 默认**开**：这是保底健康检查，用户装完就该有；
         // `dailyCheckAutoMount` 也默认开，但它只重建**确信失效**的链接
@@ -259,6 +264,18 @@ pub fn load_config() -> Value {
                 .map(|text| json!(text))
                 .collect();
             config["customDirs"] = Value::Array(cleaned);
+        }
+        // 仓库位置：`hubDir`（账本 / 回收站 / 报告）与 `skillsDir`（真身）。
+        //
+        // 这两个字段以前只写在文档注释里、**从没在这张白名单里透传过**，于是填了
+        // 也不生效，永远落回 `config_dir()/skills-hub`（2026-11-28 查出来的死开关）。
+        // `skillsDir` 用来借现成仓库：指到 AgentHub 的 `.agent_skills/skills` 就能
+        // 共用同一批真身，不复制、不改对方。
+        for key in ["hubDir", "skillsDir"] {
+            let value = raw.get(key).and_then(Value::as_str).map(str::trim).unwrap_or("");
+            if !value.is_empty() {
+                config[key] = json!(value);
+            }
         }
         // schedule：三个字段逐个收敛。时刻必须是合法 HH:MM，坏了退回 09:00 ——
         // 留着坏值会让调度器每分钟解析失败一次，等于这个功能悄悄死掉。

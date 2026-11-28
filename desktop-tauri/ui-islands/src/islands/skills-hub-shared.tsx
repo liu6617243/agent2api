@@ -266,6 +266,11 @@ export function cardStatus(row: s.LibraryRow): {
   if (valid.length > 0) {
     return { dot: hasBad ? 'sk-dot-bad' : 'sk-dot-ok', label: t('已挂载'), variant: 'success' }
   }
+  // 链接活着、但目标不在本机中央（别的中枢管的）：客户端能用，只是不归本机
+  // 真身目录管 —— 标「外部链接」比笼统的「未挂载」准确，也解释了为什么它不算失效。
+  if (mounts.some(item => item.external)) {
+    return { dot: 'sk-dot-ok', label: t('外部链接'), variant: 'outline' }
+  }
   if (!row.inManifest) {
     if (row.origin === 'hub-extra') return { dot: 'sk-dot-warn', label: t('中央未登记'), variant: 'warning' }
     if (row.origin === 'system') return { dot: 'sk-dot-muted', label: t('客户端自带'), variant: 'outline' }

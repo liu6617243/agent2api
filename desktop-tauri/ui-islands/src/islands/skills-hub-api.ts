@@ -246,6 +246,17 @@ export type HubConfig = {
   /** L3 文本相似度提示（默认关：0.85 在「把 X 转成 Y」这类描述上误报率高） */
   l3Enabled: boolean
   l3Threshold: number
+  /**
+   * 中央仓库根目录（台账 / 回收站 / 报告）。空串 = 默认 `<数据目录>/skills-hub`。
+   */
+  hubDir: string
+  /**
+   * 技能真身目录。空串 = `<hubDir>/skills`。
+   *
+   * 可指到**现成的仓库**（典型：AgentHub 的 `~\.agent_skills\skills`）：
+   * 两边共用同一批真身，谁都能往里新增技能，只有台账各管各的。
+   */
+  skillsDir: string
   /** 只存用户改过的覆盖：`{ [toolId]: { enabled?, name?, paths?[] } }` */
   tools: Record<string, { enabled?: boolean; name?: string; paths?: string[] }>
   customDirs: string[]
@@ -425,7 +436,7 @@ export function adoptSkill(name: string): Promise<{ ok: boolean; action: string;
   return api('POST', `${BASE}/adopt`, { name })
 }
 
-export function removeSkill(name: string): Promise<{ name: string; trash: string; mounts: number }> {
+export function removeSkill(name: string): Promise<{ name: string; trash: string; mounts: number; shared?: boolean }> {
   return api('POST', `${BASE}/remove`, { name })
 }
 

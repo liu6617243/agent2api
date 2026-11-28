@@ -1413,5 +1413,9 @@
   "确认执行收纳吗？\n收进中央 {i} 个 · 挂载变更 {m} 处 · {c} 条冲突进入人工裁决。\n所有覆盖/删除先进入回收站，可还原。": "Run adoption?\n{i} to central · {m} mount changes · {c} conflicts go to manual review.\nEvery overwrite/deletion goes to Trash first and can be restored.",
   "最后收纳": "Last adoption",
   "调整仅影响之后的收纳与挂载动作": "Changes only affect subsequent adoption and mount actions",
-  "WebDAV 同步": "WebDAV sync"
+  "WebDAV 同步": "WebDAV sync",
+  "技能真身目录": "Skill source directory",
+  "留空 = {path}": "Leave empty = {path}",
+  "可指向现成仓库（例如 AgentHub 的 .agent_skills\\skills），两边共用同一批技能；在这里新增技能也会写进去。两边的台账仍各存一份。": "Can point at an existing repository (e.g. AgentHub's .agent_skills\\skills) so both sides share one copy of every skill; skills added here are written into it too. Each side keeps its own ledger.",
+  "已从本机台账移除（真身在共用仓库，未删除）": "Removed from this ledger only (the skill stays in the shared repository)"
 }

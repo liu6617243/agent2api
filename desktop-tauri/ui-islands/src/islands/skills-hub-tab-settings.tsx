@@ -96,6 +96,9 @@ function Settings({ onChanged }: Props): React.ReactElement {
   const suggestions = probe.data?.items ?? []
 
   const hubPath = hubDir(trash.data?.dir)
+  // 真身目录留空时的默认值，只用于输入框占位提示（真正解析在后端 `store::skills_dir`）。
+  const defaultSkillsDir =
+    hubPath && hubPath !== '—' ? `${hubPath.replace(/[\\/]+$/, '')}/skills` : ''
 
   // 界面读草稿（草稿只在用户改过之后存在，否则就是服务端值）。
   const cfg = draft ?? values
@@ -121,6 +124,8 @@ function Settings({ onChanged }: Props): React.ReactElement {
       value.trashDays,
       value.l3Enabled,
       value.l3Threshold,
+      value.hubDir,
+      value.skillsDir,
       value.tools,
       value.schedule,
     ])
@@ -155,12 +160,15 @@ function Settings({ onChanged }: Props): React.ReactElement {
         trashDays: draft.trashDays,
         l3Enabled: draft.l3Enabled,
         l3Threshold: draft.l3Threshold,
+        hubDir: draft.hubDir,
+        skillsDir: draft.skillsDir,
         tools: draft.tools,
         schedule: draft.schedule,
       })
       setPending(false)
       config.reload()
       tools.reload()
+      probe.reload()
       onChanged()
       toast(t('配置已保存'), 'ok')
     } catch (error) {
@@ -655,6 +663,22 @@ function Settings({ onChanged }: Props): React.ReactElement {
                     >
                       {t('复制')}
                     </Button>
+                  </div>
+                </div>
+
+                {/* 真身目录可指到**现成仓库**：共用同一批技能，不复制、不停用对方。
+                    留空 = `<中央仓库>/skills`。填错的表现是「中央技能库 0」，
+                    所以占位里把生效值写出来，别让人靠猜。 */}
+                <div className='sk-field sk-field-block'>
+                  <div className='sk-field-label'>{t('技能真身目录')}</div>
+                  <input
+                    className='sk-input'
+                    value={cfg?.skillsDir ?? ''}
+                    placeholder={defaultSkillsDir ? t('留空 = {path}', { path: defaultSkillsDir }) : ''}
+                    onChange={event => edit({ skillsDir: event.target.value })}
+                  />
+                  <div className='sk-field-hint'>
+                    {t('可指向现成仓库（例如 AgentHub 的 .agent_skills\\skills），两边共用同一批技能；在这里新增技能也会写进去。两边的台账仍各存一份。')}
                   </div>
                 </div>
 

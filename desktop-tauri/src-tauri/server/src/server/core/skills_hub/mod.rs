@@ -314,6 +314,49 @@ pub fn library() -> Value {
         health.iter().any(|(item, _, ext)| *item == key && *ext)
     };
 
+    // ── 扫描行也要带挂载事实 ──────────────────────────────────
+    //
+    // 共享真身（`skillsDir` 指向现成仓库）之后，渠道目录里的链接目标就是本机
+    // 中央目录，本该显示「已挂载」；但扫描层只产出 `origin == "link"` 的一行、
+    // `mounts` 一律为空，而卡片判「已挂载」看的正是 `mounts[].valid` —— 于是
+    // 用户看到 108 个技能全「未挂载」，AgentHub 里却全「已挂载」。
+    //
+    // 这里按链接的真实落点补一条挂载记录：落在本机中央 → valid；落在别处 →
+    // external（别的中枢管的链接，不改不抢，只标来路）。
+    let central_root = store::skills_dir();
+    let central_key = match std::fs::canonicalize(&central_root) {
+        Ok(real) => scan::path_key(&real),
+        Err(_) => scan::path_key(&central_root),
+    };
+    let mount_prefix = format!("{}{}", central_key, std::path::MAIN_SEPARATOR);
+    let link_mount = |row: &Value| -> Option<Value> {
+        let target = text(row, "linkTarget");
+        if target.is_empty() {
+            return None;
+        }
+        let target_key = match std::fs::canonicalize(&target) {
+            Ok(real) => scan::path_key(&real),
+            Err(_) => scan::path_key(std::path::Path::new(&target)),
+        };
+        let inside = target_key == central_key || target_key.starts_with(mount_prefix.as_str());
+        Some(json!({
+            "tool": text(row, "tool"),
+            "name": text(row, "name"),
+            "path": text(row, "dir"),
+            "target": target,
+            "valid": inside,
+            "external": !inside,
+        }))
+    };
+    // 同一技能在多个渠道各有一条链接时，两行会合并成一行 —— 挂载也要合并，
+    // 按链接路径去重，否则只看得到最后一个渠道。
+    let push_mount = |list: &mut Vec<Value>, item: Value| {
+        let path = text(&item, "path");
+        if !list.iter().any(|row| text(row, "path") == path) {
+            list.push(item);
+        }
+    };
+
     let mut rows: Vec<Value> = Vec::new();
     for action in planned.get("actions").and_then(Value::as_array).into_iter().flatten() {
         if text(action, "kind") != "import" {
@@ -362,6 +405,16 @@ pub fn library() -> Value {
             row["tool"] = skill.get("tool").cloned().unwrap_or(Value::Null);
             row["dir"] = json!(dir);
             row["linkTarget"] = skill.get("linkTarget").cloned().unwrap_or(json!(""));
+            if origin == "link" {
+                if let Some(item) = link_mount(skill) {
+                    if !row["mounts"].is_array() {
+                        row["mounts"] = json!([]);
+                    }
+                    if let Some(list) = row["mounts"].as_array_mut() {
+                        push_mount(list, item);
+                    }
+                }
+            }
             continue;
         }
         rows.push(json!({
@@ -382,7 +435,11 @@ pub fn library() -> Value {
             "tool": skill.get("tool").cloned().unwrap_or(Value::Null),
             "dir": json!(dir),
             "sources": [{ "tool": text(skill, "tool"), "name": name }],
-            "mounts": [],
+            "mounts": if origin == "link" {
+                link_mount(skill).into_iter().collect::<Vec<Value>>()
+            } else {
+                Vec::new()
+            },
         }));
     }
 

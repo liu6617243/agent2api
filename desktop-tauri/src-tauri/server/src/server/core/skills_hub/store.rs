@@ -49,12 +49,47 @@ pub fn hub_dir() -> PathBuf {
     }
 }
 
+/// 真身目录。默认 `<hub>/skills`，可被配置的 `skillsDir` 指到**现成的外部仓库**
+/// （典型：AgentHub 的 `~/.agent_skills/skills`），做到「共用一份真身、不复制」。
+///
+/// 共用是可写的：本机收纳新技能、从渠道导入技能都写进这个目录，和 AgentHub
+/// 看到的是同一批文件。会各管各的只有台账 —— 本机从不回写对方的 manifest。
+///
+/// 两种填法都接受：填到 skills 那一层（`…\.agent_skills\skills`）直接用；填到仓库
+/// 那一层（`…\.agent_skills`）自动补一层 `skills`。判据是「下面有没有 skills 子目录」，
+/// 这样用户复制粘贴哪个路径都不会挂到空目录上。
 pub fn skills_dir() -> PathBuf {
-    hub_dir().join("skills")
+    let config = tools::load_config();
+    let custom = config.get("skillsDir").and_then(Value::as_str).unwrap_or("").trim();
+    if custom.is_empty() {
+        return hub_dir().join("skills");
+    }
+    let path = tools::expand_path(custom);
+    if path.join("skills").is_dir()
+        && !path
+            .file_name()
+            .map(|name| name.to_string_lossy().eq_ignore_ascii_case("skills"))
+            .unwrap_or(false)
+    {
+        path.join("skills")
+    } else {
+        path
+    }
 }
 
 pub fn trash_dir() -> PathBuf {
     hub_dir().join(".trash")
+}
+
+/// 真身目录是否来自**外部共用仓库**（`skillsDir` 指向别处，如 AgentHub 的
+/// `.agent_skills/skills`）。
+///
+/// ── 这个判断为什么必须存在 ──────────────────────────────────
+/// 共用真身之后，「删除技能」若照旧把 `skills_dir()/<name>` 搬进本机回收站，
+/// 就等于从 AgentHub 的仓库里把技能搬走了 —— 用户的原话是「不想动已有资源」。
+/// 所以共享模式下删除只收敛本机这一侧：摘挂载、删台账、立墓碑，真身原地不动。
+pub fn is_shared_dir() -> bool {
+    !same_file(&skills_dir(), &hub_dir().join("skills"))
 }
 
 pub fn reports_dir() -> PathBuf {
@@ -163,6 +198,136 @@ pub fn save_manifest(manifest: &Value) -> Result<(), String> {
     next["updatedAt"] = json!(now_iso());
     let text = serde_json::to_string_pretty(&next).map_err(|error| format!("台账序列化失败：{error}"))?;
     write_atomic(&manifest_file(), &text)
+}
+
+/// 「共用真身仓库」：真身目录指到现成仓库时，把对方台账**当成初始清单**并进本机。
+///
+/// ── 为什么需要这一步 ────────────────────────────────────────
+/// 把 `skillsDir` 指到 AgentHub 的 `.agent_skills/skills` 之后，真身不复制、两个
+/// 软件共用同一批目录；但「这些技能叫什么、挂在哪」记在对方那本 manifest 里。
+/// 不镜像过来的话，本机看到的是 108 个「中央未登记 / 未挂载」—— 用户得手点
+/// 108 次「纳管」。
+///
+/// ── 边界（重要）─────────────────────────────────────────────
+/// * **真身共用且可写**：技能目录本身是两边共用的，本机新增技能直接写进
+///   `skills_dir()`（即对方仓库的 `skills/`），不复制一份。
+/// * **台账各管各的**：本机只**读**对方 manifest 做首次认领，之后所有写入（解除
+///   登记、删条目、墓碑）都落在本机台账 —— 绝不回写对方的 `manifest.json`，
+///   否则两边会互相覆盖，AgentHub 一升级就全乱。
+/// * 只增不删：对方删掉的技能本机不会跟着消失（删除在本机是显式动作 + 墓碑）。
+/// * 首次认领连挂载一起抄，之后挂载也归本机管：不这样做的话「解除登记」会在
+///   下一次检测里被对方的记录复活。
+/// * `health` 不抄：那是对方的检测结果，本机自己算。
+/// * 每次检测都跑一遍，所以对方新增技能 / 新挂载会自动补进来 —— 这正是「对方更新
+///   了也不受影响」的落地方式。
+pub fn mirror_shared_ledger() -> usize {
+    use serde_json::map::Entry;
+
+    let skills = skills_dir();
+    let Some(parent) = skills.parent() else { return 0 };
+    let external = parent.join("manifest.json");
+    if !external.is_file() {
+        return 0;
+    }
+    // 默认布局下 `skillsDir` 就在自己仓库里，那本 manifest 就是自己的，没什么可镜像
+    if same_file(&external, &manifest_file()) {
+        return 0;
+    }
+    let Ok(text) = fs::read_to_string(&external) else { return 0 };
+    let Ok(source) = serde_json::from_str::<Value>(&text) else { return 0 };
+    let Some(source_skills) = source.get("skills").and_then(Value::as_object) else { return 0 };
+
+    let mut manifest = load_manifest();
+    let mut changed = 0usize;
+    let dead = manifest.get("deleted").and_then(Value::as_object).cloned().unwrap_or_default();
+    if let Some(slot) = manifest.get_mut("skills").and_then(Value::as_object_mut) {
+        for (name, incoming) in source_skills {
+            if !incoming.is_object() {
+                continue;
+            }
+            // 本机删过的技能不镜像回来：删除是显式动作，墓碑就是给它立的路障
+            if dead.contains_key(name) {
+                continue;
+            }
+            match slot.entry(name.clone()) {
+                Entry::Vacant(row) => {
+                    // 首次认领：连挂载一起抄。之后本机自己管 —— 否则「解除登记」
+                    // 会在下一次检测里被对方的记录复活。
+                    let mut copy = incoming.clone();
+                    if let Some(map) = copy.as_object_mut() {
+                        map.remove("health");
+                    }
+                    row.insert(copy);
+                    changed += 1;
+                }
+                Entry::Occupied(mut row) => {
+                    // 已有条目：只补来源（纯追加的元数据），不补挂载
+                    let local = row.get_mut();
+                    changed += merge_records(local, incoming, "sources", |item| {
+                        format!("{}\u{0}{}", field(item, "tool"), field(item, "originalName"))
+                    });
+                }
+            }
+        }
+    }
+    // 墓碑也镜像：对方删过的技能，本机不该在下一次扫描里又把它「发现」回来
+    if let Some(dead) = source.get("deleted").and_then(Value::as_object) {
+        if let Some(slot) = manifest.get_mut("deleted").and_then(Value::as_object_mut) {
+            for (name, mark) in dead {
+                if !slot.contains_key(name) {
+                    slot.insert(name.clone(), mark.clone());
+                    changed += 1;
+                }
+            }
+        }
+    }
+    if changed > 0 {
+        let _ = save_manifest(&manifest);
+    }
+    changed
+}
+
+/// 两个路径是否指向同一处。Windows 上 junction / 符号链接必须先解析再比，
+/// 否则「同一批文件的两个写法」会被判成两处。
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn field(row: &Value, key: &str) -> String {
+    row.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// 按 `identity` 去重，把 `incoming` 里的某类记录补进 `local`（只增不删）。返回补了几条。
+fn merge_records<F>(local: &mut Value, incoming: &Value, key: &str, identity: F) -> usize
+where
+    F: Fn(&Value) -> String,
+{
+    let Some(items) = incoming.get(key).and_then(Value::as_array) else { return 0 };
+    if items.is_empty() {
+        return 0;
+    }
+    let Some(map) = local.as_object_mut() else { return 0 };
+    let slot = map.entry(key.to_string()).or_insert_with(|| json!([]));
+    if !slot.is_array() {
+        *slot = json!([]);
+    }
+    let Some(list) = slot.as_array_mut() else { return 0 };
+    let mut added = 0usize;
+    for item in items {
+        let id = identity(item);
+        if list.iter().any(|row| identity(row) == id) {
+            continue;
+        }
+        list.push(item.clone());
+        added += 1;
+    }
+    added
 }
 
 /// 台账里的某个技能（不可变借用，找不到给 `Null`）。

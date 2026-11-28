@@ -62,8 +62,25 @@ pub fn link_target(path: &Path) -> String {
     }
 }
 
-/// 链接是否指向 `target`（忽略大小写与尾部斜杠差异）。
+/// 两个路径是否指向同一处。
+///
+/// ── 为什么不能只比字符串 ──────────────────────────────────
+/// 把真身目录借到现成仓库（`skillsDir` → `.agent_skills/skills`）以后，同一个
+/// 位置会有两种写法：`skills-hub/skills/x` 与 `.agent_skills/skills/x`，中间还
+/// 可能隔一层 junction。只比字符串会把「本来就指向中央」的链接判成外链，于是
+/// 明明挂着也显示未挂载。先 `canonicalize` 解析掉链接再比，才不会误判。
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(left), Ok(right)) => scan::path_key(&left) == scan::path_key(&right),
+        _ => false,
+    }
+}
+
+/// 链接是否指向 `target`（忽略大小写与尾部斜杠差异，junction 先解析）。
 pub fn points_to(path: &Path, target: &Path) -> bool {
+    if same_dir(path, target) {
+        return true;
+    }
     let got = link_target(path);
     if got.is_empty() {
         return false;
@@ -259,7 +276,8 @@ pub fn verify(mount_record: &Value) -> Value {
     let central = store::skills_dir().join(skill);
     let link_exists = is_link(&path);
     let target = link_target(&path);
-    let points_ok = !target.is_empty() && scan::path_key(Path::new(&target)) == scan::path_key(&central);
+    let points_ok = same_dir(&path, &central)
+        || (!target.is_empty() && scan::path_key(Path::new(&target)) == scan::path_key(&central));
     // 目标本身是个活技能目录（有 SKILL.md）。比较键不解析 `..`，所以不能用
     // `path_key(target) == path_key(central)` 判「指到中央」之后再谈外部 ——
     // 得先确认这条链接**没有**指到中央，再看目标是否健康。

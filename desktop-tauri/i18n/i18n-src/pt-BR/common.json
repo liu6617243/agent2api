@@ -1402,5 +1402,9 @@
   "确认执行收纳吗？\n收进中央 {i} 个 · 挂载变更 {m} 处 · {c} 条冲突进入人工裁决。\n所有覆盖/删除先进入回收站，可还原。": "Executar a adoção?\n{i} para o central · {m} alterações de montagem · {c} conflitos vão para revisão manual.\nToda sobrescrita/exclusão vai primeiro para a Lixeira e pode ser restaurada.",
   "最后收纳": "Última adoção",
   "调整仅影响之后的收纳与挂载动作": "As alterações afetam apenas adoções e montagens futuras",
-  "WebDAV 同步": "Sincronização WebDAV"
+  "WebDAV 同步": "Sincronização WebDAV",
+  "技能真身目录": "Diretório real das habilidades",
+  "留空 = {path}": "Vazio = {path}",
+  "可指向现成仓库（例如 AgentHub 的 .agent_skills\\skills），两边共用同一批技能；在这里新增技能也会写进去。两边的台账仍各存一份。": "Pode apontar para um repositório existente (ex.: .agent_skills\\skills do AgentHub) para compartilhar as mesmas habilidades; habilidades adicionadas aqui também são gravadas nele. Cada lado mantém seu próprio registro.",
+  "已从本机台账移除（真身在共用仓库，未删除）": "Removido apenas deste registro (a habilidade continua no repositório compartilhado)"
 }

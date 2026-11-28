@@ -577,6 +577,10 @@ fn build_entry(dir: &Path, tool: &str, origin: &str) -> Value {
 /// 因为只有那个没被链接的真实目录才算技能。链接目标有 SKILL.md 就是客户端
 /// 真能用的技能，必须让用户看见；这类链接**不参与**去重收纳（见 `plan` 里
 /// `origin == "link"` 的排除），免得把别人中枢管的技能整批搬进本机中央库。
+///
+/// `skillsDir` 指到共用仓库时，这些链接的目标正好是本机中央目录 —— 它们依然是
+/// **挂载产物**、不是来源副本，所以排除规则不变；「这个链接算不算本机挂载」由
+/// `mount::verify`（canonicalize 后比中央路径）判定，不在这里猜。
 pub fn scan_channel(dir: &Path, tool: &str) -> (Vec<Value>, Vec<Value>) {
     let mut skills: Vec<Value> = Vec::new();
     let mut mounts: Vec<Value> = Vec::new();

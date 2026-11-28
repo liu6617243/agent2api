@@ -313,6 +313,11 @@ fn survey(config: &Value) -> Survey {
         }));
     }
 
+    // 「共用现成仓库」：真身目录指向别的中枢（如 AgentHub 的 `.agent_skills/skills`）
+    // 时，先把对方台账里本机还不认识的条目并进来，否则整页会显示成「108 个未登记」。
+    // 只读对方的 manifest、只写本机台账；真身目录本身是共用可写的（新技能直接写进去）。
+    store::mirror_shared_ledger();
+
     let manifest = store::load_manifest();
 
     // 系统自带技能不参与去重收纳（不进中央、不挂载），墓碑里的技能也不再回来；
@@ -1427,11 +1432,17 @@ pub fn adopt(name: &str) -> Result<Value, String> {
 ///
 /// 名字校验与 `adopt` 同一口径：这个函数会 **按名字拼出中央目录并搬走它**，
 /// 漏一次校验就等于接受 `../` 之类的名字去动中央仓库外面的东西。
+///
+/// ── 共用真身时只收敛本机这一侧 ──────────────────────────────
+/// `skillsDir` 指向别的仓库（AgentHub 的 `.agent_skills/skills`）时，真身是两家
+/// 共有的：照旧搬走等于把对方的技能也删了。所以那种情况下不动磁盘，只摘掉本机
+/// 登记的挂载、删本机台账条目、立墓碑（下一轮扫描不会再把它收回来）。
 pub fn remove(name: &str) -> Result<Value, String> {
     let name = name.trim();
     if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
         return Err("非法的技能名".to_string());
     }
+    let shared = store::is_shared_dir();
     let manifest = store::load_manifest();
     let entry = store::manifest_skill(&manifest, name).clone();
     let mut removed_mounts = 0usize;
@@ -1445,7 +1456,7 @@ pub fn remove(name: &str) -> Result<Value, String> {
     }
     let central = store::skills_dir().join(name);
     let mut trashed = String::new();
-    if central.exists() {
+    if central.exists() && !shared {
         let backed = store::to_trash(&central, name)?;
         trashed = backed.file_name().map(|value| value.to_string_lossy().to_string()).unwrap_or_default();
     }
@@ -1454,9 +1465,13 @@ pub fn remove(name: &str) -> Result<Value, String> {
         map.remove(name);
     }
     store::save_manifest(&next)?;
-    // 墓碑：下一轮扫描看见工具目录里的残留副本也不会把它收回来
-    store::tombstone(name, "用户删除")?;
-    Ok(json!({ "name": name, "trash": trashed, "mounts": removed_mounts }))
+    // 墓碑：下一轮扫描看见工具目录里的残留副本也不会把它收回来。
+    // 共用仓库不立：真身还在对方手里、对方还在用，把它标成「已删」只会让本机
+    // 以后认不回来 —— 共享模式下的删除是「解除本机登记」，不是「销毁技能」。
+    if !shared {
+        store::tombstone(name, "用户删除")?;
+    }
+    Ok(json!({ "name": name, "trash": trashed, "mounts": removed_mounts, "shared": shared }))
 }
 
 /// 切换一处挂载的启用状态（技能详情页的开关）。
