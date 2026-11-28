@@ -478,14 +478,17 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/skills-hub/daily-check/run", post(api::skills_hub::post_daily_check_run))
         .route("/api/skills-hub/sync", post(api::skills_hub::post_sync))
         .route("/api/skills-hub/resolve", post(api::skills_hub::post_resolve))
+        .route("/api/skills-hub/resolve-all", post(api::skills_hub::post_resolve_all))
         .route("/api/skills-hub/repair", post(api::skills_hub::post_repair))
         .route("/api/skills-hub/trash", get(api::skills_hub::get_trash))
         .route("/api/skills-hub/trash/restore", post(api::skills_hub::post_trash_restore))
         .route("/api/skills-hub/trash/purge", post(api::skills_hub::post_trash_purge))
         .route("/api/skills-hub/adopt", post(api::skills_hub::post_adopt))
+        .route("/api/skills-hub/adopt-all", post(api::skills_hub::post_adopt_all))
         .route("/api/skills-hub/remove", post(api::skills_hub::post_remove))
         .route("/api/skills-hub/mount/toggle", post(api::skills_hub::post_mount_toggle))
         .route("/api/skills-hub/mount/unregister", post(api::skills_hub::post_mount_unregister))
+        .route("/api/skills-hub/mount/unregister-all", post(api::skills_hub::post_mount_unregister_all))
         // ── 设置页「版本信息」──
         // 一次取全：版本 / 环境 / 路径 / 开关状态 / 关键计数（见 api::system_info
         // 的模块头）。挂 protected —— 数据目录、可执行文件路径与 Key 数量都属于

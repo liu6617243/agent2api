@@ -1284,5 +1284,18 @@
   "已解除 {name} 在 {tool} 的挂载登记": "Unregistered {name} from {tool}",
   "解除失败：{error}": "Unregister failed: {error}",
   "部分失败：{n} 处未修复": "Partial failure: {n} not repaired",
-  "失败明细": "Failure details"
+  "失败明细": "Failure details",
+  "一键处理": "Resolve all",
+  "处理中…": "Processing…",
+  "立即执行": "Run now",
+  "冲突需要你裁决，其余事项可以一键处理。": "Conflicts need your decision; everything else can be resolved in one click.",
+  "将自动执行：": "The following will run automatically:",
+  "解除 {n} 条外部链接登记（磁盘链接不动）": "Unregister {n} external link entries (disk links untouched)",
+  "重建 {n} 处失效挂载": "Rebuild {n} broken mounts",
+  "纳管 {n} 个中央未登记技能": "Adopt {n} unregistered skills",
+  "当前没有可自动处理的事项。冲突与孤儿目录不在此列：冲突需要你选一边，孤儿由同步确认执行收纳。": "Nothing to auto-resolve right now. Conflicts and orphan folders are excluded: conflicts need your pick, orphans are collected by sync confirmation.",
+  "冲突与孤儿目录不在此列：冲突需要你选一边，孤儿由同步确认执行收纳。": "Conflicts and orphan folders are excluded: conflicts need your pick, orphans are collected by sync confirmation.",
+  "处理失败：{error}": "Failed to resolve: {error}",
+  "重建失败 {n} 处：": "{n} mounts failed to rebuild:",
+  "纳入跳过 {n} 个：": "{n} adoptions skipped:"
 }

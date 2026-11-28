@@ -24,9 +24,11 @@
 //! POST /api/skills-hub/trash/restore  从回收站还原（{file}）
 //! POST /api/skills-hub/trash/purge    清空过期回收站
 //! POST /api/skills-hub/adopt          纳管中央目录里未登记的技能（{name}）
+//! POST /api/skills-hub/adopt-all      批量纳管（无参数，收所有可收的）
 //! POST /api/skills-hub/remove         删除技能（{name}）
 //! POST /api/skills-hub/mount/toggle   切换一处挂载（{name, tool, enabled}）
 //! POST /api/skills-hub/mount/unregister 解除登记（{name, tool}），不动磁盘链接
+//! POST /api/skills-hub/mount/unregister-all 批量解除登记（无参数，清所有外链）
 //! ```
 //!
 //! ── 为什么全部挂 protected ──────────────────────────────────
@@ -263,6 +265,11 @@ pub async fn post_repair(State(_state): State<ServerState>) -> Response {
     ok_json(skills_hub::repair())
 }
 
+/// 一键处理：解除外部登记 + 重建真失效挂载 + 纳管中央未登记，一个端点全做完。
+pub async fn post_resolve_all(State(_state): State<ServerState>) -> Response {
+    ok_json(skills_hub::resolve_all())
+}
+
 pub async fn post_daily_check_run(State(_state): State<ServerState>, Query(params): Query<HashMap<String, String>>) -> Response {
     ok_json(skills_hub::run_daily_check(flag(&params, "autoMount")))
 }
@@ -299,6 +306,11 @@ pub async fn post_adopt(State(_state): State<ServerState>, body: Bytes) -> Respo
         Ok(value) => ok_json(value),
         Err(message) => errors::management_error(400, message),
     }
+}
+
+/// 批量纳管：中央里所有未登记的真实目录一次收进台账。
+pub async fn post_adopt_all(State(_state): State<ServerState>) -> Response {
+    ok_json(skills_hub::adopt_all_skills())
 }
 
 pub async fn post_remove(State(_state): State<ServerState>, body: Bytes) -> Response {
@@ -358,4 +370,9 @@ pub async fn post_mount_unregister(State(_state): State<ServerState>, body: Byte
         Ok(value) => ok_json(value),
         Err(message) => errors::management_error(400, message),
     }
+}
+
+/// 批量解除登记：清掉所有外部链接的台账记录，不动磁盘链接。
+pub async fn post_mount_unregister_all(State(_state): State<ServerState>) -> Response {
+    ok_json(skills_hub::unregister_all_mounts())
 }

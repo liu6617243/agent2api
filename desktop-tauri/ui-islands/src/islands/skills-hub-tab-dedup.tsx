@@ -94,32 +94,6 @@ function Dedup({ onChanged, onOpenSkill, enterKey }: Props): React.ReactElement 
     }
   }
 
-  // 修复挂载只有全量接口（`mount::repair_all`），没有「修这一条」。所以这一区
-  // 只给一个按钮，不假装能逐行点 —— 界面上放一排点了没用的按钮比没有按钮更糟。
-  // 失败明细必须展示：只 toast 修好的条数，外链没被接管 / 真实目录没被摘
-  // 这些「为什么还剩」的原因就全被吞掉了。
-  const [repairNote, setRepairNote] = React.useState('')
-  const repair = async () => {
-    setBusy('repair')
-    try {
-      const result = await s.repairMounts()
-      const failed = result.failed ?? []
-      if (failed.length > 0) {
-        setRepairNote(failed.map(item => `${item.skill} @ ${item.tool}：${item.message}`).join('\n'))
-        toast(t('部分失败：{n} 处未修复', { n: num(failed.length) }), 'err')
-      } else {
-        setRepairNote('')
-        toast(t('重建完成：修复 {n} 处', { n: num(result.repaired) }), 'ok')
-      }
-      overview.reload()
-      onChanged()
-    } catch (error) {
-      toast(t('重建失败：{error}', { error: errorText(error) }), 'err')
-    } finally {
-      setBusy('')
-    }
-  }
-
   // 解除登记：只删台账，不动磁盘链接。用于别的中枢在管的链接位 ——
   // 摘掉重挂会被抢回去，两个软件抢同一条路径。
   const unregister = async (name: string, tool: string) => {
@@ -152,6 +126,64 @@ function Dedup({ onChanged, onOpenSkill, enterKey }: Props): React.ReactElement 
     }
   }
 
+  // ─── 一键处理（参考 AgentHub：一个按钮、自动决策、事后汇总）──────────
+  // 用户不关心内部分了几类：按钮替他决定 —— 解除外部登记 → 重建真失效
+  // 挂载 → 纳管中央未登记，顺序执行。冲突要人选一边、孤儿归同步确认执行，
+  // 都不在此列，弹窗里说明。失败明细在汇总区展示，不静默吞掉。
+  const [note, setNote] = React.useState('')
+  const resolveAll = async () => {
+    setBusy('resolve-all')
+    try {
+      const result = await s.resolveAll()
+      const failed = result.repair.failed ?? []
+      const skipped = result.adopt.skipped ?? []
+      const lines: string[] = []
+      if (failed.length > 0) {
+        lines.push(t('重建失败 {n} 处：', { n: num(failed.length) }))
+        lines.push(...failed.map(item => `${item.skill} @ ${item.tool}：${item.message}`))
+      }
+      if (skipped.length > 0) {
+        lines.push(t('纳入跳过 {n} 个：', { n: num(skipped.length) }))
+        lines.push(...skipped.map(item => `${item.name}：${item.reason}`))
+      }
+      setNote(lines.join('\n'))
+      toast(result.message, failed.length + skipped.length > 0 ? 'err' : 'ok')
+      overview.reload()
+      conflicts.reload()
+      onChanged()
+    } catch (error) {
+      toast(t('处理失败：{error}', { error: errorText(error) }), 'err')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const askResolveAll = async () => {
+    const ask = (window as unknown as { wbConfirm?: { ask?: (options: Record<string, unknown>) => Promise<boolean> } }).wbConfirm?.ask
+    const parts: string[] = []
+    if (externals.length > 0) {
+      parts.push(t('解除 {n} 条外部链接登记（磁盘链接不动）', { n: num(externals.length) }))
+    }
+    if (broken.length > 0) {
+      parts.push(t('重建 {n} 处失效挂载', { n: num(broken.length) }))
+    }
+    const adoptables = extras.filter(item => !item.isLink)
+    if (adoptables.length > 0) {
+      parts.push(t('纳管 {n} 个中央未登记技能', { n: num(adoptables.length) }))
+    }
+    const nothing = parts.length === 0
+    const body = nothing
+      ? t('当前没有可自动处理的事项。冲突与孤儿目录不在此列：冲突需要你选一边，孤儿由同步确认执行收纳。')
+      : [t('将自动执行：'), ...parts.map(part => `• ${part}`), '', t('冲突与孤儿目录不在此列：冲突需要你选一边，孤儿由同步确认执行收纳。')].join('\n')
+    const ok = await Promise.resolve(ask?.({
+      title: t('一键处理'),
+      text: body,
+      okText: t('立即执行'),
+    }) ?? true)
+    if (!ok) return
+    await resolveAll()
+  }
+
   const items = conflicts.data?.items ?? []
   const duplicates = conflicts.data?.duplicates ?? []
   const hints = conflicts.data?.hints ?? []
@@ -171,7 +203,24 @@ function Dedup({ onChanged, onOpenSkill, enterKey }: Props): React.ReactElement 
       <div className='sk-dedup'>
         {clean ? (
           <Empty>{t('没有待处理项。同名异容、链接异常、挂载失效、孤儿目录都会出现在这里。')}</Empty>
-        ) : null}
+        ) : (
+          // ── 页顶统一入口（参考 AgentHub）：一个按钮替用户把不需要裁决的
+          // 事项全部做完。放在页首而不是某个区块里 —— 它本来就是跨区块动作。
+          <div className='sk-dedup-toolbar'>
+            <span className='sk-muted'>
+              {t('冲突需要你裁决，其余事项可以一键处理。')}
+            </span>
+            <Button
+              type='button'
+              size='sm'
+              variant='default'
+              disabled={busy === 'resolve-all'}
+              onClick={() => void askResolveAll()}
+            >
+              {busy === 'resolve-all' ? t('处理中…') : t('一键处理')}
+            </Button>
+          </div>
+        )}
 
         {items.length > 0 ? (
           <Section
@@ -286,20 +335,15 @@ function Dedup({ onChanged, onOpenSkill, enterKey }: Props): React.ReactElement 
           </Section>
         ) : null}
 
-        {broken.length > 0 || repairNote ? (
+        {broken.length > 0 || note ? (
           <Section
             title={t('挂载失效')}
             hint={t('{n} 处。客户端目录里的链接指不到中央真身 —— 重建只改链接，不动内容。', { n: num(broken.length) })}
-            action={(
-              <Button type='button' size='sm' variant='outline' disabled={busy === 'repair'} onClick={() => void repair()}>
-                {t('全部重建')}
-              </Button>
-            )}
           >
-            {repairNote ? (
+            {note ? (
               <div className='sk-conflict-detail' style={{ whiteSpace: 'pre-line' }}>
                 <b>{t('失败明细')}</b>
-                {repairNote}
+                {note}
               </div>
             ) : null}
             {broken.length > 0 ? (

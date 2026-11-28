@@ -1273,5 +1273,18 @@
   "已解除 {name} 在 {tool} 的挂载登记": "Desregistrado {name} de {tool}",
   "解除失败：{error}": "Falha ao desregistrar: {error}",
   "部分失败：{n} 处未修复": "Falha parcial: {n} não reparados",
-  "失败明细": "Detalhes da falha"
+  "失败明细": "Detalhes da falha",
+  "一键处理": "Resolver tudo",
+  "处理中…": "Processando…",
+  "立即执行": "Executar agora",
+  "冲突需要你裁决，其余事项可以一键处理。": "Conflitos exigem sua decisão; o restante pode ser resolvido com um clique.",
+  "将自动执行：": "Será executado automaticamente:",
+  "解除 {n} 条外部链接登记（磁盘链接不动）": "Cancelar registro de {n} links externos (links no disco intactos)",
+  "重建 {n} 处失效挂载": "Reconstruir {n} montagens quebradas",
+  "纳管 {n} 个中央未登记技能": "Adotar {n} habilidades não registradas",
+  "当前没有可自动处理的事项。冲突与孤儿目录不在此列：冲突需要你选一边，孤儿由同步确认执行收纳。": "Nada para resolver automaticamente agora. Conflitos e pastas órfãs ficam de fora: conflitos exigem sua escolha, órfãos são coletados na confirmação de sincronização.",
+  "冲突与孤儿目录不在此列：冲突需要你选一边，孤儿由同步确认执行收纳。": "Conflitos e pastas órfãs ficam de fora: conflitos exigem sua escolha, órfãos são coletados na confirmação de sincronização.",
+  "处理失败：{error}": "Falha ao resolver: {error}",
+  "重建失败 {n} 处：": "{n} montagens não reconstruídas:",
+  "纳入跳过 {n} 个：": "{n} adoções ignoradas:"
 }

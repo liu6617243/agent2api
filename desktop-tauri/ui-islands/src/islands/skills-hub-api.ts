@@ -427,6 +427,21 @@ export function unregisterMount(name: string, tool: string): Promise<{ ok: boole
   return api('POST', `${BASE}/mount/unregister`, { name, tool })
 }
 
+/** 批量解除登记：清掉所有外部链接的台账记录（不动磁盘链接）。 */
+export function unregisterAllMounts(): Promise<{ removed: number; items: { name: string; tool: string; path: string }[] }> {
+  return api('POST', `${BASE}/mount/unregister-all`, {})
+}
+
+/** 批量纳管：中央里所有未登记的真实目录一次收进台账。 */
+export function adoptAllSkills(): Promise<{ adopted: number; names: string[]; skipped: { name: string; reason: string }[] }> {
+  return api('POST', `${BASE}/adopt-all`, {})
+}
+
+/** 一键处理：解除外部登记 + 重建真失效挂载 + 纳管中央未登记，一次做完。冲突与孤儿不在此列。 */
+export function resolveAll(): Promise<{ unregistered: { removed: number }; repair: { repaired: number; failed: RepairFailure[] }; adopt: { adopted: number; skipped: { name: string; reason: string }[] }; message: string }> {
+  return api('POST', `${BASE}/resolve-all`, {})
+}
+
 export function loadReports(limit = 20): Promise<{ items: ReportRow[] }> {
   return api('GET', `${BASE}/reports?limit=${limit}`)
 }

@@ -189,7 +189,10 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
   // 失效挂载是「待处理」的第四类来源。之前它只进了 `todoTotal`、没进副标题，
   // 于是出现「4 项」配「冲突 0 · 孤儿 0 · 未登记 0」—— 四个数各自都对，加起来
   // 却对不上总数，用户只能猜第 4 项是什么。现在四类同进同出，总数 = 副标题之和。
-  const brokenList = data.mountHealth.filter(item => !item.valid)
+  // external（别的中枢在管的健康链接）不算失效 —— 不排除的话，解除登记前
+  // 仪表盘永远挂着「N 处挂载失效」，而处理页那边它根本不在失效列表里，
+  // 两边对不上；§69 全部重建修完也压不掉这个数字，就是这个原因。
+  const brokenList = data.mountHealth.filter(item => !item.valid && !item.external)
   const brokenMounts = brokenList.length
   const todoTotal = data.pendingConflicts.length + data.orphans.length + data.hubExtra.length + brokenMounts
   // 「份消除」= 来源副本数 − 去重后的技能数，两个数字必须是同一轮扫描的两个

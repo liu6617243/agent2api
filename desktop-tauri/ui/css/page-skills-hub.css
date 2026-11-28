@@ -934,6 +934,17 @@
 
 /* ── 去重 ── */
 .sk-dedup { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+/* 页顶统一处理入口：一个「一键处理」按钮跨区块动作，说明文字在左、按钮在右 */
+.sk-dedup-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+}
 .sk-conflict-list { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .sk-conflict {
   /* 左侧 3px 竖条是「这条要你动手」的标记，用 warn（不是 danger）：

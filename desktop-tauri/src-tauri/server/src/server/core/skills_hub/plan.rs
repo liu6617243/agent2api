@@ -1535,6 +1535,86 @@ pub fn unregister(name: &str, tool: &str) -> Result<Value, String> {
     }))
 }
 
+/// 批量解除登记：把所有「别的中枢在管的健康链接」的台账记录一次清掉。
+///
+/// 只删台账，不动磁盘链接（与单条 `unregister` 同一底线）。条目来源是
+/// `verify_all` 的 `external` 标记，与处理页「外部链接」区块同源 ——
+/// 界面上看到几条，这里就清几条。外链常常成批出现（别的中枢一次发布
+/// N 个技能），逐条点等于惩罚用户。
+pub fn unregister_all() -> Value {
+    let manifest = store::load_manifest();
+    let health = mount::verify_all(&manifest);
+    let mut items: Vec<Value> = Vec::new();
+    for row in &health {
+        if row.get("external").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let name = text_of(row, "skill");
+        let tool = text_of(row, "tool");
+        if name.is_empty() || tool.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(text_of(row, "path"));
+        if store::drop_mount(&name, &tool, &path).is_ok() {
+            items.push(json!({ "name": name, "tool": tool, "path": path.to_string_lossy() }));
+        }
+    }
+    json!({ "removed": items.len(), "items": items })
+}
+
+/// 批量纳管：中央里所有「有真实目录、台账没记」的技能一次收进来。
+///
+/// 单条 `adopt` 的循环。链接与悬空目录 `adopt` 自己会拒，这里收集成
+/// `skipped` 让界面能说明「为什么少了几个」，而不是静默少掉。
+pub fn adopt_all() -> Value {
+    let manifest = store::load_manifest();
+    let recorded = store::manifest_names(&manifest);
+    let mut names: Vec<String> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    for name in store::skill_names() {
+        if recorded.contains_key(&name) {
+            continue;
+        }
+        match adopt(&name) {
+            Ok(_) => names.push(name),
+            Err(reason) => skipped.push(json!({ "name": name, "reason": reason })),
+        }
+    }
+    json!({ "adopted": names.len(), "names": names, "skipped": skipped })
+}
+
+/// 一键处理：把处理页里「不需要人裁决」的三类事项按安全顺序自动做完。
+///
+/// 参考 AgentHub 的做法（仪表盘「一键修复」只调一个 `repair_mounts`，孤儿与
+/// 纳管交给同步确认执行）：用户只看到一个按钮，内部自己决定先做什么。
+/// 顺序有讲究：
+/// 1. **先解除外部登记** —— 外链是别的中枢在管的健康链接，必须先从台账里
+///    摘掉，`repair` 才不会对着它们报「失效」（也避免下一个软件启动时
+///    两个中枢又为同一条链接打架）；
+/// 2. **再重建真失效挂载** —— 此时台账里剩下的失效都是本程序该管的；
+/// 3. **最后纳管中央未登记** —— 放最后，避免前面步骤改变了中央目录
+///    内容后重复计算。
+///
+/// 冲突（同名异容等）与孤儿目录**不在范围内**：前者必须人选一边，后者
+/// 由同步的「确认执行」统一收纳（与 AgentHub 一致）。结果里给汇总数字，
+/// 失败明细原样透出，界面只 toast 汇总、不暴露内部分类。
+pub fn resolve_all(config: &Value) -> Value {
+    let unregistered = unregister_all();
+    let repaired = repair(config);
+    let adopted = adopt_all();
+    json!({
+        "unregistered": unregistered,
+        "repair": repaired,
+        "adopt": adopted,
+        "message": format!(
+            "已处理：解除 {} 条外部登记 · 重建 {} 处挂载 · 纳入 {} 个技能",
+            unregistered.get("removed").and_then(Value::as_u64).unwrap_or(0),
+            repaired.get("repaired").and_then(Value::as_u64).unwrap_or(0),
+            adopted.get("adopted").and_then(Value::as_u64).unwrap_or(0),
+        ),
+    })
+}
+
 // ─── 日报 ────────────────────────────────────────────────────
 
 fn render_report(

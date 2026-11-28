@@ -625,6 +625,29 @@ pub fn unregister_mount(name: &str, tool: &str) -> Result<Value, String> {
     out
 }
 
+/// 批量解除登记：清掉所有外部链接的台账记录（不动磁盘链接）。
+pub fn unregister_all_mounts() -> Value {
+    let out = plan::unregister_all();
+    invalidate();
+    out
+}
+
+/// 批量纳管：中央里所有未登记的真实目录一次收进台账。
+pub fn adopt_all_skills() -> Value {
+    let out = plan::adopt_all();
+    invalidate();
+    out
+}
+
+/// 一键处理：外部登记 → 真失效挂载 → 中央未登记，一次做完（见 `plan::resolve_all`）。
+/// 冲突与孤儿不在此列：前者要人选，后者归同步确认执行。
+pub fn resolve_all() -> Value {
+    let config = tools::load_config();
+    let out = plan::resolve_all(&config);
+    invalidate();
+    out
+}
+
 /// 一键修复失效挂载。
 pub fn repair() -> Value {
     let config = tools::load_config();
