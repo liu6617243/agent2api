@@ -174,6 +174,15 @@ pub fn default_config() -> Value {
         "l3Threshold": 0.85,
         "tools": {},
         "customDirs": [],
+        // 每日自动巡检三项（对齐参考实现的配置页）。
+        // `dailyCheck` 默认**开**：这是保底健康检查，用户装完就该有；
+        // `dailyCheckAutoMount` 也默认开，但它只重建**确信失效**的链接
+        // （外链不算失效，见 `mount::verify` 的 `external`）。
+        "schedule": {
+            "dailyCheck": true,
+            "dailyCheckTime": "09:00",
+            "dailyCheckAutoMount": true,
+        },
     })
 }
 
@@ -250,6 +259,33 @@ pub fn load_config() -> Value {
                 .map(|text| json!(text))
                 .collect();
             config["customDirs"] = Value::Array(cleaned);
+        }
+        // schedule：三个字段逐个收敛。时刻必须是合法 HH:MM，坏了退回 09:00 ——
+        // 留着坏值会让调度器每分钟解析失败一次，等于这个功能悄悄死掉。
+        if let Some(schedule) = raw.get("schedule").and_then(Value::as_object) {
+            let daily_check = schedule
+                .get("dailyCheck")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let auto_mount = schedule
+                .get("dailyCheckAutoMount")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let time_text = schedule
+                .get("dailyCheckTime")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            let time_text = if super::schedule::is_valid_clock(time_text) {
+                time_text.to_string()
+            } else {
+                "09:00".to_string()
+            };
+            config["schedule"] = json!({
+                "dailyCheck": daily_check,
+                "dailyCheckTime": time_text,
+                "dailyCheckAutoMount": auto_mount,
+            });
         }
     }
     config

@@ -905,6 +905,10 @@ impl ServerState {
         if let Some(db) = self.db().cloned() {
             core::cloud_sync::auto_sync::spawn_worker(db);
         }
+        // 技能仓库的每日自动巡检。放在这里与记忆调度并列：它要扫磁盘上的
+        // 技能目录与挂载状态，不该挡住端口监听；开关默认开，但第一轮只在
+        // 配置里的 `schedule.dailyCheck` 为真且「该跑的时点已过」时才动。
+        core::skills_hub::spawn_daily_check();
         // 记忆中枢的自动化调度。放在这里而不是 `bootstrap`：它要做文件扫描，
         // 不该挡住端口监听；而它自己的第一轮也只在 `auto.enabled` 打开时才动。
         core::memory::schedule::spawn();

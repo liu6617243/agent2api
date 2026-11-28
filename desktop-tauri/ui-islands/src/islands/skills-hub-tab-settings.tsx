@@ -59,11 +59,27 @@ function iconLetter(name: string): string {
   return /[a-zA-Z]/.test(trimmed[0]) ? trimmed[0].toUpperCase() : trimmed[0]
 }
 
+/**
+ * epoch 毫秒 → `MM-DD HH:mm`。
+ *
+ * 只给「上次巡检是什么时候」用：不带年份，因为这块信息永远说的是最近一次，
+ * 加年份会让一行短文案变长，反而更难扫。坏值给 `—`，不抛错。
+ */
+function formatWhen(at: number | undefined): string {
+  if (!at || !Number.isFinite(at)) return '—'
+  const date = new Date(at)
+  if (Number.isNaN(date.getTime())) return '—'
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
 function Settings({ onChanged }: Props): React.ReactElement {
   const config = useLoad(() => s.loadConfig(), [])
   const tools = useLoad(() => s.loadTools(), [])
   const trash = useLoad(() => s.loadTrash(), [])
   const probe = useLoad(() => s.loadProbe(), [])
+  // 巡检状态条要显示「上次巡检的时间与结论」，不读它这块只能画个空壳。
+  const check = useLoad(() => s.loadDailyCheck(), [])
 
   const [section, setSection] = React.useState<Section>('tools')
   const [toolFilter, setToolFilter] = React.useState<ToolFilter>('all')
@@ -97,7 +113,17 @@ function Settings({ onChanged }: Props): React.ReactElement {
   // 开关点开再点回去（或改了数字又改回原值）就不该再提示保存。
   const savedShape = (value: s.HubConfig | null | undefined): string => {
     if (!value) return ''
-    return JSON.stringify([value.mountMode, value.trashDays, value.l3Enabled, value.l3Threshold, value.tools])
+    // 逐字段列出而不是 `JSON.stringify(value)`：后者一旦后端新增字段
+    // （比如这次的 `schedule`）就会出现「没改任何东西也显示未保存」。
+    // 新增字段记得往这里补一项 —— 漏了的表现是「改了不提示保存」。
+    return JSON.stringify([
+      value.mountMode,
+      value.trashDays,
+      value.l3Enabled,
+      value.l3Threshold,
+      value.tools,
+      value.schedule,
+    ])
   }
   const dirty = draft !== null && savedShape(draft) !== savedShape(values)
 
@@ -130,6 +156,7 @@ function Settings({ onChanged }: Props): React.ReactElement {
         l3Enabled: draft.l3Enabled,
         l3Threshold: draft.l3Threshold,
         tools: draft.tools,
+        schedule: draft.schedule,
       })
       setPending(false)
       config.reload()
@@ -458,52 +485,174 @@ function Settings({ onChanged }: Props): React.ReactElement {
 
           {/* ══ 检测与调度（行为开关）══ */}
           {section === 'auto' ? (
-            <div className='sk-cfg-panel'>
-              <div className='sk-cfg-panel-title'>{t('同步与挂载')}</div>
-              <div className='sk-cfg-panel-hint'>{t('这些开关直接决定同步会怎么动你的磁盘')}</div>
+            <>
+              {/* ── 第一块：每日自动健康检测 ──
+                  参考实现的顺序是「开关 → 时刻 → 自动修复 → 上次结果」，
+                  这里照抄。开关默认开：这是保底健康检查，装完就该有。 */}
+              <div className='sk-cfg-panel'>
+                <div className='sk-cfg-panel-title'>{t('全自动每日健康检测与自动对账')}</div>
 
-              <div className='sk-field'>
-                <div className='sk-field-copy'>
-                  <div className='sk-field-label'>{t('挂载模式')}</div>
-                  <div className='sk-field-hint'>
-                    {t('目录链接：渠道目录里放一个指向中央的链接，磁盘上只有一份内容（推荐）。复制：真的复制一份，之后两边各自独立 —— 只在前一种建不起来时用。')}
+                <div className='sk-field'>
+                  <div className='sk-field-copy'>
+                    <div className='sk-field-label'>{t('每日全自动健康检测开关')}</div>
+                    <div className='sk-field-hint'>
+                      {t('开启后系统每天在设定时刻自动扫描全部渠道连通性、新技能与挂载完整性')}
+                    </div>
+                  </div>
+                  <div className='sk-field-control'>
+                    <Switch
+                      checked={cfg.schedule.dailyCheck}
+                      onCheckedChange={next => edit({ schedule: { ...cfg.schedule, dailyCheck: next } })}
+                    />
                   </div>
                 </div>
-                <div className='sk-field-control'>
-                  <Switch
-                    checked={cfg.mountMode === 'copy'}
-                    onCheckedChange={next => edit({ mountMode: next ? 'copy' : 'junction' })}
-                  />
-                  <span className='sk-field-value'>{cfg.mountMode === 'copy' ? t('复制副本') : t('目录链接')}</span>
-                </div>
-              </div>
 
-              <div className='sk-field'>
-                <div className='sk-field-copy'>
-                  <div className='sk-field-label'>{t('相似度提示（L3）')}</div>
-                  <div className='sk-field-hint'>
-                    {t('按描述文本的余弦相似度列出疑似重复。默认关：0.85 在「把 X 转成 Y」这类写法上误报率很高，自动合并会造成技能莫名消失。')}
+                <div className='sk-field'>
+                  <div className='sk-field-copy'>
+                    <div className='sk-field-label'>{t('每日巡检执行时刻')}</div>
+                    <div className='sk-field-hint'>
+                      {t('格式为 24 小时制 HH:mm，如错过设定时刻（睡眠关机），开机首次 tick 自动补测')}
+                    </div>
                   </div>
-                </div>
-                <div className='sk-field-control'>
-                  <Switch
-                    checked={cfg.l3Enabled}
-                    onCheckedChange={next => edit({ l3Enabled: next })}
-                  />
-                  {cfg.l3Enabled ? (
+                  <div className='sk-field-control'>
                     <input
                       className='sk-input sk-input-num'
-                      type='number' min={0.3} max={0.99} step={0.01}
-                      defaultValue={cfg.l3Threshold}
-                      onBlur={event => {
-                        const next = Number(event.target.value)
-                        if (Number.isFinite(next)) edit({ l3Threshold: next })
-                      }}
+                      type='time'
+                      value={cfg.schedule.dailyCheckTime}
+                      disabled={!cfg.schedule.dailyCheck}
+                      onChange={event => edit({ schedule: { ...cfg.schedule, dailyCheckTime: event.target.value } })}
                     />
-                  ) : null}
+                  </div>
+                </div>
+
+                <div className='sk-field'>
+                  <div className='sk-field-copy'>
+                    <div className='sk-field-label'>{t('巡检自动修复与纳管')}</div>
+                    <div className='sk-field-hint'>
+                      {t('检测到失效的 Junction 挂载时自动重建，无冲突孤儿目录自动尝试安全收纳')}
+                    </div>
+                  </div>
+                  <div className='sk-field-control'>
+                    <Switch
+                      checked={cfg.schedule.dailyCheckAutoMount}
+                      onCheckedChange={next => edit({ schedule: { ...cfg.schedule, dailyCheckAutoMount: next } })}
+                    />
+                  </div>
+                </div>
+
+                {/* 上次巡检结论。没跑过就不画这一条 —— 画一个「尚未运行」的空盒子
+                    比不画更让人怀疑功能坏了。 */}
+                {check.data?.last ? (
+                  <div className='sk-check-strip'>
+                    <div className='sk-check-strip-head'>
+                      <div className='sk-check-strip-left'>
+                        <Badge variant={check.data.last.ok ? 'success' : 'warning'}>
+                          {check.data.last.ok ? t('全渠道健康良好') : t('发现待处理项')}
+                        </Badge>
+                        <span className='sk-check-strip-when'>
+                          {t('上次巡检：{when}', { when: formatWhen(check.data.last.checkedAt) })}
+                        </span>
+                      </div>
+                      <Button
+                        type='button' size='sm' variant='ghost'
+                        disabled={busy === 'check'}
+                        onClick={() => {
+                          setBusy('check')
+                          void s.runDailyCheck(cfg.schedule.dailyCheckAutoMount)
+                            .then(() => { check.reload(); onChanged(); toast(t('巡检完成'), 'ok') })
+                            .catch(error => toast(t('巡检失败：{error}', { error: String(error) }), 'err'))
+                            .finally(() => setBusy(''))
+                        }}
+                      >
+                        {busy === 'check' ? t('巡检中…') : t('立即执行一次全自动检测')}
+                      </Button>
+                    </div>
+                    <div className='sk-check-strip-summary'>{check.data.last.summary}</div>
+                  </div>
+                ) : null}
+              </div>
+
+              {/* ── 第二块：挂载模式与生命周期 ──
+                  挂载模式用卡片单选而不是开关。两个选项各有适用场景，
+                  开关只能表示「是不是 A」，说不清「B 是什么、什么时候该用 B」。 */}
+              <div className='sk-cfg-panel'>
+                <div className='sk-cfg-panel-title'>{t('挂载模式与生命周期')}</div>
+                <div className='sk-cfg-panel-hint'>{t('调整仅影响之后的同步与挂载动作')}</div>
+
+                <div className='sk-field sk-field-block'>
+                  <div className='sk-field-label'>{t('挂载模式')}</div>
+                  <div className='sk-mount-choice'>
+                    {([
+                      { value: 'junction', title: t('Junction（推荐）'), desc: t('按技能粒度建立目录联接，零拷贝、即时生效。') },
+                      { value: 'copy', title: t('直接复制'), desc: t('独立文件拷贝，兼容性好但可能产生漂移。') },
+                    ] as const).map(item => {
+                      const active = cfg.mountMode === item.value
+                      return (
+                        <button
+                          key={item.value}
+                          type='button'
+                          className={`sk-mount-card${active ? ' is-active' : ''}`}
+                          aria-pressed={active}
+                          onClick={() => edit({ mountMode: item.value })}
+                        >
+                          <span className='sk-mount-card-title'>{item.title}</span>
+                          <span className='sk-mount-card-desc'>{item.desc}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+
+                <div className='sk-field'>
+                  <div className='sk-field-copy'>
+                    <div className='sk-field-label'>{t('L3 语义去重提示')}</div>
+                    <div className='sk-field-hint'>{t('本地向量计算，仅提示建议，绝不强行合并')}</div>
+                  </div>
+                  <div className='sk-field-control'>
+                    <Switch
+                      checked={cfg.l3Enabled}
+                      onCheckedChange={next => edit({ l3Enabled: next })}
+                    />
+                  </div>
                 </div>
               </div>
-            </div>
+
+              {/* ── 第三块：中央数据仓库位置 ── */}
+              <div className='sk-cfg-panel'>
+                <div className='sk-cfg-panel-title'>{t('中央数据仓库位置')}</div>
+                <div className='sk-cfg-panel-hint'>{t('技能真身（skills/）、清单（manifest.json）存放位置')}</div>
+
+                <div className='sk-field sk-field-block'>
+                  <div className='sk-field-label'>{t('中央仓库物理路径')}</div>
+                  <div className='sk-path-row'>
+                    <input className='sk-input' value={hubPath} readOnly />
+                    <Button
+                      type='button' size='sm' variant='ghost'
+                      onClick={copyHub}
+                    >
+                      {t('复制')}
+                    </Button>
+                  </div>
+                </div>
+
+                <div className='sk-field'>
+                  <div className='sk-field-copy'>
+                    <div className='sk-field-label'>{t('全局同步与跨设备 WebDAV')}</div>
+                    <div className='sk-field-hint'>
+                      {t('记忆模块每 24 小时一轮自动同步；节奏在「设置 · 同步时间」里改。')}
+                    </div>
+                  </div>
+                  <div className='sk-field-control'>
+                    <Button
+                      type='button' size='sm' variant='ghost'
+                      onClick={() => toast(t('跨设备同步节奏在「设置 · 同步时间」里调'), 'ok')}
+                    >
+                      {t('去 设置 · 同步时间')}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            </>
           ) : null}
 
           {/* ══ 回收站与存储 ══ */}

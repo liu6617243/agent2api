@@ -249,6 +249,15 @@ export type HubConfig = {
   /** 只存用户改过的覆盖：`{ [toolId]: { enabled?, name?, paths?[] } }` */
   tools: Record<string, { enabled?: boolean; name?: string; paths?: string[] }>
   customDirs: string[]
+  /** 每日自动巡检（后端 `skills_hub::schedule` 据此起调度） */
+  schedule: {
+    /** 每日全自动健康检测开关 */
+    dailyCheck: boolean
+    /** 执行时刻，`HH:MM` 24 小时制 */
+    dailyCheckTime: string
+    /** 巡检时顺手重建失效挂载 / 纳管无冲突孤儿 */
+    dailyCheckAutoMount: boolean
+  }
 }
 
 /* ─── 回收站（`skills_hub::trash`）─────────────────────────── */

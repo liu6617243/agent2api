@@ -38,12 +38,14 @@
 mod mount;
 mod plan;
 mod scan;
+mod schedule;
 mod store;
 mod tools;
 
 use serde_json::{json, Value};
 
 pub use plan::{normalize_name, plan as sync_plan};
+pub use schedule::spawn as spawn_daily_check;
 pub use tools::{default_config, KV_KEY};
 
 /// 磁盘或配置被改过之后，把两层缓存一起作废。
