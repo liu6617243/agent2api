@@ -307,6 +307,7 @@ export function SkillCardGrid({
   rows,
   onOpen,
   footer = 'sources',
+  badge = 'state',
   className,
 }: {
   rows: s.LibraryRow[]
@@ -320,6 +321,16 @@ export function SkillCardGrid({
    * 个客户端了」。同一个技能在两处的状态判定仍是同一份 `cardStatus`。
    */
   footer?: 'sources' | 'mounts'
+  /**
+   * 右上角徽标的口径。
+   *
+   * `state`（默认）是技能库那六档：已挂载 / 待收纳 / 外部链接 / 客户端自带…
+   * `ledger` 是 AgentHub 仪表盘速览卡的口径 —— 只问「台账里登记了没有」，
+   * 对应 `inManifest ? 已收纳 : 待收纳`。仪表盘一屏 18 张卡，六档标签里的
+   * 「外部链接 / 客户端自带」在这里没有决策价值：用户在那儿只想知道
+   * 「这个技能到底收进中央没有」。
+   */
+  badge?: 'state' | 'ledger'
   className?: string
 }): React.ReactElement {
   return (
@@ -329,6 +340,10 @@ export function SkillCardGrid({
         const chips = sourceTools(row)
         const mounts = (row.mounts ?? []).filter(item => item.valid).length
         const key = `${row.origin}-${row.tool ?? ''}-${row.name}`
+        const led = badge === 'ledger'
+        const label = led ? (row.inManifest ? t('已收纳') : t('待收纳')) : status.label
+        const variant = led ? (row.inManifest ? 'success' : 'brand') : status.variant
+        const dot = led ? (row.inManifest ? 'sk-dot-ok' : 'sk-dot-pending') : status.dot
         return (
           <button
             key={key}
@@ -338,15 +353,15 @@ export function SkillCardGrid({
           >
             <div className='sk-skill-head'>
               {footer === 'mounts' ? null : (
-                <span className={`sk-dot sk-skill-dot ${status.dot}`} aria-hidden='true' />
+                <span className={`sk-dot sk-skill-dot ${dot}`} aria-hidden='true' />
               )}
               <span className='sk-skill-name' title={row.skillName || row.name}>{row.skillName || row.name}</span>
-              <Badge className='sk-skill-badge' variant={status.variant} shape='tag'>{status.label}</Badge>
+              <Badge className='sk-skill-badge' variant={variant} shape='tag'>{label}</Badge>
             </div>
             <div className='sk-skill-desc'>{row.description || t('（没有 description，Agent 触发不出这个技能）')}</div>
             {footer === 'mounts' ? (
               <div className='sk-skill-foot'>
-                <span className={`sk-dot ${status.dot}`} aria-hidden='true' />
+                <span className={`sk-dot ${dot}`} aria-hidden='true' />
                 <span className='sk-skill-tool'>{row.tool || chips[0] || t('中央')}</span>
                 <span className='sk-skill-mounts'>{t('{n} 挂载', { n: mounts })} <span aria-hidden='true'>›</span></span>
               </div>

@@ -615,6 +615,29 @@ function Settings({ onChanged }: Props): React.ReactElement {
                     />
                   </div>
                 </div>
+
+                {/* 保留天数归「生命周期」不归「回收站」：它约束的是所有移除动作
+                    多久之后自动过期，由同步流程顺手清理（AgentHub 同）。 */}
+                <div className='sk-field'>
+                  <div className='sk-field-copy'>
+                    <div className='sk-field-label'>{t('回收站保留天数')}</div>
+                    <div className='sk-field-hint'>
+                      {t('超期后由清理动作自动清除')}
+                    </div>
+                  </div>
+                  <div className='sk-field-control'>
+                    <input
+                      className='sk-input sk-input-num'
+                      type='number' min={0} max={3650}
+                      defaultValue={cfg.trashDays}
+                      onBlur={event => {
+                        const next = Number(event.target.value)
+                        if (Number.isFinite(next)) edit({ trashDays: Math.max(0, Math.floor(next)) })
+                      }}
+                    />
+                    <span className='sk-field-value'>{t('天')}</span>
+                  </div>
+                </div>
               </div>
 
               {/* ── 第三块：中央数据仓库位置 ── */}
@@ -655,65 +678,46 @@ function Settings({ onChanged }: Props): React.ReactElement {
             </>
           ) : null}
 
-          {/* ══ 回收站与存储 ══ */}
+          {/* ══ 回收站与存储 ══
+              对齐 AgentHub 设置页「回收站与存储」档：只有两块。
+              ── 为什么保留天数不在这 ──
+              它管的是「所有移除动作的保留期」，属于生命周期策略，跟挂载模式
+              是一组（AgentHub 也把它放在「挂载模式与生命周期」里）。摆在回收站
+              档会让用户以为它只管回收站自己的容量。 */}
           {section === 'trash' ? (
-            <div className='sk-cfg-panel'>
-              <div className='sk-cfg-panel-title'>{t('回收站')}</div>
-              <div className='sk-cfg-panel-hint'>{t('删技能、原位转挂载、冲突裁决落选 —— 三处移除的真实内容都先进这里')}</div>
-
-              <div className='sk-field'>
-                <div className='sk-field-copy'>
-                  <div className='sk-field-label'>{t('回收站保留天数')}</div>
-                  <div className='sk-field-hint'>
-                    {t('被删的真身、被替换的旧版本都先进回收站。删错了没有第二次机会（内容只有你自己写得出来），所以这里别设太小。')}
-                  </div>
+            <>
+              <div className='sk-cfg-panel'>
+                <div className='sk-cfg-panel-title'>
+                  {t('回收站（{n} 项）', { n: trashItems.length })}
                 </div>
-                <div className='sk-field-control'>
-                  <input
-                    className='sk-input sk-input-num'
-                    type='number' min={0} max={3650}
-                    defaultValue={cfg.trashDays}
-                    onBlur={event => {
-                      const next = Number(event.target.value)
-                      if (Number.isFinite(next)) edit({ trashDays: Math.max(0, Math.floor(next)) })
-                    }}
-                  />
-                  <span className='sk-field-value'>{t('天')}</span>
+                <div className='sk-cfg-panel-hint'>
+                  {t('被替换或删除的技能目录先进回收站，保留 {n} 天可还原。', { n: cfg.trashDays })}
                 </div>
-              </div>
 
-              <div className='sk-cfg-trash-head'>
-                <span className='sk-field-label'>{t('回收站内容')}</span>
-                <Button
-                  type='button' size='sm' variant='ghost'
-                  disabled={busy === 'purge'}
-                  onClick={() => {
-                    setBusy('purge')
-                    void s.purgeTrash()
-                      .then(result => { toast(t('清掉 {n} 项', { n: result.removed }), 'ok'); trash.reload(); onChanged() })
-                      .catch(error => toast(t('清理失败：{error}', { error: String(error) }), 'err'))
-                      .finally(() => setBusy(''))
-                  }}
-                >
-                  {t('清理过期项')}
-                </Button>
-              </div>
-              {trash.loading && !trash.data ? (
-                <Empty>{t('正在读取…')}</Empty>
-              ) : trashItems.length === 0 ? (
-                <Empty>{t('回收站是空的')}</Empty>
-              ) : (
-                <div className='sk-table'>
-                  <div className='sk-table-head'>
-                    <span>{t('技能')}</span><span>{t('体积')}</span><span>{t('存了')}</span><span>{t('还剩')}</span><span />
-                  </div>
-                  {trashItems.map(row => (
-                    <div key={row.file} className='sk-table-row'>
-                      <span className='sk-cell-name' title={row.file}>{row.name}</span>
-                      <span>{sizeText(row.size)}</span>
-                      <span>{t('{n} 天前', { n: row.ageDays })}</span>
-                      <span>{t('还剩 {n} 天', { n: row.daysLeft })}</span>
-                      <span>
+                {trash.loading && !trash.data ? (
+                  <Empty>{t('正在读取…')}</Empty>
+                ) : trashItems.length === 0 ? (
+                  <Empty>{t('回收站是空的')}</Empty>
+                ) : (
+                  <div>
+                    {trashItems.map(row => (
+                      <div key={row.file} className='sk-trash-row'>
+                        <span className='sk-trash-icon' aria-hidden>
+                          <svg viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='1.8' strokeLinecap='round' strokeLinejoin='round'>
+                            <path d='M3 6h18' /><path d='M8 6V4h8v2' />
+                            <path d='M19 6l-1 14H6L5 6' /><path d='M10 11v5M14 11v5' />
+                          </svg>
+                        </span>
+                        <div className='sk-trash-copy'>
+                          <div className='sk-trash-name' title={row.file}>{row.name}</div>
+                          <div className='sk-trash-meta'>
+                            {t('{when} · {size} · 还剩 {n} 天', {
+                              when: clockText(row.mtimeMs),
+                              size: sizeText(row.size),
+                              n: row.daysLeft,
+                            })}
+                          </div>
+                        </div>
                         <Button
                           type='button' size='sm' variant='ghost'
                           disabled={busy === `restore-${row.file}`}
@@ -725,21 +729,46 @@ function Settings({ onChanged }: Props): React.ReactElement {
                               .finally(() => setBusy(''))
                           }}
                         >
-                          {t('放回中央库')}
+                          {t('还原')}
                         </Button>
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              <div className='sk-cfg-panel-title' style={{ marginTop: 14 }}>{t('位置')}</div>
-              <div className='sk-cfg-panel-hint'>{t('这两个目录归技能仓库自己管，别手动往里放别的东西')}</div>
-              <div className='sk-kv'>
-                <span>{t('中央仓库')}</span><code>{hubPath}</code>
-                <span>{t('回收站')}</span><code>{trash.data?.dir || '—'}</code>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
-            </div>
+
+              {/* ── 危险区 ──
+                  为什么单独一块、且只在这里出现：这是全页唯一「删了就没了」的动作。
+                  AgentHub 把它做成独立区块并描红；混在普通操作里点错的代价不可逆。 */}
+              <div className='sk-cfg-panel sk-danger-panel'>
+                <div className='sk-cfg-panel-title sk-danger-title'>{t('危险区')}</div>
+                <div className='sk-field'>
+                  <div className='sk-field-copy'>
+                    <div className='sk-field-label'>{t('清空回收站')}</div>
+                    <div className='sk-field-hint'>
+                      {t('立即永久删除 .trash 内的历史技能版本，不可恢复。')}
+                    </div>
+                  </div>
+                  <div className='sk-field-control'>
+                    <Button
+                      type='button' size='sm' variant='destructive'
+                      disabled={busy === 'purge' || trashItems.length === 0}
+                      onClick={() => {
+                        // 二次确认：这是全页唯一不可恢复的动作，AgentHub 同款语义。
+                        if (!window.confirm(t('确定清空回收站里的 {n} 项？该操作不可恢复。', { n: trashItems.length }))) return
+                        setBusy('purge')
+                        void s.emptyTrash()
+                          .then(result => { toast(t('已清空回收站（{n} 项）', { n: result.removed }), 'ok'); trash.reload(); onChanged() })
+                          .catch(error => toast(t('清空失败：{error}', { error: String(error) }), 'err'))
+                          .finally(() => setBusy(''))
+                      }}
+                    >
+                      {t('清空')}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            </>
           ) : null}
         </div>
       )}
@@ -754,6 +783,21 @@ function Settings({ onChanged }: Props): React.ReactElement {
  * `store.rs` 的目录布局），反推一次比多一次请求划算。反推失败宁可显示 `—`，
  * 也不要把回收站路径当成中央仓库路径显示 —— 用户会照着它往错的地方放文件。
  */
+/**
+ * 毫秒时间戳 → 「11-27 22:14」。
+ *
+ * 为什么不直接 `toLocaleString`：它给出「2026/11/27 22:14:31」——年份和秒对
+ * 「什么时候被删的」这个问题都是噪声。回收站条目只活几天，月日时分足够定位；
+ * 完整文件名（含时间戳）已经放在行首的 `title` 里，需要精确值悬停看。
+ */
+function clockText(timestamp: number | undefined): string {
+  if (!timestamp) return '—'
+  const at = new Date(timestamp)
+  if (Number.isNaN(at.getTime())) return '—'
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${pad(at.getHours())}:${pad(at.getMinutes())}`
+}
+
 function hubDir(trashPath: string | undefined): string {
   if (!trashPath) return '—'
   const hit = trashPath.replace(/[\\/][^\\/]*$/, '')

@@ -22,7 +22,8 @@
 //! POST /api/skills-hub/repair         一键修复失效挂载
 //! GET  /api/skills-hub/trash          回收站
 //! POST /api/skills-hub/trash/restore  从回收站还原（{file}）
-//! POST /api/skills-hub/trash/purge    清空过期回收站
+//! POST /api/skills-hub/trash/purge    清理过期回收站（按保留天数）
+//! POST /api/skills-hub/trash/empty    清空回收站（全部，不看保留天数）
 //! POST /api/skills-hub/adopt          纳管中央目录里未登记的技能（{name}）
 //! POST /api/skills-hub/adopt-all      批量纳管（无参数，收所有可收的）
 //! POST /api/skills-hub/remove         删除技能（{name}）
@@ -291,6 +292,11 @@ pub async fn post_trash_restore(State(_state): State<ServerState>, body: Bytes) 
 
 pub async fn post_trash_purge(State(_state): State<ServerState>) -> Response {
     ok_json(skills_hub::purge_trash())
+}
+
+/// 清空回收站（不看保留天数）。设置页「危险区 · 清空」走这里。
+pub async fn post_trash_empty(State(_state): State<ServerState>) -> Response {
+    ok_json(skills_hub::empty_trash())
 }
 
 pub async fn post_adopt(State(_state): State<ServerState>, body: Bytes) -> Response {

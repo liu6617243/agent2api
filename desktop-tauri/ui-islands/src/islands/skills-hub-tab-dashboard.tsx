@@ -2,7 +2,7 @@ import * as React from 'react'
 import { Badge, Button } from '@ui'
 import { t } from '../i18n'
 import * as s from './skills-hub-api'
-import { Empty, Panel, Section, SkillCardGrid, ago, errorText, num, toast, useLoad } from './skills-hub-shared'
+import { Empty, Panel, SkillCardGrid, ago, errorText, num, scanTime, toast, useLoad } from './skills-hub-shared'
 
 /**
  * 技能仓库 · 仪表盘。
@@ -95,8 +95,22 @@ function reportStamp(file: string): string {
   return `${hit[2]}-${hit[3]} ${hit[4]}:${hit[5]}`
 }
 
-/** 一条待办：裁决 / 孤儿 / 中央未登记，统一成「标题 + 一句说明 + 查看」。 */
-type TodoRow = { key: string; title: string; sub: string; skill: string }
+/**
+ * 一条待办：裁决 / 孤儿 / 中央未登记 / 外部链接 / 失效挂载。
+ *
+ * 统一成「图标 + 标题 + 一句说明 + 一个动作」。`action` 决定那颗按钮做什么 ——
+ * AgentHub 就是这么分工的：冲突给「裁决」跳去重页，孤儿给「查看」跳同步页，
+ * 中央未登记给「纳管」直接改台账。把它摊平成一个无脑的「查看」会让用户多点
+ * 两层才办得成事，也让仪表盘失去「把不用动脑的事办完」的站位。
+ */
+type TodoRow = {
+  key: string
+  title: string
+  sub: string
+  skill: string
+  action: 'dedup' | 'sync' | 'adopt' | 'unregister' | 'open'
+  tool?: string
+}
 
 function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.ReactElement {
   // 仪表盘是全套里唯一「一眼看全现在」的一页，切回来还显示几分钟前的数字等于
@@ -108,6 +122,8 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
   const check = useLoad(() => s.loadDailyCheck(), [enterKey], { refreshOnEnter: true })
   const [checking, setChecking] = React.useState(false)
   const [query, setQuery] = React.useState('')
+  /** 渠道卡片点出来的筛选；空串 = 全部。同一时刻只选一个渠道（AgentHub 同款）。 */
+  const [toolFilter, setToolFilter] = React.useState('')
   const [reports, setReports] = React.useState<Record<string, ReportMeta>>({})
 
   const data = overview.data
@@ -174,66 +190,14 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
 
   // ─── 机械类事项的处理动作（参考 AgentHub：动作挂在仪表盘，不占裁决页）──
   //
-  // AgentHub 的仪表盘就是这么分工的：失效挂载那张卡上直接挂「一键修复」，
-  // 「中央未登记」每行挂「纳管」，「陌生目录（孤儿）」行只给「查看」跳同步页。
-  // 需要人对着两份内容做判断的冲突，才进「去重与冲突」页逐条裁决。
+  // AgentHub 的分工：失效挂载那张卡上挂「一键修复」，「中央未登记」行挂
+  // 「纳管」，「陌生目录（孤儿）」行只给「查看」跳同步页，需要人对着两份内容
+  // 做判断的冲突才进去重页逐条裁决。这里照同一套分工。
   //
-  // 所以这里把 `resolve-all` 的入口从裁决页搬回仪表盘：它本来就是跨区块的机械
-  // 动作，摆在裁决页会让用户以为「裁决」能顺手把这些办了，也会在无可裁决冲突
-  // 时把整个按钮藏掉（旧实现：`clean` 分支下压根不渲染 toolbar）。
+  // 特意不再保留跨类的「一键处理」总按钮：它会让用户以为冲突也能一键办掉，
+  // 而冲突永远需要人做选择。一个区块一个入口，才是 AgentHub 的写法。
   const [busy, setBusy] = React.useState('')
   const [note, setNote] = React.useState('')
-
-  const resolveAll = async () => {
-    setBusy('resolve-all')
-    try {
-      const result = await s.resolveAll()
-      const failed = result.repair.failed ?? []
-      const skipped = result.adopt.skipped ?? []
-      const lines: string[] = []
-      if (failed.length > 0) {
-        lines.push(t('重建失败 {n} 处：', { n: num(failed.length) }))
-        lines.push(...failed.map(item => `${item.skill} @ ${item.tool}：${item.message}`))
-      }
-      if (skipped.length > 0) {
-        lines.push(t('纳入跳过 {n} 个：', { n: num(skipped.length) }))
-        lines.push(...skipped.map(item => `${item.name}：${item.reason}`))
-      }
-      setNote(lines.join('\n'))
-      toast(result.message, failed.length + skipped.length > 0 ? 'err' : 'ok')
-      refreshNow()
-    } catch (error) {
-      toast(t('处理失败：{error}', { error: errorText(error) }), 'err')
-    } finally {
-      setBusy('')
-    }
-  }
-
-  const askResolveAll = async () => {
-    const ask = (window as unknown as { wbConfirm?: { ask?: (options: Record<string, unknown>) => Promise<boolean> } }).wbConfirm?.ask
-    const parts: string[] = []
-    if (externals.length > 0) {
-      parts.push(t('解除 {n} 条外部链接登记（磁盘链接不动）', { n: num(externals.length) }))
-    }
-    if (brokenMounts > 0) {
-      parts.push(t('重建 {n} 处失效挂载', { n: num(brokenMounts) }))
-    }
-    const adoptables = extras.filter(item => !item.isLink)
-    if (adoptables.length > 0) {
-      parts.push(t('纳管 {n} 个中央未登记技能', { n: num(adoptables.length) }))
-    }
-    const nothing = parts.length === 0
-    const body = nothing
-      ? t('当前没有可自动处理的事项。冲突需要你选一边，孤儿目录由同步确认执行收纳。')
-      : [t('将自动执行：'), ...parts.map(part => `• ${part}`), '', t('冲突需要你选一边，孤儿目录由同步确认执行收纳。')].join('\n')
-    const ok = await Promise.resolve(ask?.({
-      title: t('一键处理'),
-      text: body,
-      okText: t('立即执行'),
-    }) ?? true)
-    if (!ok) return
-    await resolveAll()
-  }
 
   const unregister = async (name: string, tool: string) => {
     setBusy(`unregister:${tool}:${name}`)
@@ -263,6 +227,31 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
     }
   }
 
+  // 「挂载与去重」卡片上的「一键修复」：只重建失效的 Junction，不动内容。
+  // AgentHub 把入口放在这张卡上，本机跟着放 —— 失效挂载属于「机械活」，
+  // 不该让用户先进去重页再找按钮。
+  const repairMounts = async () => {
+    setBusy('repair')
+    try {
+      const result = await s.repairMounts()
+      const failed = result.failed ?? []
+      setNote(failed.length > 0
+        ? [t('重建失败 {n} 处：', { n: num(failed.length) }), ...failed.map(item => `${item.skill} @ ${item.tool}：${item.message}`)].join('\n')
+        : '')
+      toast(
+        failed.length > 0
+          ? t('已重建 {n} 处，{k} 处失败', { n: num(result.repaired), k: num(failed.length) })
+          : t('已重建 {n} 处失效挂载', { n: num(result.repaired) }),
+        failed.length > 0 ? 'err' : 'ok',
+      )
+      refreshNow()
+    } catch (error) {
+      toast(t('修复失败：{error}', { error: errorText(error) }), 'err')
+    } finally {
+      setBusy('')
+    }
+  }
+
   if (!data) {
     return (
       <Panel loading={overview.loading} error={overview.error} onRetry={overview.reload}>
@@ -273,29 +262,31 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
 
   // 渠道区只画「目录真的找到了」的渠道 —— 未找到目录 / 已停用的完整配置在配置页
   // 已经有（含候选路径、启用开关），仪表盘重复一遍只会把已连接的挤到下面。
-  // 卡片里的状态徽标因此恒为「已连接」，不再需要三态分支。
   // 同一份过滤结果既喂卡片、也喂上面「已连接渠道」那格，别再写第二遍。
   const liveTools = data.tools.filter(row => row.dir)
-  const channelSkills = data.tools.reduce((sum, row) => sum + row.skillCount, 0)
-  // 失效挂载是「待处理」的第四类来源。之前它只进了 `todoTotal`、没进副标题，
-  // 于是出现「4 项」配「冲突 0 · 孤儿 0 · 未登记 0」—— 四个数各自都对，加起来
-  // 却对不上总数，用户只能猜第 4 项是什么。现在四类同进同出，总数 = 副标题之和。
-  // external（别的中枢在管的健康链接）不算失效 —— 不排除的话，解除登记前
-  // 仪表盘永远挂着「N 处挂载失效」，而处理页那边它根本不在失效列表里，
-  // 两边对不上；§69 全部重建修完也压不掉这个数字，就是这个原因。
+
+  // 失效挂载：`external`（别的中枢在管的健康链接）不算失效 —— 不排除的话，
+  // 解除登记前仪表盘永远挂着「N 处挂载失效」，而处理页那边它根本不在失效
+  // 列表里，两边对不上；§69 全部重建修完也压不掉这个数字，就是这个原因。
   const brokenList = data.mountHealth.filter(item => !item.valid && !item.external)
   const brokenMounts = brokenList.length
-  // 另外三类同样在这里先算好：仪表盘现在是它们的唯一处理入口（裁决页只留冲突），
-  // 所以「有没有东西要处理」「一键处理会做几件事」都靠这三个数组。
+  // 另外四类同样先算好：仪表盘是它们的处理入口（裁决页只留冲突）。
   const externals = data.mountHealth.filter(item => item.external)
   const extras = data.hubExtra ?? []
   const orphans = data.orphans ?? []
-  // 两个数必须分开：`listed` 是表格实际会画出的行数（决定显不显示空状态），
-  // `autoFixable` 是「一键处理」真能办掉的件数（悬空链接后端会拒绝纳管，
-  // 所以不算）。混用会出现「表里有 1 行、却显示空状态」或反之。
-  const listed = externals.length + brokenMounts + extras.length
-  const autoFixable = externals.length + brokenMounts + extras.filter(item => !item.isLink).length
-  const todoTotal = data.pendingConflicts.length + data.orphans.length + data.hubExtra.length + brokenMounts
+  const conflicts = data.pendingConflicts
+
+  /**
+   * 「待处理优化」总数 = 五类之和。
+   *
+   * AgentHub 的 `x()` 是「冲突 + 孤儿 + 中央未登记」；本机多两类（其他软件维护的
+   * 外部链接、失效挂载）。之前只把失效挂载算进来、外链漏在外面，于是卡片写
+   * 「0 项」、下面列表却挂着 4 行「外部链接登记」—— 同一页两个数互相打脸。
+   * 现在总数与列表行数同源，副标题把每一类都点出来。
+   */
+  const todoTotal = conflicts.length + orphans.length + extras.length + externals.length + brokenMounts
+  const others = externals.length + brokenMounts
+
   // 「份消除」= 本轮扫描里**真的被 L1 合并掉**的冗余副本对数。
   //
   // 不要用 `sourceCount − visibleSkills`（2026-11-28 用户报的 bug）：
@@ -311,8 +302,15 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
 
   const items = library.data?.items ?? []
   const needle = query.trim().toLowerCase()
+  // 渠道筛选与关键词是「与」关系：点了某个渠道卡片，网格只留该渠道收进来或
+  // 挂在该渠道里的技能 —— 和 AgentHub 的 `d.value` 过滤口径一致。
   const quick = items
     .filter(row => {
+      if (toolFilter) {
+        const hitSource = (row.sources ?? []).some(source => source.tool === toolFilter)
+        const hitMount = (row.mounts ?? []).some(mount => mount.tool === toolFilter)
+        if (!hitSource && !hitMount) return false
+      }
       if (!needle) return true
       return (
         row.name.toLowerCase().includes(needle)
@@ -320,67 +318,90 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
         || (row.description ?? '').toLowerCase().includes(needle)
       )
     })
-    .slice(0, 12)
+    .slice(0, 18)
 
-  // 四类问题**轮流**取，先各取第一条再取第二条。
+  // 五类问题**轮流**取，先各取第一条再取第二条。
   //
-  // 不能像原来那样先拼成一个大数组再 `slice(0, 3)`：挂载失效排在最后，只要前三类
-  // 里有一条，它就被整类切掉。而用户遇到的情况正是「右上角写 4 项、副标题三个 0」——
-  // 那 4 项全是挂载失效，列表里一条都看不见，点「去裁决」进去也是空的。
+  // 不能先拼成一个大数组再 `slice(0, 3)`：失效挂载排在最后，只要前面几类里有
+  // 一条，它就被整类切掉 —— 而用户遇到的情况正是「右上角写 4 项、列表一条都
+  // 看不见」。轮流取保证每一类都有机会露头。
   const buckets: TodoRow[][] = [
-    data.pendingConflicts.map(item => ({
+    conflicts.map(item => ({
       key: `c-${item.id}`,
       title: t('待裁决 · {title}', { title: item.title }),
       sub: item.detail,
       skill: item.skill ?? '',
+      action: 'dedup',
     })),
-    data.orphans.map(item => ({
+    orphans.map(item => ({
       key: `o-${item.tool}-${item.name}`,
       title: t('孤儿目录 · {name}', { name: item.name }),
       sub: t('存在于 {tool}，待收纳', { tool: item.tool }),
       skill: item.name,
+      action: 'sync',
     })),
-    data.hubExtra.map(item => ({
+    extras.map(item => ({
       key: `h-${item.name}`,
       title: t('中央未登记 · {name}', { name: item.name }),
       sub: item.isLink ? t('悬空链接，指向的真身已不在') : t('中央有目录，台账里没有记录'),
       skill: item.name,
+      action: item.isLink ? 'open' : 'adopt',
+    })),
+    externals.map(item => ({
+      key: `x-${item.tool}-${item.skill}`,
+      title: t('外部链接登记 · {name}', { name: item.skill }),
+      sub: t('{tool} 里由其他软件维护，磁盘链接不动', { tool: item.tool }),
+      skill: item.skill,
+      tool: item.tool,
+      action: 'unregister',
     })),
     brokenList.map(item => ({
-      key: `m-${item.tool}-${item.name}`,
-      title: t('挂载失效 · {name}', { name: item.name }),
+      key: `m-${item.tool}-${item.skill}`,
+      title: t('挂载失效 · {name}', { name: item.skill }),
       sub: t('{tool} 里的链接指不到中央真身', { tool: item.tool }),
-      skill: item.name,
+      skill: item.skill,
+      action: 'open',
     })),
   ]
   const todo: TodoRow[] = []
-  for (let round = 0; round < 2 && todo.length < 3; round += 1) {
+  for (let round = 0; round < 2 && todo.length < 6; round += 1) {
     for (const bucket of buckets) {
-      if (todo.length >= 3) break
+      if (todo.length >= 6) break
       const row = bucket[round]
       if (row) todo.push(row)
     }
   }
 
+  // AgentHub 的胶囊文案是「· {时间} 已自动完成」/「· 尚未运行检测」，两态都
+  // 只陈述事实、不做评价。本机保留「有 N 项待处理」这一句，因为巡检失败时
+  // 用户第一件想知道的就是「差在哪」。
   const checkState = last
     ? last.ok
-      ? t('{ago}检测通过', { ago: ago(last.checkedAt) })
-      : t('{ago}检测有 {n} 项待处理', {
-        ago: ago(last.checkedAt),
-        n: last.brokenMounts + last.conflicts + last.orphans + last.hubExtra,
+      ? t('· {time} 已自动完成', { time: scanTime(last.checkedAt) })
+      : t('· {time} 完成，{n} 项待处理', {
+        time: scanTime(last.checkedAt),
+        n: num(last.brokenMounts + last.conflicts + last.orphans + last.hubExtra),
       })
-    : t('尚未运行检测')
+    : t('· 尚未运行检测')
 
   return (
     <Panel loading={overview.loading} error={overview.error} onRetry={overview.reload}>
       <div className='sk-dash'>
-        {/* ── 页头：标题 + 中央路径 + 三个动作 ── */}
+        {/* ── 页头：标题 + 中央路径芯片 + 三个动作 ──
+            AgentHub 把中央仓库路径做成标题右侧的胶囊，而不是单独一行副标题 ——
+            一行头只放「这是什么 + 在哪」，视线不用上下跳。这里照排。 */}
         <div className='sk-dash-head'>
           <div className='sk-dash-head-copy'>
-            <div className='sk-dash-title'>{t('技能仓库 · 仪表盘')}</div>
-            <div className='sk-dash-sub' title={data.hubDir}>
-              <span>{t('中央技能库：')}</span>
-              <code>{data.hubDir}</code>
+            <div className='sk-dash-title-row'>
+              <span className='sk-dash-title'>{t('技能仓库 · 仪表盘')}</span>
+              <span className='sk-dash-pill' title={data.hubDir}>
+                <svg viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='1.8' strokeLinecap='round' strokeLinejoin='round' aria-hidden='true'>
+                  <rect x='3' y='4' width='18' height='7' rx='2' />
+                  <rect x='3' y='13' width='18' height='7' rx='2' />
+                  <path d='M7 7.5h.01M7 16.5h.01' />
+                </svg>
+                <code>{data.hubDir}</code>
+              </span>
             </div>
           </div>
           <div className='sk-dash-head-actions'>
@@ -400,17 +421,24 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
         <div className='sk-check-bar'>
           <div className='sk-check-main'>
             <span className={`sk-check-glyph${last ? (last.ok ? ' is-ok' : ' is-warn') : ''}`} aria-hidden='true'>
-              <svg viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round'>
-                <path d='M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9' />
-                <path d='M13.7 21a2 2 0 0 1-3.4 0' />
-              </svg>
+              {last && !last.ok ? (
+                <svg viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round'>
+                  <circle cx='12' cy='12' r='9' />
+                  <path d='M12 7.5v5M12 16.2v.1' />
+                </svg>
+              ) : (
+                <svg viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round'>
+                  <circle cx='12' cy='12' r='9' />
+                  <path d='m8.4 12.2 2.4 2.4 4.8-5' />
+                </svg>
+              )}
             </span>
             <span className='sk-check-title'>{t('全自动每日检测')}</span>
             <span className='sk-check-state'>{checkState}</span>
           </div>
           <div className='sk-check-actions'>
             <Button type='button' size='sm' variant='outline' disabled={checking} onClick={() => void runCheck(false)}>
-              {checking ? t('检测中…') : t('立即全面检测')}
+              {checking ? t('检测中…') : t('立即全盘检测')}
             </Button>
             <button type='button' className='sk-icon-btn' title={t('重新读取状态')} onClick={refreshNow} aria-label={t('重新读取状态')}>
               <svg viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round' aria-hidden='true'>
@@ -437,10 +465,10 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
               <b>{num(uniqueSkills)}</b>
               <span>{t('个技能')}</span>
             </div>
-            <div className='sk-stat-sub'>{t('来自 {n} 个来源副本', { n: num(data.sourceCount) })}</div>
+            <div className='sk-stat-sub'>{t('来自 {n} 份原始副本', { n: num(data.sourceCount) })}</div>
             <div className='sk-stat-foot'>
               <button type='button' className='sk-stat-link' onClick={() => onGo('library')}>
-                {t('去技能库')} <span aria-hidden='true'>→</span>
+                {t('去浏览')} <span aria-hidden='true'>→</span>
               </button>
             </div>
           </div>
@@ -462,7 +490,9 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
               <b>{num(data.tools.length)}</b>
               <span>{t('个渠道')}</span>
             </div>
-            <div className='sk-stat-sub'>{t('共 {n} 个技能目录', { n: num(channelSkills) })}</div>
+            {/* AgentHub 这张卡只有「N/M 个渠道」+「管理 →」，没有第二行统计。
+                多加一行「共 N 个技能目录」会把用户引去数目录，而那一格真正要
+                回答的是「接了几个客户端」。 */}
             <div className='sk-stat-foot'>
               <button type='button' className='sk-stat-link' onClick={() => onGo('settings')}>
                 {t('管理')} <span aria-hidden='true'>→</span>
@@ -487,14 +517,21 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
             </div>
             <div className={`sk-stat-sub${brokenMounts > 0 ? ' is-warn' : ' is-ok'}`}>
               {brokenMounts > 0
-                ? t('{n} 处挂载失效', { n: num(brokenMounts) })
-                : t('挂载全部有效')}
+                ? t('{n} 个失效挂载', { n: num(brokenMounts) })
+                : t('✓ 健康')}
             </div>
-            <div className='sk-stat-foot'>
-              <button type='button' className='sk-stat-link' onClick={() => onGo('dedup')}>
-                {t('去冲突')} <span aria-hidden='true'>→</span>
-              </button>
-            </div>
+            {brokenMounts > 0 ? (
+              <div className='sk-stat-foot'>
+                <button
+                  type='button'
+                  className='sk-stat-link'
+                  disabled={busy === 'repair'}
+                  onClick={() => void repairMounts()}
+                >
+                  {busy === 'repair' ? t('修复中…') : t('一键修复')}
+                </button>
+              </div>
+            ) : null}
           </div>
 
           <div className='sk-stat'>
@@ -512,17 +549,21 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
               <span>{t('项')}</span>
             </div>
             <div className={`sk-stat-sub${todoTotal > 0 ? ' is-warn' : ' is-ok'}`}>
-              {t('冲突 {c} · 孤儿 {o} · 未登记 {h} · 挂载 {m}', {
-                c: num(data.pendingConflicts.length),
-                o: num(data.orphans.length),
-                h: num(data.hubExtra.length),
-                m: num(brokenMounts),
+              {t('{c} 冲突 + {o} 孤儿 + {h} 未登记', {
+                c: num(conflicts.length),
+                o: num(orphans.length),
+                h: num(extras.length),
               })}
+              {others > 0 ? t(' + {n} 其他', { n: num(others) }) : null}
             </div>
             <div className='sk-stat-foot'>
-              <button type='button' className='sk-stat-link' onClick={() => onGo('dedup')}>
-                {t('去裁决')} <span aria-hidden='true'>→</span>
-              </button>
+              {todoTotal > 0 ? (
+                <button type='button' className='sk-stat-link' onClick={() => onGo('dedup')}>
+                  {t('去裁决')} <span aria-hidden='true'>→</span>
+                </button>
+              ) : (
+                <span className='sk-stat-ok'>{t('✓ 已就绪')}</span>
+              )}
             </div>
           </div>
         </div>
@@ -542,8 +583,13 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
               <span className='sk-block-count' title={t('只显示已连接的渠道')}>{num(liveTools.length)}</span>
             </span>
             <div className='sk-block-action'>
+              {toolFilter ? (
+                <Button type='button' size='sm' variant='ghost' onClick={() => setToolFilter('')}>
+                  {t('清除筛选（显示全部）')}
+                </Button>
+              ) : null}
               <Button type='button' size='sm' variant='ghost' onClick={() => onGo('settings')}>
-                {t('+ 添加渠道')}
+                {t('+ 增减渠道')}
               </Button>
             </div>
           </div>
@@ -555,27 +601,39 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
             </Empty>
           ) : (
             <div className='sk-channels'>
-              {liveTools.map(row => (
-                <div key={row.id} className='sk-channel'>
-                  <span className='sk-channel-glyph is-ok' aria-hidden='true'>
-                    {(row.name || '?').trim().charAt(0).toUpperCase()}
-                  </span>
-                  <div className='sk-channel-body'>
-                    <div className='sk-channel-name'>
-                      <span title={row.name}>{row.name}</span>
-                      {row.builtin ? null : <Badge variant='outline' shape='tag'>{t('自定义')}</Badge>}
-                      <Badge variant='success' shape='tag'>{t('已连接')}</Badge>
-                    </div>
-                    <code className='sk-channel-path' title={row.dir ?? ''}>
-                      {row.dir}
-                    </code>
-                  </div>
-                  <div className='sk-channel-meta'>
-                    <span>{t('{n} 技能', { n: num(row.skillCount) })}</span>
-                    <span>{t('{n} 挂载', { n: num(row.mountCount) })}</span>
-                  </div>
-                </div>
-              ))}
+              {liveTools.map(row => {
+                const active = toolFilter === row.id
+                return (
+                  <button
+                    key={row.id}
+                    type='button'
+                    className={`sk-channel${active ? ' is-active' : ''}`}
+                    aria-pressed={active}
+                    title={t('点击按 {name} 筛选下方技能列表', { name: row.name })}
+                    onClick={() => setToolFilter(active ? '' : row.id)}
+                  >
+                    <span className='sk-channel-glyph is-ok' aria-hidden='true'>
+                      {(row.name || '?').trim().charAt(0).toUpperCase()}
+                    </span>
+                    <span className='sk-channel-body'>
+                      <span className='sk-channel-name'>
+                        <span title={row.name}>{row.name}</span>
+                        {row.builtin ? null : <Badge variant='outline' shape='tag'>{t('自定义')}</Badge>}
+                      </span>
+                    </span>
+                    {/* AgentHub 这张卡右侧是「N 技能」+ 挂载状态标签，不再单列目录。
+                        目录在配置页和 tooltip 里都有，占一行只会挤掉名字。 */}
+                    <span className='sk-channel-meta'>
+                      <span>{t('{n} 技能', { n: num(row.skillCount) })}</span>
+                      {row.mountCount > 0 ? (
+                        <Badge variant='success' shape='tag'>{t('已挂载 {n}', { n: num(row.mountCount) })}</Badge>
+                      ) : (
+                        <Badge variant='outline' shape='tag'>{t('未挂载')}</Badge>
+                      )}
+                    </span>
+                  </button>
+                )
+              })}
             </div>
           )}
         </section>
@@ -593,7 +651,7 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
                 </svg>
               </span>
               {t('技能快捷速览与控制')}
-              <span className='sk-block-count'>{num(items.length)}</span>
+              <span className='sk-block-count'>{num(quick.length)}</span>
             </span>
             <div className='sk-block-action'>
               <label className='sk-search-wrap'>
@@ -610,7 +668,7 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
                 />
               </label>
               <Button type='button' size='sm' variant='outline' onClick={() => onGo('library')}>
-                {t('全部技能库')}
+                {t('全量技能库')}
               </Button>
             </div>
           </div>
@@ -618,10 +676,10 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
             <Empty>
               {items.length === 0
                 ? t('技能库里还没有任何技能。去配置页接上客户端的技能目录，然后同步一次。')
-                : t('没有符合搜索的技能')}
+                : t('没有找到符合条件的技能')}
             </Empty>
           ) : (
-            <SkillCardGrid rows={quick} onOpen={onOpenSkill} footer='mounts' className='sk-quick-grid' />
+            <SkillCardGrid rows={quick} onOpen={onOpenSkill} footer='mounts' badge='ledger' className='sk-quick-grid' />
           )}
         </section>
 
@@ -680,171 +738,101 @@ function Dashboard({ onGo, onOpenSkill, onChanged, enterKey }: Props): React.Rea
             <div className='sk-block-head'>
               <span className='sk-block-title'>{t('待办决策与孤儿')}</span>
               <div className='sk-block-action'>
-                <Button type='button' size='sm' variant='ghost' onClick={() => onGo('dedup')}>
-                  {t('去裁决')}
-                </Button>
+                {todoTotal > 0 ? (
+                  <Button type='button' size='sm' variant='ghost' onClick={() => onGo('dedup')}>
+                    {t('去裁决')}
+                  </Button>
+                ) : null}
               </div>
             </div>
             {todo.length === 0 ? (
-              <Empty>{t('没有待处理项，仓库是干净的')}</Empty>
+              // AgentHub 的空态是居中的大对勾 —— 「仓库是干净的」是个好消息，
+              // 用一行灰字说掉太像报错。样式沿用本机既有的 `.sk-empty-state`。
+              <div className='sk-empty-state'>
+                <span className='sk-empty-state-glyph is-ok' aria-hidden='true'>
+                  <svg viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='1.6' strokeLinecap='round' strokeLinejoin='round'>
+                    <circle cx='12' cy='12' r='9.2' />
+                    <path d='m8.2 12.3 2.6 2.6 5-5.4' />
+                  </svg>
+                </span>
+                <span className='sk-empty-state-title'>{t('暂无待办事项')}</span>
+              </div>
             ) : (
-              <ul className='sk-todo-list'>
-                {todo.map(row => (
-                  <li key={row.key}>
-                    <span className='sk-todo-glyph' aria-hidden='true'>
-                      <svg viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round'>
-                        <circle cx='12' cy='12' r='8.5' />
-                        <path d='M12 8v4.5M12 16v.1' />
-                      </svg>
-                    </span>
-                    <span className='sk-todo-copy'>
-                      <span className='sk-todo-title' title={row.title}>{row.title}</span>
-                      <span className='sk-todo-sub'>{row.sub}</span>
-                    </span>
-                    <Button
-                      type='button'
-                      size='sm'
-                      variant='ghost'
-                      disabled={!row.skill}
-                      onClick={() => { if (row.skill) onOpenSkill(row.skill) }}
-                    >
-                      {t('查看')}
+              <>
+                <ul className='sk-todo-list'>
+                  {todo.map(row => (
+                    <li key={row.key}>
+                      <span className='sk-todo-glyph' aria-hidden='true'>
+                        <svg viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round'>
+                          <circle cx='12' cy='12' r='8.5' />
+                          <path d='M12 8v4.5M12 16v.1' />
+                        </svg>
+                      </span>
+                      <span className='sk-todo-copy'>
+                        <span className='sk-todo-title' title={row.title}>{row.title}</span>
+                        <span className='sk-todo-sub'>{row.sub}</span>
+                      </span>
+                      {row.action === 'dedup' ? (
+                        <Button type='button' size='sm' variant='ghost' onClick={() => onGo('dedup')}>
+                          {t('裁决')}
+                        </Button>
+                      ) : row.action === 'sync' ? (
+                        <Button type='button' size='sm' variant='ghost' onClick={() => onGo('sync')}>
+                          {t('查看')}
+                        </Button>
+                      ) : row.action === 'adopt' ? (
+                        <Button
+                          type='button'
+                          size='sm'
+                          variant='ghost'
+                          disabled={busy === `adopt:${row.skill}`}
+                          onClick={() => void adopt(row.skill)}
+                        >
+                          {t('纳管')}
+                        </Button>
+                      ) : row.action === 'unregister' ? (
+                        <Button
+                          type='button'
+                          size='sm'
+                          variant='ghost'
+                          disabled={busy === `unregister:${row.tool}:${row.skill}`}
+                          onClick={() => void unregister(row.skill, row.tool ?? '')}
+                        >
+                          {t('解除登记')}
+                        </Button>
+                      ) : (
+                        <Button
+                          type='button'
+                          size='sm'
+                          variant='ghost'
+                          disabled={!row.skill}
+                          onClick={() => { if (row.skill) onOpenSkill(row.skill) }}
+                        >
+                          {t('看详情')}
+                        </Button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+                {todoTotal > todo.length ? (
+                  <div className='sk-dedup-summary'>
+                    <span>{t('还有 {n} 项待处理，去对应页面逐条看完。', { n: num(todoTotal - todo.length) })}</span>
+                    <Button type='button' size='sm' variant='ghost' onClick={() => onGo('dedup')}>
+                      {t('去裁决')}
                     </Button>
-                  </li>
-                ))}
-              </ul>
+                  </div>
+                ) : null}
+                {note ? (
+                  <div className='sk-conflict-detail' style={{ whiteSpace: 'pre-line' }}>
+                    <b>{t('失败明细')}</b>
+                    {note}
+                  </div>
+                ) : null}
+              </>
             )}
           </section>
         </div>
 
-        {/* ── 需要处理（机械动作区）─────────────────────────────────
-            对齐 AgentHub 的站位：仪表盘才是「把不用动脑的事办完」的地方。
-            AgentHub 在「挂载与去重」那张卡上直接挂「一键修复」，未登记行挂
-            「纳管」，陌生目录行跳同步 —— 裁决页只管冲突。
-
-            这里把四类机械事项按「能不能自动做」分成两段：上半是自动段（外链
-            登记 / 失效挂载 / 未登记），一个按钮全处理；下半是孤儿，只给「去同步」，
-            因为收纳是同步的职责，造个按钮等于绕开同步直接改台账。 */}
-        <section className='sk-block'>
-          <div className='sk-block-head'>
-            <span className='sk-block-title'>
-              <span className='sk-block-glyph' aria-hidden='true'>
-                <svg viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round'>
-                  <path d='M14.7 6.3a5 5 0 0 0 6.9 6.9l-8.3 8.3a2.5 2.5 0 0 1-3.5-3.5z' />
-                  <path d='M3 21l3-3' />
-                </svg>
-              </span>
-              {t('需要处理')}
-              <span className='sk-block-count'>{num(listed)}</span>
-            </span>
-            <div className='sk-block-action'>
-              <Button
-                type='button'
-                size='sm'
-                variant='ghost'
-                disabled={busy === 'resolve-all' || autoFixable === 0}
-                onClick={() => void askResolveAll()}
-              >
-                {busy === 'resolve-all' ? t('处理中…') : t('一键处理')}
-              </Button>
-            </div>
-          </div>
-
-          {listed === 0 ? (
-            <Empty>{t('挂载全部有效，中央目录也都登记过了')}</Empty>
-          ) : (
-            <div className='sk-table'>
-              <div className='sk-table-head'>
-                <span>{t('事项')}</span>
-                <span>{t('技能')}</span>
-                <span>{t('位置')}</span>
-                <span>{t('操作')}</span>
-              </div>
-
-              {externals.map(item => (
-                <div key={`x-${item.tool}-${item.skill}`} className='sk-table-row'>
-                  <span className='sk-cell-note'>{t('外部链接登记（其他软件维护，磁盘链接不动）')}</span>
-                  <span className='sk-cell-name'>{item.skill}</span>
-                  <span className='sk-cell-note'><code>{item.path}</code></span>
-                  <span className='sk-row-actions'>
-                    <Button
-                      type='button'
-                      size='sm'
-                      variant='ghost'
-                      disabled={busy === `unregister:${item.tool}:${item.skill}`}
-                      onClick={() => void unregister(item.skill, item.tool)}
-                    >
-                      {t('解除登记')}
-                    </Button>
-                  </span>
-                </div>
-              ))}
-
-              {brokenList.map(item => (
-                <div key={`m-${item.tool}-${item.skill}`} className='sk-table-row'>
-                  <span className='sk-cell-note'>
-                    {t('挂载失效（链接指不到中央真身）')}
-                    {item.centralExists === false ? <span className='sk-muted'> · {t('中央真身也不在了')}</span> : null}
-                  </span>
-                  <span className='sk-cell-name'>{item.skill}</span>
-                  <span className='sk-cell-note'><code>{item.path}</code></span>
-                  <span className='sk-row-actions'>
-                    <Button type='button' size='sm' variant='ghost' onClick={() => onOpenSkill(item.skill)}>
-                      {t('看详情')}
-                    </Button>
-                  </span>
-                </div>
-              ))}
-
-              {extras.map(item => (
-                <div key={`h-${item.name}`} className='sk-table-row'>
-                  <span className='sk-cell-note'>
-                    {item.isLink ? t('中央未登记（悬空链接，指向的真身已不在）') : t('中央未登记（中央有目录，台账无记录）')}
-                  </span>
-                  <span className='sk-cell-name'>{item.name}</span>
-                  <span className='sk-cell-note'><code>{item.path}</code></span>
-                  <span className='sk-row-actions'>
-                    {item.isLink ? (
-                      <Button type='button' size='sm' variant='ghost' onClick={() => onOpenSkill(item.name)}>
-                        {t('看详情')}
-                      </Button>
-                    ) : (
-                      <Button
-                        type='button'
-                        size='sm'
-                        variant='outline'
-                        disabled={busy === `adopt:${item.name}`}
-                        onClick={() => void adopt(item.name)}
-                      >
-                        {t('纳管')}
-                      </Button>
-                    )}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {note ? (
-            <div className='sk-conflict-detail' style={{ whiteSpace: 'pre-line' }}>
-              <b>{t('失败明细')}</b>
-              {note}
-            </div>
-          ) : null}
-
-          {orphans.length > 0 ? (
-            <div className='sk-dedup-summary'>
-              <span>
-                {t('另有 {n} 个孤儿目录（渠道里有、中央还没有）。收纳由同步统一完成，去同步页确认执行即可。', {
-                  n: num(orphans.length),
-                })}
-              </span>
-              <Button type='button' size='sm' variant='ghost' onClick={() => onGo('sync')}>
-                {t('去同步')}
-              </Button>
-            </div>
-          ) : null}
-        </section>
       </div>
     </Panel>
   )

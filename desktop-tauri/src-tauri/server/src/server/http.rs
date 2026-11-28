@@ -483,6 +483,7 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/skills-hub/trash", get(api::skills_hub::get_trash))
         .route("/api/skills-hub/trash/restore", post(api::skills_hub::post_trash_restore))
         .route("/api/skills-hub/trash/purge", post(api::skills_hub::post_trash_purge))
+        .route("/api/skills-hub/trash/empty", post(api::skills_hub::post_trash_empty))
         .route("/api/skills-hub/adopt", post(api::skills_hub::post_adopt))
         .route("/api/skills-hub/adopt-all", post(api::skills_hub::post_adopt_all))
         .route("/api/skills-hub/remove", post(api::skills_hub::post_remove))

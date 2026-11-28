@@ -486,6 +486,29 @@ pub fn purge_trash(trash_days: i64) -> usize {
     removed
 }
 
+/// 清空回收站（不管是否过期），返回清掉的条数。
+///
+/// ── 为什么和 `purge_trash` 分成两个函数 ──────────────────────
+/// `purge_trash` 是「按保留天数扫过期」的定时动作：同步流程每轮顺手调用一次
+/// （见 `plan.rs`），早一天都不该删。而设置页「危险区 · 清空」的语义是
+/// **用户此刻就要这里全空**，跟保留天数无关。把两者合并成一个函数，要么定时
+/// 清理会越权删掉未过期内容，要么「清空」点了半天什么都不消失 —— 后者正是
+/// 之前「点了没反应」那类反馈的来源。
+pub fn empty_trash() -> usize {
+    let mut removed = 0usize;
+    let entries = match fs::read_dir(trash_dir()) {
+        Ok(value) => value,
+        Err(_) => return removed,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// 从回收站还原：回到中央真身目录并补回台账记录。
 /// 从回收站条目名还原技能名（`<name>.<ts>` 或 `<name>.<ts>-<n>`）。
 ///

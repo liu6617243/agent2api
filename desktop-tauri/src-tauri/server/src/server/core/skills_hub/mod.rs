@@ -791,6 +791,13 @@ pub fn purge_trash() -> Value {
     json!({ "removed": removed })
 }
 
+/// 清空回收站：与「按天数清过期」分开，见 `store::empty_trash` 的注释。
+pub fn empty_trash() -> Value {
+    let removed = store::empty_trash();
+    invalidate();
+    json!({ "removed": removed })
+}
+
 // ─── 渠道探测 ────────────────────────────────────────────────
 
 /// 渠道清单（含解析出的实际目录与是否存在）。

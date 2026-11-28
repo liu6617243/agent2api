@@ -416,6 +416,11 @@ export function purgeTrash(): Promise<{ removed: number }> {
   return api('POST', `${BASE}/trash/purge`, {})
 }
 
+/** 清空回收站（全部，不看保留天数）。设置页「危险区」用。 */
+export function emptyTrash(): Promise<{ removed: number }> {
+  return api('POST', `${BASE}/trash/empty`, {})
+}
+
 export function adoptSkill(name: string): Promise<{ ok: boolean; action: string; name: string }> {
   return api('POST', `${BASE}/adopt`, { name })
 }
