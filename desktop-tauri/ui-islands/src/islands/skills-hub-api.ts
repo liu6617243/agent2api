@@ -451,12 +451,25 @@ export function unregisterAllMounts(): Promise<{ removed: number; items: { name:
   return api('POST', `${BASE}/mount/unregister-all`, {})
 }
 
-/** 批量纳管：中央里所有未登记的真实目录一次收进台账。 */
+/**
+ * 批量纳管：中央里所有未登记的真实目录一次收进台账。
+ *
+ * 当前没有页面调用它 —— §71 按 AgentHub 拆分后，「中央未登记」改成仪表盘逐条
+ * 「纳管」（`adoptSkill`），不再提供跨类批处理。保留包装是因为后端路由
+ * `/adopt-all` 仍在（脚本与将来的批量场景可用），且删掉它会让这条路由失去
+ * 唯一的前端声明。
+ */
 export function adoptAllSkills(): Promise<{ adopted: number; names: string[]; skipped: { name: string; reason: string }[] }> {
   return api('POST', `${BASE}/adopt-all`, {})
 }
 
-/** 一键处理：解除外部登记 + 重建真失效挂载 + 纳管中央未登记，一次做完。冲突与孤儿不在此列。 */
+/**
+ * 一键处理：解除外部登记 + 重建真失效挂载 + 纳管中央未登记，一次做完。冲突与孤儿不在此列。
+ *
+ * **仪表盘已不调用**（2026-11-28 按 AgentHub 去掉跨类「一键处理」总按钮：分类
+ * 不同，动作也不该挤在一个按钮里）。现在走的是「失效挂载 → 卡上的一键修复」
+ * +「外链 / 未登记 → 逐条动作」。包装保留原因同 `adoptAllSkills`。
+ */
 export function resolveAll(): Promise<{ unregistered: { removed: number }; repair: { repaired: number; failed: RepairFailure[] }; adopt: { adopted: number; skipped: { name: string; reason: string }[] }; message: string }> {
   return api('POST', `${BASE}/resolve-all`, {})
 }
